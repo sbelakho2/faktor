@@ -77,6 +77,19 @@ impl Rig {
     pub(crate) async fn get(&self, path: &str) -> (StatusCode, Value) {
         self.send(reqwest::Method::GET, path, None).await
     }
+
+    /// An unauthenticated GET, used only for the browser-facing OAuth
+    /// loopback callback (which is protected by the one-shot flow state, not
+    /// the daemon bearer).
+    pub(crate) async fn get_unauth(&self, path: &str) -> (StatusCode, String) {
+        let response = self
+            .client()
+            .get(format!("{}{}", self.base, path))
+            .send()
+            .await
+            .unwrap();
+        (response.status(), response.text().await.unwrap())
+    }
     pub(crate) async fn post(&self, path: &str, body: Value) -> (StatusCode, Value) {
         self.send(reqwest::Method::POST, path, Some(body)).await
     }

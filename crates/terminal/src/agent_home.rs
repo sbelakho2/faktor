@@ -3,9 +3,9 @@
 //! The per-session scratch HOME under the daemon data dir (`<base>/<session>/
 //! home` with the conventional XDG subdirectories), created no-follow below
 //! the trusted base; the [`ProcessSupervisor`] install/readback/apply
-//! methods; the real-home credential-path vocabulary the Linux confinement
-//! policy must never grant; and the pre-spawn confinement gate over
-//! credential-overlapping roots.
+//! methods; the real-home credential-path vocabulary the Linux/macOS
+//! confinement policy must never grant; and the pre-spawn confinement gate
+//! over credential-overlapping roots.
 
 use std::path::PathBuf;
 #[cfg(all(test, target_os = "linux"))]
@@ -14,11 +14,11 @@ use std::sync::Mutex;
 use faktor_core::error::Error;
 use faktor_core::id::SessionId;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use crate::NetworkIsolation;
 use crate::ProcessSupervisor;
 use crate::{AgentHomePolicy, EnvSpec, ProcessOwner, SpawnConfig};
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use crate::{DENY_ALL_REFUSAL_PREFIX, FILESYSTEM_REFUSAL_PREFIX};
 
 /// The data-dir subdirectory holding per-session agent scratch homes:
@@ -245,9 +245,9 @@ fn preserve_toolchain_homes(env: &mut Vec<(std::ffi::OsString, std::ffi::OsStrin
 }
 
 /// Test-only override of the real-home credential paths (Linux Landlock
-/// tests): lets a test point the confinement policy at a hermetic temp home
-/// without mutating the process environment. Never compiled into production
-/// builds; the real function otherwise reads HOME/USERPROFILE directly.
+/// tests): lets a test point the confinement policy at a hermetic temp home without mutating the process environment. Never
+/// compiled into production builds; the real function otherwise reads
+/// HOME/USERPROFILE directly.
 #[cfg(all(test, target_os = "linux"))]
 static CREDENTIAL_PATH_OVERRIDE: Mutex<Option<Vec<PathBuf>>> = Mutex::new(None);
 
@@ -264,8 +264,9 @@ pub(crate) fn override_credential_paths_for_tests(paths: Option<Vec<PathBuf>>) {
 /// the daemon's own HOME/USERPROFILE. Empty when the daemon carries no home
 /// (then no store can be reached through a home path). Pure environment
 /// read; the child's environment may point somewhere else entirely. Used by
-/// the Linux Landlock seam (the only platform with a confinement backend).
-#[cfg(target_os = "linux")]
+/// the Linux Landlock seam and the macOS sandbox profile builder (the
+/// platforms with a per-process confinement backend).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn real_home_credential_paths() -> Vec<PathBuf> {
     #[cfg(all(test, target_os = "linux"))]
     if let Some(paths) = CREDENTIAL_PATH_OVERRIDE
@@ -301,11 +302,14 @@ pub(crate) fn real_home_credential_paths() -> Vec<PathBuf> {
 /// real backends exist (pre-exec `unshare(CLONE_NEWNET)` and/or Landlock)
 /// and are ALWAYS attempted — capability heuristics never pre-judge them,
 /// only the actual syscalls prove or refuse; a failure refuses the spawn
-/// typed via [`spawn_failure`]. Every other platform has no filesystem
-/// backend at all, so a `Required` workspace demand is refused BEFORE
-/// spawn, typed, and no process is forked; `BestEffort` falls back to the
-/// honest application-policy-only execution (the projection never claimed
-/// otherwise).
+/// typed via [`spawn_failure`]. On macOS the generated sandbox profile is
+/// probed through `/usr/bin/sandbox-exec` here, BEFORE any child exists: a
+/// missing/refusing backend is a typed `sandbox_backend_unavailable`
+/// refusal for a Required demand, while a BestEffort filesystem demand
+/// honestly falls back to application-policy-only execution. Every other
+/// platform with neither backend (Windows) has no filesystem confinement at
+/// all, so a `Required` workspace demand is refused BEFORE spawn, typed, and
+/// no process is forked.
 ///
 /// On every platform this gate ALSO refuses a `Required` confinement whose
 /// configured roots cover a real-home credential store (audit item 6): the
@@ -314,37 +318,38 @@ pub(crate) fn real_home_credential_paths() -> Vec<PathBuf> {
 /// without granting that store — the spawn is refused typed, never run
 /// while silently granting credentials. `BestEffort` demands continue and
 /// the rule builder drops the overlapping root, keeping the store denied.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn isolation_gate(cfg: &SpawnConfig) -> Result<(), Error> {
-    if !cfg.filesystem_isolation.is_required() {
-        return Ok(());
-    }
-    let credentials = real_home_credential_paths();
-    for root in cfg
-        .filesystem_isolation
-        .roots()
-        .iter()
-        .chain(cfg.filesystem_isolation.writable_roots())
-    {
-        for credential in &credentials {
-            if faktor_core::command::paths_overlap(root, credential) {
-                return Err(Error::permission(format!(
-                    "sandbox unavailable: refusing spawn under \
-                     FilesystemIsolation::Workspace(required) of `{}` BEFORE spawn: confinement \
-                     root {} covers the home credential store {}; the confinement policy never \
-                     grants home credentials (move the workspace out of the home directory or \
-                     use an explicit external-cwd grant)",
-                    cfg.cmd,
-                    root.display(),
-                    credential.display()
-                )));
+    if cfg.filesystem_isolation.is_required() {
+        let credentials = real_home_credential_paths();
+        for root in cfg
+            .filesystem_isolation
+            .roots()
+            .iter()
+            .chain(cfg.filesystem_isolation.writable_roots())
+        {
+            for credential in &credentials {
+                if faktor_core::command::paths_overlap(root, credential) {
+                    return Err(Error::permission(format!(
+                        "sandbox unavailable: refusing spawn under \
+                         FilesystemIsolation::Workspace(required) of `{}` BEFORE spawn: \
+                         confinement root {} covers the home credential store {}; the \
+                         confinement policy never grants home credentials (move the workspace \
+                         out of the home directory or use an explicit external-cwd grant)",
+                        cfg.cmd,
+                        root.display(),
+                        credential.display()
+                    )));
+                }
             }
         }
     }
+    #[cfg(target_os = "macos")]
+    crate::sandbox::ensure_usable(cfg)?;
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn isolation_gate(cfg: &SpawnConfig) -> Result<(), Error> {
     if cfg.network_isolation == NetworkIsolation::DenyAll {
         return Err(Error::permission(format!(

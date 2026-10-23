@@ -12,9 +12,10 @@
 //! namespace (`unshare(CLONE_NEWNET)` pre-exec; loopback is left DOWN —
 //! an empty netns is adequate, nothing is brought up), and ANY failure to
 //! produce that isolated child refuses the spawn with a typed permission
-//! error; it NEVER warns and runs unenforced. Platforms without the
-//! backend (macOS/windows) refuse a DenyAll request BEFORE spawn. The
-//! policy layer DECIDES the requirement
+//! error; it NEVER warns and runs unenforced. macOS enforces DenyAll with a
+//! generated `/usr/bin/sandbox-exec` profile (all network families denied);
+//! Windows, which has no per-process network backend, refuses a DenyAll
+//! request BEFORE spawn. The policy layer DECIDES the requirement
 //! (`faktor-sandbox::SandboxGuarantee::Required` →
 //! [`NetworkIsolationRequirement::DenyAll`] → `DenyAll` here); this crate
 //! ENFORCES it, so there is no preflight platform guessing anywhere.
@@ -243,7 +244,8 @@ pub enum NetworkIsolation {
     /// exec: the child is never run proxy-only-but-unconfined. Platforms
     /// with no BrokerOnly backend (macOS/windows) refuse the request typed
     /// BEFORE spawn; those platforms keep proxy flags as application
-    /// configuration only and report the honest app-level state.
+    /// configuration only and report the honest app-level state. macOS
+    /// keeps DenyAll (the stronger, broker-less confinement) available.
     BrokerOnly {
         /// The broker endpoint (loopback literal) the confined child may
         /// reach.
@@ -415,7 +417,7 @@ pub enum NetworkEnforcement {
     /// the child to the relayed broker endpoint with no external route.
     OsLevelBrokerOnly,
     /// No per-process network-isolation backend exists on this platform
-    /// (macOS/windows); a DenyAll or BrokerOnly request fails closed before
+    /// (Windows today); a DenyAll or BrokerOnly request fails closed before
     /// spawn.
     Unavailable,
 }
@@ -462,10 +464,10 @@ impl std::fmt::Display for NetworkEnforcement {
 }
 
 /// Set once a `NetworkIsolation::DenyAll` spawn has succeeded in this
-/// process: the unshare pre-exec path ran without error, so the backend is
-/// PROVEN active at spawn. This is the ONLY thing that may move the Linux
-/// report off [`NetworkEnforcement::AppLevel`].
-#[cfg(target_os = "linux")]
+/// process: the Linux unshare pre-exec path or the macOS sandbox profile ran
+/// without error, so the backend is PROVEN active at spawn. This is the ONLY
+/// thing that may move the report off [`NetworkEnforcement::AppLevel`].
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 static DENY_ALL_PROVEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Set once a `NetworkIsolation::BrokerOnly` spawn has succeeded: the
@@ -495,6 +497,14 @@ pub const fn broker_only_supported() -> bool {
     cfg!(target_os = "linux")
 }
 
+/// True when this BUILD has a full `DenyAll` per-process network-isolation
+/// backend (Linux network namespaces, macOS sandbox profiles). A compile-time
+/// platform fact only, never an enforcement claim: the spawn layer still
+/// probes the actual backend and refuses typed when it cannot be applied.
+pub const fn deny_all_supported() -> bool {
+    cfg!(any(target_os = "linux", target_os = "macos"))
+}
+
 /// Probe override used by adversarial tests to force the enforcement
 /// verdict (the real probe is otherwise read-only; forcing NEVER changes
 /// what the spawn code applies — see the forced-lie test).
@@ -503,12 +513,13 @@ static NET_PROBE_OVERRIDE: std::sync::atomic::AtomicI8 = std::sync::atomic::Atom
 
 /// What the spawn path of THIS crate actually enforces.
 ///
-/// - **linux**: [`NetworkEnforcement::AppLevel`] until the unshare path is
+/// - **linux/macos**: [`NetworkEnforcement::AppLevel`] until the backend is
 ///   proven active at spawn (one successful [`NetworkIsolation::DenyAll`]
-///   spawn flips it to [`NetworkEnforcement::OsLevel`]). Capability
-///   existence is NOT proof (audit 4/28/35-39).
-/// - **macos/windows**: [`NetworkEnforcement::Unavailable`] — no backend
-///   is implemented; DenyAll requests are refused before spawn.
+///   spawn flips it to [`NetworkEnforcement::OsLevel`]). Capability existence
+///   is NOT proof (audit 4/28/35-39).
+/// - **windows**: [`NetworkEnforcement::Unavailable`] — no per-process
+///   network backend is implemented; DenyAll requests are refused before
+///   spawn (Job Objects are process containment, never network security).
 pub fn platform_network_enforcement() -> NetworkEnforcement {
     #[cfg(test)]
     {
@@ -523,18 +534,20 @@ pub fn platform_network_enforcement() -> NetworkEnforcement {
     real_platform_network_enforcement()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn real_platform_network_enforcement() -> NetworkEnforcement {
     if DENY_ALL_PROVEN.load(std::sync::atomic::Ordering::SeqCst) {
         NetworkEnforcement::OsLevel
-    } else if BROKER_ONLY_PROVEN.load(std::sync::atomic::Ordering::SeqCst) {
-        NetworkEnforcement::OsLevelBrokerOnly
     } else {
+        #[cfg(target_os = "linux")]
+        if BROKER_ONLY_PROVEN.load(std::sync::atomic::Ordering::SeqCst) {
+            return NetworkEnforcement::OsLevelBrokerOnly;
+        }
         NetworkEnforcement::AppLevel
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn real_platform_network_enforcement() -> NetworkEnforcement {
     NetworkEnforcement::Unavailable
 }
@@ -558,13 +571,30 @@ fn override_network_probe(v: Option<NetworkEnforcement>) {
     );
 }
 
-/// The linux unshare backend lives behind this module
-/// (`crates/terminal/src/sandbox/linux.rs`); every other platform has no
-/// backend module at all (DenyAll and BrokerOnly are refused before spawn
-/// there).
+/// The Linux unshare/Landlock backend lives behind this module
+/// (`crates/terminal/src/sandbox/linux.rs`).
 #[cfg(target_os = "linux")]
 #[path = "sandbox/linux.rs"]
 mod sandbox;
+
+/// The macOS sandbox-exec backend (`crates/terminal/src/sandbox/macos.rs`):
+/// generated SBPL profiles deny network for `DenyAll`, deny home credentials
+/// and writes outside the workspace/temp roots, and refuse typed when the
+/// launcher is missing or declines a profile. Windows has no such backend
+/// (DenyAll/filesystem demands are refused before spawn there).
+#[cfg(target_os = "macos")]
+#[path = "sandbox/macos.rs"]
+mod sandbox;
+
+/// The macOS sandbox plan the PTY authority applies by rewriting its child
+/// command to the system launcher (same profile generator as the
+/// supervisor). `None` means no OS confinement was demanded.
+#[cfg(target_os = "macos")]
+pub use sandbox::plan_for_pty as macos_sandbox_plan;
+#[cfg(target_os = "macos")]
+pub use sandbox::SandboxPlan as MacSandboxPlan;
+#[cfg(target_os = "macos")]
+pub use sandbox::SANDBOX_BACKEND_UNAVAILABLE;
 
 /// The live sandbox bridge of one BrokerOnly spawn: the child's dedicated
 /// network namespace plus the relay that makes exactly the broker endpoint
@@ -1770,11 +1800,37 @@ impl ProcessSupervisor {
     /// layers the exact [`EnvSpec`] policy on top. A `DenyAll`
     /// network-isolation request installs its pre-exec hook here, so EVERY
     /// spawn entry point (async, sync, detached) carries the backend or
-    /// none.
+    /// none. On macOS the demanded SBPL profile is applied with
+    /// `/usr/bin/sandbox-exec` here (the launcher execs the original
+    /// command, preserving the pid/group the guardian owns).
     #[allow(unsafe_code)]
-    fn command_base(&self, cfg: &SpawnConfig) -> std::process::Command {
-        let mut cmd = std::process::Command::new(&cfg.cmd);
-        cmd.args(&cfg.args).current_dir(&cfg.cwd);
+    fn command_base(&self, cfg: &SpawnConfig) -> Result<std::process::Command, Error> {
+        #[cfg(target_os = "macos")]
+        let plan = sandbox::plan_for_spawn(cfg)?;
+        let mut cmd = {
+            #[cfg(target_os = "macos")]
+            {
+                match &plan {
+                    Some(plan) => {
+                        let mut cmd = std::process::Command::new(&plan.program);
+                        cmd.args(&plan.args);
+                        cmd
+                    }
+                    None => {
+                        let mut cmd = std::process::Command::new(&cfg.cmd);
+                        cmd.args(&cfg.args);
+                        cmd
+                    }
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let mut cmd = std::process::Command::new(&cfg.cmd);
+                cmd.args(&cfg.args);
+                cmd
+            }
+        };
+        cmd.current_dir(&cfg.cwd);
         // Own process group so kills target the whole tree.
         #[cfg(unix)]
         {
@@ -1829,17 +1885,17 @@ impl ProcessSupervisor {
             }
             FilesystemIsolation::Inherit => {}
         }
-        cmd
+        Ok(cmd)
     }
 
     /// THE env policy: `env_clear()` then the resolved [`EnvSpec`]. No
     /// implicit daemon environment and no legacy PATH/HOME injection —
     /// every spawn entry point (async, sync, detached) carries exactly the
     /// spec's environment.
-    fn command(&self, cfg: &SpawnConfig) -> std::process::Command {
-        let mut cmd = self.command_base(cfg);
+    fn command(&self, cfg: &SpawnConfig) -> Result<std::process::Command, Error> {
+        let mut cmd = self.command_base(cfg)?;
         cfg.env.apply(&mut cmd);
-        cmd
+        Ok(cmd)
     }
 
     /// [`Self::command`] plus the pre-exec budget plan: on unix the
@@ -1851,15 +1907,15 @@ impl ProcessSupervisor {
         &self,
         cfg: &SpawnConfig,
         budgets: Option<&TreeBudgets>,
-    ) -> std::process::Command {
-        let mut cmd = self.command(cfg);
+    ) -> Result<std::process::Command, Error> {
+        let mut cmd = self.command(cfg)?;
         #[cfg(unix)]
         if let Some(budgets) = budgets {
             budget::install_child_rlimits(&mut cmd, budgets);
         }
         #[cfg(not(unix))]
         let _ = budgets;
-        cmd
+        Ok(cmd)
     }
 
     /// The EFFECTIVE budget report of one spawn, applied post-spawn on top
@@ -2122,7 +2178,7 @@ impl ProcessSupervisor {
         let effective_deadline = budgets
             .map(|budgets| budget::deadline_with_wall(deadline, &budgets))
             .unwrap_or(deadline);
-        let mut std_cmd = contain_on_create(self.command_with_budgets(&cfg, budgets.as_ref()));
+        let mut std_cmd = contain_on_create(self.command_with_budgets(&cfg, budgets.as_ref())?);
         install_network_isolation(&mut std_cmd, bridge.as_ref());
         if cfg.capture {
             std_cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -2165,7 +2221,7 @@ impl ProcessSupervisor {
         };
         #[cfg(windows)]
         win_spawn::assign_and_resume_tokio(&containment.job, &mut child).await?;
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         mark_network_isolation_proven(&cfg);
         let id = self.register(
             pid,
@@ -2523,7 +2579,7 @@ impl ProcessSupervisor {
             .chars()
             .take(300)
             .collect();
-        let mut cmd = contain_on_create(self.command_with_budgets(&cfg, budgets.as_ref()));
+        let mut cmd = contain_on_create(self.command_with_budgets(&cfg, budgets.as_ref())?);
         install_network_isolation(&mut cmd, bridge.as_ref());
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -2541,7 +2597,7 @@ impl ProcessSupervisor {
             let mut child = child;
             #[cfg(windows)]
             win_spawn::assign_and_resume_std(&containment.job, &mut child)?;
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             mark_network_isolation_proven(&cfg);
             let pid = child.id();
             // Fail closed: a child whose guardian cannot be forked is
@@ -2653,7 +2709,7 @@ impl ProcessSupervisor {
         self.prepare_agent_home(&mut cfg)?;
         let bridge = prepare_network_isolation(&cfg)?;
         cfg.capture = false;
-        let mut cmd = contain_on_create(self.command(&cfg));
+        let mut cmd = contain_on_create(self.command(&cfg)?);
         install_network_isolation(&mut cmd, bridge.as_ref());
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -2663,7 +2719,7 @@ impl ProcessSupervisor {
         let mut child = cmd.spawn().map_err(|e| spawn_failure(&cfg, e))?;
         #[cfg(windows)]
         win_spawn::assign_and_resume_std(&containment.job, &mut child)?;
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         mark_network_isolation_proven(&cfg);
         let pid = child.id();
         // Fail closed: a child whose guardian cannot be forked is killed
@@ -2742,7 +2798,7 @@ impl ProcessSupervisor {
         isolation_gate(&cfg)?;
         self.prepare_agent_home(&mut cfg)?;
         let bridge = prepare_network_isolation(&cfg)?;
-        let mut cmd = contain_on_create(self.command(&cfg));
+        let mut cmd = contain_on_create(self.command(&cfg)?);
         install_network_isolation(&mut cmd, bridge.as_ref());
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
         let started_ms = now_ms();
@@ -2755,7 +2811,7 @@ impl ProcessSupervisor {
             let mut child = child;
             #[cfg(windows)]
             win_spawn::assign_and_resume_std(&containment.job, &mut child)?;
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             mark_network_isolation_proven(&cfg);
             let pid = child.id();
             // Fail closed: a child whose guardian cannot be forked is
@@ -2863,7 +2919,7 @@ impl ProcessSupervisor {
     }
 
     /// The daemon-death guardian pid of one registered row (tests only).
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     pub(crate) fn guardian_pid_for_tests(&self, id: u64) -> Option<u32> {
         faktor_core::lock::recover(&self.registry)
             .get(&id)
@@ -2875,7 +2931,7 @@ impl ProcessSupervisor {
     /// control pipe WITHOUT terminating the child — exactly what a SIGKILL
     /// of the daemon does to the last write end. Returns whether a guardian
     /// was present (tests only).
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     pub(crate) fn release_guardian_for_tests(&self, id: u64) -> bool {
         let taken = faktor_core::lock::recover(&self.registry)
             .get_mut(&id)
@@ -3001,7 +3057,7 @@ fn now_ms() -> i64 {
 /// sandbox crate's "sandbox unavailable" phrasing so daemon error text
 /// stays consistent). Linux's typed refusal is built in [`spawn_failure`];
 /// only the backend-less pre-spawn gate uses this literal.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 const DENY_ALL_REFUSAL_PREFIX: &str = "sandbox unavailable: refusing spawn under \
                                        NetworkIsolation::DenyAll";
 
@@ -3018,7 +3074,7 @@ const BROKER_ONLY_REFUSAL_PREFIX: &str = "sandbox unavailable: refusing spawn un
 /// the child never runs while the projection would claim `workspace`. Linux
 /// enforces via Landlock; only the backend-less pre-spawn gate uses this
 /// literal.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 const FILESYSTEM_REFUSAL_PREFIX: &str = "sandbox unavailable: refusing spawn under \
                                          FilesystemIsolation::Workspace(required)";
 
@@ -3108,24 +3164,35 @@ fn spawn_failure(cfg: &SpawnConfig, e: std::io::Error) -> Error {
     if demands.is_empty() {
         return Error::not_found(format!("spawn {}: {e}", cfg.cmd));
     }
-    Error::permission(format!(
+    #[cfg(target_os = "macos")]
+    let detail = format!(
+        "{}: sandbox unavailable: refusing spawn under {} of `{}`: the confined child could \
+         not be created ({e}); never running it unenforced",
+        sandbox::SANDBOX_BACKEND_UNAVAILABLE,
+        demands.join(" + "),
+        cfg.cmd
+    );
+    #[cfg(not(target_os = "macos"))]
+    let detail = format!(
         "sandbox unavailable: refusing spawn under {} of `{}`: the confined child could not be \
          created ({e}); never running it unenforced",
         demands.join(" + "),
         cfg.cmd
-    ))
+    );
+    Error::permission(detail)
 }
 
 /// A successful isolated spawn proves its backend active at spawn: the
 /// enforcement report may then claim OsLevel (DenyAll) or OsLevelBrokerOnly
 /// (BrokerOnly) — see [`platform_network_enforcement`].
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn mark_network_isolation_proven(cfg: &SpawnConfig) {
     match cfg.network_isolation {
         NetworkIsolation::DenyAll => {
             DENY_ALL_PROVEN.store(true, std::sync::atomic::Ordering::SeqCst);
         }
         NetworkIsolation::BrokerOnly { .. } => {
+            #[cfg(target_os = "linux")]
             BROKER_ONLY_PROVEN.store(true, std::sync::atomic::Ordering::SeqCst);
         }
         NetworkIsolation::Inherit => {}
@@ -3177,7 +3244,7 @@ pub fn deny_all_spawn_confinement() -> Option<SpawnConfinementHook> {
 /// after a successful spawn so [`platform_network_enforcement`] reports the
 /// honest state.
 pub fn record_deny_all_isolation_proven() {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     DENY_ALL_PROVEN.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
@@ -3187,11 +3254,15 @@ pub fn record_deny_all_isolation_proven() {
 /// [`FilesystemIsolation::Workspace`] — one backend, two spawn seams, never
 /// a second confinement implementation.
 ///
-/// `None` for [`FilesystemIsolation::Inherit`] and on every platform with
-/// no backend (macOS/Windows). `None` for a `Workspace { required: false }`
-/// demand is the honest BestEffort fallback (application-policy-only); for
-/// a `required: true` demand it is platform truth the caller must map to a
-/// typed refusal BEFORE any child exists — never a silent no-op.
+/// `None` for [`FilesystemIsolation::Inherit`] and on platforms with no
+/// pre-exec confinement hook (Windows). macOS uses the separate
+/// `macos_sandbox_plan` command-construction seam instead: its backend is
+/// a generated `sandbox-exec` profile, which cannot be expressed as a
+/// pre-exec mutation of the already-built command. `None` for a
+/// `Workspace { required: false }` demand is the honest BestEffort fallback
+/// (application-policy-only); for a `required: true` demand it is platform
+/// truth the caller must map to a typed refusal BEFORE any child exists —
+/// never a silent no-op.
 #[allow(unsafe_code)]
 pub fn workspace_spawn_confinement(
     isolation: &FilesystemIsolation,
@@ -3358,147 +3429,8 @@ mod win_containment_policy {
 /// assign strictly, verify membership while it cannot run, resume LAST.
 /// Any failure terminates the still-suspended child and refuses the spawn.
 #[cfg(windows)]
-mod win_spawn {
-    use std::os::windows::process::CommandExt;
-
-    use faktor_winjob::{JobGuard, JobLimits};
-    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE};
-    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SUSPEND_RESUME};
-
-    use super::*;
-
-    // `NtResumeProcess` (ntdll): resume every thread of a process. The
-    // kernel transition needed is `ResumeThread`, but
-    // `std::process::Command::spawn` closes the primary-thread handle that
-    // `CreateProcess` returned and exposes no resume seam; process-wide
-    // resume is the user-mode counterpart of the WDK-documented
-    // `ZwResumeProcess` and takes only a process handle (opened with
-    // `PROCESS_SUSPEND_RESUME`). A just-created suspended process has
-    // exactly one thread, so this is precisely "resume the primary thread".
-    #[link(name = "ntdll")]
-    extern "system" {
-        fn NtResumeProcess(process_handle: HANDLE) -> i32;
-    }
-
-    /// Create the per-child containment job. Fail-closed: without the job
-    /// there is no tree guarantee, so the spawn is refused before any
-    /// process exists.
-    pub(super) fn create_job() -> Result<JobGuard, Error> {
-        JobGuard::create_strict().map_err(|code| {
-            Error::internal(format!(
-                "windows containment: CreateJobObject(KILL_ON_JOB_CLOSE) failed \
-                 (win32 error {code}); refusing the spawn"
-            ))
-        })
-    }
-
-    /// [`create_job`] with the requested Job Object resource limits
-    /// (`PROCESS_MEMORY` / `ACTIVE_PROCESS`): the job carries them BEFORE
-    /// the suspended child is assigned, so the tree is bounded from its
-    /// first instruction.
-    pub(super) fn create_job_with_limits(limits: JobLimits) -> Result<JobGuard, Error> {
-        JobGuard::create_with_limits_strict(limits).map_err(|code| {
-            Error::internal(format!(
-                "windows containment: CreateJobObject(memory/process limits) failed \
-                 (win32 error {code}); refusing the spawn"
-            ))
-        })
-    }
-
-    /// Mark the command `CREATE_SUSPENDED` (the pure policy owns the flag).
-    pub(super) fn suspend_on_create(cmd: &mut std::process::Command) {
-        cmd.creation_flags(win_containment_policy::creation_flags());
-    }
-
-    /// The assign → verify → resume core, executed while the child is STILL
-    /// suspended. Ordering is the containment guarantee:
-    /// 1. `assign_strict` — a failed assignment refuses the spawn;
-    /// 2. `contains` — membership is verified before any instruction runs,
-    ///    so it cannot race a descendant;
-    /// 3. resume — the ONLY exposure point, gated by the pure
-    ///    [`win_containment_policy::may_resume`] predicate.
-    fn assign_verify_resume(job: &JobGuard, pid: u32) -> Result<(), Error> {
-        if pid == 0 {
-            return Err(Error::internal(
-                "windows containment: spawned child has no pid; refusing the spawn",
-            ));
-        }
-        job.assign_strict(pid).map_err(|code| {
-            Error::internal(format!(
-                "windows containment: AssignProcessToJobObject(pid {pid}) failed \
-                 (win32 error {code}); the suspended child is terminated, never resumed \
-                 uncontained"
-            ))
-        })?;
-        // The child is still suspended: this check cannot race a descendant.
-        let verified_member = job.contains(pid);
-        if !win_containment_policy::may_resume(true, verified_member) {
-            return Err(Error::internal(format!(
-                "windows containment: pid {pid} is not a job member after assignment; \
-                 the suspended child is terminated, never resumed uncontained"
-            )));
-        }
-        resume(pid).map_err(|code| {
-            Error::internal(format!(
-                "windows containment: NtResumeProcess(pid {pid}) failed (status {code}); \
-                 the child is terminated"
-            ))
-        })
-    }
-
-    #[allow(unsafe_code)]
-    fn resume(pid: u32) -> Result<(), u32> {
-        // SAFETY: `pid` names the just-created, still-suspended child; the
-        // handle is closed on every path.
-        unsafe {
-            let process = OpenProcess(PROCESS_SUSPEND_RESUME, 0, pid);
-            if process.is_null() {
-                return Err(GetLastError());
-            }
-            let status = NtResumeProcess(process);
-            CloseHandle(process);
-            if status < 0 {
-                Err(status as u32)
-            } else {
-                Ok(())
-            }
-        }
-    }
-
-    /// Contain an already-created std child. On failure the child is killed
-    /// while still suspended (`TerminateProcess` works on a suspended
-    /// process; the primary thread never runs) and the error is returned.
-    pub(super) fn assign_and_resume_std(
-        job: &JobGuard,
-        child: &mut std::process::Child,
-    ) -> Result<(), Error> {
-        let pid = child.id();
-        match assign_verify_resume(job, pid) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                Err(e)
-            }
-        }
-    }
-
-    /// tokio twin of [`assign_and_resume_std`].
-    pub(super) async fn assign_and_resume_tokio(
-        job: &JobGuard,
-        child: &mut tokio::process::Child,
-    ) -> Result<(), Error> {
-        let pid = child.id().unwrap_or(0);
-        match assign_verify_resume(job, pid) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                Err(e)
-            }
-        }
-    }
-}
+#[path = "win_spawn.rs"]
+mod win_spawn;
 
 /// Is the pid still alive (zombies do not count)?
 #[cfg(not(unix))]
@@ -3988,3 +3920,11 @@ mod sandbox_hostile;
 #[cfg(all(test, unix))]
 #[path = "supervisor_hostile.rs"]
 mod supervisor_hostile;
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "macos_sandbox_tests.rs"]
+mod macos_sandbox_tests;
+
+#[cfg(all(test, unix))]
+#[path = "final_surface_probes.rs"]
+mod final_surface_probes;

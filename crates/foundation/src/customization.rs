@@ -459,6 +459,49 @@ impl CustomizationService {
         })
     }
 
+    /// Project an OAuth lifecycle state (expired/denied) onto a REMOTE MCP
+    /// row without touching the stored credential. A state change advances
+    /// the revision so clients observe the transition; repeating the same
+    /// state is idempotent. `authorized` remains owned by
+    /// [`CustomizationService::set_mcp_auth`] because it requires a token.
+    pub fn set_mcp_auth_state(
+        &self,
+        id: &str,
+        state: &str,
+    ) -> Result<McpServerRecord, FoundationError> {
+        if !matches!(state, "expired" | "denied" | "unconfigured" | "signed_out") {
+            return Err(FoundationError::Malformed(
+                "MCP auth state must be expired, denied, unconfigured or signed_out".into(),
+            ));
+        }
+        self.db.write("mcp auth state", |conn| {
+            conn.execute(
+                "UPDATE mcp_server SET auth_state = ?2, revision = revision + 1,
+                   updated_ms = ?3
+                 WHERE id = ?1 AND transport = 'streamable_http' AND auth_state != ?2",
+                params![id, state, now_ms()],
+            )
+            .map_err(|e| FoundationError::Store(e.to_string()))?;
+            let record = conn
+                .query_row(
+                    "SELECT id, name, command, args_json, env_json, trust_origin,
+                            trusted, enabled, created_ms, updated_ms, revision,
+                            transport, endpoint, auth_state, auth_account,
+                            auth_scopes_json, auth_token_ref, timeout_ms,
+                            output_cap_bytes, stderr_cap_bytes
+                     FROM mcp_server WHERE id = ?1",
+                    params![id],
+                    map_mcp,
+                )
+                .optional()
+                .map_err(|e| FoundationError::Store(e.to_string()))?;
+            match record {
+                Some(record) => Ok(record),
+                None => Err(FoundationError::NotFound(format!("mcp server {id}"))),
+            }
+        })
+    }
+
     pub fn delete_mcp_server(&self, id: &str) -> Result<(), FoundationError> {
         self.db.write("mcp delete", |conn| {
             let changed = conn

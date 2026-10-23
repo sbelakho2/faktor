@@ -394,6 +394,21 @@ const ROUTE_CLASSES: &[(&str, &str)] = &[
     ("GET", "/native/entitlements"),
     ("GET", "/native/billing/overview"),
     ("POST", "/native/billing/subscription"),
+    ("GET", "/native/billing/invoices"),
+    ("GET", "/native/billing/invoices/1"),
+    ("GET", "/native/billing/payments"),
+    ("GET", "/native/billing/payment-methods"),
+    ("GET", "/native/billing/tax"),
+    ("GET", "/native/billing/plan-preview"),
+    ("GET", "/native/billing/seat-preview"),
+    ("POST", "/native/billing/invoices"),
+    ("POST", "/native/billing/invoices/1/pay"),
+    ("POST", "/native/billing/payment-methods"),
+    ("POST", "/native/billing/subscribe"),
+    ("POST", "/native/billing/seats"),
+    ("POST", "/native/billing/plan"),
+    ("POST", "/native/billing/subscription/cancel"),
+    ("POST", "/native/billing/refunds"),
     ("GET", "/native/sessions"),
     ("GET", "/native/session/1/turns"),
     ("GET", "/native/session/1/tasks"),
@@ -442,6 +457,19 @@ fn needs_control_principal(path: &str) -> bool {
         "/native/entitlements"
             | "/native/billing/overview"
             | "/native/billing/subscription"
+            | "/native/billing/invoices"
+            | "/native/billing/invoices/1"
+            | "/native/billing/payments"
+            | "/native/billing/payment-methods"
+            | "/native/billing/tax"
+            | "/native/billing/plan-preview"
+            | "/native/billing/seat-preview"
+            | "/native/billing/invoices/1/pay"
+            | "/native/billing/subscribe"
+            | "/native/billing/seats"
+            | "/native/billing/plan"
+            | "/native/billing/subscription/cancel"
+            | "/native/billing/refunds"
             | "/native/usage/export?org=org-local"
             | "/native/identity"
             | "/native/repositories"
@@ -720,8 +748,15 @@ async fn every_registered_route_rejects_missing_credentials() {
         // DTO: an anonymous, shape-less call is refused typed (400/409)
         // before or at the token check — NEVER 2xx. The SCM webhook is
         // signature-authenticated and typed 409 while unwired.
-        let expected: &[u16] = if path == "/native/scm/webhook" {
+        let expected: &[u16] = if path == "/native/scm/webhook" || path == "/native/billing/webhook"
+        {
             &[409]
+        } else if path.contains("/oauth/callback/") {
+            // The browser-facing OAuth loopback callback cannot carry the
+            // daemon bearer. It is protected by the one-shot flow id + PKCE
+            // state; a forged flow is a typed 400, never a 2xx, and never
+            // exposes a credential.
+            &[400, 401, 403]
         } else if path.starts_with("/native/workers/") || path.starts_with("/native/jobs/") {
             &[400, 401, 403, 409]
         } else {

@@ -1793,6 +1793,198 @@ fn provision_cli_billing(dir: &std::path::Path) {
 }
 
 #[test]
+fn local_billing_payment_cli_uses_the_same_durable_service() {
+    use billing_cli::BillingAction;
+    use faktor_payments::{
+        AddPaymentMethodRequest, IssueInvoiceRequest, PayInvoiceRequest, PaymentService,
+        SqlitePaymentStore, StaticSecrets,
+    };
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("faktor-plus.json");
+    let body = serde_json::json!({
+        "cloud": { "enabled": true },
+        "billing": {
+            "enabled": true,
+            "organization": "org-cli-pay",
+            "account": "acct-cli-pay",
+            "account_name": "CLI Pay",
+            "default_plan": "pro",
+            "plans": {
+                "pro": { "plan_id": "pro", "features": ["credits"], "limits": {} }
+            },
+            "payments": {
+                "enabled": true,
+                "database": "payment.db",
+                "provider": "local",
+                "prices": {
+                    "pro": {
+                        "plan_id": "pro",
+                        "currency": "USD",
+                        "monthly_minor": 10000,
+                        "annual_minor": 100000,
+                        "per_seat_monthly_minor": 2500,
+                        "per_seat_annual_minor": 25000
+                    }
+                },
+                "tax": {
+                    "default_jurisdiction": "US-CA",
+                    "rates": { "US-CA": { "rate_bps": 825, "inclusive": false } }
+                }
+            }
+        }
+    });
+    std::fs::write(&path, serde_json::to_vec_pretty(&body).unwrap()).unwrap();
+
+    let subscribed = billing_cli::render(
+        BillingAction::Subscribe {
+            plan: "pro".into(),
+            interval: "monthly".into(),
+            seats: 2,
+            trial_days: None,
+            email: "cli@example.com".into(),
+            name: "CLI".into(),
+            idempotency_key: Some("cli-sub".into()),
+        },
+        dir.path(),
+        Some(path.clone()),
+    )
+    .unwrap();
+    assert_eq!(subscribed["subscription"]["quantity"], 2);
+    let subscription_id = subscribed["subscription"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Issue and pay through the SAME service the CLI opens, then read it back
+    // through the CLI subcommands.
+    let config = load_entry_config(dir.path(), Some(path.clone())).unwrap().0;
+    let runtime_config = config
+        .billing
+        .payments
+        .as_ref()
+        .unwrap()
+        .runtime_config(&config.billing.plans)
+        .unwrap();
+    let store = Arc::new(SqlitePaymentStore::open(&dir.path().join("payment.db")).unwrap());
+    let service = PaymentService::open_local(
+        store,
+        runtime_config,
+        Arc::new(faktor_cloud::SystemClock),
+        Arc::new(StaticSecrets::default()),
+    )
+    .unwrap();
+    let organization = faktor_cloud::OrganizationId::try_new("org-cli-pay").unwrap();
+    let method = service
+        .add_payment_method(
+            &organization,
+            AddPaymentMethodRequest {
+                token: "tok_cli".into(),
+                brand: "visa".into(),
+                last4: "4242".into(),
+                exp_month: 12,
+                exp_year: 2030,
+                set_default: true,
+                idempotency_key: "cli-method".into(),
+            },
+        )
+        .unwrap()
+        .payment_method;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let invoice = rt
+        .block_on(service.issue_invoice(
+            &organization,
+            IssueInvoiceRequest {
+                subscription_id: subscription_id.clone(),
+                usage: vec![faktor_payments::UsageCharge {
+                    description: "cli usage".into(),
+                    quantity: 1,
+                    unit_amount_minor: 500,
+                }],
+                credits_minor: 0,
+                discount_minor: 0,
+                tax_jurisdiction: Some("US-CA".into()),
+                due_in_days: Some(7),
+                idempotency_key: "cli-invoice".into(),
+            },
+        ))
+        .unwrap()
+        .invoice;
+    assert_eq!(invoice.total_minor, 16_779);
+    rt.block_on(service.pay_invoice(
+        &organization,
+        PayInvoiceRequest {
+            invoice_id: invoice.id.clone(),
+            payment_method_id: method.id,
+            idempotency_key: "cli-pay".into(),
+        },
+    ))
+    .unwrap();
+
+    let invoices = billing_cli::render(
+        BillingAction::Invoices {
+            since: None,
+            limit: Some(10),
+            format: "json".into(),
+        },
+        dir.path(),
+        Some(path.clone()),
+    )
+    .unwrap();
+    assert_eq!(invoices["items"][0]["status"], "paid");
+    let csv = billing_cli::render(
+        BillingAction::Invoices {
+            since: None,
+            limit: Some(10),
+            format: "csv".into(),
+        },
+        dir.path(),
+        Some(path.clone()),
+    )
+    .unwrap();
+    assert!(csv.as_str().unwrap().contains("INV-000001"));
+    let one = billing_cli::render(
+        BillingAction::Invoice {
+            id: invoice.id.clone(),
+            format: "json".into(),
+        },
+        dir.path(),
+        Some(path.clone()),
+    )
+    .unwrap();
+    assert_eq!(one["invoice"]["status"], "paid");
+    let payments = billing_cli::render(
+        BillingAction::Payments { limit: Some(10) },
+        dir.path(),
+        Some(path.clone()),
+    )
+    .unwrap();
+    assert_eq!(payments["payments"].as_array().unwrap().len(), 1);
+
+    let seats = billing_cli::render(
+        BillingAction::Seats {
+            quantity: 3,
+            subscription: Some(subscription_id),
+            idempotency_key: Some("cli-seats".into()),
+        },
+        dir.path(),
+        Some(path.clone()),
+    )
+    .unwrap();
+    assert_eq!(seats["subscription"]["quantity"], 3);
+    assert_eq!(seats["proration"]["charge_minor"], 2_500);
+
+    let tax = billing_cli::render(BillingAction::Tax, dir.path(), Some(path)).unwrap();
+    assert_eq!(tax["tax"]["state"], "available");
+    assert_eq!(tax["prices"]["pro"]["formattedMonthly"], "100.00 USD");
+    assert_eq!(tax["prices"]["pro"]["monthlyMinor"], 10_000);
+}
+
+#[test]
 fn local_billing_cli_reaches_the_same_service_effect() {
     use billing_cli::{BillingAction, BillingCreditsAction, BillingSubscriptionAction};
     let dir = tempfile::tempdir().unwrap();

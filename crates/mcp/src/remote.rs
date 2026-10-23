@@ -49,6 +49,7 @@ use faktor_provider::egress::{
 };
 use faktor_security::destination::DestinationPolicy;
 use faktor_security::payload::ScanPolicy;
+use futures::future::BoxFuture;
 use futures::StreamExt;
 use reqwest::header::{HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::Url;
@@ -118,6 +119,22 @@ impl SecretToken {
         Ok(Self::new(text))
     }
 
+    /// Crate-internal access for the OAuth form encoder and state checks.
+    /// Never public: no caller outside this crate can read a bearer token.
+    pub(crate) fn expose(&self) -> &str {
+        self.value.as_str()
+    }
+
+    /// Replace this exact credential in a server-supplied message. The
+    /// plaintext is only used for the replacement; the result is bounded by
+    /// the caller and the secret itself is never returned or logged.
+    pub fn scrub(&self, text: &str) -> String {
+        if self.value.is_empty() {
+            return text.to_string();
+        }
+        text.replace(self.value.as_str(), "[redacted]")
+    }
+
     fn authorization_header(&self) -> Result<HeaderValue, Error> {
         let value = Zeroizing::new(format!("Bearer {}", self.value.as_str()));
         HeaderValue::from_str(value.as_str()).map_err(|_| {
@@ -137,6 +154,27 @@ impl SecretToken {
 impl fmt::Debug for SecretToken {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("SecretToken(<redacted>)")
+    }
+}
+
+/// The one refresh seam a remote MCP session uses when its credential
+/// expires. The OAuth implementation lives outside this transport (the
+/// daemon wires the vault-backed provider); static tokens simply have no
+/// provider. `refresh` is called ONLY after a 401, so a healthy session never
+/// pays for or races a refresh.
+pub trait RemoteAuth: Send + Sync {
+    /// The current access token, refreshed proactively when its recorded
+    /// expiry has passed. A failure is a typed OAuth error.
+    fn token<'a>(&'a self) -> BoxFuture<'a, Result<SecretToken, Error>>;
+
+    /// Force one refresh after the server rejected the current token.
+    fn refresh<'a>(&'a self) -> BoxFuture<'a, Result<SecretToken, Error>>;
+
+    /// Optional reflection scrubber for a server-supplied error message.
+    /// Implementations hold the current token and replace it; the default
+    /// (static-token sessions) is handled by the transport itself.
+    fn scrub(&self, text: &str) -> String {
+        text.to_string()
     }
 }
 
@@ -220,6 +258,9 @@ pub struct RemoteMcpConfig {
     /// Absolute http(s) endpoint. Query/fragment/userinfo are refused.
     pub endpoint: String,
     pub token: Option<SecretToken>,
+    /// Vault-backed OAuth credential with expiry-aware refresh. Mutually
+    /// exclusive in practice with `token`; OAuth wins when both are present.
+    pub auth: Option<std::sync::Arc<dyn RemoteAuth>>,
     pub timeout: Duration,
     pub output_cap_bytes: usize,
     pub protocol_version: String,
@@ -231,6 +272,7 @@ impl RemoteMcpConfig {
             name: name.into(),
             endpoint: endpoint.into(),
             token: None,
+            auth: None,
             timeout: Duration::from_secs(30),
             output_cap_bytes: 16 * 1024 * 1024,
             protocol_version: CLIENT_PROTOCOL_VERSION.into(),
@@ -244,6 +286,7 @@ impl fmt::Debug for RemoteMcpConfig {
             .field("name", &self.name)
             .field("endpoint", &self.endpoint)
             .field("token", &self.token)
+            .field("oauth", &self.auth.as_ref().map(|_| "<configured>"))
             .field("timeout", &self.timeout)
             .field("output_cap_bytes", &self.output_cap_bytes)
             .field("protocol_version", &self.protocol_version)
@@ -277,6 +320,7 @@ pub struct RemoteMcpServer {
     name: String,
     endpoint: Url,
     token: Option<SecretToken>,
+    auth: Option<std::sync::Arc<dyn RemoteAuth>>,
     default_timeout: Duration,
     output_cap: usize,
     protocol_version: String,
@@ -293,6 +337,7 @@ impl fmt::Debug for RemoteMcpServer {
             .field("name", &self.name)
             .field("endpoint", &self.endpoint)
             .field("token", &self.token)
+            .field("oauth", &self.auth.as_ref().map(|_| "<configured>"))
             .finish_non_exhaustive()
     }
 }
@@ -373,6 +418,7 @@ impl RemoteMcpServer {
             name: cfg.name,
             endpoint,
             token: cfg.token,
+            auth: cfg.auth,
             default_timeout: cfg.timeout,
             output_cap: cfg.output_cap_bytes,
             protocol_version: cfg.protocol_version,
@@ -752,7 +798,7 @@ impl RemoteMcpServer {
         builder = builder
             .header(ACCEPT, "application/json, text/event-stream")
             .header(CONTENT_TYPE, "application/json");
-        if let Some(token) = &self.token {
+        if let Some(token) = self.bearer().await? {
             builder = builder.header(AUTHORIZATION, token.authorization_header()?);
         }
         if let Some(session_id) = session_id {
@@ -773,6 +819,15 @@ impl RemoteMcpServer {
         }
     }
 
+    /// The current bearer: OAuth (which may refresh on its recorded expiry)
+    /// or the static token. A failure is the typed OAuth transport error.
+    async fn bearer(&self) -> Result<Option<SecretToken>, Error> {
+        if let Some(auth) = &self.auth {
+            return auth.token().await.map(Some);
+        }
+        Ok(self.token.clone())
+    }
+
     async fn send_request(
         &self,
         request: Value,
@@ -781,19 +836,6 @@ impl RemoteMcpServer {
         deadline: tokio::time::Instant,
         expect_response: bool,
     ) -> Result<SendOutcome, Error> {
-        let mut builder = self
-            .client
-            .post(self.endpoint.as_str())
-            .map_err(map_egress)?;
-        builder = builder
-            .header(ACCEPT, "application/json, text/event-stream")
-            .header(CONTENT_TYPE, "application/json");
-        if let Some(token) = &self.token {
-            builder = builder.header(AUTHORIZATION, token.authorization_header()?);
-        }
-        if let Some(session_id) = session_id {
-            builder = builder.header(HeaderName::from_static(SESSION_HEADER), session_id);
-        }
         let version = self
             .session
             .try_read()
@@ -804,23 +846,52 @@ impl RemoteMcpServer {
                     .map(|session| session.protocol_version.clone())
             })
             .unwrap_or_else(|| self.protocol_version.clone());
-        builder = builder.header(HeaderName::from_static(PROTOCOL_HEADER), version);
         let body = bounded_request_body(&request)?;
-        builder = builder.body(body);
-        let response =
-            match tokio::time::timeout_at(deadline, self.client.send_checked(builder)).await {
-                Ok(Ok(response)) => response,
-                Ok(Err(error)) => return Err(map_egress(error)),
-                Err(_) => {
-                    if expect_response {
-                        self.cancel_best_effort(id).await;
+        let mut refreshed = false;
+        let (response, status, token) = loop {
+            let token = self.bearer().await?;
+            let mut builder = self
+                .client
+                .post(self.endpoint.as_str())
+                .map_err(map_egress)?;
+            builder = builder
+                .header(ACCEPT, "application/json, text/event-stream")
+                .header(CONTENT_TYPE, "application/json");
+            if let Some(token) = &token {
+                builder = builder.header(AUTHORIZATION, token.authorization_header()?);
+            }
+            if let Some(session_id) = session_id {
+                builder = builder.header(HeaderName::from_static(SESSION_HEADER), session_id);
+            }
+            builder = builder.header(HeaderName::from_static(PROTOCOL_HEADER), version.clone());
+            builder = builder.body(body.clone());
+            let response =
+                match tokio::time::timeout_at(deadline, self.client.send_checked(builder)).await {
+                    Ok(Ok(response)) => response,
+                    Ok(Err(error)) => return Err(map_egress(error)),
+                    Err(_) => {
+                        if expect_response {
+                            self.cancel_best_effort(id).await;
+                        }
+                        return Err(Error::timeout(format!(
+                            "MCP remote request {id} exceeded its deadline"
+                        )));
                     }
-                    return Err(Error::timeout(format!(
-                        "MCP remote request {id} exceeded its deadline"
-                    )));
+                };
+            let status = response.status().as_u16();
+            if status == 401 && !refreshed {
+                if let Some(auth) = &self.auth {
+                    // The server rejected the credential: force exactly ONE
+                    // refresh and replay the same bounded request. The replay
+                    // is safe here because the first attempt produced only a
+                    // 401 (no application-level effect was accepted).
+                    auth.refresh().await?;
+                    refreshed = true;
+                    continue;
                 }
-            };
-        let status = response.status().as_u16();
+            }
+            break (response, status, token);
+        };
         let session_header = match header_text(response.headers(), SESSION_HEADER) {
             Some(session) if !valid_session_id(&session) => {
                 return Err(self.protocol_error("MCP server sent an invalid Mcp-Session-Id header"))
@@ -828,14 +899,21 @@ impl RemoteMcpServer {
             session => session,
         };
         if matches!(status, 401 | 403) {
-            let code = if status == 401 {
+            let code = if status == 401 && self.auth.is_some() {
+                // The refresh was attempted and the retried request was
+                // still refused: the credential is expired/revoked.
+                crate::oauth::OAUTH_EXPIRED_CODE
+            } else if status == 401 {
                 AUTH_REQUIRED_CODE
             } else {
                 AUTH_FORBIDDEN_CODE
             };
             return Err(Error::new(
                 ErrorKind::Permission,
-                if status == 401 {
+                if status == 401 && self.auth.is_some() {
+                    "MCP remote server rejected the refreshed OAuth credential (HTTP 401)"
+                        .to_string()
+                } else if status == 401 {
                     "MCP remote server requires authorization (HTTP 401)".to_string()
                 } else {
                     "MCP remote server refused the credential (HTTP 403)".to_string()
@@ -862,7 +940,7 @@ impl RemoteMcpServer {
                     "MCP remote HTTP {status}: {}",
                     sanitize_message(
                         &json_error_message(&detail).unwrap_or_default(),
-                        self.token.as_ref()
+                        token.as_ref()
                     )
                 ),
             ));
@@ -942,13 +1020,16 @@ impl RemoteMcpServer {
             .and_then(|code| code.as_i64())
             .map(|code| code.to_string())
             .unwrap_or_else(|| "unknown".into());
-        let message = sanitize_message(
-            error
-                .get("message")
-                .and_then(|message| message.as_str())
-                .unwrap_or(""),
-            self.token.as_ref(),
-        );
+        let raw_message = error
+            .get("message")
+            .and_then(|message| message.as_str())
+            .unwrap_or("");
+        let scrubbed = self
+            .auth
+            .as_ref()
+            .map(|auth| auth.scrub(raw_message))
+            .unwrap_or_else(|| raw_message.to_string());
+        let message = sanitize_message(&scrubbed, self.token.as_ref());
         Error::new(
             ErrorKind::Provider {
                 code: JSONRPC_ERROR_CODE.into(),
@@ -975,17 +1056,37 @@ impl RemoteMcpServer {
             return;
         };
         if let Ok(session) = HeaderValue::from_str(&session_id) {
-            if let Ok(mut builder) = self.client.delete(self.endpoint.as_str()) {
-                builder = builder.header(HeaderName::from_static(SESSION_HEADER), session);
-                builder =
-                    builder.header(HeaderName::from_static(PROTOCOL_HEADER), protocol_version);
-                if let Some(token) = &self.token {
+            let mut refreshed = false;
+            loop {
+                let token = self.bearer().await.ok().flatten();
+                let Ok(mut builder) = self.client.delete(self.endpoint.as_str()) else {
+                    break;
+                };
+                builder = builder.header(HeaderName::from_static(SESSION_HEADER), session.clone());
+                builder = builder.header(
+                    HeaderName::from_static(PROTOCOL_HEADER),
+                    protocol_version.clone(),
+                );
+                if let Some(token) = &token {
                     if let Ok(value) = token.authorization_header() {
                         builder = builder.header(AUTHORIZATION, value);
                     }
                 }
-                let _ =
+                let response =
                     tokio::time::timeout(CANCEL_TIMEOUT, self.client.send_checked(builder)).await;
+                let rejected =
+                    matches!(&response, Ok(Ok(response)) if response.status().as_u16() == 401);
+                if rejected && !refreshed {
+                    if let Some(auth) = &self.auth {
+                        // A session DELETE is best-effort, but a rejected OAuth
+                        // bearer still gets the same single refresh+retry.
+                        if auth.refresh().await.is_ok() {
+                            refreshed = true;
+                            continue;
+                        }
+                    }
+                }
+                break;
             }
         }
         *self.session.write().await = None;

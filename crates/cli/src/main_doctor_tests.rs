@@ -68,6 +68,14 @@ fn doctor_reports_network_isolation_strength_honestly() {
             "{sandbox}"
         );
         assert!(browser.contains("BrokerOnly requested"), "{browser}");
+    } else if faktor_terminal::deny_all_supported() {
+        assert!(sandbox.contains("backend=deny_all_available"), "{sandbox}");
+        assert!(
+            sandbox.contains("BrokerOnly unavailable"),
+            "the missing broker backend must be named honestly: {sandbox}"
+        );
+        assert!(browser.contains("NOT OS-confined"), "{browser}");
+        assert!(browser.contains(std::env::consts::OS), "{browser}");
     } else {
         assert!(sandbox.contains("backend=unavailable"), "{sandbox}");
         assert!(sandbox.contains("refused typed"), "{sandbox}");
@@ -2063,7 +2071,7 @@ fn doctor_reports_agent_home_and_first_run_choice_honestly() {
         .expect("first-run choice line");
     assert!(choice.contains("platform="), "{choice}");
     assert!(choice.contains("network_backend="), "{choice}");
-    if faktor_terminal::broker_only_supported() {
+    if config::network_backend_available() {
         assert!(choice.contains("decision=fail_closed"), "{choice}");
     } else {
         assert!(choice.contains("decision=pending"), "{choice}");

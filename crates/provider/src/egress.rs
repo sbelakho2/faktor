@@ -170,6 +170,8 @@ pub enum RouteLabel {
     OidcTokenExchange,
     /// Billing vendor usage-report page.
     BillingVendorReport,
+    /// A payment-provider API call (Stripe-compatible adapter).
+    PaymentProvider,
     /// Updater artifact/manifest download.
     UpdaterArtifact,
     /// An external semantic provider call.
@@ -191,6 +193,7 @@ impl std::fmt::Display for RouteLabel {
             RouteLabel::OidcJwks => "oidc_jwks",
             RouteLabel::OidcTokenExchange => "oidc_token_exchange",
             RouteLabel::BillingVendorReport => "billing_vendor_report",
+            RouteLabel::PaymentProvider => "payment_provider",
             RouteLabel::UpdaterArtifact => "updater_artifact",
             RouteLabel::SemanticProvider => "semantic_provider",
             RouteLabel::CommerceSource => "commerce_source",

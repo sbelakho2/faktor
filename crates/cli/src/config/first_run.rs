@@ -264,8 +264,8 @@ impl SandboxFirstRunDecision {
 pub struct SandboxFirstRunState {
     pub decision: SandboxFirstRunDecision,
     /// True when this build/platform has a per-process network-isolation
-    /// backend (Linux). On other platforms the choice is presented at
-    /// startup.
+    /// backend (Linux network namespaces, macOS sandbox profiles). On
+    /// backend-less platforms the choice is presented at startup.
     pub backend_available: bool,
     /// The durable record when one exists.
     pub record: Option<SandboxFirstRunRecord>,
@@ -281,9 +281,10 @@ impl SandboxFirstRunState {
 }
 
 /// True when THIS build/platform has a per-process network-isolation
-/// backend (the same compile-time fact the terminal crate reports).
+/// backend (the same compile-time fact the terminal crate reports: Linux
+/// network namespaces or macOS sandbox profiles).
 pub fn network_backend_available() -> bool {
-    faktor_terminal::broker_only_supported()
+    faktor_terminal::deny_all_supported()
 }
 
 /// The decision document path under `data_dir`.

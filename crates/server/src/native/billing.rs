@@ -751,10 +751,32 @@ pub(crate) async fn native_billing_overview(
         return wire_status(billing_disabled());
     };
     match service.overview(&principal.organization) {
-        Ok(overview) => money_json(serde_json::json!({
-            "ok": true,
-            "billing": overview,
-        })),
+        Ok(overview) => {
+            let mut value = serde_json::json!({
+                "ok": true,
+                "billing": overview,
+            });
+            // The additive payment plane replaces the four honest
+            // unavailable capability states with the REAL provider/subscription
+            // state. Without it the pre-payment overview remains byte-shape
+            // identical (the five unavailable causes are kept).
+            if let Some(payments) = state.deps.payments.as_ref() {
+                if let Ok(real) = payments.overview(&principal.organization) {
+                    if let Some(billing) = value["billing"].as_object_mut() {
+                        billing.insert("payment".into(), serde_json::json!(real.payment));
+                        billing.insert("invoices".into(), serde_json::json!(real.invoices));
+                        billing.insert("seats".into(), serde_json::json!(real.seats_capability));
+                        billing.insert("tax".into(), serde_json::json!(real.tax_capability));
+                        billing.insert(
+                            "currency".into(),
+                            serde_json::json!(real.currency_capability),
+                        );
+                        billing.insert("payments".into(), serde_json::json!(real));
+                    }
+                }
+            }
+            money_json(value)
+        }
         Err(e) => wire_status(billing_err(e)),
     }
 }

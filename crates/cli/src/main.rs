@@ -44,6 +44,7 @@ mod evidence;
 mod graph;
 mod impact;
 mod mcp_bridge;
+mod mcp_oauth;
 mod payload;
 mod scm_daemon;
 mod sso_auth;
@@ -208,6 +209,12 @@ pub(crate) enum Command {
         data_dir: String,
         #[arg(long, global = true)]
         config: Option<String>,
+    },
+    /// Manage remote MCP OAuth: login, status, logout.
+    #[command(display_order = 45)]
+    Mcp {
+        #[command(subcommand)]
+        action: mcp_oauth::McpAction,
     },
     /// List sessions.
     #[command(display_order = 30)]
@@ -625,7 +632,7 @@ pub(crate) async fn main() {
             data_dir,
             config,
         } => {
-            billing_cli::command(action, expand(&data_dir), config.map(|c| expand(&c)));
+            billing_cli::command(action, expand(&data_dir), config.map(|c| expand(&c))).await;
         }
         Command::Enterprise {
             action,
@@ -673,6 +680,12 @@ pub(crate) async fn main() {
                         std::process::exit(1);
                     }
                 }
+            }
+        }
+        Command::Mcp { action } => {
+            if let Err(error) = mcp_oauth::command(action).await {
+                eprintln!("mcp: {error}");
+                std::process::exit(1);
             }
         }
         Command::Sessions { data_dir } => {
@@ -2659,6 +2672,12 @@ fn doctor_sandbox_config(config_path: Option<&std::path::Path>) -> Option<config
 pub(crate) fn doctor_network_isolation_line(lines: &mut Vec<String>) {
     let backend = if faktor_terminal::broker_only_supported() {
         "deny_all+broker_only_available".to_string()
+    } else if faktor_terminal::deny_all_supported() {
+        format!(
+            "deny_all_available (BrokerOnly unavailable on {}: browser launches stay \
+             proxy-only at the application level and BrokerOnly requests are refused typed)",
+            std::env::consts::OS
+        )
     } else {
         format!(
             "unavailable (typed platform boundary: no per-process network-isolation backend \

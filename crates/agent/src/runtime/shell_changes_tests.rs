@@ -1094,7 +1094,7 @@ async fn read_only_shell_has_kernel_write_denial_and_no_change_manifest() {
     // refusal (fail closed, never an unconfined run), so the tool fails and
     // the turn ends recoverable — but a write still never lands and there is
     // still no change accounting.
-    if cfg!(target_os = "linux") {
+    if cfg!(any(target_os = "linux", target_os = "macos")) {
         assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
         assert!(
             root.join("target/scratch.txt").exists(),
@@ -1174,7 +1174,7 @@ async fn read_only_child_shell_is_forced_read_only(
     // Platform split exactly as the explicit read-only path: Linux installs
     // the kernel backend; elsewhere the Required demand is a TYPED spawn
     // refusal. Either way the write must never land.
-    if cfg!(target_os = "linux") {
+    if cfg!(any(target_os = "linux", target_os = "macos")) {
         assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn, "{label}");
     } else {
         assert_eq!(

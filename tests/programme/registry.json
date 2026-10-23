@@ -1,8 +1,8 @@
 {
   "schema": "faktor-test-programme-registry/v1",
-  "generated_at": "2026-10-23T14:45:01.330Z",
-  "commit": "d79191e63c79890930fabe5dbe029857ad0f3b12",
-  "tree": "a6d062570a8aa5e249016b2a3d0331c23e7d7e09",
+  "generated_at": "2026-10-23T20:34:10.683Z",
+  "commit": "786fae201a839b6ea92678f239ac758013f22c8b",
+  "tree": "b91c1dafbacc0bf9e333c5c962e97efd2c35dce3",
   "layers": [
     "structural",
     "unit",
@@ -19,18 +19,18 @@
     "release"
   ],
   "counts": {
-    "rows": 954,
+    "rows": 978,
     "by_kind": {
       "acceptance-scenario": 40,
       "act-now": 8,
       "adapter": 8,
       "builtin-tool": 14,
-      "cli-command": 48,
+      "cli-command": 49,
       "config-key": 53,
       "control": 200,
       "invariant": 159,
       "jetbrains-contribution": 1,
-      "native-route": 273,
+      "native-route": 296,
       "provider-adapter": 6,
       "screen": 72,
       "vscode-contribution": 39,
@@ -38,19 +38,19 @@
       "workflow": 16
     },
     "by_status": {
-      "deferred": 811,
-      "proven": 75,
+      "deferred": 834,
+      "proven": 76,
       "stub": 68
     },
     "by_lane": {
       "nightly": 513,
-      "pull": 623,
-      "trusted": 953,
+      "pull": 647,
+      "trusted": 977,
       "weekly-live": 342
     },
     "by_layer": {
       "agent-evals": 1,
-      "contracts": 409,
+      "contracts": 433,
       "ide-screen-readers": 385,
       "state-model-crash": 257,
       "unit-property": 242
@@ -1874,7 +1874,7 @@
         "passed": true,
         "observed": {
           "command": "billing",
-          "help_bytes": 859,
+          "help_bytes": 1375,
           "unknown_flag_exit": 2
         }
       }
@@ -2800,6 +2800,43 @@
         "observed": {
           "command": "impact",
           "help_bytes": 576,
+          "unknown_flag_exit": 2
+        }
+      }
+    },
+    {
+      "id": "cli.mcp",
+      "kind": "cli-command",
+      "path": "crates/cli/src/main.rs",
+      "layers": [
+        "contracts"
+      ],
+      "lanes": [
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "cli.exit-codes.mcp",
+        "cli.help.mcp"
+      ],
+      "evidence_kind": "exact-value",
+      "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
+      "status": "proven",
+      "meta": {
+        "command": "mcp"
+      },
+      "adversarial": [
+        "help",
+        "unknown-flag",
+        "missing-daemon",
+        "redaction",
+        "idempotence"
+      ],
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "mcp",
+          "help_bytes": 458,
           "unknown_flag_exit": 2
         }
       }
@@ -18026,6 +18063,76 @@
       "evidence": null
     },
     {
+      "id": "native.get.native.billing.invoices",
+      "kind": "native-route",
+      "path": "crates/server/src/api/lifecycle.rs",
+      "layers": [
+        "contracts"
+      ],
+      "lanes": [
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "native.route-contract.native.get.native.billing.invoices"
+      ],
+      "evidence_kind": "exact-value",
+      "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
+      "status": "deferred",
+      "meta": {
+        "rev8": false,
+        "credential": false,
+        "method": "get",
+        "surface_path": "native/billing/invoices"
+      },
+      "adversarial": [
+        "auth",
+        "strict-body",
+        "typed-error",
+        "bounds",
+        "traversal",
+        "duplicate",
+        "isolation",
+        "no-secret"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "native.get.native.billing.invoices.id",
+      "kind": "native-route",
+      "path": "crates/server/src/api/lifecycle.rs",
+      "layers": [
+        "contracts"
+      ],
+      "lanes": [
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "native.route-contract.native.get.native.billing.invoices.id"
+      ],
+      "evidence_kind": "exact-value",
+      "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
+      "status": "deferred",
+      "meta": {
+        "rev8": false,
+        "credential": false,
+        "method": "get",
+        "surface_path": "native/billing/invoices/id"
+      },
+      "adversarial": [
+        "auth",
+        "strict-body",
+        "typed-error",
+        "bounds",
+        "traversal",
+        "duplicate",
+        "isolation",
+        "no-secret"
+      ],
+      "evidence": null
+    },
+    {
       "id": "native.get.native.billing.overview",
       "kind": "native-route",
       "path": "crates/server/src/api/lifecycle.rs",
@@ -18047,6 +18154,181 @@
         "credential": false,
         "method": "get",
         "surface_path": "native/billing/overview"
+      },
+      "adversarial": [
+        "auth",
+        "strict-body",
+        "typed-error",
+        "bounds",
+        "traversal",
+        "duplicate",
+        "isolation",
+        "no-secret"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "native.get.native.billing.payment-methods",
+      "kind": "native-route",
+      "path": "crates/server/src/api/lifecycle.rs",
+      "layers": [
+        "contracts"
+      ],
+      "lanes": [
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "native.route-contract.native.get.native.billing.payment-methods"
+      ],
+      "evidence_kind": "exact-value",
+      "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
+      "status": "deferred",
+      "meta": {
+        "rev8": false,
+        "credential": false,
+        "method": "get",
+        "surface_path": "native/billing/payment-methods"
+      },
+      "adversarial": [
+        "auth",
+        "strict-body",
+        "typed-error",
+        "bounds",
+        "traversal",
+        "duplicate",
+        "isolation",
+        "no-secret"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "native.get.native.billing.payments",
+      "kind": "native-route",
+      "path": "crates/server/src/api/lifecycle.rs",
+      "layers": [
+        "contracts"
+      ],
+      "lanes": [
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "native.route-contract.native.get.native.billing.payments"
+      ],
+      "evidence_kind": "exact-value",
+      "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
+      "status": "deferred",
+      "meta": {
+        "rev8": false,
+        "credential": false,
+        "method": "get",
+        "surface_path": "native/billing/payments"
+      },
+      "adversarial": [
+        "auth",
+        "strict-body",
+        "typed-error",
+        "bounds",
+        "traversal",
+        "duplicate",
+        "isolation",
+        "no-secret"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "native.get.native.billing.plan-preview",
+      "kind": "native-route",
+      "path": "crates/server/src/api/lifecycle.rs",
+      "layers": [
+        "contracts"
+      ],
+      "lanes": [
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "native.route-contract.native.get.native.billing.plan-preview"
+      ],
+      "evidence_kind": "exact-value",
+      "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
+      "status": "deferred",
+      "meta": {
+        "rev8": false,
+        "credential": false,
+        "method": "get",
+        "surface_path": "native/billing/plan-preview"
+      },
+      "adversarial": [
+        "auth",
+        "strict-body",
+        "typed-error",
+        "bounds",
+        "traversal",
+        "duplicate",
+        "isolation",
+        "no-secret"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "native.get.native.billing.seat-preview",
+      "kind": "native-route",
+      "path": "crates/server/src/api/lifecycle.rs",
+      "layers": [
+        "contracts"
+      ],
+      "lanes": [
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "native.route-contract.native.get.native.billing.seat-preview"
+      ],
+      "evidence_kind": "exact-value",
+      "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
+      "status": "deferred",
+      "meta": {
+        "rev8": false,
+        "credential": false,
+        "method": "get",
+        "surface_path": "native/billing/seat-preview"
+      },
+      "adversarial": [
+        "auth",
+        "strict-body",
+        "typed-error",
+        "bounds",
+        "traversal",
+        "duplicate",
+        "isolation",
+        "no-secret"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "native.get.native.billing.tax",
+      "kind": "native-route",
+      "path": "crates/server/src/api/lifecycle.rs",
+      "layers": [
+        "contracts"
+      ],
+      "lanes": [
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "native.route-contract.native.get.native.billing.tax"
+      ],
+      "evidence_kind": "exact-value",
+      "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
+      "status": "deferred",
+      "meta": {
+        "rev8": false,
+        "credential": false,
+        "method": "get",
+        "surface_path": "native/billing/tax"
       },
       "adversarial": [
         "auth",
@@ -19508,6 +19790,76 @@
           }
         ]
       }
+    },
+    {
+      "id": "native.get.native.mcp.servers.id.oauth.callback.flow-id",
+      "kind": "native-route",
+      "path": "crates/server/src",
+      "layers": [
+        "contracts"
+      ],
+      "lanes": [
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "native.route-contract.native.get.native.mcp.servers.id.oauth.callback.flow-id"
+      ],
+      "evidence_kind": "exact-value",
+      "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
+      "status": "deferred",
+      "meta": {
+        "rev8": false,
+        "credential": false,
+        "method": "get",
+        "surface_path": "native/mcp/servers/id/oauth/callback/flow-id"
+      },
+      "adversarial": [
+        "auth",
+        "strict-body",
+        "typed-error",
+        "bounds",
+        "traversal",
+        "duplicate",
+        "isolation",
+        "no-secret"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "native.get.native.mcp.servers.id.oauth.status",
+      "kind": "native-route",
+      "path": "crates/server/src/api/lifecycle.rs",
+      "layers": [
+        "contracts"
+      ],
+      "lanes": [
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "native.route-contract.native.get.native.mcp.servers.id.oauth.status"
+      ],
+      "evidence_kind": "exact-value",
+      "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
+      "status": "deferred",
+      "meta": {
+        "rev8": false,
+        "credential": false,
+        "method": "get",
+        "surface_path": "native/mcp/servers/id/oauth/status"
+      },
+      "adversarial": [
+        "auth",
+        "strict-body",
+        "typed-error",
+        "bounds",
+        "traversal",
+        "duplicate",
+        "isolation",
+        "no-secret"
+      ],
+      "evidence": null
     },
     {
       "id": "native.get.native.mcp.servers.id.resources",
@@ -22914,6 +23266,251 @@
       "evidence": null
     },
     {
+      "id": "native.post.native.billing.invoices",
+      "kind": "native-route",
+      "path": "crates/server/src/api/lifecycle.rs",
+      "layers": [
+        "contracts"
+      ],
+      "lanes": [
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "native.route-contract.native.post.native.billing.invoices"
+      ],
+      "evidence_kind": "exact-value",
+      "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
+      "status": "deferred",
+      "meta": {
+        "rev8": false,
+        "credential": false,
+        "method": "post",
+        "surface_path": "native/billing/invoices"
+      },
+      "adversarial": [
+        "auth",
+        "strict-body",
+        "typed-error",
+        "bounds",
+        "traversal",
+        "duplicate",
+        "isolation",
+        "no-secret"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "native.post.native.billing.invoices.id.pay",
+      "kind": "native-route",
+      "path": "crates/server/src/api/lifecycle.rs",
+      "layers": [
+        "contracts"
+      ],
+      "lanes": [
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "native.route-contract.native.post.native.billing.invoices.id.pay"
+      ],
+      "evidence_kind": "exact-value",
+      "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
+      "status": "deferred",
+      "meta": {
+        "rev8": false,
+        "credential": false,
+        "method": "post",
+        "surface_path": "native/billing/invoices/id/pay"
+      },
+      "adversarial": [
+        "auth",
+        "strict-body",
+        "typed-error",
+        "bounds",
+        "traversal",
+        "duplicate",
+        "isolation",
+        "no-secret"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "native.post.native.billing.payment-methods",
+      "kind": "native-route",
+      "path": "crates/server/src/api/lifecycle.rs",
+      "layers": [
+        "contracts"
+      ],
+      "lanes": [
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "native.route-contract.native.post.native.billing.payment-methods"
+      ],
+      "evidence_kind": "exact-value",
+      "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
+      "status": "deferred",
+      "meta": {
+        "rev8": false,
+        "credential": false,
+        "method": "post",
+        "surface_path": "native/billing/payment-methods"
+      },
+      "adversarial": [
+        "auth",
+        "strict-body",
+        "typed-error",
+        "bounds",
+        "traversal",
+        "duplicate",
+        "isolation",
+        "no-secret"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "native.post.native.billing.plan",
+      "kind": "native-route",
+      "path": "crates/server/src/api/lifecycle.rs",
+      "layers": [
+        "contracts"
+      ],
+      "lanes": [
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "native.route-contract.native.post.native.billing.plan"
+      ],
+      "evidence_kind": "exact-value",
+      "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
+      "status": "deferred",
+      "meta": {
+        "rev8": false,
+        "credential": false,
+        "method": "post",
+        "surface_path": "native/billing/plan"
+      },
+      "adversarial": [
+        "auth",
+        "strict-body",
+        "typed-error",
+        "bounds",
+        "traversal",
+        "duplicate",
+        "isolation",
+        "no-secret"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "native.post.native.billing.refunds",
+      "kind": "native-route",
+      "path": "crates/server/src/api/lifecycle.rs",
+      "layers": [
+        "contracts"
+      ],
+      "lanes": [
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "native.route-contract.native.post.native.billing.refunds"
+      ],
+      "evidence_kind": "exact-value",
+      "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
+      "status": "deferred",
+      "meta": {
+        "rev8": false,
+        "credential": false,
+        "method": "post",
+        "surface_path": "native/billing/refunds"
+      },
+      "adversarial": [
+        "auth",
+        "strict-body",
+        "typed-error",
+        "bounds",
+        "traversal",
+        "duplicate",
+        "isolation",
+        "no-secret"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "native.post.native.billing.seats",
+      "kind": "native-route",
+      "path": "crates/server/src/api/lifecycle.rs",
+      "layers": [
+        "contracts"
+      ],
+      "lanes": [
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "native.route-contract.native.post.native.billing.seats"
+      ],
+      "evidence_kind": "exact-value",
+      "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
+      "status": "deferred",
+      "meta": {
+        "rev8": false,
+        "credential": false,
+        "method": "post",
+        "surface_path": "native/billing/seats"
+      },
+      "adversarial": [
+        "auth",
+        "strict-body",
+        "typed-error",
+        "bounds",
+        "traversal",
+        "duplicate",
+        "isolation",
+        "no-secret"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "native.post.native.billing.subscribe",
+      "kind": "native-route",
+      "path": "crates/server/src/api/lifecycle.rs",
+      "layers": [
+        "contracts"
+      ],
+      "lanes": [
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "native.route-contract.native.post.native.billing.subscribe"
+      ],
+      "evidence_kind": "exact-value",
+      "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
+      "status": "deferred",
+      "meta": {
+        "rev8": false,
+        "credential": false,
+        "method": "post",
+        "surface_path": "native/billing/subscribe"
+      },
+      "adversarial": [
+        "auth",
+        "strict-body",
+        "typed-error",
+        "bounds",
+        "traversal",
+        "duplicate",
+        "isolation",
+        "no-secret"
+      ],
+      "evidence": null
+    },
+    {
       "id": "native.post.native.billing.subscription",
       "kind": "native-route",
       "path": "crates/server/src/api/lifecycle.rs",
@@ -22935,6 +23532,76 @@
         "credential": false,
         "method": "post",
         "surface_path": "native/billing/subscription"
+      },
+      "adversarial": [
+        "auth",
+        "strict-body",
+        "typed-error",
+        "bounds",
+        "traversal",
+        "duplicate",
+        "isolation",
+        "no-secret"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "native.post.native.billing.subscription.cancel",
+      "kind": "native-route",
+      "path": "crates/server/src/api/lifecycle.rs",
+      "layers": [
+        "contracts"
+      ],
+      "lanes": [
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "native.route-contract.native.post.native.billing.subscription.cancel"
+      ],
+      "evidence_kind": "exact-value",
+      "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
+      "status": "deferred",
+      "meta": {
+        "rev8": false,
+        "credential": false,
+        "method": "post",
+        "surface_path": "native/billing/subscription/cancel"
+      },
+      "adversarial": [
+        "auth",
+        "strict-body",
+        "typed-error",
+        "bounds",
+        "traversal",
+        "duplicate",
+        "isolation",
+        "no-secret"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "native.post.native.billing.webhook",
+      "kind": "native-route",
+      "path": "crates/server/src/api/lifecycle.rs",
+      "layers": [
+        "contracts"
+      ],
+      "lanes": [
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "native.route-contract.native.post.native.billing.webhook"
+      ],
+      "evidence_kind": "exact-value",
+      "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
+      "status": "deferred",
+      "meta": {
+        "rev8": false,
+        "credential": false,
+        "method": "post",
+        "surface_path": "native/billing/webhook"
       },
       "adversarial": [
         "auth",
@@ -24114,6 +24781,146 @@
       "evidence": null
     },
     {
+      "id": "native.post.native.mcp.servers.id.oauth.complete",
+      "kind": "native-route",
+      "path": "crates/server/src/api/lifecycle.rs",
+      "layers": [
+        "contracts"
+      ],
+      "lanes": [
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "native.route-contract.native.post.native.mcp.servers.id.oauth.complete"
+      ],
+      "evidence_kind": "exact-value",
+      "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
+      "status": "deferred",
+      "meta": {
+        "rev8": false,
+        "credential": false,
+        "method": "post",
+        "surface_path": "native/mcp/servers/id/oauth/complete"
+      },
+      "adversarial": [
+        "auth",
+        "strict-body",
+        "typed-error",
+        "bounds",
+        "traversal",
+        "duplicate",
+        "isolation",
+        "no-secret"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "native.post.native.mcp.servers.id.oauth.connect",
+      "kind": "native-route",
+      "path": "crates/server/src/api/lifecycle.rs",
+      "layers": [
+        "contracts"
+      ],
+      "lanes": [
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "native.route-contract.native.post.native.mcp.servers.id.oauth.connect"
+      ],
+      "evidence_kind": "exact-value",
+      "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
+      "status": "deferred",
+      "meta": {
+        "rev8": false,
+        "credential": false,
+        "method": "post",
+        "surface_path": "native/mcp/servers/id/oauth/connect"
+      },
+      "adversarial": [
+        "auth",
+        "strict-body",
+        "typed-error",
+        "bounds",
+        "traversal",
+        "duplicate",
+        "isolation",
+        "no-secret"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "native.post.native.mcp.servers.id.oauth.login",
+      "kind": "native-route",
+      "path": "crates/server/src/api/lifecycle.rs",
+      "layers": [
+        "contracts"
+      ],
+      "lanes": [
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "native.route-contract.native.post.native.mcp.servers.id.oauth.login"
+      ],
+      "evidence_kind": "exact-value",
+      "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
+      "status": "deferred",
+      "meta": {
+        "rev8": false,
+        "credential": false,
+        "method": "post",
+        "surface_path": "native/mcp/servers/id/oauth/login"
+      },
+      "adversarial": [
+        "auth",
+        "strict-body",
+        "typed-error",
+        "bounds",
+        "traversal",
+        "duplicate",
+        "isolation",
+        "no-secret"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "native.post.native.mcp.servers.id.oauth.logout",
+      "kind": "native-route",
+      "path": "crates/server/src/api/lifecycle.rs",
+      "layers": [
+        "contracts"
+      ],
+      "lanes": [
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "native.route-contract.native.post.native.mcp.servers.id.oauth.logout"
+      ],
+      "evidence_kind": "exact-value",
+      "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
+      "status": "deferred",
+      "meta": {
+        "rev8": false,
+        "credential": false,
+        "method": "post",
+        "surface_path": "native/mcp/servers/id/oauth/logout"
+      },
+      "adversarial": [
+        "auth",
+        "strict-body",
+        "typed-error",
+        "bounds",
+        "traversal",
+        "duplicate",
+        "isolation",
+        "no-secret"
+      ],
+      "evidence": null
+    },
+    {
       "id": "native.post.native.mcp.servers.id.oauth.revoke",
       "kind": "native-route",
       "path": "crates/server/src/api/lifecycle.rs",
@@ -24135,6 +24942,41 @@
         "credential": false,
         "method": "post",
         "surface_path": "native/mcp/servers/id/oauth/revoke"
+      },
+      "adversarial": [
+        "auth",
+        "strict-body",
+        "typed-error",
+        "bounds",
+        "traversal",
+        "duplicate",
+        "isolation",
+        "no-secret"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "native.post.native.mcp.servers.id.oauth.status",
+      "kind": "native-route",
+      "path": "crates/server/src/api/lifecycle.rs",
+      "layers": [
+        "contracts"
+      ],
+      "lanes": [
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "native.route-contract.native.post.native.mcp.servers.id.oauth.status"
+      ],
+      "evidence_kind": "exact-value",
+      "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
+      "status": "deferred",
+      "meta": {
+        "rev8": false,
+        "credential": false,
+        "method": "post",
+        "surface_path": "native/mcp/servers/id/oauth/status"
       },
       "adversarial": [
         "auth",
@@ -24893,7 +25735,7 @@
             "passed": true,
             "observed": {
               "status": 200,
-              "handle": "vault://provider_key/c52d5fe13007c8a7b421b549f3b7a61a"
+              "handle": "vault://provider_key/2f7fb2fbcccb121a51ecbc5438e95390"
             }
           },
           {

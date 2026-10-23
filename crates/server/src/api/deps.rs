@@ -106,6 +106,11 @@ pub struct ServerDeps {
     /// answers a typed 409 `billing_disabled` and the daemon is otherwise
     /// byte-identical to the pre-billing daemon.
     pub billing: Option<Arc<faktor_cloud::EntitlementService>>,
+    /// The additive payment/invoice/seat/tax/currency plane. `None` = the
+    /// `[billing.payments]` subsection is disabled (the default): every
+    /// payment route answers a typed 409 `payments_disabled` and the
+    /// overview keeps its honest unavailable states.
+    pub payments: Option<Arc<faktor_payments::PaymentService>>,
     /// The signed updater service (`[updater]`). `None` = the section is
     /// disabled (the default): every `/native/updater/*` route answers a
     /// typed 409 `updater_disabled` and the daemon is otherwise byte-
@@ -276,6 +281,7 @@ impl ServerDeps {
             scm: None,
             scm_webhook: None,
             billing: None,
+            payments: None,
             updater: None,
             workers: None,
             enterprise: None,
@@ -382,6 +388,13 @@ impl ServerDeps {
     /// without it every billing route answers 409 `billing_disabled`.
     pub fn with_billing(mut self, billing: Arc<faktor_cloud::EntitlementService>) -> Self {
         self.billing = Some(billing);
+        self
+    }
+
+    /// Wire the additive payment/invoice plane (`[billing.payments]`).
+    /// Without it every payment route answers 409 `payments_disabled`.
+    pub fn with_payments(mut self, payments: Arc<faktor_payments::PaymentService>) -> Self {
+        self.payments = Some(payments);
         self
     }
 

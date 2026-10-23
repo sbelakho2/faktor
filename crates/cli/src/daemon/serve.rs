@@ -1862,6 +1862,41 @@ fn wire_billing_plane(
     );
     deps = deps.with_billing(service);
     tracing::info!("commercial billing enabled");
+    // The additive `[billing.payments]` subsection: disabled by default (no
+    // payment.db is created and every payment route answers 409). When
+    // enabled, the durable invoice/subscription store opens here; the local
+    // provider is fully offline, while the Stripe adapter receives the
+    // daemon's ONE checked egress transport. Provider credentials are
+    // resolved from environment-variable NAMES and are never logged.
+    if let Some(payments_cfg) = config_billing.payments.as_ref().filter(|cfg| cfg.enabled) {
+        let path = config_billing
+            .payments_path(data_dir)
+            .map_err(|e| format!("payments config: {e}"))?
+            .ok_or_else(|| "payments config: enabled section resolved no database".to_string())?;
+        let runtime = payments_cfg
+            .runtime_config(&config_billing.plans)
+            .map_err(|e| format!("payments config: {e}"))?;
+        let payment_store = Arc::new(
+            faktor_payments::SqlitePaymentStore::open(&path)
+                .map_err(|e| format!("payment store {}: {e}", path.display()))?,
+        );
+        let transport = if runtime.provider == faktor_payments::ProviderKind::Stripe {
+            Some(graph.transport.clone())
+        } else {
+            None
+        };
+        let clock: Arc<dyn faktor_cloud::Clock> = Arc::new(faktor_cloud::SystemClock);
+        let payments = faktor_payments::build_service(
+            payment_store,
+            runtime,
+            clock,
+            transport,
+            Arc::new(faktor_payments::EnvSecrets),
+        )
+        .map_err(|e| format!("payments service: {e}"))?;
+        deps = deps.with_payments(Arc::new(payments));
+        tracing::info!("commercial payments enabled");
+    }
     graph.orchestrator.set_admission_gate(billing_gate);
     Ok((deps, value_gate, billing_report))
 }

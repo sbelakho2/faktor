@@ -581,8 +581,8 @@ async fn native_terminal_spawn_is_isolated_or_refused_under_the_fail_closed_defa
             // Linux with a usable kernel/user-namespace policy: the child
             // really ran inside the sandbox namespace, and the response
             // records exactly that.
-            if !cfg!(target_os = "linux") {
-                panic!("no platform without a backend may admit an os_isolated spawn");
+            if !faktor_terminal::deny_all_supported() {
+                panic!("no platform without a DenyAll backend may admit an os_isolated spawn");
             }
             let body: serde_json::Value = resp.json().await.unwrap();
             assert_eq!(body["executionProfile"]["shell"], "os_isolated", "{body}");
@@ -598,8 +598,8 @@ async fn native_terminal_spawn_is_isolated_or_refused_under_the_fail_closed_defa
             );
         }
         status => {
-            // Platform truth (macOS/Windows) or a refused unshare: the
-            // typed fail-closed refusal, BEFORE any child exists.
+            // Platform truth (Windows) or a refused backend: the typed
+            // fail-closed refusal, BEFORE any child exists.
             assert_eq!(status, 403, "the default is fail-closed");
             let body: serde_json::Value = resp.json().await.unwrap();
             assert_eq!(body["code"], "execution_denied", "{body}");

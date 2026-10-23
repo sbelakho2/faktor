@@ -11,15 +11,19 @@ use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::Json;
 use faktor_core::error::{Error, ErrorKind};
 use faktor_foundation::customization::{McpServerDraft, McpServerRecord};
 use faktor_foundation::Foundation;
+use faktor_mcp::oauth::{
+    OAuthClient, OAUTH_DENIED_CODE, OAUTH_DISCOVERY_CODE, OAUTH_EXPIRED_CODE,
+    OAUTH_UNCONFIGURED_CODE,
+};
 use faktor_mcp::remote::{
-    RemoteCapabilities, RemoteMcpConfig, RemoteMcpServer, SecretToken, AUTH_FORBIDDEN_CODE,
-    AUTH_REQUIRED_CODE, CAPABILITY_UNSUPPORTED_CODE, JSONRPC_ERROR_CODE, PROTOCOL_CODE,
-    SESSION_EXPIRED_CODE, TRANSPORT_CODE,
+    RemoteCapabilities, RemoteMcpConfig, RemoteMcpServer, AUTH_FORBIDDEN_CODE, AUTH_REQUIRED_CODE,
+    CAPABILITY_UNSUPPORTED_CODE, JSONRPC_ERROR_CODE, PROTOCOL_CODE, SESSION_EXPIRED_CODE,
+    TRANSPORT_CODE,
 };
 use faktor_mcp::{McpConfig, McpConnection, McpServer};
 use faktor_terminal::ProcessSupervisor;
@@ -69,6 +73,14 @@ fn ready_connection(slot: &ServerSlot) -> Option<Arc<McpConnection>> {
 pub struct McpRuntime {
     supervisor: Option<Arc<ProcessSupervisor>>,
     live: tokio::sync::Mutex<HashMap<String, Arc<ServerSlot>>>,
+    /// The OAuth engine used for discovery/login/token refresh/revocation.
+    /// Production is external-address only; the local-fixture constructor
+    /// installs the explicit loopback rule.
+    oauth_client: OAuthClient,
+    /// Bounded, single-use authorization-code flows awaiting the operator's
+    /// loopback callback. Nothing here is durable: a daemon restart expires
+    /// an unfinished flow and the operator starts again.
+    pub(crate) oauth_flows: tokio::sync::Mutex<HashMap<String, super::mcp_oauth::PendingLogin>>,
     /// TEST-ONLY loopback client (the production constructor always builds
     /// the checked external-address client inside `RemoteMcpServer`).
     #[cfg(test)]
@@ -80,6 +92,8 @@ impl McpRuntime {
         Self {
             supervisor,
             live: tokio::sync::Mutex::new(HashMap::new()),
+            oauth_client: OAuthClient::production(),
+            oauth_flows: tokio::sync::Mutex::new(HashMap::new()),
             #[cfg(test)]
             remote_client: None,
         }
@@ -93,15 +107,26 @@ impl McpRuntime {
         Self {
             supervisor,
             live: tokio::sync::Mutex::new(HashMap::new()),
+            oauth_client: OAuthClient::with_address_policy(
+                faktor_provider::egress::EgressAddressPolicy::LOCAL,
+            ),
+            oauth_flows: tokio::sync::Mutex::new(HashMap::new()),
             remote_client: Some(client),
         }
+    }
+
+    /// The OAuth engine clone for a login/status/revocation request. The
+    /// engine is configuration-only; each request builds its own checked
+    /// client for the exact discovered origin.
+    pub(crate) fn oauth_client(&self) -> OAuthClient {
+        self.oauth_client.clone()
     }
 
     pub(crate) async fn start(
         &self,
         record: &McpServerRecord,
         env: Vec<(String, String)>,
-        vault: Option<&faktor_foundation::SecretVault>,
+        foundation: Option<&faktor_foundation::Foundation>,
     ) -> Result<Vec<serde_json::Value>, Error> {
         if !record.trusted {
             return Err(mcp_provider_error(
@@ -161,7 +186,7 @@ impl McpRuntime {
                 }
             },
             Role::Connect(slot) => {
-                let connection = match self.connect(record, env, vault).await {
+                let connection = match self.connect(record, env, foundation).await {
                     Ok(connection) => Arc::new(connection),
                     Err(error) => {
                         self.fail_slot(&record.id, &slot, error.clone()).await;
@@ -198,7 +223,7 @@ impl McpRuntime {
         &self,
         record: &McpServerRecord,
         env: Vec<(String, String)>,
-        vault: Option<&faktor_foundation::SecretVault>,
+        foundation: Option<&faktor_foundation::Foundation>,
     ) -> Result<McpConnection, Error> {
         match record.transport.as_str() {
             "stdio" => {
@@ -227,30 +252,23 @@ impl McpRuntime {
                         "this streamable_http MCP server has no endpoint; save the spec again",
                     )
                 })?;
-                let token = match record.auth_token_ref.as_deref() {
-                    Some(handle) => {
-                        let vault = vault.ok_or_else(|| {
-                            mcp_provider_error(
-                                AUTH_REQUIRED_CODE,
-                                "the server has a stored credential but the vault is not wired",
-                            )
-                        })?;
-                        let bytes = vault.reveal(handle).map_err(|error| {
-                            mcp_provider_error(
-                                AUTH_REQUIRED_CODE,
-                                format!(
-                                    "the stored MCP credential is unavailable; reconnect OAuth: {error}"
-                                ),
-                            )
-                        })?;
-                        Some(SecretToken::from_bytes(bytes).map_err(|error| {
-                            mcp_provider_error(AUTH_REQUIRED_CODE, error.message)
-                        })?)
+                let credential = if record.auth_token_ref.is_some() {
+                    let foundation = foundation.ok_or_else(|| {
+                        mcp_provider_error(
+                            AUTH_REQUIRED_CODE,
+                            "the server has a stored credential but the vault is not wired",
+                        )
+                    })?;
+                    super::mcp_oauth::load_credential(foundation, record, self.oauth_client())?
+                } else {
+                    super::mcp_oauth::LoadedCredential {
+                        token: None,
+                        auth: None,
                     }
-                    None => None,
                 };
                 let mut config = RemoteMcpConfig::new(record.name.clone(), endpoint);
-                config.token = token;
+                config.token = credential.token;
+                config.auth = credential.auth;
                 // Re-clamp even though save validates 100..=600000: a
                 // tampered durable row must not create an unbounded deadline.
                 config.timeout =
@@ -495,6 +513,10 @@ fn mcp_failure(error: Error) -> Response {
                 ("mcp_not_configured", StatusCode::CONFLICT)
             }
             "mcp_tools_failed" => ("mcp_tools_failed", StatusCode::CONFLICT),
+            OAUTH_UNCONFIGURED_CODE => (OAUTH_UNCONFIGURED_CODE, StatusCode::CONFLICT),
+            OAUTH_DENIED_CODE => (OAUTH_DENIED_CODE, StatusCode::FORBIDDEN),
+            OAUTH_EXPIRED_CODE => (OAUTH_EXPIRED_CODE, StatusCode::CONFLICT),
+            OAUTH_DISCOVERY_CODE => (OAUTH_DISCOVERY_CODE, StatusCode::BAD_GATEWAY),
             _ => ("mcp_start_failed", StatusCode::CONFLICT),
         },
         ErrorKind::Timeout => ("mcp_timeout", StatusCode::GATEWAY_TIMEOUT),
@@ -702,7 +724,22 @@ pub(crate) async fn native_mcp_servers(
         } else {
             None
         };
-        out.push(mcp_view(&record, health, tools, capabilities));
+        let mut view = mcp_view(&record, health, tools, capabilities);
+        if record.transport == "streamable_http" {
+            let status = super::mcp_oauth::auth_status(foundation, &record);
+            view["auth"] = serde_json::json!({
+                "state": status["state"],
+                "account": status["account"],
+                "scopes": status["scopes"],
+                "hasToken": status["hasToken"],
+                "method": status["method"],
+                "issuer": status.get("issuer"),
+                "expiresAtMs": status.get("expiresAtMs"),
+                "hasRefresh": status.get("hasRefresh"),
+                "renewable": status.get("renewable"),
+            });
+        }
+        out.push(view);
         if out.len() >= limit {
             break;
         }
@@ -768,10 +805,7 @@ async fn start_mcp_record(
     let timeout = Duration::from_millis(record.timeout_ms.unwrap_or(10_000).clamp(100, 600_000));
     match tokio::time::timeout(
         timeout,
-        state
-            .deps
-            .mcp_runtime
-            .start(record, env, Some(&foundation.vault)),
+        state.deps.mcp_runtime.start(record, env, Some(foundation)),
     )
     .await
     {
@@ -876,12 +910,22 @@ pub(crate) async fn native_mcp_server_tools(
     }
 }
 
-// SECRET-FIELD-GATE-WIRE-DTO: MCP OAuth callback body; the token is written
-// straight to the vault and only the opaque handle is persisted.
+fn default_mcp_auth_action() -> String {
+    "login".into()
+}
+
+// SECRET-FIELD-GATE-WIRE-DTO: MCP OAuth wire body; access tokens, client
+// secrets and authorization codes are wrapped/moved into the vault in the
+// same handler and never persisted or echoed in plaintext.
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct NativeMcpAuthBody {
-    /// `connect` | `reconnect` | `revoke`
+    /// The panel's selected server id. The PATH id is authoritative; this is
+    /// accepted only so the generic UI command body validates.
+    #[serde(default)]
+    id: Option<String>,
+    /// `connect` | `reconnect` | `revoke` | `login` | `complete` | `logout`
+    #[serde(default = "default_mcp_auth_action")]
     action: String,
     #[serde(default)]
     access_token: Option<String>,
@@ -891,6 +935,319 @@ pub(crate) struct NativeMcpAuthBody {
     scopes: Vec<String>,
     #[serde(default)]
     expected_revision: Option<u64>,
+    /// `authorization_code` (default) or `client_credentials`.
+    #[serde(default)]
+    mode: Option<String>,
+    /// A pre-registered OAuth client id; omitted triggers RFC 7591 dynamic
+    /// registration when the authorization server supports it.
+    #[serde(default)]
+    client_id: Option<String>,
+    #[serde(default)]
+    client_secret: Option<String>,
+    /// The operator's loopback callback (http://127.0.0.1:<port>/...).
+    #[serde(default)]
+    redirect_uri: Option<String>,
+    #[serde(default)]
+    flow_id: Option<String>,
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+}
+
+/// `GET|POST /native/mcp/servers/{id}/oauth/status` — the non-secret OAuth
+/// lifecycle view: durable state, account, granted scopes, issuer and
+/// expiry. Never a token, refresh token or client secret.
+pub(crate) async fn native_mcp_server_oauth_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let foundation = match foundation(&state) {
+        Ok(f) => f,
+        Err(r) => return r,
+    };
+    match foundation.customization.mcp_server(&id) {
+        Ok(Some(record)) => {
+            Json(super::mcp_oauth::auth_status(foundation, &record)).into_response()
+        }
+        Ok(None) => wire_status(not_found("MCP server")),
+        Err(e) => foundation_error(e),
+    }
+}
+
+/// `POST /native/mcp/servers/{id}/oauth/login` (alias `/oauth/connect`) —
+/// start the operator flow. In `authorization_code` mode the response is the
+/// authorization URL plus a single-use flow id; the CLI/IDE owns the
+/// loopback listener and posts the callback to `/oauth/complete`. In
+/// `client_credentials` mode the exchange happens immediately. No token is
+/// ever returned.
+pub(crate) async fn native_mcp_server_oauth_login(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Result<Json<NativeMcpAuthBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(_) => return wire_status(malformed_body("invalid MCP OAuth login body")),
+    };
+    if let Some(body_id) = body.id.as_deref() {
+        if body_id != id {
+            return wire_status(malformed_body(
+                "the OAuth login body id does not match the path server id",
+            ));
+        }
+    }
+    let foundation = match foundation(&state) {
+        Ok(f) => f,
+        Err(r) => return r,
+    };
+    let record = match foundation.customization.mcp_server(&id) {
+        Ok(Some(record)) => record,
+        Ok(None) => return wire_status(not_found("MCP server")),
+        Err(e) => return foundation_error(e),
+    };
+    if let Err(error) = require_remote_oauth_record(&record) {
+        return mcp_failure(error);
+    }
+    let mode = body.mode.as_deref().unwrap_or("authorization_code");
+    match super::mcp_oauth::begin_login(
+        &state.deps.mcp_runtime,
+        foundation,
+        &record,
+        mode,
+        body.client_id.as_deref(),
+        body.client_secret.as_deref(),
+        body.redirect_uri.as_deref(),
+        headers.get("host").and_then(|value| value.to_str().ok()),
+        body.scopes,
+        body.account,
+    )
+    .await
+    {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => {
+            super::mcp_oauth::project_login_error(foundation, &record, &error);
+            mcp_failure(error)
+        }
+    }
+}
+
+/// `POST /native/mcp/servers/{id}/oauth/complete` — exchange the loopback
+/// callback code exactly once and persist the vault bundle. A replayed flow
+/// id, wrong state or PKCE mismatch is the typed `oauth_denied`; an expired
+/// flow is `oauth_expired`; missing metadata is `oauth_unconfigured`.
+pub(crate) async fn native_mcp_server_oauth_complete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Result<Json<NativeMcpAuthBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(_) => return wire_status(malformed_body("invalid MCP OAuth callback body")),
+    };
+    if let Some(body_id) = body.id.as_deref() {
+        if body_id != id {
+            return wire_status(malformed_body(
+                "the OAuth callback body id does not match the path server id",
+            ));
+        }
+    }
+    let (Some(flow_id), Some(code), Some(state_value)) = (
+        body.flow_id.as_deref(),
+        body.code.as_deref(),
+        body.state.as_deref(),
+    ) else {
+        return wire_status(malformed_body(
+            "complete requires flowId, code and state from the loopback callback",
+        ));
+    };
+    let foundation = match foundation(&state) {
+        Ok(f) => f,
+        Err(r) => return r,
+    };
+    let record = match foundation.customization.mcp_server(&id) {
+        Ok(Some(record)) => record,
+        Ok(None) => return wire_status(not_found("MCP server")),
+        Err(e) => return foundation_error(e),
+    };
+    if let Err(error) = require_remote_oauth_record(&record) {
+        return mcp_failure(error);
+    }
+    match super::mcp_oauth::complete_login(
+        &state.deps.mcp_runtime,
+        foundation,
+        &record,
+        flow_id,
+        code,
+        state_value,
+    )
+    .await
+    {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => {
+            super::mcp_oauth::project_login_error(foundation, &record, &error);
+            mcp_failure(error)
+        }
+    }
+}
+
+/// `GET /native/mcp/servers/{id}/oauth/callback/{flowId}` — the
+/// daemon-owned loopback redirect for a UI-started login. The browser
+/// carries only the one-shot flow id plus the AS `code`/`state`; state is
+/// verified by the pending flow, and the page never renders a credential.
+pub(crate) async fn native_mcp_server_oauth_callback(
+    State(state): State<AppState>,
+    Path((id, flow_id)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let (Some(code), Some(state_value)) = (params.get("code"), params.get("state")) else {
+        let detail = params
+            .get("error")
+            .map(|error| format!("authorization server returned {error}"))
+            .unwrap_or_else(|| "the callback carried no code/state".into());
+        return (
+            StatusCode::BAD_REQUEST,
+            Html(callback_page("Login failed", &detail, false)),
+        )
+            .into_response();
+    };
+    let foundation = match foundation(&state) {
+        Ok(f) => f,
+        Err(response) => return response,
+    };
+    let record = match foundation.customization.mcp_server(&id) {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Html(callback_page("Login failed", "MCP server not found", false)),
+            )
+                .into_response()
+        }
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Html(callback_page(
+                    "Login failed",
+                    &format!("MCP server read failed: {error}"),
+                    false,
+                )),
+            )
+                .into_response()
+        }
+    };
+    match super::mcp_oauth::complete_login(
+        &state.deps.mcp_runtime,
+        foundation,
+        &record,
+        &flow_id,
+        code,
+        state_value,
+    )
+    .await
+    {
+        Ok(_) => (
+            StatusCode::OK,
+            Html(callback_page(
+                "Login complete",
+                "The MCP server credential is stored. You can close this window and return to Faktor.",
+                true,
+            )),
+        )
+            .into_response(),
+        Err(error) => {
+            super::mcp_oauth::project_login_error(foundation, &record, &error);
+            let detail = format!(
+                "{}: {}",
+                match &error.kind {
+                    ErrorKind::Provider { code, .. } => code.as_str(),
+                    _ => "oauth_login_failed",
+                },
+                error.message
+            );
+            (StatusCode::BAD_REQUEST, Html(callback_page("Login failed", &detail, false)))
+                .into_response()
+        }
+    }
+}
+
+fn callback_page(title: &str, detail: &str, success: bool) -> String {
+    let color = if success { "#1a7f37" } else { "#b42318" };
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{title}</title></head>\
+         <body style=\"font-family: system-ui, sans-serif; margin: 3rem; max-width: 42rem\">\
+         <h1 style=\"color: {color}\">{title}</h1><p>{detail}</p></body></html>",
+        title = escape_html(title),
+        detail = escape_html(detail),
+        color = color
+    )
+}
+
+fn escape_html(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars().take(1024) {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            ch if ch.is_control() => {}
+            ch => out.push(ch),
+        }
+    }
+    out
+}
+
+/// `POST /native/mcp/servers/{id}/oauth/logout` — remote revocation
+/// (best-effort, reported honestly), local vault deletion, live-session
+/// close and durable `signed_out`.
+pub(crate) async fn native_mcp_server_oauth_logout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let foundation = match foundation(&state) {
+        Ok(f) => f,
+        Err(r) => return r,
+    };
+    let record = match foundation.customization.mcp_server(&id) {
+        Ok(Some(record)) => record,
+        Ok(None) => return wire_status(not_found("MCP server")),
+        Err(e) => return foundation_error(e),
+    };
+    if let Err(error) = require_remote_oauth_record(&record) {
+        return mcp_failure(error);
+    }
+    match super::mcp_oauth::logout(&state.deps.mcp_runtime, foundation, &record).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => mcp_failure(error),
+    }
+}
+
+fn require_remote_oauth_record(record: &McpServerRecord) -> Result<(), Error> {
+    if record.transport != "streamable_http" {
+        return Err(mcp_provider_error(
+            "mcp_oauth_unsupported",
+            "OAuth binding applies to streamable_http servers only",
+        ));
+    }
+    Ok(())
 }
 
 /// `GET /native/mcp/servers/{id}/auth` — the durable auth binding without
@@ -908,16 +1265,9 @@ pub(crate) async fn native_mcp_server_auth_get(
         Err(r) => return r,
     };
     match foundation.customization.mcp_server(&id) {
-        Ok(Some(record)) => Json(serde_json::json!({
-            "serverId": record.id,
-            "transport": record.transport,
-            "state": record.auth_state,
-            "account": record.auth_account,
-            "scopes": record.auth_scopes,
-            "hasToken": record.auth_token_ref.is_some(),
-            "revision": record.revision,
-        }))
-        .into_response(),
+        Ok(Some(record)) => {
+            Json(super::mcp_oauth::auth_status(foundation, &record)).into_response()
+        }
         Ok(None) => wire_status(not_found("MCP server")),
         Err(e) => foundation_error(e),
     }
@@ -945,6 +1295,13 @@ pub(crate) async fn native_mcp_server_auth(
             "action must be connect, reconnect or revoke",
         ));
     }
+    if let Some(body_id) = body.id.as_deref() {
+        if body_id != id {
+            return wire_status(malformed_body(
+                "the auth body id does not match the path server id",
+            ));
+        }
+    }
     let foundation = match foundation(&state) {
         Ok(f) => f,
         Err(r) => return r,
@@ -961,27 +1318,17 @@ pub(crate) async fn native_mcp_server_auth(
         );
     }
     if body.action == "revoke" {
-        if let Some(handle) = record.auth_token_ref.clone() {
-            if let Err(e) = foundation.vault.delete(&handle) {
-                return foundation_error(e);
+        if let Some(expected) = body.expected_revision {
+            if record.revision != expected {
+                return conflict(
+                    "mcp_revision",
+                    "the MCP server changed before revocation; refresh and retry",
+                );
             }
         }
-        return match foundation.customization.set_mcp_auth(
-            &id,
-            None,
-            None,
-            Vec::new(),
-            body.expected_revision,
-        ) {
-            Ok(record) => Json(serde_json::json!({
-                "serverId": record.id,
-                "state": record.auth_state,
-                "account": record.auth_account,
-                "scopes": record.auth_scopes,
-                "revoked": true,
-            }))
-            .into_response(),
-            Err(e) => foundation_error(e),
+        return match super::mcp_oauth::logout(&state.deps.mcp_runtime, foundation, &record).await {
+            Ok(value) => Json(value).into_response(),
+            Err(error) => mcp_failure(error),
         };
     }
     let Some(token) = body.access_token.as_deref() else {
@@ -1101,24 +1448,9 @@ pub(crate) async fn native_mcp_server_oauth_revoke(
             "OAuth binding applies to streamable_http servers only",
         );
     }
-    if let Some(handle) = record.auth_token_ref.clone() {
-        if let Err(e) = foundation.vault.delete(&handle) {
-            return foundation_error(e);
-        }
-    }
-    // Revocation closes the live session before the durable signed_out row.
-    let _ = state.deps.mcp_runtime.stop(&id).await;
-    match foundation
-        .customization
-        .set_mcp_auth(&id, None, None, Vec::new(), None)
-    {
-        Ok(record) => Json(serde_json::json!({
-            "serverId": record.id,
-            "state": record.auth_state,
-            "revoked": true,
-        }))
-        .into_response(),
-        Err(e) => foundation_error(e),
+    match super::mcp_oauth::logout(&state.deps.mcp_runtime, foundation, &record).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => mcp_failure(error),
     }
 }
 

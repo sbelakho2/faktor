@@ -447,9 +447,7 @@ async fn start(
     Result<Vec<Value>, faktor_core::error::Error>,
 ) {
     let runtime = Arc::new(McpRuntime::with_remote_client(None, fixture.client()));
-    let result = runtime
-        .start(&record, Vec::new(), Some(&foundation.vault))
-        .await;
+    let result = runtime.start(&record, Vec::new(), Some(foundation)).await;
     (runtime, result)
 }
 
@@ -774,7 +772,7 @@ async fn failed_start_clears_the_slot_and_a_retry_connects() {
     record.id = "retry".into();
     record.name = "retry".into();
     let error = runtime
-        .start(&record, Vec::new(), Some(&foundation.vault))
+        .start(&record, Vec::new(), Some(&foundation))
         .await
         .expect_err("a wrong bearer token must fail");
     assert_eq!(auth_error_code(&error), AUTH_REQUIRED_CODE, "{error:?}");
@@ -790,7 +788,7 @@ async fn failed_start_clears_the_slot_and_a_retry_connects() {
         .unwrap();
     record.auth_token_ref = Some(right.handle);
     let tools = runtime
-        .start(&record, Vec::new(), Some(&foundation.vault))
+        .start(&record, Vec::new(), Some(&foundation))
         .await
         .expect("a retry after a cleared failure connects");
     assert_eq!(tools[0]["name"], "echo");
@@ -890,11 +888,7 @@ async fn a_failing_sibling_never_poisons_eight_single_flight_starts() {
     let failing = {
         let runtime = runtime.clone();
         let record = guarded_record.clone();
-        tokio::spawn(async move {
-            runtime
-                .start(&record, Vec::new(), Some(&foundation.vault))
-                .await
-        })
+        tokio::spawn(async move { runtime.start(&record, Vec::new(), Some(&foundation)).await })
     };
 
     for task in tasks {

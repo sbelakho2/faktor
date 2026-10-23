@@ -7083,6 +7083,9 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         ("crates/terminal/src/budget.rs", 1),
         ("crates/terminal/src/guardian.rs", 1),
         ("crates/terminal/src/sandbox/linux.rs", 1),
+        // Windows containment ordering: the one resume seam (NtResumeProcess)
+        // plus job/process handle use, all inside this platform module.
+        ("crates/terminal/src/win_spawn.rs", 1),
         ("crates/winjob/src/lib.rs", 1),
         // fd-identity exec of the verified updater artifact (`fexecve`); the
         // single unsafe block exists solely to bind exec to the hashed inode.
@@ -7095,11 +7098,11 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         // handle / process token.
         ("crates/updater/src/win_exec.rs", 1),
         // --- function-level allows in mixed files ---
-        // `terminal/src/lib.rs` now carries TEN: the DenyAll/BrokerOnly PTY
-        // confinement seams plus the filesystem-workspace confinement seam
-        // (`workspace_spawn_confinement`, audit P1), each an allocation-free
-        // pre-exec hook installer with its own per-site SAFETY comment.
-        ("crates/terminal/src/lib.rs", 10),
+        // `terminal/src/lib.rs` carries NINE: the DenyAll/BrokerOnly PTY
+        // confinement seams plus the Linux filesystem-workspace seam, each an
+        // allocation-free pre-exec hook installer with its own per-site SAFETY
+        // comment (the macOS launcher seam needs no unsafe).
+        ("crates/terminal/src/lib.rs", 9),
         ("crates/fs/src/tree_manifest.rs", 3),
         ("crates/git/src/guard.rs", 3),
         ("crates/session/src/actor.rs", 1),
@@ -7121,6 +7124,9 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         // The terminal unix test module (moved out of lib.rs by the audit-17
         // split): the three libc probes keep their per-site SAFETY comments.
         ("crates/terminal/src/tests.rs", 3),
+        // Independent final-wave live probes: the two zero-signal liveness
+        // checks (pid and process group) carry per-site SAFETY comments.
+        ("crates/terminal/src/final_surface_probes.rs", 2),
         // The terminal windows runtime-certification module (split out of
         // lib.rs by the source-size ceiling): its one libc probe keeps the
         // per-site SAFETY justification.

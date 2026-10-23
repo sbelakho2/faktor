@@ -1105,6 +1105,7 @@ dependencies = [
  "faktor-ollama",
  "faktor-openai",
  "faktor-orchestrator",
+ "faktor-payments",
  "faktor-protocol",
  "faktor-provider",
  "faktor-router",
@@ -1526,6 +1527,7 @@ dependencies = [
 name = "faktor-mcp"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "faktor-cas",
  "faktor-core",
  "faktor-provider",
@@ -1533,9 +1535,11 @@ dependencies = [
  "faktor-terminal",
  "faktor-test-mocks",
  "futures",
+ "rand",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "tokio",
@@ -1617,6 +1621,26 @@ dependencies = [
  "tokio",
  "tracing",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "faktor-payments"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "faktor-cloud",
+ "faktor-core",
+ "faktor-provider",
+ "hmac",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -1800,6 +1824,7 @@ dependencies = [
  "faktor-memory",
  "faktor-openai",
  "faktor-orchestrator",
+ "faktor-payments",
  "faktor-protocol",
  "faktor-provider",
  "faktor-pty",
@@ -2185,6 +2210,7 @@ dependencies = [
  "faktor-ollama",
  "faktor-openai",
  "faktor-orchestrator",
+ "faktor-payments",
  "faktor-protocol",
  "faktor-provider",
  "faktor-router",

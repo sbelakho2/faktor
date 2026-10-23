@@ -47,14 +47,14 @@
 //! enforces:
 //!
 //! - both external rules `Deny` + [`FilesystemGuarantee::Required`] + a
-//!   build with an OS confinement backend (Linux Landlock) ⇒ `workspace`:
-//!   the spawn layer confines the child or refuses typed BEFORE exec, never
-//!   an unconfined run;
+//!   build with an OS confinement backend (Linux Landlock, macOS
+//!   sandbox-exec profiles) ⇒ `workspace`: the spawn layer confines the
+//!   child or refuses typed BEFORE exec, never an unconfined run;
 //! - both external rules `Deny` + [`FilesystemGuarantee::BestEffort`] +
 //!   backend ⇒ `workspace_best_effort`: the spawn layer installs the
 //!   confinement when the kernel provides the ABI and otherwise runs
 //!   application-policy-only — the tag never claims a guaranteed jail;
-//! - no backend on this build (macOS/Windows today) or
+//! - no backend on this build (Windows today) or
 //!   [`FilesystemGuarantee::None`] ⇒ `application-policy-only`: only the
 //!   app-level capability engine is behind the external `Deny` rules; a
 //!   `Required` demand on such a build is a typed spawn refusal, never an
@@ -73,13 +73,14 @@ use faktor_core::capability::{Capability, PermissionDecision};
 use faktor_security::destination::{Decision, DeniedReason, DestinationPolicy, RequestTarget};
 
 /// True when THIS build has an OS-level per-process filesystem-confinement
-/// backend (Linux Landlock + mount namespace). A compile-time build fact
-/// only, never an enforcement claim: the runtime can still refuse a
-/// `Required` spawn typed (e.g. an old kernel without Landlock ABI v1), and
-/// a `BestEffort` spawn can fall back to application-policy-only. The
-/// spawn layer owns all runtime capability decisions.
+/// backend (Linux Landlock + mount namespace, macOS sandbox-exec profiles).
+/// A compile-time build fact only, never an enforcement claim: the runtime
+/// can still refuse a `Required` spawn typed (e.g. an old kernel without the
+/// Landlock ABI, or a missing/refusing macOS sandbox launcher), and a
+/// `BestEffort` spawn can fall back to application-policy-only. The spawn
+/// layer owns all runtime capability decisions.
 pub const fn filesystem_backend_available() -> bool {
-    cfg!(target_os = "linux")
+    cfg!(any(target_os = "linux", target_os = "macos"))
 }
 
 /// The strongest filesystem-confinement contract a policy claims for its
@@ -154,10 +155,11 @@ pub enum SandboxGuarantee {
     /// permitted shell under `ExecuteShell` + `Network(deny)` would
     /// otherwise open its own sockets, so an unenforceable requirement is
     /// a spawn refusal, never a warn-and-run downgrade. THE SECURE DEFAULT
-    /// for untrusted shell execution: platforms with no backend
-    /// (macOS/Windows today) refuse the shell typed instead of running it
-    /// unenforced; Windows Job Objects are process containment, never
-    /// network security.
+    /// for untrusted shell execution: platforms with no backend (Windows
+    /// today) refuse the shell typed instead of running it unenforced;
+    /// Windows Job Objects are process containment, never network security.
+    /// macOS enforces the demand with a generated sandbox-exec profile that
+    /// denies all network families.
     #[default]
     Required,
     /// Best-effort: commands run behind the existing app-level capability
@@ -241,9 +243,9 @@ pub struct SpawnProfile {
     ///   execution falls back to application-policy-only otherwise. NEVER
     ///   an OS-jail guarantee.
     /// - `application-policy-only` — no OS confinement backend on this
-    ///   build, or the guarantee is `None`: only the app-level capability
-    ///   engine backs the rules. A `Required` demand here refuses the spawn
-    ///   typed.
+    ///   build (Windows today), or the guarantee is `None`: only the
+    ///   app-level capability engine backs the rules. A `Required` demand
+    ///   here refuses the spawn typed.
     /// - `workspace+external:<read>-<write>` — at least one external rule
     ///   is not `Deny`: the profile names the rule tags; no workspace-only
     ///   confinement is claimed.
@@ -1403,7 +1405,7 @@ mod tests {
         assert_eq!(profile.network, "required");
         assert_eq!(profile.shell, "os_isolated");
         // Deny-everything external ⇒ workspace-only where the OS backend
-        // exists; on builds without one (non-Linux) the Required demand
+        // exists; on backend-less builds (Windows today) the Required demand
         // projects the honest application-policy-only tag, never a claimed
         // jail (parity with the adversarial projection matrix).
         let locked = SandboxPolicy {

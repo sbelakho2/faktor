@@ -2914,6 +2914,70 @@ fn validate_spawn_request(request: &TerminalSpawnRequest) -> Result<(), Terminal
 /// semantics are the network backend's own: the fresh namespace has no
 /// interface, no route and `lo` DOWN, so neither external destinations nor
 /// the daemon's loopback are reachable from an `os_isolated` PTY child.
+#[cfg(target_os = "macos")]
+fn spawn_pty_under_isolation(
+    cfg: &PtyConfig,
+    network: NetworkIsolation,
+    filesystem: &FilesystemIsolation,
+) -> Result<Pty, TerminalServiceError> {
+    if matches!(network, NetworkIsolation::BrokerOnly { .. }) {
+        return Err(TerminalServiceError::Denied(format!(
+            "sandbox unavailable: refusing spawn under NetworkIsolation::BrokerOnly of `{}` \
+             BEFORE spawn: the interactive terminal authority never brokers a child; never \
+             running it unconfined",
+            cfg.command
+        )));
+    }
+    let cwd = cfg
+        .cwd
+        .as_deref()
+        .map(Path::new)
+        .unwrap_or_else(|| Path::new("/"));
+    let plan = faktor_terminal::macos_sandbox_plan(
+        network,
+        filesystem,
+        cwd,
+        &cfg.command,
+        &cfg.args,
+        &cfg.env,
+    )
+    .map_err(|e| TerminalServiceError::Denied(e.message))?;
+    let demanded =
+        network == NetworkIsolation::DenyAll || !matches!(filesystem, FilesystemIsolation::Inherit);
+    match plan {
+        Some(plan) => {
+            // The system launcher is a transparent exec: the child pid/group
+            // (and therefore the pty reader and guardian) are unchanged.
+            let mut wrapped = cfg.clone();
+            wrapped.command = plan.program.to_string_lossy().into_owned();
+            wrapped.args = plan.args;
+            let pty = Pty::spawn(&wrapped).map_err(|e| {
+                if demanded {
+                    TerminalServiceError::Denied(format!(
+                        "{}: sandbox unavailable: refusing spawn under \
+                         NetworkIsolation::DenyAll + FilesystemIsolation of `{}`: the confined \
+                         child could not be created ({e}); never running it unenforced",
+                        faktor_terminal::SANDBOX_BACKEND_UNAVAILABLE,
+                        cfg.command
+                    ))
+                } else {
+                    TerminalServiceError::Refused(e.message)
+                }
+            })?;
+            if network == NetworkIsolation::DenyAll {
+                faktor_terminal::record_deny_all_isolation_proven();
+            }
+            Ok(pty)
+        }
+        // No confinement was demanded (or a BestEffort demand honestly fell
+        // back with a warning): the plain pty spawn is the recorded state.
+        None => Pty::spawn(cfg).map_err(|e| TerminalServiceError::Refused(e.message)),
+    }
+}
+
+/// The pre-exec hook path used on Linux (and the typed refusal on platforms
+/// with neither backend).
+#[cfg(not(target_os = "macos"))]
 fn spawn_pty_under_isolation(
     cfg: &PtyConfig,
     network: NetworkIsolation,

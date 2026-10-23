@@ -55,7 +55,10 @@ fn exposure_requires_assignment_and_verified_membership() {
 #[test]
 fn windows_spawn_source_orders_assign_verify_resume() {
     let src = include_str!("lib.rs");
-    let inner = body(src, "fn assign_verify_resume(");
+    // The Windows spawn core lives in its own module file (the source-size
+    // ceiling split); the ordering contract is scanned there.
+    let win = include_str!("win_spawn.rs");
+    let inner = body(win, "fn assign_verify_resume(");
     let i_assign = inner.find("assign_strict(").expect("strict assignment");
     let i_member = inner
         .find("contains(pid)")
@@ -84,10 +87,10 @@ fn windows_spawn_source_orders_assign_verify_resume() {
     // the budget-aware command builder, spawn/detached through the plain
     // env builder. The budget-aware form must still be contain_on_create.
     let contain_calls = production
-        .matches("contain_on_create(self.command(&cfg))")
+        .matches("contain_on_create(self.command(&cfg)?)")
         .count()
         + production
-            .matches("contain_on_create(self.command_with_budgets(&cfg, budgets.as_ref()))")
+            .matches("contain_on_create(self.command_with_budgets(&cfg, budgets.as_ref())?)")
             .count();
     assert_eq!(
         contain_calls, 4,

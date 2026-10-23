@@ -69,6 +69,7 @@ members = [
     "crates/worker",
     "crates/updater",
     "crates/cli",
+    "crates/payments",
     "crates/ci-tools",
     "crates/test-mocks",
     "crates/acp",
@@ -165,6 +166,7 @@ faktor-cloud = { path = "crates/cloud" }
 faktor-worker = { path = "crates/worker" }
 faktor-updater = { path = "crates/updater" }
 faktor-cli = { path = "crates/cli" }
+faktor-payments = { path = "crates/payments" }
 faktor-ci-tools = { path = "crates/ci-tools" }
 
 serde = { version = "1", features = ["derive"] }

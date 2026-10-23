@@ -13,6 +13,7 @@
 //! `spawn_detached_with_pipes`, so the child lands in the supervisor's
 //! bounded registry with owner rows and the daemon-shutdown kill scope.
 
+pub mod oauth;
 pub mod remote;
 
 use std::collections::HashMap;

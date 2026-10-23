@@ -1,4 +1,4 @@
-//! Daemon-death guardian for supervised process groups (Linux).
+//! Daemon-death guardian for supervised process groups (Linux + macOS).
 //!
 //! [`ProcessSupervisor`](crate::ProcessSupervisor) children are spawned into
 //! their own process group (`process_group(0)`), so a daemon that dies
@@ -36,7 +36,19 @@
 //! in its pre-exec hook ([`install_pdeathsig`]), with a `getppid` check that
 //! refuses the exec if the daemon died between fork and the hook; the
 //! guardian is the primary authority and covers descendants the direct
-//! child may already have created.
+//! child may already have created. macOS has no parent-death signal, so the
+//! forked guardian is the only daemon-death mechanism there. Windows uses
+//! its per-child `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` job (see
+//! `faktor-winjob` / `terminal::ChildContainment`): the OS
+//! closes the job handle with the daemon and kills every member, so no
+//! forked guardian is needed or created there.
+//!
+//! The guard channel is close-on-exec from the instant it exists on BOTH
+//! platforms: Linux uses one atomic `pipe2(O_CLOEXEC)`; macOS has no
+//! `pipe2`, so both ends of a private unlinked FIFO are opened with
+//! `O_CLOEXEC` (`pipe()` plus a later `fcntl` would leave a concurrent
+//! fork/exec window in which another child could inherit the write end and
+//! mask daemon death forever).
 //!
 //! Reaping: the daemon stays the direct child's parent, so its reaper
 //! consumes the leader; daemon death reparents the leader and init reaps it.
@@ -46,7 +58,7 @@
                        // block/function in this module carries a `// SAFETY:` justification and is
                        // enumerated by tests/static-authority.
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod imp {
     use std::os::fd::{FromRawFd, OwnedFd, RawFd};
     use std::time::{Duration, Instant};
@@ -89,10 +101,11 @@ mod imp {
 
     /// Bounded identity of one protected process group leader.
     ///
-    /// `start_time` is Linux `/proc/<pid>/stat` field 22 (clock ticks since
-    /// boot), captured while the leader is unreaped (a zombie still has a
-    /// `/proc` entry). `None` means the marker could not be captured; such a
-    /// record verifies [`IdentityVerdict::Unverifiable`] and can never
+    /// `start_time` is the platform marker captured while the leader is
+    /// unreaped: Linux `/proc/<pid>/stat` field 22 (clock ticks since boot)
+    /// or macOS `proc_pidinfo(PROC_PIDTBSDINFO)` start seconds/microseconds
+    /// packed into one u64. `None` means the marker could not be captured;
+    /// such a record verifies [`IdentityVerdict::Unverifiable`] and can never
     /// authorize a kill.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) struct ProcessIdentity {
@@ -185,8 +198,9 @@ mod imp {
         identity.pid != 0 && identity.pgid == identity.pid && identity.pgid <= i32::MAX as u32
     }
 
-    /// The Linux start-time marker of `pid`, or `None` when the process does
-    /// not exist. Allocation-free: safe to call in the forked guardian.
+    /// The platform start-time marker of `pid`, or `None` when the process
+    /// does not exist. Allocation-free: safe to call in the forked guardian.
+    #[cfg(target_os = "linux")]
     pub(crate) fn process_start_time(pid: u32) -> Option<u64> {
         if pid == 0 {
             return None;
@@ -265,6 +279,43 @@ mod imp {
         None
     }
 
+    /// macOS start-time marker: `proc_pidinfo(PROC_PIDTBSDINFO)` start
+    /// seconds/microseconds packed into one u64. `libproc` is a thin syscall
+    /// wrapper and the struct is a plain C POD, so this is safe from the
+    /// forked guardian (no allocation, no locks).
+    #[cfg(target_os = "macos")]
+    pub(crate) fn process_start_time(pid: u32) -> Option<u64> {
+        if pid == 0 || pid > i32::MAX as u32 {
+            return None;
+        }
+        // SAFETY: `proc_bsdinfo` is a plain C POD struct whose all-zero bit
+        // pattern is a valid initial value; the kernel fills it via
+        // `proc_pidinfo` before any field is read (and the size check below
+        // rejects a partial fill).
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        // SAFETY: `info` is a live, correctly sized `proc_bsdinfo` and
+        // `size` reports exactly that size, so the kernel writes stay inside
+        // the struct; `pid` is only a scalar argument the kernel validates.
+        let r = unsafe {
+            libc::proc_pidinfo(
+                pid as libc::c_int,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&mut info as *mut libc::proc_bsdinfo).cast(),
+                size,
+            )
+        };
+        if r < size || info.pbi_pid != pid {
+            return None;
+        }
+        Some(
+            info.pbi_start_tvsec
+                .wrapping_mul(1_000_000)
+                .wrapping_add(info.pbi_start_tvusec),
+        )
+    }
+
     /// Does any process (live or zombie) still belong to `pgid`? `EPERM`
     /// counts as existing; 0 and out-of-range ids are never probed.
     fn group_exists(pgid: u32) -> bool {
@@ -281,6 +332,7 @@ mod imp {
         raw_errno() == libc::EPERM
     }
 
+    #[cfg(target_os = "linux")]
     fn raw_errno() -> i32 {
         // SAFETY: `__errno_location` returns this thread's live errno slot
         // pointer for the whole thread lifetime; the immediate read cannot
@@ -289,24 +341,135 @@ mod imp {
         unsafe { *libc::__errno_location() }
     }
 
-    /// Create one guard-channel pipe with `pipe2(O_CLOEXEC)` or refuse typed:
-    /// the daemon-death contract depends on no other process holding a copy
-    /// of the write end, and the kernel applies `FD_CLOEXEC` at creation, so
-    /// no concurrent fork/exec can ever inherit an unprotected end.
+    #[cfg(target_os = "macos")]
+    fn raw_errno() -> i32 {
+        // SAFETY: `__error` returns this thread's live errno slot pointer for
+        // the whole thread lifetime; the immediate read cannot race another
+        // thread (errno is thread-local) and the pointer is non-null.
+        unsafe { *libc::__error() }
+    }
+
+    /// Create one guard channel whose BOTH ends are close-on-exec at the
+    /// instant they exist, or refuse typed: the daemon-death contract
+    /// depends on no other process holding a copy of the write end.
+    ///
+    /// Linux uses one atomic `pipe2(O_CLOEXEC)`. macOS has no `pipe2`, and a
+    /// `pipe()` + later `fcntl(FD_CLOEXEC)` pair leaves a window in which a
+    /// concurrent fork/exec could inherit an unprotected write end (masking
+    /// daemon death forever); instead both ends of a private unlinked FIFO
+    /// are opened with `O_CLOEXEC` (`O_RDONLY|O_NONBLOCK` first, then
+    /// `O_WRONLY`), the name is unlinked, and the reader STAYS nonblocking:
+    /// Darwin does not report `POLLHUP` on a FIFO read end when the last
+    /// writer closes, so the nonblocking `read` in the wait loop is the
+    /// portable EOF probe. The open descriptors keep the channel alive and
+    /// every step either produced a CLOEXEC descriptor or refused.
     fn create_cloexec_pipe() -> Result<[RawFd; 2], Error> {
-        let mut fds = [0 as RawFd; 2];
-        // SAFETY: `fds` is a live two-element array; `pipe2` writes both
-        // descriptors on success and returns non-zero on failure (checked
-        // before any read); `O_CLOEXEC` is applied atomically by the
-        // kernel, so no concurrent fork/exec can inherit either end.
-        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        #[cfg(target_os = "linux")]
+        {
+            let mut fds = [0 as RawFd; 2];
+            // SAFETY: `fds` is a live two-element array; `pipe2` writes both
+            // descriptors on success and returns non-zero on failure (checked
+            // before any read); `O_CLOEXEC` is applied atomically by the
+            // kernel, so no concurrent fork/exec can inherit either end.
+            if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+                return Err(Error::internal(format!(
+                    "guardian pipe2 failed: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            pipe_seam(&fds);
+            Ok(fds)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            create_cloexec_pipe_fifo()
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn create_cloexec_pipe_fifo() -> Result<[RawFd; 2], Error> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let mut template = std::env::temp_dir().as_os_str().as_bytes().to_vec();
+        if template.last() == Some(&b'/') {
+            template.pop();
+        }
+        template.extend_from_slice(b"/faktor-terminal-guardian-XXXXXX\0");
+        // SAFETY: `template` is a writable NUL-terminated buffer whose final
+        // six bytes are the `X` placeholder `mkdtemp` replaces; it outlives
+        // the call, and a null return is refused before the buffer is read.
+        let created = unsafe { libc::mkdtemp(template.as_mut_ptr().cast()) };
+        if created.is_null() {
             return Err(Error::internal(format!(
-                "guardian pipe2 failed: {}",
+                "guardian fifo: mkdtemp failed: {}",
                 std::io::Error::last_os_error()
             )));
         }
-        pipe_seam(&fds);
-        Ok(fds)
+        template.pop(); // strip the NUL: `template` now names the directory
+        let dir = CString::new(template).expect("mkdtemp output has no interior NUL");
+        let mut fifo_bytes = dir.as_bytes().to_vec();
+        fifo_bytes.extend_from_slice(b"/c");
+        let fifo = CString::new(fifo_bytes).expect("no interior NUL");
+        let cleanup = |read: Option<RawFd>, write: Option<RawFd>| {
+            // SAFETY: each `Some` descriptor was returned by a successful
+            // `open` below and is owned by this call, so closing it exactly
+            // once cannot touch another descriptor; unlink/rmdir are
+            // best-effort removal of this call's private, unguessable path
+            // (live descriptors do not depend on the name).
+            unsafe {
+                if let Some(fd) = read {
+                    libc::close(fd);
+                }
+                if let Some(fd) = write {
+                    libc::close(fd);
+                }
+                libc::unlink(fifo.as_ptr());
+                libc::rmdir(dir.as_ptr());
+            }
+        };
+        // SAFETY: `fifo` is a NUL-terminated path inside the private 0700
+        // directory just created; mode 0600 grants only the owner.
+        if unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) } != 0 {
+            let err = std::io::Error::last_os_error();
+            cleanup(None, None);
+            return Err(Error::internal(format!(
+                "guardian fifo: mkfifo failed: {err}"
+            )));
+        }
+        // SAFETY: `fifo` is the validated NUL-terminated path; O_RDONLY on a
+        // FIFO with O_NONBLOCK returns immediately with no writer present,
+        // and O_CLOEXEC makes the descriptor close-on-exec at creation.
+        let read = unsafe {
+            libc::open(
+                fifo.as_ptr(),
+                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if read < 0 {
+            let err = std::io::Error::last_os_error();
+            cleanup(None, None);
+            return Err(Error::internal(format!(
+                "guardian fifo: read open failed: {err}"
+            )));
+        }
+        // SAFETY: the read end is already open, so O_WRONLY cannot block;
+        // O_CLOEXEC makes the write end close-on-exec at creation.
+        let write = unsafe { libc::open(fifo.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
+        if write < 0 {
+            let err = std::io::Error::last_os_error();
+            cleanup(Some(read), None);
+            return Err(Error::internal(format!(
+                "guardian fifo: write open failed: {err}"
+            )));
+        }
+        // The read end intentionally stays O_NONBLOCK: Darwin's FIFO poll
+        // never reports POLLHUP for a vanished writer, so the wait loop uses
+        // a nonblocking read (EAGAIN = writer alive, 0 = EOF) instead of
+        // relying on poll's hangup bit.
+        pipe_seam(&[read, write]);
+        cleanup(None, None); // unlink the name; the fds keep it alive
+        Ok([read, write])
     }
 
     /// Test seam fired inside [`create_cloexec_pipe`] at the instant both
@@ -372,6 +535,7 @@ mod imp {
     /// check closes the fork→prctl race: a parent that died in that window
     /// can never deliver the signal, so the child refuses to exec instead of
     /// running unguarded.
+    #[cfg(target_os = "linux")]
     pub(crate) fn install_pdeathsig(cmd: &mut std::process::Command) {
         use std::os::unix::process::CommandExt;
         let parent = std::process::id() as libc::pid_t;
@@ -416,8 +580,9 @@ mod imp {
     impl GuardianHandle {
         /// Fork the daemon-death guardian for the group led by `pid`.
         ///
-        /// Returns `Ok(None)` only where no backend exists (never on Linux);
-        /// `Err` means the spawn must be refused: the caller kills and reaps
+        /// Returns `Ok(None)` only where no forked-guardian backend exists
+        /// (never on Linux or macOS); `Err` means the spawn must be refused:
+        /// the caller kills and reaps
         /// the child rather than exposing it unguarded.
         pub(crate) fn try_spawn(pid: u32) -> Result<Option<Self>, Error> {
             if pid == 0 {
@@ -667,6 +832,31 @@ mod imp {
                 )));
             }
             if r == 0 {
+                // Darwin quirk: a FIFO read end with no writer never reports
+                // POLLHUP, so a guardian that died before detaching would
+                // otherwise only be noticed at the readiness ceiling. The
+                // ready end is nonblocking on macOS; probe it directly.
+                #[cfg(target_os = "macos")]
+                {
+                    let mut probe = 0u8;
+                    // SAFETY: `ready` is the live readiness read end owned
+                    // by this call and `probe` is a live one-byte slot.
+                    let n = unsafe { libc::read(ready, (&mut probe as *mut u8).cast(), 1) };
+                    if n == 1 {
+                        return Ok(());
+                    }
+                    if n == 0 {
+                        return Err(Error::internal("guardian exited before detaching"));
+                    }
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() != Some(libc::EAGAIN)
+                        && err.raw_os_error() != Some(libc::EINTR)
+                    {
+                        return Err(Error::internal(format!(
+                            "guardian readiness read failed: {err}"
+                        )));
+                    }
+                }
                 continue; // deadline re-checked at the loop head
             }
             let mut byte = 0u8;
@@ -795,6 +985,25 @@ mod imp {
                     break;
                 }
                 if r == 0 {
+                    // Darwin quirk: poll never reports POLLHUP on a FIFO
+                    // read end whose last writer closed. The reader is
+                    // nonblocking on macOS, so probe with `read` each tick:
+                    // EAGAIN means the writer is still alive with no bytes
+                    // to send, 0 means the owner is gone (EOF is the
+                    // protocol). Linux keeps the blocking pipe and poll's
+                    // hangup/data wakeups; this block compiles out there.
+                    #[cfg(target_os = "macos")]
+                    {
+                        let mut buf = [0u8; 16];
+                        let n = libc::read(control, buf.as_mut_ptr().cast(), buf.len());
+                        let err = raw_errno();
+                        if n == 0 {
+                            break; // EOF: the owner is gone (or released)
+                        }
+                        if n < 0 && err != libc::EAGAIN && err != libc::EINTR {
+                            break; // an unusable channel can never protect
+                        }
+                    }
                     if !group_exists(identity.pgid) {
                         libc::_exit(GUARDIAN_EXIT_NOTHING_TO_DO);
                     }
@@ -964,16 +1173,24 @@ mod imp {
                 .unwrap_or_else(|e| e.into_inner())
         }
 
-        /// The largest pid the kernel can never assign (Linux
-        /// `/proc/sys/kernel/pid_max`; pid_max itself is out of range).
-        /// Falls back to a high constant, capped to the `pid_t` range so the
-        /// record stays structurally plausible.
+        /// The largest pid the kernel can never assign. Linux reads
+        /// `/proc/sys/kernel/pid_max` (pid_max itself is out of range);
+        /// macOS uses `i32::MAX - 1`, far beyond its pid ceiling. Both are
+        /// capped to the `pid_t` range so the record stays structurally
+        /// plausible.
         fn never_assigned_pid() -> u32 {
-            std::fs::read_to_string("/proc/sys/kernel/pid_max")
-                .ok()
-                .and_then(|text| text.trim().parse::<u32>().ok())
-                .unwrap_or(1 << 22)
-                .min(i32::MAX as u32)
+            #[cfg(target_os = "linux")]
+            {
+                std::fs::read_to_string("/proc/sys/kernel/pid_max")
+                    .ok()
+                    .and_then(|text| text.trim().parse::<u32>().ok())
+                    .unwrap_or(1 << 22)
+                    .min(i32::MAX as u32)
+            }
+            #[cfg(target_os = "macos")]
+            {
+                (i32::MAX - 1) as u32
+            }
         }
 
         /// The detach-before-return guarantee, adversarially: the seam holds
@@ -1104,6 +1321,7 @@ mod imp {
         /// the daemon's death would never close the write end and the
         /// guardian would never kill the owned process group. `/proc`
         /// identifies an inherited end by pipe inode.
+        #[cfg(target_os = "linux")]
         #[test]
         fn child_spawned_during_creation_cannot_hold_a_guardian_pipe() {
             let _serial = guardian_serial();
@@ -1165,13 +1383,15 @@ mod imp {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod imp {
     use faktor_core::error::Error;
 
-    /// Inert handle where no guardian backend exists (Linux-first): spawns
-    /// proceed with the platform's other containment (Windows job objects)
-    /// or the existing in-process lifecycle (other unixes).
+    /// Inert handle where no forked guardian backend exists. Windows already
+    /// owns the equivalent guarantee through its per-child
+    /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` job: the OS closes the job handle
+    /// with the daemon and kills every member, so a guardian process would be
+    /// redundant. Other unixes keep the in-process lifecycle.
     #[derive(Debug)]
     pub(crate) struct GuardianHandle;
 
@@ -1184,6 +1404,7 @@ mod imp {
 
 #[cfg(target_os = "linux")]
 pub(crate) use imp::install_pdeathsig;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) use imp::GuardianHandle;
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 pub(crate) use imp::{ProcessIdentity, GUARDIAN_EXIT_REFUSED_RECYCLED};

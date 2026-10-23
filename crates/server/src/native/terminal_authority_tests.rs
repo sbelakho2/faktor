@@ -122,11 +122,8 @@ mod terminal_authority_tests {
     ) -> Option<TerminalCreation> {
         match service.spawn(sid, request) {
             Ok(creation) => {
-                if !cfg!(target_os = "linux") {
-                    panic!(
-                        "only Linux has a per-process network-isolation backend; no other \
-                         platform may admit an os_isolated spawn"
-                    );
+                if !faktor_terminal::deny_all_supported() {
+                    panic!("no platform without a DenyAll backend may admit an os_isolated spawn");
                 }
                 let profile =
                     ExecutionProfile::parse(&creation.view.execution_profile).expect("profile");
@@ -334,7 +331,7 @@ mod terminal_authority_tests {
             .unwrap();
         assert_eq!(
             admitted.profile().filesystem,
-            if cfg!(target_os = "linux") {
+            if faktor_sandbox::filesystem_backend_available() {
                 "workspace"
             } else {
                 "application-policy-only"
@@ -469,9 +466,10 @@ mod terminal_authority_tests {
         // default (the host config default too). The spawn under it is
         // EITHER genuinely confined (Linux: the shared network-namespace
         // backend, the SAME pre-exec `unshare` hook the shell supervisor
-        // installs) OR refused TYPED before any child exists (macOS/Windows
-        // by platform truth; Linux when the unshare is refused) — never a
-        // warn-and-run unenforced shell. (The explicit operator grant admits
+        // installs) OR refused TYPED before any child exists (Windows by
+        // platform truth; Linux when the unshare is refused; macOS when the
+        // sandbox launcher/profile is unavailable) — never a warn-and-run
+        // unenforced shell. (The explicit operator grant admits
         // the strictly weaker network-capable spawn; see the profile test.)
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("candidate");
@@ -514,7 +512,7 @@ mod terminal_authority_tests {
         let request = spawn_request("/bin/sh", &["-c", program.as_str()]);
         let service = service_with_policy(&manager, policy);
         let creation = expect_os_isolated_outcome(&service, &manager, &sid, &request, &marker);
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         assert!(
             creation.is_none(),
             "platform truth: with no backend the os_isolated spawn MUST refuse typed"
@@ -942,7 +940,7 @@ mod terminal_authority_tests {
                 &spawn_request("/bin/sh", &["-c", program.as_str()]),
                 &marker,
             );
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             assert!(
                 creation.is_none(),
                 "platform truth: with no backend the os_isolated spawn MUST refuse typed"
@@ -966,7 +964,7 @@ mod terminal_authority_tests {
             assert_eq!(profile.network, "required");
             assert_eq!(profile.network_isolation, "deny_all");
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         assert!(rows.is_empty(), "a fail-closed refusal journals nothing");
     }
 
@@ -1094,7 +1092,7 @@ mod terminal_authority_tests {
             &spawn_request("/bin/sh", &["-c", program.as_str()]),
             &marker,
         );
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         assert!(
             creation.is_none(),
             "explicit terminal isolation must refuse typed where no backend exists"

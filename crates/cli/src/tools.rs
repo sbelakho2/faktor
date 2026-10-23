@@ -3142,8 +3142,8 @@ mod tests {
         // DenyAll. A platform without the OS-level backend refuses BEFORE
         // spawn with the typed "sandbox unavailable" text surfaced to the
         // turn — never a generic "denied by sandbox", never an unenforced
-        // shell, and the program body never execs. On Linux the same spawn
-        // must isolate the child or refuse typed.
+        // shell, and the program body never execs. On Linux and macOS the
+        // same spawn must isolate the child or refuse typed.
         // `fixture_exact`: the secure `Required` + `OsIsolated` pair below is
         // the crate default, so `fixture`'s "plain allow shell" test-grant
         // translation would rewrite it into the user-granted network-capable
@@ -3166,10 +3166,10 @@ mod tests {
         let tool = run_command_tool();
         match (tool.execute)(ctx(&f), serde_json::json!({ "command": command })).await {
             Ok(_) => {
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                 panic!("only an OS-level platform may run a shell under Required");
-                #[cfg(target_os = "linux")]
-                assert!(marker.exists(), "on Linux the isolated child ran");
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                assert!(marker.exists(), "the isolated child ran");
             }
             Err(e) => {
                 assert_eq!(e.kind, ErrorKind::Permission);

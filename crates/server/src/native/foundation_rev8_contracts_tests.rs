@@ -198,6 +198,74 @@ async fn mcp_auth_token_never_round_trips_and_bounds_are_typed() {
 }
 
 #[tokio::test]
+async fn mcp_oauth_status_and_logout_surface_never_renders_the_credential() {
+    let rig = Rig::new().await;
+    let (status, saved) = rig
+        .post(
+            "/native/mcp/servers",
+            json!({
+                "id": "oauth-surface", "name": "OAuth Surface", "command": "", "args": [],
+                "env": [], "trusted": true, "enabled": true,
+                "transport": "streamable_http",
+                "endpoint": "https://mcp.example.com/rpc", "timeout_ms": 5000,
+                "output_cap_bytes": 1048576
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    let (status, bound) = rig
+        .post(
+            "/native/mcp/servers/oauth-surface/auth",
+            json!({"action": "connect", "accessToken": "sk-surface-secret",
+                   "account": "operator", "scopes": ["mcp.read"]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{bound}");
+
+    let (status, view) = rig
+        .get("/native/mcp/servers/oauth-surface/oauth/status")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["hasToken"], true);
+    assert_eq!(view["method"], "credential");
+    assert_eq!(view["account"], "operator");
+    assert!(!view.to_string().contains("sk-surface-secret"));
+
+    // The generic UI command shape (POST /oauth/{login|status|logout}) also
+    // accepts status; no credential is returned.
+    let (status, posted) = rig
+        .post("/native/mcp/servers/oauth-surface/oauth/status", json!({}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{posted}");
+    assert!(!posted.to_string().contains("sk-surface-secret"));
+
+    let (status, out) = rig
+        .post("/native/mcp/servers/oauth-surface/oauth/logout", json!({}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["state"], "signed_out");
+    assert_eq!(out["revoked"], true);
+    assert_eq!(out["remoteRevoked"], false);
+    assert_eq!(out["auth"]["hasToken"], false);
+    assert!(!out.to_string().contains("sk-surface-secret"));
+    let (status, cleared) = rig.get("/native/mcp/servers/oauth-surface/auth").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cleared["hasToken"], false);
+
+    // The browser callback is reachable without the daemon bearer (the
+    // browser cannot carry it); a forged flow is a typed page, never a
+    // credential or an unauthenticated daemon surface.
+    let (status, page) = rig
+        .get_unauth(
+            "/native/mcp/servers/oauth-surface/oauth/callback/forged?code=forged&state=forged",
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{page}");
+    assert!(page.contains("oauth_denied"), "{page}");
+    assert!(!page.contains("sk-surface-secret"), "{page}");
+}
+
+#[tokio::test]
 async fn review_comments_crud_is_scoped_and_revisioned() {
     let rig = Rig::new().await;
     let path = format!("/native/session/{}/review/comments", rig.session);

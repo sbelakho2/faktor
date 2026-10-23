@@ -182,7 +182,7 @@ fn filesystem_projection_is_enforcement_honest() {
     let backend = filesystem_backend_available();
     assert_eq!(
         backend,
-        cfg!(target_os = "linux"),
+        cfg!(any(target_os = "linux", target_os = "macos")),
         "backend is the build fact"
     );
     // Required: a guaranteed jail where the backend exists, an honest

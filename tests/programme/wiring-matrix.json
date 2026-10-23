@@ -173,6 +173,70 @@
     "PUT /native/memory/policy": {
       "state": "unwired",
       "reason": "memory policy/retention endpoint; memory facts are managed through session records and no policy UI calls it."
+    },
+    "GET /native/billing/invoices": {
+      "state": "unwired",
+      "reason": "billing/invoice administration endpoint; the Faktor-owned IDE panels do not yet expose invoice, seat or tax management, and the same PaymentService is driven by `faktor billing` and its lifecycle tests."
+    },
+    "GET /native/billing/invoices/{id}": {
+      "state": "unwired",
+      "reason": "billing/invoice administration endpoint; the Faktor-owned IDE panels do not yet expose invoice, seat or tax management, and the same PaymentService is driven by `faktor billing` and its lifecycle tests."
+    },
+    "GET /native/billing/payment-methods": {
+      "state": "unwired",
+      "reason": "billing/invoice administration endpoint; the Faktor-owned IDE panels do not yet expose invoice, seat or tax management, and the same PaymentService is driven by `faktor billing` and its lifecycle tests."
+    },
+    "GET /native/billing/payments": {
+      "state": "unwired",
+      "reason": "billing/invoice administration endpoint; the Faktor-owned IDE panels do not yet expose invoice, seat or tax management, and the same PaymentService is driven by `faktor billing` and its lifecycle tests."
+    },
+    "GET /native/billing/plan-preview": {
+      "state": "unwired",
+      "reason": "billing/invoice administration endpoint; the Faktor-owned IDE panels do not yet expose invoice, seat or tax management, and the same PaymentService is driven by `faktor billing` and its lifecycle tests."
+    },
+    "GET /native/billing/seat-preview": {
+      "state": "unwired",
+      "reason": "billing/invoice administration endpoint; the Faktor-owned IDE panels do not yet expose invoice, seat or tax management, and the same PaymentService is driven by `faktor billing` and its lifecycle tests."
+    },
+    "GET /native/billing/tax": {
+      "state": "unwired",
+      "reason": "billing/invoice administration endpoint; the Faktor-owned IDE panels do not yet expose invoice, seat or tax management, and the same PaymentService is driven by `faktor billing` and its lifecycle tests."
+    },
+    "POST /native/billing/invoices": {
+      "state": "unwired",
+      "reason": "billing/invoice administration endpoint; the Faktor-owned IDE panels do not yet expose invoice, seat or tax management, and the same PaymentService is driven by `faktor billing` and its lifecycle tests."
+    },
+    "POST /native/billing/invoices/{id}/pay": {
+      "state": "unwired",
+      "reason": "billing/invoice administration endpoint; the Faktor-owned IDE panels do not yet expose invoice, seat or tax management, and the same PaymentService is driven by `faktor billing` and its lifecycle tests."
+    },
+    "POST /native/billing/payment-methods": {
+      "state": "unwired",
+      "reason": "billing/invoice administration endpoint; the Faktor-owned IDE panels do not yet expose invoice, seat or tax management, and the same PaymentService is driven by `faktor billing` and its lifecycle tests."
+    },
+    "POST /native/billing/plan": {
+      "state": "unwired",
+      "reason": "billing/invoice administration endpoint; the Faktor-owned IDE panels do not yet expose invoice, seat or tax management, and the same PaymentService is driven by `faktor billing` and its lifecycle tests."
+    },
+    "POST /native/billing/refunds": {
+      "state": "unwired",
+      "reason": "billing/invoice administration endpoint; the Faktor-owned IDE panels do not yet expose invoice, seat or tax management, and the same PaymentService is driven by `faktor billing` and its lifecycle tests."
+    },
+    "POST /native/billing/seats": {
+      "state": "unwired",
+      "reason": "billing/invoice administration endpoint; the Faktor-owned IDE panels do not yet expose invoice, seat or tax management, and the same PaymentService is driven by `faktor billing` and its lifecycle tests."
+    },
+    "POST /native/billing/subscribe": {
+      "state": "unwired",
+      "reason": "billing/invoice administration endpoint; the Faktor-owned IDE panels do not yet expose invoice, seat or tax management, and the same PaymentService is driven by `faktor billing` and its lifecycle tests."
+    },
+    "POST /native/billing/subscription/cancel": {
+      "state": "unwired",
+      "reason": "billing/invoice administration endpoint; the Faktor-owned IDE panels do not yet expose invoice, seat or tax management, and the same PaymentService is driven by `faktor billing` and its lifecycle tests."
+    },
+    "POST /native/billing/webhook": {
+      "state": "unwired",
+      "reason": "provider webhook ingress: authenticated by the HMAC signature, called by the payment provider (local/Stripe), never by an IDE client; verified signature-first with replay/out-of-order refusal."
     }
   },
   "configEvidence": {

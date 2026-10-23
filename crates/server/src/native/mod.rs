@@ -24,6 +24,8 @@ pub(crate) mod agents;
 pub(crate) mod attachment;
 /// Wave 3 commercial metering routes (usage fold / entitlements / credits).
 pub(crate) mod billing;
+/// Additive payment/invoice/seat/tax/currency routes.
+pub(crate) mod billing_payments;
 pub(crate) mod board;
 /// Revision 8 daemon contract routes (instructions/presets/trust/browser/
 /// context pins/export/efficiency/budget/provenance).
@@ -51,6 +53,8 @@ pub(crate) mod worktrees_api;
 pub use foundation::install_call_receipt_sink;
 /// Edition 5 lifecycle surfaces (MCP/skills/hooks/memory/session ops).
 pub(crate) mod foundation_ext;
+/// Vault-backed OAuth credential provider and operator login/status/logout.
+pub(crate) mod mcp_oauth;
 /// Native MCP lifecycle (stdio + Streamable HTTP) and catalog surface.
 pub(crate) mod mcp_surface;
 pub use mcp_surface::McpRuntime;
@@ -112,6 +116,7 @@ pub(crate) use attachment::*;
 /// (`tests/attachment_decode_alloc.rs`).
 pub use attachment::{decode_attachment_base64, MAX_ATTACHMENT_UPLOAD_BYTES};
 pub(crate) use billing::*;
+pub(crate) use billing_payments::*;
 pub(crate) use board::*;
 pub(crate) use control_plane::*;
 pub(crate) use enterprise::*;

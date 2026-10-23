@@ -50,6 +50,7 @@ faktor-worker.workspace = true
 faktor-updater.workspace = true
 faktor-scm.workspace = true
 faktor-commerce.workspace = true
+faktor-payments.workspace = true
 faktor-approval.workspace = true
 faktor-supply-core.workspace = true
 faktor-supply-supplier.workspace = true

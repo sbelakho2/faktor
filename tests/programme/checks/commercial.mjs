@@ -85,7 +85,7 @@ export const COMMERCIAL_ACTIONS = [
     cli: {
       file: 'crates/cli/src/billing_cli.rs',
       marker: 'BillingAction::Credits',
-      via: ['render'],
+      via: ['render_impl'],
       service: /\.grant_credits\s*\(/,
     },
   },
@@ -110,6 +110,7 @@ export const COMMERCIAL_ACTIONS = [
     cli: {
       file: 'crates/cli/src/billing_cli.rs',
       marker: 'BillingAction::Overview',
+      via: ['render_impl'],
       service: /\.overview\s*\(/,
     },
   },
@@ -124,6 +125,7 @@ export const COMMERCIAL_ACTIONS = [
     cli: {
       file: 'crates/cli/src/billing_cli.rs',
       marker: 'BillingAction::Subscription',
+      via: ['render_impl'],
       service: /\.(change_subscription|cancel_subscription)\s*\(/,
     },
   },

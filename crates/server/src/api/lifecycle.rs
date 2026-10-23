@@ -581,6 +581,44 @@ fn native_core_routes(router: Router<AppState>) -> Router<AppState> {
             "/native/billing/subscription",
             post(native_billing_subscription),
         )
+        // Additive payment/invoice/seat/tax/currency plane (disabled unless
+        // `[billing.payments]` is enabled). Reads are BillingRead; every
+        // mutation is BillingWrite (owner) + a required Idempotency-Key.
+        .route(
+            "/native/billing/invoices",
+            get(native_billing_invoices).post(native_billing_issue_invoice),
+        )
+        .route("/native/billing/invoices/{id}", get(native_billing_invoice))
+        .route(
+            "/native/billing/invoices/{id}/pay",
+            post(native_billing_pay_invoice),
+        )
+        .route("/native/billing/payments", get(native_billing_payments))
+        .route(
+            "/native/billing/payment-methods",
+            get(native_billing_payment_methods).post(native_billing_add_payment_method),
+        )
+        .route("/native/billing/tax", get(native_billing_tax))
+        .route("/native/billing/subscribe", post(native_billing_subscribe))
+        .route("/native/billing/seats", post(native_billing_seats))
+        .route("/native/billing/plan", post(native_billing_plan))
+        .route(
+            "/native/billing/subscription/cancel",
+            post(native_billing_cancel),
+        )
+        .route("/native/billing/refunds", post(native_billing_refund))
+        .route(
+            "/native/billing/plan-preview",
+            get(native_billing_plan_preview),
+        )
+        .route(
+            "/native/billing/seat-preview",
+            get(native_billing_seat_preview),
+        )
+        // The provider webhook ingress is the ONE route without the daemon
+        // password: the HMAC signature is the credential, and it is verified
+        // before the event id/order/store is consulted.
+        .route("/native/billing/webhook", post(native_billing_webhook))
         // A BOUNDED download of the same usage ledger `/native/usage` folds.
         .route("/native/usage/export", get(native_usage_export))
         // Value-centric paid entitlements (additive): the plan-mapped,
@@ -949,6 +987,31 @@ fn native_foundation_routes(router: Router<AppState>) -> Router<AppState> {
         .route(
             "/native/mcp/servers/{id}/auth",
             get(mcp_surface::native_mcp_server_auth_get).post(mcp_surface::native_mcp_server_auth),
+        )
+        .route(
+            "/native/mcp/servers/{id}/oauth/login",
+            post(mcp_surface::native_mcp_server_oauth_login),
+        )
+        .route(
+            "/native/mcp/servers/{id}/oauth/connect",
+            post(mcp_surface::native_mcp_server_oauth_login),
+        )
+        .route(
+            "/native/mcp/servers/{id}/oauth/complete",
+            post(mcp_surface::native_mcp_server_oauth_complete),
+        )
+        .route(
+            "/native/mcp/servers/{id}/oauth/status",
+            get(mcp_surface::native_mcp_server_oauth_status)
+                .post(mcp_surface::native_mcp_server_oauth_status),
+        )
+        .route(
+            "/native/mcp/servers/{id}/oauth/callback/{flow_id}",
+            get(mcp_surface::native_mcp_server_oauth_callback),
+        )
+        .route(
+            "/native/mcp/servers/{id}/oauth/logout",
+            post(mcp_surface::native_mcp_server_oauth_logout),
         )
         .route(
             "/native/mcp/servers/{id}/oauth/revoke",

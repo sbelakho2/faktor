@@ -87,6 +87,12 @@ pub struct BillingCfg {
     /// schedule rows are written and no vendor call is ever made.
     #[serde(default)]
     pub report: Option<BillingReportCfg>,
+    /// The additive `[billing.payments]` subsection: the real payment /
+    /// invoice / seat / tax / currency plane. Absent/disabled = no
+    /// `payment.db` is created and every payment route answers typed 409
+    /// `payments_disabled`; the overview keeps the honest unavailable states.
+    #[serde(default)]
+    pub payments: Option<BillingPaymentsCfg>,
 }
 
 /// The `[billing.subscription]` subsection: the explicit local subscription
@@ -210,6 +216,7 @@ pub const BILLING_FIELDS: &[&str] = &[
     "managed_providers",
     "subscription",
     "report",
+    "payments",
 ];
 
 /// The default billing database file name (relative to the daemon data
@@ -251,6 +258,7 @@ impl<'de> serde::Deserialize<'de> for BillingCfg {
                         "managed_providers" => (256, "managed_providers"),
                         "subscription" => (512, "subscription"),
                         "report" => (1024, "report"),
+                        "payments" => (2048, "payments"),
                         other => return Err(A::Error::unknown_field(other, BILLING_FIELDS)),
                     };
                     if seen & bit != 0 {
@@ -276,13 +284,23 @@ impl<'de> serde::Deserialize<'de> for BillingCfg {
                             out.subscription =
                                 map.next_value::<Option<BillingSubscriptionCfg>>()?
                         }
-                        _ => out.report = map.next_value::<Option<BillingReportCfg>>()?,
+                        1024 => out.report = map.next_value::<Option<BillingReportCfg>>()?,
+                        _ => {
+                            out.payments = map.next_value::<Option<BillingPaymentsCfg>>()?
+                        }
                     }
                 }
                 // Disabled parity: an explicitly disabled report section
                 // resolves exactly like the absent one.
                 if out.report.as_ref().is_some_and(|report| !report.enabled) {
                     out.report = None;
+                }
+                if out
+                    .payments
+                    .as_ref()
+                    .is_some_and(|payments| !payments.enabled)
+                {
+                    out.payments = None;
                 }
                 Ok(out)
             }
@@ -330,6 +348,15 @@ impl BillingCfg {
         Ok(Some(data_dir.join(name)))
     }
 
+    /// The resolved payment database path under `data_dir` (`None` when the
+    /// payments subsection is absent/disabled: no `payment.db` is created).
+    pub fn payments_path(&self, data_dir: &Path) -> Result<Option<std::path::PathBuf>, String> {
+        let Some(payments) = self.payments.as_ref().filter(|payments| payments.enabled) else {
+            return Ok(None);
+        };
+        payments.database_path(data_dir)
+    }
+
     /// The organization the daemon meters into (required when enabled).
     pub fn organization(&self) -> Result<faktor_cloud::OrganizationId, String> {
         let raw = self.organization.clone().ok_or_else(|| {
@@ -352,6 +379,15 @@ impl BillingCfg {
         }
         if let Some(report) = &self.report {
             report.validate()?;
+        }
+        if let Some(payments) = &self.payments {
+            if !self.enabled {
+                return Err(
+                    "billing payments: an enabled [billing.payments] section requires [billing] enabled"
+                        .into(),
+                );
+            }
+            payments.validate(&self.plans)?;
         }
         if self.enabled {
             let organization = self.organization()?;
@@ -506,6 +542,248 @@ impl BillingReportCfg {
     }
 }
 
+/// The additive `[billing.payments]` subsection: the real commercial
+/// payment/invoice plane. It is separate from the inference plan table (which
+/// intentionally carries no price) and names its provider credentials by
+/// environment-variable NAME only.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct BillingPaymentsCfg {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub database: Option<String>,
+    /// `local` (offline SQLite provider) or `stripe` (checked-egress adapter).
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub webhook_secret_env: Option<String>,
+    /// The plan price catalogue, keyed by plan id (the key must equal the
+    /// entry's `plan_id`).
+    #[serde(default)]
+    pub prices: std::collections::BTreeMap<String, BillingPlanPriceCfg>,
+    /// Optional currency exponent overrides (USD/EUR default to 2, JPY to 0).
+    #[serde(default)]
+    pub currencies: std::collections::BTreeMap<String, u32>,
+    /// Explicit FX rates; no conversion is ever inferred.
+    #[serde(default)]
+    pub fx: Vec<BillingFxCfg>,
+    #[serde(default)]
+    pub tax: Option<BillingTaxCfg>,
+    #[serde(default)]
+    pub dunning: Option<BillingDunningCfg>,
+    #[serde(default)]
+    pub stripe: Option<BillingStripeCfg>,
+}
+
+/// One exact plan price in one currency (integer minor units).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BillingPlanPriceCfg {
+    pub plan_id: String,
+    pub currency: String,
+    pub monthly_minor: i64,
+    pub annual_minor: i64,
+    #[serde(default)]
+    pub per_seat_monthly_minor: i64,
+    #[serde(default)]
+    pub per_seat_annual_minor: i64,
+}
+
+/// One explicit directional FX rate (`rate_bps = 10_000` is 1:1).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BillingFxCfg {
+    pub from: String,
+    pub to: String,
+    pub rate_bps: i64,
+}
+
+/// One tax jurisdiction.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BillingTaxRateCfg {
+    pub rate_bps: i64,
+    pub inclusive: bool,
+}
+
+/// The configured tax table and default jurisdiction.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct BillingTaxCfg {
+    #[serde(default)]
+    pub default_jurisdiction: Option<String>,
+    #[serde(default)]
+    pub rates: std::collections::BTreeMap<String, BillingTaxRateCfg>,
+}
+
+/// The dunning policy.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BillingDunningCfg {
+    pub max_attempts: u32,
+    pub grace_ms: i64,
+}
+
+/// The Stripe adapter's environment-variable references.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BillingStripeCfg {
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    #[serde(default)]
+    pub webhook_secret_env: Option<String>,
+    #[serde(default)]
+    pub user_agent: Option<String>,
+}
+
+/// The default payment database file name.
+pub const DEFAULT_PAYMENTS_DATABASE: &str = "payments.db";
+/// The default local webhook secret environment variable.
+pub const DEFAULT_PAYMENTS_WEBHOOK_ENV: &str = "FAKTOR_BILLING_WEBHOOK_SECRET";
+
+impl BillingPaymentsCfg {
+    /// The resolved database path (`None` when disabled).
+    pub fn database_path(&self, data_dir: &Path) -> Result<Option<std::path::PathBuf>, String> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        let name = self
+            .database
+            .clone()
+            .unwrap_or_else(|| DEFAULT_PAYMENTS_DATABASE.to_string());
+        CloudCfg::validate_database_name("payments database", &name)?;
+        Ok(Some(data_dir.join(name)))
+    }
+
+    /// Validate the subsection. A disabled subsection validates only its
+    /// strict shape.
+    pub fn validate(
+        &self,
+        plans: &std::collections::BTreeMap<String, faktor_cloud::PlanConfig>,
+    ) -> Result<(), String> {
+        if let Some(database) = &self.database {
+            CloudCfg::validate_database_name("payments database", database)?;
+        }
+        if !self.enabled {
+            return Ok(());
+        }
+        let _ = self.runtime_config(plans)?;
+        Ok(())
+    }
+
+    /// The runtime configuration handed to `faktor-payments`. Strict: an
+    /// unknown plan, malformed currency, negative price, absent plan price for
+    /// a configured plan, duplicate FX pair or bad tax/dunning value is a
+    /// configuration error, never silently dropped.
+    pub fn runtime_config(
+        &self,
+        plans: &std::collections::BTreeMap<String, faktor_cloud::PlanConfig>,
+    ) -> Result<faktor_payments::PaymentsConfig, String> {
+        let provider = match self.provider.as_deref().unwrap_or("local") {
+            "local" => faktor_payments::ProviderKind::Local,
+            "stripe" => faktor_payments::ProviderKind::Stripe,
+            other => {
+                return Err(format!(
+                    "billing payments: unknown provider {other:?} (local|stripe)"
+                ))
+            }
+        };
+        let mut catalogue = faktor_payments::PriceCatalogue::default();
+        for (code, exponent) in &self.currencies {
+            catalogue.currencies.insert(
+                code.clone(),
+                faktor_payments::CurrencySpec {
+                    exponent: *exponent,
+                },
+            );
+        }
+        for (key, price) in &self.prices {
+            if !plans.contains_key(key) {
+                return Err(format!(
+                    "billing payments: price {key:?} names a plan absent from [billing.plans]"
+                ));
+            }
+            catalogue.plans.insert(
+                key.clone(),
+                faktor_payments::PlanPrice {
+                    plan_id: price.plan_id.clone(),
+                    currency: price.currency.clone(),
+                    monthly_minor: price.monthly_minor,
+                    annual_minor: price.annual_minor,
+                    per_seat_monthly_minor: price.per_seat_monthly_minor,
+                    per_seat_annual_minor: price.per_seat_annual_minor,
+                },
+            );
+        }
+        for rate in &self.fx {
+            let key = format!("{}/{}", rate.from, rate.to);
+            if catalogue.fx.insert(key.clone(), rate.rate_bps).is_some() {
+                return Err(format!("billing payments: duplicate FX rate {key:?}"));
+            }
+        }
+        let tax = match &self.tax {
+            None => faktor_payments::TaxConfig::default(),
+            Some(tax) => faktor_payments::TaxConfig {
+                default_jurisdiction: tax.default_jurisdiction.clone(),
+                rates: tax
+                    .rates
+                    .iter()
+                    .map(|(jurisdiction, rate)| {
+                        (
+                            jurisdiction.clone(),
+                            faktor_payments::TaxRate {
+                                rate_bps: rate.rate_bps,
+                                inclusive: rate.inclusive,
+                            },
+                        )
+                    })
+                    .collect(),
+            },
+        };
+        let dunning = match &self.dunning {
+            None => faktor_payments::DunningConfig::default(),
+            Some(dunning) => faktor_payments::DunningConfig {
+                max_attempts: dunning.max_attempts,
+                grace_ms: dunning.grace_ms,
+            },
+        };
+        let mut stripe = faktor_payments::StripeConfig::default();
+        if let Some(cfg) = &self.stripe {
+            if let Some(base_url) = &cfg.base_url {
+                stripe.base_url = base_url.clone();
+            }
+            if let Some(env) = &cfg.api_key_env {
+                stripe.api_key_env = env.clone();
+            }
+            if let Some(env) = &cfg.webhook_secret_env {
+                stripe.webhook_secret_env = env.clone();
+            }
+            if let Some(agent) = &cfg.user_agent {
+                stripe.user_agent = agent.clone();
+            }
+        }
+        let webhook_secret_env = self
+            .webhook_secret_env
+            .clone()
+            .unwrap_or_else(|| DEFAULT_PAYMENTS_WEBHOOK_ENV.to_string());
+        let config = faktor_payments::PaymentsConfig {
+            provider,
+            catalogue,
+            tax,
+            dunning,
+            webhook_secret_env,
+            stripe,
+        };
+        config
+            .validate()
+            .map_err(|e| format!("billing payments: {e}"))?;
+        Ok(config)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -604,6 +882,74 @@ mod tests {
             subscription.status().unwrap(),
             faktor_cloud::SubscriptionStatus::Expired
         );
+    }
+
+    #[test]
+    fn payments_subsection_is_strict_and_builds_exact_runtime_config() {
+        let body = r#"{"enabled":true,"organization":"org-live","default_plan":"p",
+            "plans":{"p":{"plan_id":"p","features":[],"limits":{}}},
+            "payments":{"enabled":true,"database":"payment.db","provider":"local",
+              "webhook_secret_env":"FAKTOR_TEST_HOOK",
+              "prices":{"p":{"plan_id":"p","currency":"USD","monthly_minor":1000,
+                "annual_minor":10000,"per_seat_monthly_minor":250,
+                "per_seat_annual_minor":2500}},
+              "currencies":{"USD":2},
+              "tax":{"default_jurisdiction":"DE","rates":{"DE":{"rate_bps":1900,"inclusive":true}}},
+              "dunning":{"max_attempts":2,"grace_ms":1000}}}"#;
+        let cfg = enabled(body);
+        cfg.validate().unwrap();
+        let runtime = cfg
+            .payments
+            .as_ref()
+            .unwrap()
+            .runtime_config(&cfg.plans)
+            .unwrap();
+        assert_eq!(runtime.provider, faktor_payments::ProviderKind::Local);
+        assert_eq!(
+            runtime
+                .catalogue
+                .price_for("p", faktor_payments::BillingInterval::Monthly)
+                .unwrap(),
+            1000
+        );
+        assert_eq!(runtime.tax.default_jurisdiction.as_deref(), Some("DE"));
+        assert_eq!(
+            cfg.payments_path(std::path::Path::new("/tmp")).unwrap(),
+            Some(std::path::PathBuf::from("/tmp/payment.db"))
+        );
+
+        // Disabled parity: an explicitly disabled subsection is absent.
+        let disabled = enabled(r#"{"enabled":false,"payments":{"enabled":false}}"#);
+        assert!(disabled.payments.is_none());
+        // Strict: unknown keys, duplicate FX pairs, prices naming absent plans,
+        // traversal database names and negative prices are refused.
+        for body in [
+            r#"{"enabled":true,"organization":"o","plans":{"p":{"plan_id":"p","features":[],"limits":{}}},"payments":{"enabled":true,"bogus":1}}"#,
+            r#"{"enabled":true,"organization":"o","plans":{"p":{"plan_id":"p","features":[],"limits":{}}},"payments":{"enabled":true,"database":"../x.db"}}"#,
+            r#"{"enabled":true,"organization":"o","plans":{"p":{"plan_id":"p","features":[],"limits":{}}},"payments":{"enabled":true,"prices":{"p":{"plan_id":"p","currency":"USD","monthly_minor":-1,"annual_minor":1}}}}"#,
+            r#"{"enabled":true,"organization":"o","plans":{"p":{"plan_id":"p","features":[],"limits":{}}},"payments":{"enabled":true,"prices":{"absent":{"plan_id":"absent","currency":"USD","monthly_minor":1,"annual_minor":1}}}}"#,
+            r#"{"enabled":true,"organization":"o","plans":{"p":{"plan_id":"p","features":[],"limits":{}}},"payments":{"enabled":true,"fx":[{"from":"USD","to":"EUR","rate_bps":9000},{"from":"USD","to":"EUR","rate_bps":8000}]}}"#,
+            r#"{"enabled":false,"payments":{"enabled":true}}"#,
+        ] {
+            let rejected = match serde_json::from_str::<BillingCfg>(body) {
+                Ok(parsed) => parsed.validate().is_err(),
+                Err(_) => true,
+            };
+            assert!(rejected, "must refuse {body}");
+        }
+    }
+
+    #[test]
+    fn payments_require_billing_and_stripe_uses_env_names_only() {
+        let cfg = enabled(
+            r#"{"enabled":true,"organization":"o","plans":{"p":{"plan_id":"p","features":[],"limits":{}}},"payments":{"enabled":true,"provider":"stripe","stripe":{"api_key_env":"MY_STRIPE_KEY","webhook_secret_env":"MY_HOOK"}}}"#,
+        );
+        cfg.validate().unwrap();
+        let runtime = cfg.payments.unwrap().runtime_config(&cfg.plans).unwrap();
+        assert_eq!(runtime.provider, faktor_payments::ProviderKind::Stripe);
+        assert_eq!(runtime.stripe.api_key_env, "MY_STRIPE_KEY");
+        assert_eq!(runtime.stripe.webhook_secret_env, "MY_HOOK");
+        assert!(!format!("{runtime:?}").contains("sk_live"));
     }
 
     #[test]
