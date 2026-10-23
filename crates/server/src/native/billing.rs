@@ -3,10 +3,11 @@
 //!
 //! - `GET /native/usage?org=&since=&limit=` — the organization's usage fold
 //!   over the durable usage ledger plus one cursor page of its events. The
-//!   projection is read-through: the durable reservation/settlement rows of
-//!   the local sessions are ingested idempotently FIRST (the reservation
-//!   ledger stays the source of truth), then folded. Without `org` the route
-//!   keeps its frozen pre-billing shape (see `usage.rs`).
+//!   steady-state projection drains the DURABLE SETTLEMENT OUTBOX
+//!   incrementally (idempotent by reservation identity); a ONE-TIME bounded
+//!   legacy backfill runs only until its durable marker is set. Admission
+//!   never depends on this route. Without `org` the route keeps its frozen
+//!   pre-billing shape (see `usage.rs`).
 //! - `GET /native/entitlements` — the caller organization's derived
 //!   entitlement snapshot (plan features/limits from config, credit balance,
 //!   folded managed vs BYOK spend, in-flight transactions).
@@ -37,10 +38,11 @@ use crate::api::AppState;
 
 /// Bound on the usage page one response returns.
 pub(crate) const MAX_BILLING_PAGE: usize = 200;
-/// Bound on the sessions one read-through ingestion pass scans (bounded
+/// Bound on the sessions the ONE-TIME legacy backfill scans (bounded
 /// everything: a flood past the bound is reported, never silently ignored).
 pub(crate) const MAX_INGEST_SESSIONS: usize = 2_000;
-/// Bound on the tasks per session one ingestion pass scans.
+/// Bound on the tasks per session the ONE-TIME legacy backfill scans (the
+/// steady-state outbox projection has no per-task scan).
 pub(crate) const MAX_INGEST_TASKS: usize = 500;
 /// Bound on the rows one usage export returns (a download is bounded like
 /// every other read; older rows stay reachable through `since`).
@@ -74,7 +76,7 @@ pub(crate) fn org_required() -> ApiError {
     }
 }
 
-/// The typed refusal of a read-through ingestion whose bounded window was
+/// The typed refusal of a legacy backfill/outbox drain whose bounded window was
 /// exceeded: refusing loudly is the only honest answer (silently folding a
 /// prefix would under-report commercial spend).
 pub(crate) fn usage_ingest_truncated(detail: &str) -> ApiError {
@@ -229,28 +231,49 @@ pub(crate) fn resolve_org(
     Ok((principal, organization))
 }
 
-/// Project the durable spend rows of the local sessions into the
-/// organization's usage ledger (read-through ingestion; idempotent, so a
-/// re-read appends nothing). Returns the number of newly appended events
-/// plus the sessions that were scanned. A store failure is loud, and a
-/// window past the bound is a typed refusal BEFORE any write (a truncated
-/// projection would under-report commercial spend).
-///
-/// Read-through ingestion is scoped to the CONFIGURED billing organization:
-/// the daemon's local sessions belong to that tenant. Any other
-/// organization reads only its own durable ledger — it can never claim the
-/// local sessions' spend (cross-tenant attribution).
-pub(crate) fn ingest_local_spend(
+/// Drain the durable settlement outbox into the organization's usage
+/// ledger (bounded). This is the ONLY steady-state projection: it reads
+/// settled outbox rows incrementally by watermark, never every session/task/
+/// reservation. A backlog past the bound is a typed refusal.
+pub(crate) fn project_settlement_outbox(
     state: &AppState,
     organization: &OrganizationId,
-) -> Result<(usize, usize), ApiError> {
-    ingest_local_spend_with_bounds(state, organization, MAX_INGEST_SESSIONS, MAX_INGEST_TASKS)
+    max_rows: usize,
+) -> Result<crate::billing_projection::ProjectionReport, ApiError> {
+    let Some(service) = state.deps.billing.as_ref() else {
+        return Err(billing_disabled());
+    };
+    let projector = crate::billing_projection::BillingSpendProjector::new(
+        service.clone(),
+        organization.clone(),
+        state.deps.session.clone(),
+    );
+    projector.drain(max_rows).map_err(projection_err)
 }
 
-/// [`ingest_local_spend`] with explicit bounds (the production constants are
-/// passed by the route; adversarial tests pin a tighter window to prove the
-/// refusal happens before anything is written).
-pub(crate) fn ingest_local_spend_with_bounds(
+fn projection_err(error: crate::billing_projection::ProjectionError) -> ApiError {
+    use crate::billing_projection::ProjectionError;
+    match error {
+        ProjectionError::Lag { projected } => usage_ingest_truncated(&format!(
+            "{projected} outbox rows projected and more remain"
+        )),
+        ProjectionError::Outbox(detail) => ApiError {
+            code: "usage_projection_failed",
+            message: format!("settlement outbox projection failed: {detail}"),
+            http_status: 500,
+            retryable: true,
+        },
+        ProjectionError::Billing(error) => billing_err(error),
+    }
+}
+
+/// One-time LEGACY backfill (UI-triggered, bounded, never on the admission
+/// path): scan the pre-outbox settled reservation rows into the durable
+/// outbox so the ordinary projector attributes them. Idempotent by the
+/// reservation identity. A typed `NotFound` (concurrent session deletion) is
+/// the ONLY skippable `list_tasks` failure — any store/corruption/I/O error
+/// refuses the whole pass instead of under-reporting spend.
+pub(crate) fn backfill_local_spend_with_bounds(
     state: &AppState,
     organization: &OrganizationId,
     max_sessions: usize,
@@ -260,8 +283,8 @@ pub(crate) fn ingest_local_spend_with_bounds(
         return Err(billing_disabled());
     };
     // The local sessions belong to the configured billing organization.
-    // Without a configured organization (embedded/test service) the
-    // read-through is allowed so the provisioning contract stays usable.
+    // Without a configured organization (embedded/test service) the backfill
+    // is allowed so the provisioning contract stays usable.
     let owns_local_sessions = service
         .billing_organization()
         .map(|configured| configured == organization)
@@ -269,12 +292,20 @@ pub(crate) fn ingest_local_spend_with_bounds(
     if !owns_local_sessions {
         return Ok((0, 0));
     }
-    let Some(account) = service.default_account(organization).map_err(billing_err)? else {
+    let Some(_account) = service.default_account(organization).map_err(billing_err)? else {
         // No billing account exists yet: nothing can be attributed and
         // NOTHING is fabricated (the operator creates the account first).
         return Ok((0, 0));
     };
     let store = state.deps.session.store();
+    if store.billing_outbox_backfill_done().map_err(|e| {
+        faktor_protocol::error::from_core(&faktor_core::Error::new(
+            faktor_core::ErrorKind::Internal,
+            e.to_string(),
+        ))
+    })? {
+        return Ok((0, 0));
+    }
     let sessions = state
         .deps
         .session
@@ -286,65 +317,31 @@ pub(crate) fn ingest_local_spend_with_bounds(
             sessions.len()
         )));
     }
-    // Preflight the per-session task windows BEFORE appending anything, so
-    // the refusal leaves the ledger byte-identical.
+    // Preflight the per-session task windows BEFORE writing anything, so the
+    // refusal leaves the outbox byte-identical. A typed NotFound (the
+    // session was deleted concurrently) is skippable; every other error is
+    // fatal.
     for handle in &sessions {
-        if let Ok(tasks) = handle.list_tasks() {
-            if tasks.len() > max_tasks {
+        match handle.list_tasks() {
+            Ok(tasks) if tasks.len() > max_tasks => {
                 return Err(usage_ingest_truncated(&format!(
                     "a session has {} tasks, exceeding the {max_tasks}-task bound",
                     tasks.len()
                 )));
             }
+            Ok(_) => {}
+            Err(e) if e.kind == faktor_core::ErrorKind::NotFound => {}
+            Err(e) => return Err(faktor_protocol::error::from_core(&e)),
         }
     }
     let scanned = sessions.len();
-    let mut appended = 0usize;
-    let mut append = |row: faktor_session::DurableSpendRow| -> Result<(), ApiError> {
-        let projected = faktor_cloud::DurableSpendRow {
-            organization_id: organization.as_str().to_string(),
-            session_id: row.session_id,
-            task_id: row.task_id,
-            reservation_id: row.reservation_id,
-            attempt_id: row.attempt_id,
-            provider: row.provider,
-            model: row.model,
-            input_tokens: row.input_tokens,
-            output_tokens: row.output_tokens,
-            // The durable rows fold BOTH cache lines into the input total
-            // at settlement (`recorded_input_total`). `prefix_cache_tokens`
-            // is the request-side CACHEABLE-PREFIX size observed by the
-            // router, not the provider-reported cache-read count; projecting
-            // it here would double-count tokens in every total (including
-            // the token quota) and fabricate a cache line. The durable rows
-            // carry no exact cache split, so both cache buckets are the
-            // honest zero.
-            cache_read_tokens: 0,
-            cache_write_tokens: 0,
-            // Reasoning is folded into the recorded output line by the
-            // settlement; the durable rows carry no separate counter, so the
-            // projection reports the honest zero instead of fabricating one.
-            reasoning_tokens: 0,
-            provider_cost_micro: row.provider_cost_micro,
-            provider_reported_micro: row.provider_reported_micro,
-            state: row.state,
-            occurred_at_ms: row.occurred_at_ms,
-            source_operation: row.source_operation,
-        };
-        let category = service.config().category_of(&projected.provider);
-        let report = service
-            .ingest_spend_row(organization, &account, &projected, category)
-            .map_err(billing_err)?;
-        appended += report.appended;
-        Ok(())
-    };
+    let mut inserted = 0usize;
     for handle in &sessions {
         let tasks = match handle.list_tasks() {
             Ok(tasks) => tasks,
-            Err(_) => continue, // a vanished task list is skipped, never fatal
+            Err(e) if e.kind == faktor_core::ErrorKind::NotFound => continue,
+            Err(e) => return Err(faktor_protocol::error::from_core(&e)),
         };
-        // Re-check the window: a task created after the preflight must not
-        // slip past the bound silently.
         if tasks.len() > max_tasks {
             return Err(usage_ingest_truncated(&format!(
                 "a session has {} tasks, exceeding the {max_tasks}-task bound",
@@ -353,21 +350,77 @@ pub(crate) fn ingest_local_spend_with_bounds(
         }
         for task in tasks.iter() {
             let rows = handle
-                .durable_spend_rows(task.task_id, max_tasks as i64)
+                .durable_spend_rows(task.task_id, faktor_session::MAX_DURABLE_SPEND_ROWS)
                 .map_err(|e| faktor_protocol::error::from_core(&e))?;
             for row in rows {
-                append(row)?;
+                let fact = faktor_store::BillingOutboxFact {
+                    reservation_id: row.reservation_id,
+                    session_id: handle.id(),
+                    task_id: task.task_id,
+                    attempt_id: row.attempt_id,
+                    provider: row.provider,
+                    model: row.model,
+                    // Legacy durable rows fold cache/reasoning into the
+                    // input/output totals before persistence; the exact
+                    // split is unavailable, so it is honestly reported as
+                    // uncached input rather than fabricated cache lines.
+                    uncached_input_tokens: row.input_tokens,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                    output_tokens: row.output_tokens,
+                    reasoning_tokens: 0,
+                    provider_cost_micro: row.provider_cost_micro,
+                    provider_reported_micro: (row.provider_reported_micro > 0)
+                        .then_some(row.provider_reported_micro),
+                    occurred_at_ms: row.occurred_at_ms,
+                    source_operation: format!("legacy_backfill:{}", row.source_operation),
+                };
+                if store.billing_outbox_record(fact).map_err(|e| {
+                    faktor_protocol::error::from_core(&faktor_core::Error::new(
+                        faktor_core::ErrorKind::Internal,
+                        e.to_string(),
+                    ))
+                })? {
+                    inserted += 1;
+                }
             }
         }
     }
-    let _ = store; // the session read is the only durable source used here
-    Ok((appended, scanned))
+    store.mark_billing_outbox_backfill_done().map_err(|e| {
+        faktor_protocol::error::from_core(&faktor_core::Error::new(
+            faktor_core::ErrorKind::Internal,
+            e.to_string(),
+        ))
+    })?;
+    Ok((inserted, scanned))
+}
+
+/// The UI/route entry point: run the one-time legacy backfill exactly once,
+/// then drain a bounded outbox window. Admission uses the projector directly
+/// and never calls this.
+pub(crate) fn catch_up_local_spend(
+    state: &AppState,
+    organization: &OrganizationId,
+) -> Result<(usize, usize), ApiError> {
+    let (inserted, scanned) = backfill_local_spend_with_bounds(
+        state,
+        organization,
+        MAX_INGEST_SESSIONS,
+        MAX_INGEST_TASKS,
+    )?;
+    let report = project_settlement_outbox(
+        state,
+        organization,
+        crate::billing_projection::MAX_CATCHUP_OUTBOX_ROWS,
+    )?;
+    Ok((inserted + report.appended, scanned))
 }
 
 /// The billing branch of `/native/usage?org=&since=&limit=` — the
-/// organization's usage fold plus one cursor page of its usage events. The
-/// read-through ingestion runs first, so the fold always reflects the
-/// durable reservation ledger.
+/// organization's usage fold plus one cursor page of its usage events. It
+/// first runs the one-time legacy backfill (UI catch-up only) and then a
+/// bounded settlement-outbox projection, so the fold reflects every settled
+/// reservation without re-listing session history.
 pub(crate) fn billing_usage(
     state: AppState,
     headers: HeaderMap,
@@ -406,7 +459,7 @@ pub(crate) fn billing_usage(
     let Some(service) = state.deps.billing.as_ref() else {
         return wire_status(billing_disabled());
     };
-    if let Err(e) = ingest_local_spend(&state, &organization) {
+    if let Err(e) = catch_up_local_spend(&state, &organization) {
         return wire_status(e);
     }
     let page = match service.usage_page(&organization, since.as_deref(), limit) {
@@ -877,9 +930,10 @@ pub(crate) struct UsageExportQuery {
 }
 
 /// `GET /native/usage/export?org=&since=&limit=&format=csv|json` — a BOUNDED
-/// download of the organization's usage ledger. It runs the same read-through
-/// ingestion as `/native/usage`, then pages at most [`MAX_EXPORT_EVENTS`]
-/// rows. The response is an attachment; no unbounded ledger is ever buffered.
+/// download of the organization's usage ledger. It runs the same bounded
+/// backfill/outbox catch-up as `/native/usage`, then pages at most
+/// [`MAX_EXPORT_EVENTS`] rows. The response is an attachment; no unbounded
+/// ledger is ever buffered.
 pub(crate) async fn native_usage_export(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -921,7 +975,7 @@ pub(crate) async fn native_usage_export(
         }
         Some(l) => l as usize,
     };
-    if let Err(e) = ingest_local_spend(&state, &organization) {
+    if let Err(e) = catch_up_local_spend(&state, &organization) {
         return wire_status(e);
     }
     let mut rows = Vec::with_capacity(limit.min(MAX_BILLING_PAGE));

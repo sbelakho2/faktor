@@ -629,6 +629,7 @@ fn billing_admission_is_constant_at_one_million_events() {
     config.plans.insert(
         "pro".into(),
         PlanConfig {
+            period_ms: None,
             plan_id: "pro".into(),
             features: Default::default(),
             limits: [

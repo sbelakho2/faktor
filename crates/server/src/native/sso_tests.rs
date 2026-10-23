@@ -81,6 +81,7 @@ async fn harness(
         config.plans.insert(
             plan.to_string(),
             PlanConfig {
+                period_ms: None,
                 plan_id: plan.to_string(),
                 features: features.into_iter().map(str::to_string).collect(),
                 limits: Default::default(),

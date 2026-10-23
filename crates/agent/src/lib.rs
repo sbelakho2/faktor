@@ -1695,6 +1695,8 @@ impl RoutingPolicy for FixedRoutingPolicy {
 pub struct AttemptAccounting {
     budgets: Arc<dyn faktor_session::BudgetAuthority>,
     session_id: SessionId,
+    provider: String,
+    model: String,
     reservation: Option<faktor_session::ReservationId>,
     dispatched: bool,
     closed: bool,
@@ -1719,11 +1721,15 @@ impl AttemptAccounting {
     pub fn new(
         budgets: Arc<dyn faktor_session::BudgetAuthority>,
         session_id: SessionId,
+        provider: impl Into<String>,
+        model: impl Into<String>,
         reservation: Option<faktor_session::ReservationId>,
     ) -> Self {
         Self {
             budgets,
             session_id,
+            provider: provider.into(),
+            model: model.into(),
             reservation,
             dispatched: false,
             closed: false,
@@ -1804,8 +1810,10 @@ impl AttemptAccounting {
         };
         let out = self
             .budgets
-            .settle_usage(
+            .settle_usage_with_context(
                 self.session_id,
+                &self.provider,
+                &self.model,
                 reservation,
                 uncached_input_tokens,
                 cache_read_tokens,

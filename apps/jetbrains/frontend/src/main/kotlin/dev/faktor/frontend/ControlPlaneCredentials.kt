@@ -54,6 +54,17 @@ interface ControlPlaneSessionStore {
     fun write(sessionId: String?)
 }
 
+/** Outcome of the compare-and-delete used by sign-out. */
+enum class ControlPlaneDeleteOutcome {
+    /** The captured credential was still current and its row was removed. */
+    DELETED,
+    /** No credential row existed for the scope. */
+    ABSENT,
+    /** Another window/keychain write replaced the captured credential; the
+     *  NEW value is still live and must not be erased. */
+    ROTATED
+}
+
 /**
  * The credential authority: store/resolve/delete by (endpoint, organization).
  * Blank credentials are refused loudly and never written; a resolve returns
@@ -90,6 +101,24 @@ class ControlPlaneCredentialStore(private val vault: SecretVault) {
         val existed = resolve(scope) != null
         vault.setPassword(CREDENTIAL_SERVICE, scope.account(), null)
         return existed
+    }
+
+    /**
+     * Compare-and-delete: remove the row ONLY when it still holds the exact
+     * credential the sign-out captured and revoked. The re-read happens
+     * immediately before the delete so an external rotation is never erased.
+     * PasswordSafe has no native CAS, so the final compare-to-delete window
+     * is one vault call; a rotation inside it is reported by the next sign-out
+     * rather than silently overwritten by a stale capture.
+     */
+    fun compareAndDelete(scope: ControlPlaneScope?, expected: String?): ControlPlaneDeleteOutcome {
+        if (scope == null || !scope.valid() || expected == null) {
+            return ControlPlaneDeleteOutcome.ABSENT
+        }
+        val current = resolve(scope) ?: return ControlPlaneDeleteOutcome.ABSENT
+        if (current != expected) return ControlPlaneDeleteOutcome.ROTATED
+        vault.setPassword(CREDENTIAL_SERVICE, scope.account(), null)
+        return ControlPlaneDeleteOutcome.DELETED
     }
 }
 

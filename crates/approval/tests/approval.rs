@@ -723,3 +723,133 @@ fn approval_text_refuses_credentials_at_propose_and_on_load() {
         "a hand-edited ledger line must not persist a credential"
     );
 }
+
+#[test]
+fn a_backwards_wall_clock_jump_cannot_extend_an_expired_approval() {
+    let temp = tempfile::tempdir().unwrap();
+    let (authority, key) = authority(temp.path());
+    let now = faktor_approval::unix_now_ms();
+    let digest = "7".repeat(64);
+    let mut expiring = draft("agent-1", &digest, "7");
+    expiring.expires_at_ms = now + 1_500;
+    let request = authority.propose(expiring, now).unwrap();
+    authority
+        .decide(
+            &request.id,
+            Principal::new("quality-director", PrincipalKind::HumanOperator).unwrap(),
+            &key,
+            DecisionOutcome::Approved,
+            "reviewed".to_string(),
+            now + 1,
+        )
+        .unwrap();
+    let check = ApprovalCheck::new(
+        ApprovalKind::EngineeringConstraintRelaxation,
+        "req-set-1",
+        "7",
+        digest,
+    );
+    // First observation at +5s expires the request and persists that high
+    // water mark.
+    assert!(matches!(
+        authority.authorize(&check, now + 5_000),
+        Err(ApprovalError::Expired { .. })
+    ));
+    // A one-hour backwards wall-clock jump would move the wall clock before
+    // the expiry; the persisted max-seen time keeps it expired.
+    assert!(
+        matches!(
+            authority.authorize(&check, now - 3_600_000),
+            Err(ApprovalError::Expired { .. })
+        ),
+        "a backwards clock jump must not revive an expired approval"
+    );
+}
+
+#[test]
+fn a_forward_wall_clock_jump_expires_and_the_clock_does_not_go_back() {
+    let temp = tempfile::tempdir().unwrap();
+    let (authority, key) = authority(temp.path());
+    let now = faktor_approval::unix_now_ms();
+    let digest = "8".repeat(64);
+    let mut future = draft("agent-1", &digest, "8");
+    future.expires_at_ms = now + 60_000;
+    let request = authority.propose(future, now).unwrap();
+    authority
+        .decide(
+            &request.id,
+            Principal::new("quality-director", PrincipalKind::HumanOperator).unwrap(),
+            &key,
+            DecisionOutcome::Approved,
+            "reviewed".to_string(),
+            now + 1,
+        )
+        .unwrap();
+    let check = ApprovalCheck::new(
+        ApprovalKind::EngineeringConstraintRelaxation,
+        "req-set-1",
+        "8",
+        digest,
+    );
+    // A forward jump past the expiry expires the token.
+    assert!(matches!(
+        authority.authorize(&check, now + 60_001),
+        Err(ApprovalError::Expired { .. })
+    ));
+    // Returning to real time cannot un-expire it.
+    assert!(matches!(
+        authority.authorize(&check, now + 2),
+        Err(ApprovalError::Expired { .. })
+    ));
+    let anchor: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(faktor_approval::clock_anchor_path(temp.path())).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        anchor["max_seen_wall_ms"].as_u64().unwrap() >= now + 60_001,
+        "the observed high-water mark must be durably persisted: {anchor}"
+    );
+}
+
+#[test]
+fn a_cached_token_uses_its_instant_deadline_without_reading_the_wall_clock() {
+    // Covered at the model boundary by the unit test; this integration-level
+    // assertion pins the observable rule: once a token is minted, its
+    // remaining lifetime is monotonic.
+    let temp = tempfile::tempdir().unwrap();
+    let (authority, key) = authority(temp.path());
+    let now = faktor_approval::unix_now_ms();
+    let digest = "9".repeat(64);
+    let request = authority
+        .propose(draft("agent-1", &digest, "9"), now)
+        .unwrap();
+    authority
+        .decide(
+            &request.id,
+            Principal::new("quality-director", PrincipalKind::HumanOperator).unwrap(),
+            &key,
+            DecisionOutcome::Approved,
+            "reviewed".to_string(),
+            now + 1,
+        )
+        .unwrap();
+    let token = authority
+        .authorize(
+            &ApprovalCheck::new(
+                ApprovalKind::EngineeringConstraintRelaxation,
+                "req-set-1",
+                "9",
+                digest.clone(),
+            ),
+            now + 2,
+        )
+        .unwrap();
+    token
+        .require(&ApprovalCheck::new(
+            ApprovalKind::EngineeringConstraintRelaxation,
+            "req-set-1",
+            "9",
+            digest,
+        ))
+        .unwrap();
+}

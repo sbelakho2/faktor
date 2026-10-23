@@ -2978,6 +2978,8 @@ mod attempt_accounting_tests {
         let mut acct = AttemptAccounting::new(
             authority.clone(),
             SessionId::new(1),
+            "p",
+            "m",
             Some(faktor_session::ReservationId::new(7)),
         );
         acct.mark_dispatched().await.unwrap();
@@ -3019,6 +3021,8 @@ mod attempt_accounting_tests {
         let mut acct = AttemptAccounting::new(
             authority.clone(),
             SessionId::new(1),
+            "p",
+            "m",
             Some(faktor_session::ReservationId::new(8)),
         );
         let err = acct
@@ -3054,6 +3058,8 @@ mod attempt_accounting_tests {
         let mut acct = AttemptAccounting::new(
             authority.clone(),
             SessionId::new(1),
+            "p",
+            "m",
             Some(faktor_session::ReservationId::new(9)),
         );
         assert!(matches!(
@@ -3120,7 +3126,7 @@ mod attempt_accounting_tests {
         // (which require a dispatched attempt with a reservation) stay
         // refused without touching the authority.
         let authority = Arc::new(budget());
-        let mut acct = AttemptAccounting::new(authority.clone(), SessionId::new(1), None);
+        let mut acct = AttemptAccounting::new(authority.clone(), SessionId::new(1), "p", "m", None);
         acct.mark_dispatched().await.unwrap();
         assert!(
             !acct.dispatched(),

@@ -1272,6 +1272,12 @@ const CP_MIGRATIONS: &[&str] = &[
     // insert (and a read lazily catches up a v7/restored projection), so an
     // entitlement check stays O(1) instead of folding up to 1M events.
     crate::billing_store::BILLING_ROLLUP_SCHEMA_V8,
+    // v9 — REAL billing periods: event->period identity, per-period org and
+    // task aggregates, the durable period configuration, the period-rollup
+    // catch-up watermark, and the settlement-outbox projection watermark.
+    // The billing domain owns this ladder slot; the all-time v8 rollups stay
+    // for analytics while quota limits read the current period only.
+    crate::billing_store::BILLING_PERIOD_SCHEMA_V9,
 ];
 
 impl SqliteControlPlaneStore {

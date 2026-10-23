@@ -45,6 +45,7 @@ fn config_file(dir: &Path, body: serde_json::Value) -> Config {
 
 fn plan(plan_id: &str, features: &[&str]) -> PlanConfig {
     PlanConfig {
+        period_ms: None,
         plan_id: plan_id.to_string(),
         features: features.iter().map(|f| f.to_string()).collect(),
         limits: Default::default(),

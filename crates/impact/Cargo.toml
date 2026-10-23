@@ -8,6 +8,7 @@ description = "Repository relationship graph and impacted-test authority (one gr
 
 [dependencies]
 faktor-core.workspace = true
+faktor-freshness.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 blake3.workspace = true

@@ -1119,7 +1119,13 @@ pub(crate) async fn run_independent_review_call(
     // The review attempt's budget machine (attempt-accounting audit):
     // refund only pre-dispatch; ANY post-dispatch terminal outcome marks
     // the attempt UNCERTAIN; a clean paid-for exchange settles.
-    let mut acct = crate::AttemptAccounting::new(deps.budgets.clone(), session, reservation);
+    let mut acct = crate::AttemptAccounting::new(
+        deps.budgets.clone(),
+        session,
+        &provider_id,
+        &model,
+        reservation,
+    );
     // P0-2: the durable dispatch marker is written immediately BEFORE the
     // provider request is sent — a crash after provider billing must
     // recover as UNCERTAIN, never as a $0 refund.

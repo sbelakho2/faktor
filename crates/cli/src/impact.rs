@@ -124,7 +124,7 @@ impl WorkspaceImpact {
     /// before the event was flushed). The reconcile never parses files; the
     /// refresh hashes only the candidate paths.
     fn observe_changes(
-        session: &ImpactSession,
+        session: &mut ImpactSession,
         watch: &mut Option<WorkspaceWatch>,
         generation: &MaterialGeneration,
     ) -> Result<(), faktor_impact::GraphError> {
@@ -228,11 +228,11 @@ impl ImpactMetadata for WorkspaceImpact {
         // stale. The watch advances it for out-of-band edits; the bounded
         // metadata reconciliation heals dropped events. `affected(changed=A)`
         // always runs after this catch-up, on a complete current graph.
-        WorkspaceImpact::observe_changes(&entry.session, &mut entry.watch, &entry.generation)
+        WorkspaceImpact::observe_changes(&mut entry.session, &mut entry.watch, &entry.generation)
             .map_err(|error| SemanticError::Unavailable {
-                subsystem: "graph".to_string(),
-                reason: error.to_string(),
-            })?;
+            subsystem: "graph".to_string(),
+            reason: error.to_string(),
+        })?;
         let current = entry.generation.current();
         if entry.synced != current {
             let dirty = entry.generation.dirty_since(entry.synced);

@@ -1422,12 +1422,11 @@ fn authorize_plan_baseline(
                     .or(legacy.as_ref())
                     .map(|token| token.bound_digest().to_string())
             });
+    // Only an approval that binds THIS plan subject (canonical) or this
+    // decision id (legacy) is a prior baseline for this plan. An unrelated
+    // historical SupplyPlanProceed for another engineering scope/requirement
+    // must not force an extra approval on a fresh plan.
     let mut any_prior = canonical.is_some() || legacy.is_some();
-    for view in &views {
-        if view.request.kind == faktor_approval::ApprovalKind::SupplyPlanProceed {
-            any_prior = true;
-        }
-    }
     let prior_scope =
         authority.latest_request(faktor_approval::ApprovalKind::SupplyPlanProceed, &subject)?;
     let prior_legacy = authority.latest_request(

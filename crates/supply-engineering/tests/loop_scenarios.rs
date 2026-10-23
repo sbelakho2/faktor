@@ -1407,7 +1407,7 @@ fn an_expired_plan_baseline_is_not_treated_as_absence() {
     let outcome = run_with_authority(&first, &signer, &authority).unwrap();
     let digest = outcome.binding.result_digest.to_hex();
 
-    let created = faktor_approval::unix_now_ms().saturating_sub(10_000).max(1);
+    let created = faktor_approval::unix_now_ms();
     let expired = authority
         .propose(
             ApprovalDraft {
@@ -1419,7 +1419,7 @@ fn an_expired_plan_baseline_is_not_treated_as_absence() {
                 requester: Principal::new("supply-agent", PrincipalKind::Agent).unwrap(),
                 bound_revision: first.revision.get().to_string(),
                 bound_digest: digest,
-                expires_at_ms: created + 5_000,
+                expires_at_ms: created + 1_500,
             },
             created,
         )
@@ -1432,6 +1432,15 @@ fn an_expired_plan_baseline_is_not_treated_as_absence() {
             DecisionOutcome::Approved,
             "reviewed".to_string(),
             created + 1,
+        )
+        .unwrap();
+    // Observe a later instant so the approval is expired under the monotonic
+    // clock (the max-seen high-water mark is persisted).
+    authority
+        .latest_authorized(
+            ApprovalKind::SupplyPlanProceed,
+            &first.decision_id,
+            created + 5_000,
         )
         .unwrap();
 
@@ -1551,11 +1560,13 @@ fn replaying_an_approved_baseline_under_a_new_decision_id_is_refused() {
     let first = request(perf_candidates(1), engineering, vec![]);
     let outcome = run_with_authority(&first, &signer, &authority).unwrap();
     let digest = outcome.binding.result_digest.to_hex();
+    // The approval binds the immutable plan subject (not the mutable cursor
+    // id); the replay below renames only the decision id.
     approve_plan(
         &authority,
         &key,
-        &first.decision_id,
-        &first.revision.get().to_string(),
+        &plan_baseline_subject(&first).unwrap(),
+        &plan_approval_revision(&first.decision_id, first.revision, None).unwrap(),
         &digest,
         faktor_approval::unix_now_ms(),
     );
@@ -1733,5 +1744,159 @@ fn supplier_and_engineering_text_injection_is_data_only_and_executes_nothing() {
         outcome.is_self_verified(),
         "injected text must not break deterministic verification: {:?}",
         outcome.verify_integrity_only()
+    );
+}
+
+#[test]
+fn unrelated_plan_approval_does_not_force_approval_but_same_subject_prior_does() {
+    let directory = tempfile::tempdir().unwrap();
+    let key = OperatorKey::generate();
+    faktor_approval::save_operator_key(directory.path(), "quality-director", &key, false).unwrap();
+    faktor_approval::register_operator_key(
+        directory.path(),
+        "quality-director",
+        &key,
+        faktor_approval::unix_now_ms().max(1),
+    )
+    .unwrap();
+    let authority = ApprovalAuthority::open(directory.path()).unwrap();
+    let signer = ReceiptSigner::generate();
+    let now = faktor_approval::unix_now_ms();
+
+    // An unrelated engineering scope has a different plan-baseline subject.
+    let mut other_engineering = capacitor_requirements();
+    other_engineering.revision = RevisionId::new(99);
+    let other = request(perf_candidates(1), other_engineering, vec![]);
+    let other_subject = plan_baseline_subject(&other).unwrap();
+    approve_plan(
+        &authority,
+        &key,
+        &other_subject,
+        "decision-other|rev=1|prev=root",
+        &"f".repeat(64),
+        now,
+    );
+
+    // A fresh plan for THIS subject must remain a recommendation: the
+    // unrelated historical approval is not a baseline for it.
+    let first = request(perf_candidates(1), capacitor_requirements(), vec![]);
+    let subject = plan_baseline_subject(&first).unwrap();
+    assert_ne!(subject, other_subject);
+    let outcome = run_with_authority(&first, &signer, &authority).unwrap();
+    assert!(matches!(
+        outcome.decision.recommended_action,
+        RecommendedAction::Proceed { .. }
+    ));
+
+    // A prior approval for THIS subject is a baseline: changing the plan
+    // under it requires a fresh human decision.
+    approve_plan(
+        &authority,
+        &key,
+        &subject,
+        &plan_approval_revision(&first.decision_id, first.revision, None).unwrap(),
+        &outcome.binding.result_digest.to_hex(),
+        now + 10,
+    );
+    let mut candidates = perf_candidates(1);
+    candidates[0].tco.as_mut().unwrap().ex_works_unit =
+        term(Money::parse("2.00", CUR).unwrap(), "unrelated-prior-price");
+    let changed = request(candidates, capacitor_requirements(), vec![]);
+    let error = run_with_authority(&changed, &signer, &authority).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            LoopError::Approval(
+                faktor_approval::ApprovalError::Stale { .. }
+                    | faktor_approval::ApprovalError::ApprovalRequired { .. }
+            )
+        ),
+        "a same-subject prior baseline must force a fresh approval: {error}"
+    );
+}
+
+/// Independent final-wave probe: `any_prior` is scoped to THIS plan subject
+/// and the SupplyPlanProceed kind. An approval of a different kind carrying
+/// the same subject string is not a plan baseline; a real same-subject plan
+/// approval still forces a fresh human decision after the plan changes.
+#[test]
+fn another_kind_of_approval_on_the_plan_subject_is_not_a_plan_baseline() {
+    let directory = tempfile::tempdir().unwrap();
+    let key = OperatorKey::generate();
+    faktor_approval::save_operator_key(directory.path(), "quality-director", &key, false).unwrap();
+    faktor_approval::register_operator_key(
+        directory.path(),
+        "quality-director",
+        &key,
+        faktor_approval::unix_now_ms().max(1),
+    )
+    .unwrap();
+    let authority = ApprovalAuthority::open(directory.path()).unwrap();
+    let signer = ReceiptSigner::generate();
+    let now = faktor_approval::unix_now_ms().max(1);
+
+    let first = request(perf_candidates(1), capacitor_requirements(), vec![]);
+    let subject = plan_baseline_subject(&first).unwrap();
+    let unrelated = authority
+        .propose(
+            ApprovalDraft {
+                kind: ApprovalKind::EngineeringConstraintRelaxation,
+                subject: subject.clone(),
+                evidence: vec!["unrelated engineering waiver".to_string()],
+                proposed_change: "relax an unrelated constraint".to_string(),
+                risk: RiskLevel::High,
+                requester: Principal::new("supply-agent", PrincipalKind::Agent).unwrap(),
+                bound_revision: first.revision.get().to_string(),
+                bound_digest: "a".repeat(64),
+                expires_at_ms: now + 60_000,
+            },
+            now,
+        )
+        .unwrap();
+    authority
+        .decide(
+            &unrelated.id,
+            Principal::new("quality-director", PrincipalKind::HumanOperator).unwrap(),
+            &key,
+            DecisionOutcome::Approved,
+            "reviewed an unrelated engineering change".to_string(),
+            now + 1,
+        )
+        .unwrap();
+
+    let outcome = run_with_authority(&first, &signer, &authority).unwrap();
+    assert!(
+        matches!(
+            outcome.decision.recommended_action,
+            RecommendedAction::Proceed { .. }
+        ),
+        "a different approval kind on the same subject must not force a plan approval"
+    );
+
+    let digest = outcome.binding.result_digest.to_hex();
+    approve_plan(
+        &authority,
+        &key,
+        &subject,
+        &plan_approval_revision(&first.decision_id, first.revision, None).unwrap(),
+        &digest,
+        now + 10,
+    );
+    let mut candidates = perf_candidates(1);
+    candidates[0].tco.as_mut().unwrap().ex_works_unit = term(
+        Money::parse("2.00", CUR).unwrap(),
+        "independent-prior-price",
+    );
+    let changed = request(candidates, capacitor_requirements(), vec![]);
+    let error = run_with_authority(&changed, &signer, &authority).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            LoopError::Approval(
+                faktor_approval::ApprovalError::Stale { .. }
+                    | faktor_approval::ApprovalError::ApprovalRequired { .. }
+            )
+        ),
+        "a real same-subject plan approval must force a fresh decision: {error}"
     );
 }

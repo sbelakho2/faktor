@@ -1552,3 +1552,135 @@ fn model_outcome_stats_success_samples_never_carry_rework_and_hostile_rows_are_r
         other => panic!("the phase fold must refuse the same row, got {other:?}"),
     }
 }
+
+#[test]
+fn settlement_writes_exact_outbox_row_in_the_same_transaction_and_period() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), true).unwrap();
+    let ws = store.create_workspace("/w").unwrap();
+    let s = store.create_session(ws, "t", "p", "m").unwrap();
+    let task = seed_task(&store, s.id, TaskId::new(1), vec![], TaskState::Running);
+    let tid = task.task_id;
+    let now = now_ms();
+    store.set_billing_period_config(1_000, 100).unwrap();
+    let CostReserveOutcome::Granted(r) = store
+        .cost_reserve_priced(
+            s.id,
+            tid,
+            OpId::new(1),
+            100_000,
+            now,
+            Some(&known_snapshot_json()),
+            ExecutionClass::Unknown,
+        )
+        .unwrap()
+    else {
+        panic!("reserve")
+    };
+    store.cost_mark_dispatched(r, now).unwrap();
+    store
+        .cost_settle_usage_with_context(
+            r,
+            100_000,
+            7,
+            3,
+            2_000,
+            Some(9_999),
+            None,
+            1_050,
+            "managed",
+            "model-x",
+        )
+        .unwrap();
+    let rows = store.billing_outbox_after(0, 10).unwrap();
+    assert_eq!(rows.len(), 1, "exactly one durable outbox row");
+    let row = &rows[0];
+    assert_eq!(row.reservation_id, r);
+    assert_eq!(row.session_id, s.id);
+    assert_eq!(row.task_id, tid);
+    assert_eq!(row.provider, "managed");
+    assert_eq!(row.model, "model-x");
+    assert_eq!(row.uncached_input_tokens, 100_000);
+    assert_eq!(row.cache_read_tokens, 7);
+    assert_eq!(row.cache_write_tokens, 3);
+    assert_eq!(row.output_tokens, 2_000);
+    assert!(row.provider_cost_micro > 0, "the folded actual");
+    assert_eq!(row.occurred_at_ms, 1_050);
+    assert_eq!(row.period_id, "bp_1000_1100");
+    assert_eq!((row.period_start_ms, row.period_end_ms), (1_000, 1_100));
+    // A replayed legacy/backfill insert is idempotent (same reservation
+    // identity, unique key).
+    let before = rows.len();
+    store
+        .billing_outbox_record(BillingOutboxFact {
+            reservation_id: r,
+            session_id: s.id,
+            task_id: tid,
+            attempt_id: "replay".into(),
+            provider: "managed".into(),
+            model: "model-x".into(),
+            uncached_input_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            output_tokens: 0,
+            reasoning_tokens: 0,
+            provider_cost_micro: 0,
+            provider_reported_micro: None,
+            occurred_at_ms: 1_050,
+            source_operation: "legacy_backfill".into(),
+        })
+        .unwrap();
+    assert_eq!(store.billing_outbox_after(0, 10).unwrap().len(), before);
+}
+
+#[test]
+fn every_terminal_settlement_path_writes_an_outbox_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), true).unwrap();
+    let ws = store.create_workspace("/w").unwrap();
+    let s = store.create_session(ws, "t", "p", "m").unwrap();
+    let task = seed_task(&store, s.id, TaskId::new(1), vec![], TaskState::Running);
+    let tid = task.task_id;
+    let now = now_ms();
+    // Finalize: uncertain reservation settles at the reserved estimate.
+    let CostReserveOutcome::Granted(rf) = store
+        .cost_reserve_priced(
+            s.id,
+            tid,
+            OpId::new(10),
+            500,
+            now,
+            Some(&known_snapshot_json()),
+            ExecutionClass::Unknown,
+        )
+        .unwrap()
+    else {
+        panic!("reserve finalize")
+    };
+    store.cost_mark_dispatched(rf, now).unwrap();
+    store.cost_recover_open_reservations(now + 1).unwrap();
+    store.cost_finalize_uncertain(s.id, tid, now + 2).unwrap();
+    // Numeric settle path.
+    let CostReserveOutcome::Granted(rc) = store
+        .cost_reserve_priced(
+            s.id,
+            tid,
+            OpId::new(11),
+            500,
+            now,
+            Some(&known_snapshot_json()),
+            ExecutionClass::Unknown,
+        )
+        .unwrap()
+    else {
+        panic!("reserve numeric")
+    };
+    store.cost_mark_dispatched(rc, now).unwrap();
+    store
+        .cost_settle(rc, 321, Some(321), None, None, now + 3)
+        .unwrap();
+    let rows = store.billing_outbox_after(0, 10).unwrap();
+    assert_eq!(rows.len(), 2, "finalize and numeric settle both project");
+    assert!(rows.iter().any(|r| r.reservation_id == rf));
+    assert!(rows.iter().any(|r| r.reservation_id == rc));
+}

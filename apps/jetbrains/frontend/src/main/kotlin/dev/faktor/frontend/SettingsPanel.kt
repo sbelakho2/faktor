@@ -347,6 +347,13 @@ class SettingsPanel(
         controlPlaneStatus.text = text
     }
 
+    /** Single-flight sign-out: the control is disabled while the worker runs. */
+    fun setSignOutEnabled(enabled: Boolean) {
+        signOutButton.isEnabled = enabled
+    }
+
+    internal fun signOutEnabled(): Boolean = signOutButton.isEnabled
+
     fun controlPlaneEndpointText(): String = controlPlaneEndpoint.text.trim()
 
     fun controlPlaneOrganizationText(): String = controlPlaneOrganization.text.trim()

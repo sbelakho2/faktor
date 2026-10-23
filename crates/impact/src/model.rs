@@ -48,8 +48,9 @@ impl Revision {
     }
 
     /// Identity of an uncommitted material state: the digest of every scanned
-    /// file plus a generation that advances only when content changes. This
-    /// is a real dirty-worktree revision, not `Revision::default()`.
+    /// source and every topology manifest/lockfile plus a generation that
+    /// advances only when content changes. This is a real dirty-worktree
+    /// revision, not `Revision::default()`.
     pub fn material(digest: &str, generation: u64) -> Self {
         Self {
             commit: None,

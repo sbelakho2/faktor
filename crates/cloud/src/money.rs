@@ -412,6 +412,9 @@ mod tests {
                 managed_spend_micro: amount,
                 byok_spend_micro: amount,
                 total_tokens: 5,
+                period: None,
+                period_managed_spend_micro: 0,
+                period_total_tokens: 0,
                 in_flight: Vec::new(),
                 now_ms: 1,
             };

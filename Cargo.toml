@@ -26,6 +26,7 @@ members = [
     "crates/browser",
     "crates/evidence",
     "crates/semantic",
+    "crates/freshness",
     "crates/impact",
     "crates/protocol",
     "crates/cas",
@@ -118,6 +119,7 @@ engineering-solvers = { path = "crates/engineering-solvers" }
 engineering-eda = { path = "crates/engineering-eda" }
 engineering-cad = { path = "crates/engineering-cad" }
 faktor-semantic = { path = "crates/semantic" }
+faktor-freshness = { path = "crates/freshness" }
 faktor-protocol = { path = "crates/protocol" }
 faktor-cas = { path = "crates/cas" }
 faktor-store = { path = "crates/store" }

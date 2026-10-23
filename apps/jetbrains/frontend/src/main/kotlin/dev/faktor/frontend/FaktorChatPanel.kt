@@ -70,6 +70,9 @@ private const val MAX_TRANSCRIPT_CHARS = 400_000
 private const val MAX_EVIDENCE_PREVIEW_CHARS = 4000
 private const val MAX_CHILD_USAGE_FETCHES = 12
 
+/** Bounded wait for the sign-out revoke; it runs off the EDT. */
+private const val SIGN_OUT_REVOKE_TIMEOUT_MS = 5_000L
+
 /** Routine provider chunks never reach the transcript; durable milestones do. */
 private const val MAX_NOTABLE_EVENTS_PER_FLUSH = 8
 
@@ -149,7 +152,9 @@ class FaktorChatPanel(
      * `IntelliJHostEditor`; the split-mode smoke and display tests leave it
      * null so the panel never links against platform classes it does not own.
      */
-    private val edition8HostEditor: Edition8HostEditor? = null
+    private val edition8HostEditor: Edition8HostEditor? = null,
+    /** Bounded remote-revoke budget used by the background sign-out worker. */
+    private val signOutRevokeTimeoutMs: Long = SIGN_OUT_REVOKE_TIMEOUT_MS
 ) : JPanel(BorderLayout()), FaktorFrontendService.Listener {
 
     private val worker = Executors.newSingleThreadExecutor { runnable ->
@@ -181,6 +186,10 @@ class FaktorChatPanel(
     // is enqueued, so repeated clicks can never accumulate duplicate start
     // jobs in the worker queue. Cleared only by an explicit result.
     private val startInFlight = AtomicBoolean(false)
+
+    // Sign-out is a remote call; it never runs on the EDT. The gate makes
+    // repeated clicks a no-op while the worker owns the operation.
+    private val signOutInFlight = AtomicBoolean(false)
 
     // The immutable submission retried after a TRANSPORT failure: the same
     // submission id and the exact captured draft, reused by the next logical
@@ -1932,6 +1941,10 @@ class FaktorChatPanel(
             )
             return
         }
+        if (!signOutInFlight.compareAndSet(false, true)) {
+            settingsPanel.setControlPlaneStatus("control plane: sign-out is already in progress")
+            return
+        }
         val scope = controlPlaneScopeStore?.read()
             ?: ControlPlaneScope(
                 settingsPanel.controlPlaneEndpointText(),
@@ -1942,41 +1955,85 @@ class FaktorChatPanel(
         // Capture the exact credential (endpoint+organization key and token
         // value) this sign-out means to revoke and delete.
         val captured = if (scope.valid()) store.resolve(scope) else null
-        val remote = revokeRemoteControlPlaneSession(scope.takeIf { it.valid() }, sessionId, captured)
-        val current = if (scope.valid()) store.resolve(scope) else null
-        if (captured != null && current != captured) {
-            // The stored credential rotated while the revoke was in flight:
-            // the CAPTURED token was the one revoked, and the NEW credential
-            // must survive and stay live.
-            service.setControlToken(current)
-            settingsPanel.setControlPlaneStatus(
-                "control plane: credential rotated during sign-out; the NEW credential was kept"
-            )
-            appendSystem(
-                "control-plane sign-out: $remote; the credential was rotated by another window during " +
-                    "sign-out, so the NEW credential was left in the IDE credential store and remains active"
-            )
-            return
+        settingsPanel.setSignOutEnabled(false)
+        settingsPanel.setControlPlaneStatus("control plane: signing out…")
+        // The remote revoke can block for the transport timeout: it runs on
+        // the background worker, never on the EDT. All UI mutation returns
+        // through onEdt; the button stays disabled until completion.
+        runAsync("sign out") {
+            try {
+                val remote = revokeRemoteControlPlaneSession(
+                    scope.takeIf { it.valid() },
+                    sessionId,
+                    captured,
+                    signOutRevokeTimeoutMs
+                )
+                val outcome = when {
+                    !scope.valid() -> ControlPlaneDeleteOutcome.ABSENT
+                    captured == null -> if (store.delete(scope)) {
+                        ControlPlaneDeleteOutcome.DELETED
+                    } else {
+                        ControlPlaneDeleteOutcome.ABSENT
+                    }
+                    else -> store.compareAndDelete(scope, captured)
+                }
+                if (outcome == ControlPlaneDeleteOutcome.ROTATED) {
+                    // The stored credential rotated while the revoke was in
+                    // flight: the CAPTURED token was the one revoked, and
+                    // the NEW credential must survive and stay live.
+                    val current = store.resolve(scope)
+                    service.setControlToken(current)
+                    onEdt {
+                        settingsPanel.setControlPlaneStatus(
+                            "control plane: credential rotated during sign-out; the NEW credential was kept"
+                        )
+                        appendSystem(
+                            "control-plane sign-out: $remote; the credential was rotated by another window " +
+                                "during sign-out, so the NEW credential was left in the IDE credential " +
+                                "store and remains active"
+                        )
+                        finishSignOut()
+                    }
+                    return@runAsync
+                }
+                controlPlaneSessionStore?.write(null)
+                service.setControlToken(null)
+                val removed = outcome == ControlPlaneDeleteOutcome.DELETED
+                onEdt {
+                    settingsPanel.setControlPlaneSession(null)
+                    settingsPanel.clearControlPlaneTokenInput()
+                    settingsPanel.setControlPlaneStatus(
+                        if (removed) {
+                            "control plane: credential removed from the IDE credential store; remote: $remote"
+                        } else {
+                            "control plane: no credential was stored; remote: $remote"
+                        }
+                    )
+                    appendSystem(
+                        if (removed) {
+                            "control-plane sign-out: $remote; the credential was removed from the IDE " +
+                                "credential store"
+                        } else {
+                            "no stored control-plane credential to remove ($remote)"
+                        }
+                    )
+                    finishSignOut()
+                }
+            } catch (e: Throwable) {
+                onEdt {
+                    val message = e.message ?: e.javaClass.simpleName
+                    settingsPanel.setControlPlaneStatus("control plane: sign-out failed ($message)")
+                    appendSystem("control-plane sign-out failed: $message")
+                    finishSignOut()
+                }
+            }
         }
-        val removed = store.delete(if (scope.valid()) scope else null)
-        controlPlaneSessionStore?.write(null)
-        settingsPanel.setControlPlaneSession(null)
-        service.setControlToken(null)
-        settingsPanel.clearControlPlaneTokenInput()
-        settingsPanel.setControlPlaneStatus(
-            if (removed) {
-                "control plane: credential removed from the IDE credential store"
-            } else {
-                "control plane: no credential was stored"
-            }
-        )
-        appendSystem(
-            if (removed) {
-                "control-plane sign-out: $remote; the credential was removed from the IDE credential store"
-            } else {
-                "no stored control-plane credential to remove ($remote)"
-            }
-        )
+    }
+
+    /** EDT-owned completion of one sign-out attempt (single-flight release). */
+    private fun finishSignOut() {
+        settingsPanel.setSignOutEnabled(true)
+        signOutInFlight.set(false)
     }
 
     /**
@@ -1990,7 +2047,8 @@ class FaktorChatPanel(
     private fun revokeRemoteControlPlaneSession(
         scope: ControlPlaneScope?,
         sessionId: String?,
-        token: String?
+        token: String?,
+        timeoutMs: Long
     ): String {
         if (scope == null || sessionId.isNullOrBlank()) {
             return "no auth-session id is known, so the remote session was not revoked"
@@ -2002,7 +2060,12 @@ class FaktorChatPanel(
             return "the daemon is not running, so the remote session was not revoked"
         }
         return try {
-            service.revokeControlPlaneSessionWithToken(scope.organization, sessionId, token)
+            service.revokeControlPlaneSessionWithToken(
+                scope.organization,
+                sessionId,
+                token,
+                timeoutMs = timeoutMs
+            )
             "the remote session was revoked"
         } catch (e: Exception) {
             "the remote revoke failed (${e.message})"
@@ -4229,6 +4292,26 @@ class FaktorChatPanel(
     /** One synchronous credential-watch poll (internal smoke hook). */
     internal fun pollControlPlaneWatcherOnce(): Boolean =
         controlPlaneWatcher?.pollOnce() ?: false
+
+    /**
+     * Wait (from a non-EDT test thread) until the background sign-out has
+     * finished and its final EDT updates have run.
+     */
+    internal fun awaitSignOutIdleForTest(timeoutMs: Long = 5_000L): Boolean {
+        check(!SwingUtilities.isEventDispatchThread()) {
+            "awaitSignOutIdleForTest must be called off the EDT"
+        }
+        val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+        while (signOutInFlight.get()) {
+            if (System.nanoTime() >= deadline) return false
+            Thread.sleep(2)
+        }
+        SwingUtilities.invokeAndWait { }
+        return true
+    }
+
+    /** The sign-out button's enabled state (single-flight, smoke hook). */
+    internal fun signOutEnabledForTest(): Boolean = settingsPanel.signOutEnabled()
 
     /** EDT/work counters after any workload (perf harness + smoke). */
     internal fun edtMetricsForTest(): UiWorkSnapshot = uiMetrics.snapshot()

@@ -55,6 +55,8 @@ use crate::error::ControlPlaneError;
 use crate::ids::{
     BillingAccountId, CreditEntryId, InFlightTxnId, OrganizationId, SubscriptionId, UsageEventId,
 };
+use faktor_core::billing::BillingPeriod;
+
 use crate::service::{Clock, SystemClock};
 
 /// One durable spend row projected from the session reservation/settlement
@@ -152,6 +154,17 @@ impl EntitlementService {
         billing_organization: Option<OrganizationId>,
     ) -> Result<Arc<Self>, ControlPlaneError> {
         config.validate()?;
+        // Existing subscriptions (an upgraded database) get their period
+        // configuration materialized at construction: the settlement path
+        // (session store) and the usage ledger must derive identical period
+        // ids from the same anchor/length.
+        if let Some(organization) = &billing_organization {
+            if let Some(subscription) = store.subscription(organization)? {
+                if let Some(period_ms) = config.plan_period_ms(&subscription.plan_id) {
+                    store.put_period_config(organization, subscription.started_ms, period_ms)?;
+                }
+            }
+        }
         Ok(Arc::new(Self {
             store,
             clock,
@@ -209,6 +222,42 @@ impl EntitlementService {
         self.clock.now_ms()
     }
 
+    /// The CURRENT billing period of one organization, derived from the
+    /// durable subscription anchor and the configured plan length at the
+    /// service clock. `None` = no subscription or an unknown plan (the
+    /// admission gate denies either way; no period is fabricated).
+    pub fn current_period(
+        &self,
+        organization: &OrganizationId,
+    ) -> Result<Option<BillingPeriod>, ControlPlaneError> {
+        let Some(subscription) = self.store.subscription(organization)? else {
+            return Ok(None);
+        };
+        let Some(period_ms) = self.config.plan_period_ms(&subscription.plan_id) else {
+            return Ok(None);
+        };
+        Ok(BillingPeriod::derive(
+            subscription.started_ms,
+            period_ms,
+            self.now_ms(),
+        ))
+    }
+
+    /// The period configuration the settlement path must stamp (subscription
+    /// anchor + plan length), when both resolve.
+    pub fn period_config(
+        &self,
+        organization: &OrganizationId,
+    ) -> Result<Option<(i64, i64)>, ControlPlaneError> {
+        let Some(subscription) = self.store.subscription(organization)? else {
+            return Ok(None);
+        };
+        let Some(period_ms) = self.config.plan_period_ms(&subscription.plan_id) else {
+            return Ok(None);
+        };
+        Ok(Some((subscription.started_ms, period_ms)))
+    }
+
     fn new_id(prefix: &str) -> String {
         format!("{prefix}_{}", uuid::Uuid::new_v4().simple())
     }
@@ -246,6 +295,21 @@ impl EntitlementService {
         // historical full-ledger scan made every admission O(events).
         let totals = self.store.usage_totals(organization)?;
         let total_tokens = totals.total_tokens()?;
+        // Quota numerators are CURRENT-period only; the all-time totals
+        // above remain for analytics.
+        let period = self.current_period(organization)?;
+        let (period_managed_spend_micro, period_total_tokens) = match &period {
+            Some(period) => {
+                let period_totals = self
+                    .store
+                    .usage_totals_in_period(organization, &period.id)?;
+                (
+                    period_totals.managed_cost_micro,
+                    period_totals.total_tokens()?,
+                )
+            }
+            None => (0, 0),
+        };
         let in_flight = self
             .store
             .in_flight(organization)?
@@ -269,6 +333,9 @@ impl EntitlementService {
             managed_spend_micro: totals.managed_cost_micro,
             byok_spend_micro: totals.byok_cost_micro,
             total_tokens,
+            period,
+            period_managed_spend_micro,
+            period_total_tokens,
             in_flight,
             now_ms: now,
         })
@@ -409,23 +476,25 @@ impl EntitlementService {
                     if let Some(limit) = snapshot.limit(LIMIT_MAX_MANAGED_SPEND_MICRO_PER_PERIOD) {
                         // Checked: a projection that leaves u64 cannot be
                         // below the limit, so it fails closed naming the
-                        // quota — never saturates into an admission.
-                        let projected = match snapshot.managed_spend_micro.checked_add(estimate) {
-                            Some(projected) => projected,
-                            None => {
-                                return Err(EntitlementExceeded::of(
-                                    boundary,
-                                    LIMIT_MAX_MANAGED_SPEND_MICRO_PER_PERIOD,
-                                )
-                                .with_value(limit, snapshot.managed_spend_micro));
-                            }
-                        };
+                        // quota — never saturates into an admission. The
+                        // numerator is the CURRENT PERIOD only.
+                        let projected =
+                            match snapshot.period_managed_spend_micro.checked_add(estimate) {
+                                Some(projected) => projected,
+                                None => {
+                                    return Err(EntitlementExceeded::of(
+                                        boundary,
+                                        LIMIT_MAX_MANAGED_SPEND_MICRO_PER_PERIOD,
+                                    )
+                                    .with_value(limit, snapshot.period_managed_spend_micro));
+                                }
+                            };
                         if projected > limit {
                             return Err(EntitlementExceeded::of(
                                 boundary,
                                 LIMIT_MAX_MANAGED_SPEND_MICRO_PER_PERIOD,
                             )
-                            .with_value(limit, snapshot.managed_spend_micro));
+                            .with_value(limit, snapshot.period_managed_spend_micro));
                         }
                     }
                     // The free balance is checked (never saturated): a
@@ -450,10 +519,10 @@ impl EntitlementService {
         // 5. Token quota (all gated boundaries consume the same period
         //    aggregate).
         if let Some(limit) = snapshot.limit(LIMIT_MAX_TOKENS_PER_PERIOD) {
-            if snapshot.total_tokens >= limit {
+            if snapshot.period_total_tokens >= limit {
                 return Err(
                     EntitlementExceeded::of(boundary, LIMIT_MAX_TOKENS_PER_PERIOD)
-                        .with_value(limit, snapshot.total_tokens),
+                        .with_value(limit, snapshot.period_total_tokens),
                 );
             }
         }
@@ -561,6 +630,13 @@ impl EntitlementService {
     /// stale `Active` status past `expires_ms` is already inactive).
     pub fn set_subscription(&self, subscription: &Subscription) -> Result<(), ControlPlaneError> {
         subscription.validate()?;
+        if let Some(period_ms) = self.config.plan_period_ms(&subscription.plan_id) {
+            self.store.put_period_config(
+                &subscription.organization,
+                subscription.started_ms,
+                period_ms,
+            )?;
+        }
         self.store.put_subscription(subscription)?;
         Ok(())
     }
@@ -661,6 +737,13 @@ impl EntitlementService {
                 desired.updated_ms = existing.updated_ms;
             }
         } else {
+            if let Some(period_ms) = self.config.plan_period_ms(&desired.plan_id) {
+                self.store.put_period_config(
+                    &desired.organization,
+                    desired.started_ms,
+                    period_ms,
+                )?;
+            }
             self.store.put_subscription(&desired)?;
         }
         Ok((desired, replayed))
@@ -976,6 +1059,27 @@ impl EntitlementService {
         organization: &OrganizationId,
     ) -> Result<u64, ControlPlaneError> {
         Ok(self.store.usage_totals(organization)?.managed_cost_micro)
+    }
+
+    /// The managed spend of ONE period (the quota numerator).
+    pub fn managed_spend_micro_in_period(
+        &self,
+        organization: &OrganizationId,
+        period_id: &str,
+    ) -> Result<u64, ControlPlaneError> {
+        Ok(self
+            .store
+            .usage_totals_in_period(organization, period_id)?
+            .managed_cost_micro)
+    }
+
+    /// One organization's usage fold for a period (per-task rows included).
+    pub fn fold_in_period(
+        &self,
+        organization: &OrganizationId,
+        period_id: &str,
+    ) -> Result<UsageFold, ControlPlaneError> {
+        Ok(self.store.usage_fold_in_period(organization, period_id)?)
     }
 
     // --------------------------------------------------------------- credits

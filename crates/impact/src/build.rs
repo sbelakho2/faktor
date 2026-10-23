@@ -5,13 +5,19 @@
 //! the byte bound. Assembly is a single O(V+E) pass over the parsed records;
 //! incremental refresh re-parses only the changed files plus the files that
 //! import or reference them, then re-assembles from the cached records (no
-//! unchanged file is read twice).
+//! unchanged file is read twice). Freshness is the shared
+//! `faktor-freshness` authority: size/mtime/identity only shortlist suspects,
+//! and a bounded rotating exact BLAKE3 sweep eventually proves every material
+//! input (including same-length/same-mtime rewrites).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use faktor_core::id::WorkspaceId;
+use faktor_freshness::{
+    ContentDigest, FileRecord, Freshness, Observation, SweepCursor, DEFAULT_SHARDS,
+};
 
 use crate::manifest::{self, TopologyOptions, Workspace};
 use crate::model::{
@@ -45,14 +51,30 @@ const TOPOLOGY_MANIFESTS: &[&str] = &[
     "setup.py",
     "setup.cfg",
     "poetry.lock",
+    "uv.lock",
     "Pipfile",
     "Pipfile.lock",
+    "requirements.txt",
+    "requirements-dev.txt",
+    "tox.ini",
+    "lerna.json",
+    "gradle.properties",
+    "go.mod",
+    "go.sum",
+    "go.work",
 ];
 /// Agent Manager state directory name, composed so the retired-token scan
 /// never sees a product name in a skip list.
 const AGENT_STATE_DIR: &str = concat!(".", "ki", "lo");
 pub const MAX_INVALIDATION_FILES: usize = 8192;
 pub const MAX_RESOLVE_CANDIDATES: usize = 64;
+/// Bounded exact-recovery slice: a reconciliation poll hashes at most this
+/// many otherwise-clean candidates while rotating through the shared shards.
+/// Metadata remains a shortlist, so a same-length/same-mtime rewrite is found
+/// by this sweep, never by trusting the stamp.
+pub const RECOVERY_BATCH_FILES: usize = 512;
+/// Byte bound of one exact-recovery slice.
+pub const RECOVERY_BATCH_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct BuildOptions {
@@ -112,19 +134,14 @@ pub struct ChangeClassification {
     /// deleted) and therefore require a re-parse.
     pub seeds: Vec<String>,
     pub unchanged: usize,
+    /// Files BLAKE3-hashed by this scan (metadata suspects plus the bounded
+    /// exact-recovery slice). Lets perf tests prove the incremental path is
+    /// proportional to suspects, not the workspace.
+    pub files_hashed: usize,
     /// The workspace walk hit its file bound, so the absent/deleted set is
     /// not complete. Callers must rebuild rather than apply a partial seed
     /// set.
     pub truncated: bool,
-}
-
-/// Cheap on-disk identity used by whole-workspace reconciliation. Content is
-/// still decided by the blake3 digest in `classify_changes`; this stamp only
-/// selects candidates so an unchanged query never reads every file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileStamp {
-    bytes: u64,
-    modified_nanos: i128,
 }
 
 /// True when `path`'s file name is one of the workspace topology manifests
@@ -136,21 +153,17 @@ pub fn is_topology_manifest(path: &str) -> bool {
     TOPOLOGY_MANIFESTS.contains(&name)
 }
 
-fn manifest_stamp(root: &Path, relative: &str) -> Option<FileStamp> {
+fn manifest_record(root: &Path, relative: &str) -> Option<FileRecord> {
     let meta = fs::symlink_metadata(root.join(relative)).ok()?;
-    meta.file_type().is_file().then(|| file_stamp(&meta))
-}
-
-fn file_stamp(meta: &fs::Metadata) -> FileStamp {
-    let modified_nanos = meta
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|duration| duration.as_nanos() as i128)
-        .unwrap_or(0);
-    FileStamp {
-        bytes: meta.len(),
-        modified_nanos,
+    if !meta.file_type().is_file()
+        || meta.len() > MAX_FILE_BYTES
+        || meta.len() > RECOVERY_BATCH_BYTES
+    {
+        return None;
+    }
+    match faktor_freshness::observe_path(root, relative, MAX_FILE_BYTES, None) {
+        Observation::Hashed { record, .. } => Some(record),
+        _ => None,
     }
 }
 
@@ -176,16 +189,18 @@ pub struct GraphBuilder {
     files: BTreeMap<String, GraphFile>,
     /// On-disk stamp per indexed file, used by the whole-workspace
     /// reconciliation walk. Never part of the serialized graph.
-    file_meta: BTreeMap<String, FileStamp>,
+    file_meta: BTreeMap<String, FileRecord>,
     /// Stamps of the manifest/lock files the topology was discovered from.
     /// A change here invalidates the unit graph even when no source file
     /// changed, so the next refresh re-discovers topology instead of
     /// silently keeping stale crate/package relationships.
-    manifest_meta: BTreeMap<String, FileStamp>,
+    manifest_meta: BTreeMap<String, FileRecord>,
     /// Materialized path-level reverse dependency index from the last
     /// assembled graph (dependency path -> dependent paths). Refresh uses it
     /// so invalidation is O(changed + affected), never a full graph walk.
     dependents: BTreeMap<String, BTreeSet<String>>,
+    /// Rotating exact-recovery position over the shared freshness shards.
+    recovery: SweepCursor,
     options: BuildOptions,
     report: BuildReport,
 }
@@ -235,6 +250,7 @@ impl GraphBuilder {
             file_meta: BTreeMap::new(),
             manifest_meta: BTreeMap::new(),
             dependents: BTreeMap::new(),
+            recovery: SweepCursor::new(0),
             options: BuildOptions::default(),
             report,
         })
@@ -286,11 +302,12 @@ impl GraphBuilder {
             self.parse_path(&relative)?;
         }
         self.manifest_meta = self.capture_manifests();
-        self.report.material_inputs = self.material_inputs();
+        let material_inputs = self.material_inputs();
+        self.report.material_inputs = material_inputs.clone();
         if let Some(generation) = material_generation {
-            self.revision = material_revision(self.files.values(), generation);
+            self.revision = material_revision(&material_inputs, generation);
         }
-        let graph = self.assemble();
+        let graph = self.assemble_with_inputs(material_inputs);
         self.dependents = dependents_from(&graph);
         Ok(graph)
     }
@@ -310,6 +327,7 @@ impl GraphBuilder {
         self.file_meta.clear();
         self.manifest_meta.clear();
         self.dependents.clear();
+        self.recovery = SweepCursor::new(0);
         self.report.files_scanned = 0;
         self.report.files_parsed = 0;
         self.report.files_skipped = 0;
@@ -474,14 +492,14 @@ impl GraphBuilder {
         paths
     }
 
-    fn capture_manifests(&self) -> BTreeMap<String, FileStamp> {
-        let mut stamps = BTreeMap::new();
+    fn capture_manifests(&self) -> BTreeMap<String, FileRecord> {
+        let mut records = BTreeMap::new();
         for path in self.manifest_paths() {
-            if let Some(stamp) = manifest_stamp(&self.root, &path) {
-                stamps.insert(path, stamp);
+            if let Some(record) = manifest_record(&self.root, &path) {
+                records.insert(path, record);
             }
         }
-        stamps
+        records
     }
 
     /// The graph's actual material input set: every scanned source file
@@ -515,12 +533,16 @@ impl GraphBuilder {
     }
 
     /// Whole-workspace reconciliation: walk the same bounded candidate set
-    /// as the build and return every path whose on-disk stamp differs from
-    /// the indexed record (new, modified or deleted). This is the watch's
-    /// fallback for dropped events and the pre-refresh generation check; it
-    /// never re-parses, and `classify_changes` still decides by content
-    /// digest.
-    pub fn scan_changes(&self) -> Result<ChangeClassification, GraphError> {
+    /// as the build and return every path whose CONTENT differs from the
+    /// indexed record.
+    ///
+    /// Size/mtime/identity are only a shortlist: they select suspects, which
+    /// are then BLAKE3-hashed. A file whose stamp matches is still not proof,
+    /// so every poll also hashes a bounded slice of otherwise-clean
+    /// candidates from a rotating shard; over time every material input is
+    /// hashed exactly (the recovery/watcher-overflow sweep). Legacy records
+    /// without a digest are dirty once. No pass re-parses a file.
+    pub fn scan_changes(&mut self) -> Result<ChangeClassification, GraphError> {
         let scan = self.collect_candidates();
         if scan.truncated {
             return Ok(ChangeClassification {
@@ -530,19 +552,188 @@ impl GraphBuilder {
         }
         let candidates: BTreeSet<String> = scan.candidates.into_iter().collect();
         let mut seeds = BTreeSet::new();
+        let mut suspects: Vec<String> = Vec::new();
+        let mut clean: Vec<String> = Vec::new();
         let mut unchanged = 0usize;
+        let mut files_hashed = 0usize;
+
         for path in &candidates {
             let Some(file) = self.files.get(path) else {
+                // New (or newly material) path.
                 seeds.insert(path.clone());
                 continue;
             };
-            let stamp = fs::symlink_metadata(self.root.join(path))
+            let Some(stored) = self.file_meta.get(path).cloned() else {
+                suspects.push(path.clone());
+                continue;
+            };
+            let current = fs::symlink_metadata(self.root.join(path))
                 .ok()
                 .filter(|meta| meta.file_type().is_file())
-                .map(|meta| file_stamp(&meta));
-            match (stamp, self.file_meta.get(path)) {
-                (Some(current), Some(indexed))
-                    if current == *indexed && current.bytes == file.bytes =>
+                .map(|meta| FileRecord::from_metadata(path, &meta));
+            let Some(current) = current else {
+                // Deleted or replaced by a non-file.
+                seeds.insert(path.clone());
+                continue;
+            };
+            if current.size != file.bytes
+                || stored.digest.is_none()
+                || faktor_freshness::needs_hash(Some(&stored), &current)
+            {
+                suspects.push(path.clone());
+            } else {
+                // Metadata shortlist says no suspect; NOT proof of unchanged
+                // bytes (the rotating exact sweep decides that).
+                clean.push(path.clone());
+            }
+        }
+
+        // Metadata suspects: hash them (the incremental path is proportional
+        // to suspects, never the workspace). A legacy digest-less record is
+        // seeded dirty even when the hash matches today.
+        let had_suspects = !suspects.is_empty();
+        let mut suspect_bytes = 0u64;
+        let mut suspects_hashed = 0usize;
+        for path in suspects {
+            if suspects_hashed >= RECOVERY_BATCH_FILES || suspect_bytes >= RECOVERY_BATCH_BYTES {
+                // Conservative overflow: a dirty set above the batch bound
+                // is seeded without reading (never a partial clean).
+                seeds.insert(path);
+                continue;
+            }
+            let Some(stored) = self.file_meta.get(&path).cloned() else {
+                seeds.insert(path);
+                continue;
+            };
+            let legacy = stored.digest.is_none();
+            match faktor_freshness::observe_path(
+                &self.root,
+                &path,
+                self.options.max_file_bytes,
+                None,
+            ) {
+                Observation::Hashed { record, bytes } => {
+                    suspects_hashed += 1;
+                    files_hashed += 1;
+                    suspect_bytes = suspect_bytes.saturating_add(bytes);
+                    let verdict = faktor_freshness::classify(&stored, &record);
+                    match verdict {
+                        Freshness::Clean => {
+                            self.file_meta.insert(path.clone(), record.clone());
+                            unchanged += 1;
+                        }
+                        Freshness::Dirty(_) | Freshness::Unverified => {
+                            seeds.insert(path.clone());
+                        }
+                    }
+                    if legacy {
+                        // Unproven bytes are dirty the first time they are
+                        // seen, even when the hash happens to match. Record
+                        // the just-proven digest so the NEXT scan is not
+                        // legacy again.
+                        self.file_meta.insert(path.clone(), record.clone());
+                        seeds.insert(path);
+                    }
+                }
+                Observation::Missing | Observation::NotRegular => {
+                    seeds.insert(path);
+                }
+                Observation::TooLarge { .. } | Observation::Unreadable { .. } => {
+                    // Cannot prove; conservative dirty seed (the rebuild
+                    // re-applies the content bound).
+                    seeds.insert(path);
+                }
+                Observation::Cancelled => {
+                    seeds.insert(path);
+                }
+            }
+        }
+
+        // Exact recovery sweep: only when the shortlist selected no suspect.
+        // This is the path that finds a same-length/same-mtime rewrite. It is
+        // bounded per poll and rotates over every shard, so no poll hashes
+        // the whole workspace and no file is visited twice per rotation.
+        let mut recovery_bytes = 0u64;
+        if !had_suspects && seeds.is_empty() {
+            let mut recovery_files = 0usize;
+            let mut exhausted_shards = 0u32;
+            while recovery_files < RECOVERY_BATCH_FILES
+                && recovery_bytes < RECOVERY_BATCH_BYTES
+                && exhausted_shards < DEFAULT_SHARDS
+            {
+                let mut progressed = false;
+                for path in &clean {
+                    if recovery_files >= RECOVERY_BATCH_FILES
+                        || recovery_bytes >= RECOVERY_BATCH_BYTES
+                    {
+                        break;
+                    }
+                    if !self.recovery.accepts(path, DEFAULT_SHARDS) {
+                        continue;
+                    }
+                    progressed = true;
+                    self.recovery.advance_to(path);
+                    let Some(stored) = self.file_meta.get(path).cloned() else {
+                        continue;
+                    };
+                    match faktor_freshness::observe_path(
+                        &self.root,
+                        path,
+                        self.options.max_file_bytes,
+                        None,
+                    ) {
+                        Observation::Hashed { record, bytes } => {
+                            recovery_files += 1;
+                            files_hashed += 1;
+                            recovery_bytes = recovery_bytes.saturating_add(bytes);
+                            match faktor_freshness::classify(&stored, &record) {
+                                Freshness::Clean => {
+                                    self.file_meta.insert(path.clone(), record);
+                                    unchanged += 1;
+                                }
+                                Freshness::Dirty(_) | Freshness::Unverified => {
+                                    seeds.insert(path.clone());
+                                }
+                            }
+                        }
+                        Observation::Missing | Observation::NotRegular => {
+                            seeds.insert(path.clone());
+                        }
+                        Observation::TooLarge { .. } | Observation::Unreadable { .. } => {
+                            seeds.insert(path.clone());
+                        }
+                        Observation::Cancelled => {
+                            seeds.insert(path.clone());
+                        }
+                    }
+                }
+                if !progressed {
+                    self.recovery.next_shard(DEFAULT_SHARDS);
+                    exhausted_shards += 1;
+                }
+            }
+        }
+
+        // Renames/deletions: every indexed path absent from the candidate
+        // set is a seed.
+        for path in self.files.keys() {
+            if !candidates.contains(path) {
+                seeds.insert(path.clone());
+            }
+        }
+
+        // Topology manifests are material inputs: hash them every scan (they
+        // are few and bounded) so a same-length/same-mtime manifest edit is
+        // never missed.
+        let manifests = self.capture_manifests();
+        for (path, record) in &manifests {
+            files_hashed += 1;
+            match self.manifest_meta.get(path) {
+                Some(previous)
+                    if matches!(
+                        faktor_freshness::classify(previous, record),
+                        Freshness::Clean
+                    ) =>
                 {
                     unchanged += 1;
                 }
@@ -551,25 +742,16 @@ impl GraphBuilder {
                 }
             }
         }
-        for path in self.files.keys() {
-            if !candidates.contains(path) {
-                seeds.insert(path.clone());
-            }
-        }
-        let manifests = self.capture_manifests();
-        for (path, stamp) in &manifests {
-            if self.manifest_meta.get(path) != Some(stamp) {
-                seeds.insert(path.clone());
-            }
-        }
         for path in self.manifest_meta.keys() {
             if !manifests.contains_key(path) {
                 seeds.insert(path.clone());
             }
         }
+        self.manifest_meta = manifests;
         Ok(ChangeClassification {
             seeds: seeds.into_iter().collect(),
             unchanged,
+            files_hashed,
             truncated: false,
         })
     }
@@ -623,44 +805,78 @@ impl GraphBuilder {
         if parsed.truncated {
             self.report.truncated = true;
         }
-        let hash = format!("blake3:{}", blake3::hash(&bytes).to_hex());
+        let digest = ContentDigest::of(&bytes);
         self.files.insert(
             relative.to_string(),
             GraphFile {
                 path: relative.to_string(),
                 crate_name: crate_info.name.clone(),
                 language,
-                hash,
+                hash: digest.to_string(),
                 bytes: meta.len(),
                 test_target,
             },
         );
         self.records.insert(relative.to_string(), parsed);
-        self.file_meta
-            .insert(relative.to_string(), file_stamp(&meta));
+        self.file_meta.insert(
+            relative.to_string(),
+            FileRecord::from_metadata(relative, &meta).with_digest(digest),
+        );
         Ok(())
     }
 
     /// Classify changed paths by content digest. Only paths whose bytes
     /// differ from the indexed content (new, modified or deleted) become
     /// seeds; byte-identical paths are counted as unchanged and never
-    /// re-parsed. This is what makes a repeated report for the same lifetime
-    /// cheap without suppressing a later real edit.
-    pub fn classify_changes(&self, changed: &[String]) -> Result<ChangeClassification, GraphError> {
+    /// re-parsed. The shared freshness record also refreshes the stored
+    /// digest on a proven-identical read.
+    pub fn classify_changes(
+        &mut self,
+        changed: &[String],
+    ) -> Result<ChangeClassification, GraphError> {
         let mut seeds = BTreeSet::new();
         let mut unchanged = 0usize;
+        let mut files_hashed = 0usize;
         for raw in changed {
             let path = crate::model::validate_rel_path(raw)?;
             if self.workspace.crate_for_path(&path).is_none() || Language::of_path(&path).is_none()
             {
                 continue;
             }
-            match (self.files.get(&path), self.current_content(&path)?) {
-                (Some(file), CurrentContent::Hash(hash)) if file.hash == hash => {
-                    unchanged += 1;
+            let stored = self.file_meta.get(&path).cloned();
+            match faktor_freshness::observe_path(
+                &self.root,
+                &path,
+                self.options.max_file_bytes,
+                None,
+            ) {
+                Observation::Hashed { record, .. } => {
+                    files_hashed += 1;
+                    match stored.as_ref() {
+                        Some(previous)
+                            if matches!(
+                                faktor_freshness::classify(previous, &record),
+                                Freshness::Clean
+                            ) =>
+                        {
+                            unchanged += 1;
+                            self.file_meta.insert(path, record);
+                        }
+                        _ => {
+                            seeds.insert(path);
+                        }
+                    }
                 }
-                (None, CurrentContent::Missing) => unchanged += 1,
-                _ => {
+                Observation::Missing | Observation::NotRegular => {
+                    if self.files.contains_key(&path) || stored.is_some() {
+                        seeds.insert(path);
+                    } else {
+                        unchanged += 1;
+                    }
+                }
+                Observation::TooLarge { .. }
+                | Observation::Unreadable { .. }
+                | Observation::Cancelled => {
                     seeds.insert(path);
                 }
             }
@@ -668,28 +884,9 @@ impl GraphBuilder {
         Ok(ChangeClassification {
             seeds: seeds.into_iter().collect(),
             unchanged,
+            files_hashed,
             truncated: false,
         })
-    }
-
-    fn current_content(&self, path: &str) -> Result<CurrentContent, GraphError> {
-        let absolute = self.root.join(path);
-        let meta = match fs::symlink_metadata(&absolute) {
-            Ok(meta) => meta,
-            Err(_) => return Ok(CurrentContent::Missing),
-        };
-        if !meta.file_type().is_file() {
-            return Ok(CurrentContent::Missing);
-        }
-        if meta.len() > self.options.max_file_bytes {
-            return Ok(CurrentContent::Changed);
-        }
-        let bytes =
-            fs::read(&absolute).map_err(|e| GraphError::Malformed(format!("{path}: {e}")))?;
-        Ok(CurrentContent::Hash(format!(
-            "blake3:{}",
-            blake3::hash(&bytes).to_hex()
-        )))
     }
 
     /// Invalidate per changed file: re-parse the changed files and the files
@@ -749,11 +946,12 @@ impl GraphBuilder {
                 reparsed += 1;
             }
         }
-        self.report.material_inputs = self.material_inputs();
+        let material_inputs = self.material_inputs();
+        self.report.material_inputs = material_inputs.clone();
         if let Some(generation) = material_generation {
-            self.revision = material_revision(self.files.values(), generation);
+            self.revision = material_revision(&material_inputs, generation);
         }
-        let graph = self.assemble();
+        let graph = self.assemble_with_inputs(material_inputs);
         self.dependents = dependents_from(&graph);
         Ok((
             IncrementalStats {
@@ -769,6 +967,10 @@ impl GraphBuilder {
     }
 
     pub fn assemble(&self) -> Graph {
+        self.assemble_with_inputs(self.material_inputs())
+    }
+
+    fn assemble_with_inputs(&self, material_inputs: Vec<MaterialInput>) -> Graph {
         let mut nodes: BTreeMap<String, GraphNode> = BTreeMap::new();
         let mut edges: BTreeMap<(String, crate::model::EdgeKind, String), GraphEdge> =
             BTreeMap::new();
@@ -1212,7 +1414,7 @@ impl GraphBuilder {
             }
         }
 
-        self.finalize_graph(nodes, edges)
+        self.finalize_graph(nodes, edges, material_inputs)
     }
 
     /// Deterministic serialization phase of [`Self::assemble`]: stable
@@ -1221,6 +1423,7 @@ impl GraphBuilder {
         &self,
         nodes: BTreeMap<String, GraphNode>,
         edges: BTreeMap<(String, crate::model::EdgeKind, String), GraphEdge>,
+        material_inputs: Vec<MaterialInput>,
     ) -> Graph {
         // Stable node/edge vectors.
         let mut nodes: Vec<GraphNode> = nodes.into_values().collect();
@@ -1282,7 +1485,7 @@ impl GraphBuilder {
             nodes,
             edges,
             reverse_edges: reverse,
-            material_inputs: self.material_inputs(),
+            material_inputs,
             stats,
             digest: String::new(),
         };
@@ -1404,7 +1607,7 @@ impl ImpactSession {
         let mut graph = builder.build()?;
         let material = graph.revision.is_unspecified();
         let material_generation = if material {
-            let revision = material_revision(graph.files.iter(), 1);
+            let revision = material_revision(&graph.material_inputs, 1);
             graph.revision = revision.clone();
             builder.set_revision(revision);
             graph.seal()?;
@@ -1453,7 +1656,7 @@ impl ImpactSession {
     /// Whole-workspace reconciliation against the indexed state. The caller
     /// turns the returned seeds into a generation observation; this method
     /// never mutates the graph.
-    pub fn scan_material_changes(&self) -> Result<ChangeClassification, GraphError> {
+    pub fn scan_material_changes(&mut self) -> Result<ChangeClassification, GraphError> {
         self.builder.scan_changes()
     }
 
@@ -1642,14 +1845,6 @@ impl ImpactSession {
     }
 }
 
-enum CurrentContent {
-    Missing,
-    /// Content is present but outside the per-file bound; it still requires a
-    /// re-parse so the stale record is removed.
-    Changed,
-    Hash(String),
-}
-
 /// Path-level reverse dependency index for incremental invalidation. Every
 /// import/reference/call/coverage edge contributes one dependency edge from
 /// the target file to the file that must be re-parsed when it changes.
@@ -1685,12 +1880,23 @@ fn dependents_from(graph: &Graph) -> BTreeMap<String, BTreeSet<String>> {
     dependents
 }
 
-fn material_revision<'a>(files: impl Iterator<Item = &'a GraphFile>, generation: u64) -> Revision {
+/// Material identity is a pure function of the complete input inventory:
+/// every scanned source plus every topology manifest/lockfile, sorted by
+/// path, with each content digest. Generation is appended by
+/// [`Revision::material`], so a restart over identical content reproduces the
+/// same digest and a manifest-only edit changes it even when sources do not.
+fn material_revision(inputs: &[MaterialInput], generation: u64) -> Revision {
+    let mut ordered: Vec<&MaterialInput> = inputs.iter().collect();
+    ordered.sort_unstable_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.digest.cmp(&right.digest))
+    });
     let mut hasher = blake3::Hasher::new();
-    for file in files {
-        hasher.update(file.path.as_bytes());
+    for input in ordered {
+        hasher.update(input.path.as_bytes());
         hasher.update(b"\0");
-        hasher.update(file.hash.as_bytes());
+        hasher.update(input.digest.as_bytes());
         hasher.update(b"\0");
     }
     Revision::material(
@@ -2044,4 +2250,77 @@ fn resolve_name<'a>(
         imported_files,
         workspace,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_metadata_only_record_is_dirty_not_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"legacy\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn legacy() {}\n").unwrap();
+        let mut builder = GraphBuilder::new(root, Revision::default()).unwrap();
+        builder.build().unwrap();
+        let record = builder.file_meta.get_mut("src/lib.rs").unwrap();
+        let digest = record.digest.expect("a fresh record carries a digest");
+        record.digest = None;
+        let scan = builder.scan_changes().unwrap();
+        assert!(
+            scan.seeds.iter().any(|path| path == "src/lib.rs"),
+            "a metadata-only legacy record must be dirty: {scan:?}"
+        );
+        assert!(scan.files_hashed >= 1, "the legacy suspect was re-hashed");
+        // Once the digest is recorded, the same untouched tree is not seeded
+        // again by the incremental path.
+        let updated = builder.file_meta.get("src/lib.rs").unwrap();
+        assert_eq!(updated.digest, Some(digest));
+        let next = builder.scan_changes().unwrap();
+        assert!(
+            !next.seeds.iter().any(|path| path == "src/lib.rs"),
+            "the proven-identical file must not churn: {next:?}"
+        );
+    }
+
+    #[test]
+    fn material_revision_hashes_ten_thousand_inputs_in_sorted_order() {
+        let mut inputs: Vec<MaterialInput> = (0..10_000)
+            .map(|index| MaterialInput {
+                path: format!("src/f{index:05}.rs"),
+                digest: format!("blake3:{index:064x}"),
+            })
+            .collect();
+        let canonical = material_revision(&inputs, 1);
+        let started = std::time::Instant::now();
+        inputs.reverse();
+        assert_eq!(
+            material_revision(&inputs, 1),
+            canonical,
+            "the digest must be a pure function of the sorted inventory"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "sorting and hashing 10k inputs must stay bounded: {:?}",
+            started.elapsed()
+        );
+
+        inputs[0].digest = "blake3:changed".into();
+        assert_ne!(
+            material_revision(&inputs, 1),
+            canonical,
+            "every input digest must participate"
+        );
+        assert_ne!(
+            material_revision(&inputs, 2),
+            material_revision(&inputs, 1),
+            "generation is part of the revision identity"
+        );
+    }
 }

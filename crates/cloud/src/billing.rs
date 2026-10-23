@@ -566,11 +566,27 @@ pub struct PlanConfig {
     pub features: BTreeSet<String>,
     #[serde(default)]
     pub limits: BTreeMap<String, u64>,
+    /// Billing period length in milliseconds. `None` uses the deterministic
+    /// default ([`faktor_core::DEFAULT_BILLING_PERIOD_MS`], 30 days). The
+    /// period is anchored at the subscription's `started_ms`, so rollover is
+    /// a pure function of the durable subscription and this configured
+    /// length — never a wall-clock calendar inference.
+    #[serde(default)]
+    pub period_ms: Option<u64>,
 }
 
 impl PlanConfig {
     pub fn validate(&self) -> Result<(), ControlPlaneError> {
         bounded("plan id", &self.plan_id, MAX_USAGE_TEXT)?;
+        if let Some(period_ms) = self.period_ms {
+            if period_ms == 0 || period_ms > faktor_core::MAX_BILLING_PERIOD_MS as u64 {
+                return Err(ControlPlaneError::Malformed(format!(
+                    "plan {} period_ms {period_ms} is outside 1..={}",
+                    self.plan_id,
+                    faktor_core::MAX_BILLING_PERIOD_MS
+                )));
+            }
+        }
         if self.features.len() > MAX_PLAN_FEATURES {
             return Err(ControlPlaneError::Malformed(format!(
                 "plan {} carries more than {MAX_PLAN_FEATURES} features",
@@ -651,6 +667,15 @@ impl BillingConfig {
 
     pub fn plan(&self, plan_id: &str) -> Option<&PlanConfig> {
         self.plans.get(plan_id)
+    }
+
+    /// The effective billing period length of one configured plan.
+    pub fn plan_period_ms(&self, plan_id: &str) -> Option<i64> {
+        self.plan(plan_id).map(|plan| {
+            plan.period_ms
+                .map(|ms| ms.min(i64::MAX as u64) as i64)
+                .unwrap_or(faktor_core::DEFAULT_BILLING_PERIOD_MS)
+        })
     }
 
     /// The category of one provider's spend under this configuration.
@@ -837,12 +862,21 @@ pub struct EntitlementSnapshot {
     #[serde(serialize_with = "crate::money::serialize_money_map")]
     pub limits: BTreeMap<String, u64>,
     pub credits: CreditBalance,
-    /// Folded managed vs BYOK spend (projection of the reservation ledger).
+    /// All-time folded managed vs BYOK spend (analytics; the quota gate
+    /// reads the per-period fields below).
     #[serde(with = "crate::money")]
     pub managed_spend_micro: u64,
     #[serde(with = "crate::money")]
     pub byok_spend_micro: u64,
     pub total_tokens: u64,
+    /// The subscription/plan-derived period the CURRENT quota limits apply
+    /// to (`None` when no subscription/plan resolves).
+    pub period: Option<faktor_core::billing::BillingPeriod>,
+    /// Managed spend settled inside [`Self::period`] (the quota numerator).
+    #[serde(with = "crate::money")]
+    pub period_managed_spend_micro: u64,
+    /// Tokens settled inside [`Self::period`] (the quota numerator).
+    pub period_total_tokens: u64,
     pub in_flight: Vec<InFlightTxn>,
     pub now_ms: i64,
 }
@@ -2104,6 +2138,7 @@ mod tests {
         config.plans.insert(
             "pro".into(),
             PlanConfig {
+                period_ms: None,
                 plan_id: "pro".into(),
                 features: [FEATURE_MANAGED_PROVIDERS.to_string()]
                     .into_iter()
@@ -2137,6 +2172,7 @@ mod tests {
         bad.plans.insert(
             "team".into(),
             PlanConfig {
+                period_ms: None,
                 plan_id: "pro".into(),
                 features: BTreeSet::new(),
                 limits: BTreeMap::new(),

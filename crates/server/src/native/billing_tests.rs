@@ -22,6 +22,7 @@ fn billing_config() -> BillingConfig {
     config.plans.insert(
         "pro".into(),
         PlanConfig {
+            period_ms: None,
             plan_id: "pro".into(),
             features: [FEATURE_MANAGED_PROVIDERS.to_string()]
                 .into_iter()
@@ -433,8 +434,10 @@ async fn usage_fold_matches_the_reservation_ledger_byte_for_byte() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200);
-    let body: serde_json::Value = resp.json().await.unwrap();
+    let status = resp.status();
+    let text = resp.text().await.unwrap();
+    assert_eq!(status, 200, "usage route body: {text}");
+    let body: serde_json::Value = serde_json::from_str(&text).unwrap();
     let fold = &body["fold"];
     assert_money_encoding(&body);
     assert_eq!(
@@ -1783,7 +1786,7 @@ async fn usage_ingestion_bound_refusal_is_typed_and_writes_nothing() {
         next_terminal_event_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
     };
-    let err = super::ingest_local_spend_with_bounds(&state, &organization, 0, 500).unwrap_err();
+    let err = super::backfill_local_spend_with_bounds(&state, &organization, 0, 500).unwrap_err();
     assert_eq!(err.code, "usage_ingest_truncated");
     assert_eq!(err.http_status, 409);
     assert!(
@@ -1795,7 +1798,7 @@ async fn usage_ingestion_bound_refusal_is_typed_and_writes_nothing() {
         "a bounded-window refusal wrote nothing"
     );
     let (appended, scanned) =
-        super::ingest_local_spend_with_bounds(&state, &organization, 2_000, 500).unwrap();
+        super::backfill_local_spend_with_bounds(&state, &organization, 2_000, 500).unwrap();
     assert_eq!(appended, 0);
     assert_eq!(scanned, 1);
 }
@@ -2029,4 +2032,131 @@ async fn usage_ingestion_never_counts_the_request_prefix_as_cache_reads() {
     assert_eq!(total_tokens, 120, "no double count: {body}");
     assert_eq!(totals["events"].as_u64(), Some(3));
     assert_eq!(money(&totals["provider_cost_micro"]), 500);
+}
+
+#[tokio::test]
+async fn a_faulted_list_tasks_refuses_the_legacy_projection_instead_of_underreporting() {
+    let dir = tempfile::tempdir().unwrap();
+    let (handle, control_plane, billing, token, session) = billing_deps(dir.path()).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", handle.addr);
+    let (org, control_token) = bootstrap(&control_plane, "A", "a@a.test");
+    let organization = OrganizationId::try_new(org.clone()).unwrap();
+    provision_account(&billing, &organization);
+
+    let ws = session.create_workspace("/w").unwrap();
+    let sess = session
+        .create_session(ws, "t", "managed-provider", "m")
+        .unwrap();
+    sess.create_task(faktor_session::Task {
+        task_id: sess.task_id().unwrap(),
+        session_id: sess.id(),
+        goal: "metered".into(),
+        acceptance_criteria: vec![],
+        plan: vec![],
+        attachments: Vec::new(),
+        contract: Default::default(),
+        budget: Default::default(),
+        state: faktor_core::state::TaskState::Running,
+        created_ms: NOW_MS,
+        updated_ms: NOW_MS,
+    })
+    .unwrap();
+
+    // Corrupt one task row behind the store's back so `list_tasks()` returns
+    // a store/corruption error (NOT a typed NotFound, which is the only
+    // skippable case).
+    let conn = rusqlite::Connection::open(dir.path().join("store").join("faktor-plus.db")).unwrap();
+    let changed = conn
+        .execute(
+            "UPDATE task SET acceptance_criteria = 'not-json' WHERE session_id = ?1",
+            rusqlite::params![sess.id().raw() as i64],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+
+    let response = client
+        .get(format!("{base}/native/usage?org={org}"))
+        .bearer_auth(&token)
+        .header("x-faktor-control-token", &control_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        500,
+        "a faulted task listing must refuse the projection with a store failure, got {}",
+        response.status()
+    );
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "store_error", "{body}");
+    assert_eq!(
+        session.store().billing_outbox_after(0, 10).unwrap().len(),
+        0,
+        "the refusal happens before any outbox write (no partial underreport)"
+    );
+}
+
+/// Independent final-wave probe: a task row that decodes as CORRUPT (not a
+/// vanished session) must refuse the legacy projection with a typed 500 and
+/// write nothing. The wave's own test corrupts `acceptance_criteria`; this
+/// probe corrupts the plan column instead, so a partial underreport can never
+/// hide behind the only skippable NotFound arm.
+#[tokio::test]
+async fn a_corrupt_task_plan_refuses_usage_with_a_typed_500_and_no_outbox_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let (handle, control_plane, billing, token, session) = billing_deps(dir.path()).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", handle.addr);
+    let (org, control_token) = bootstrap(&control_plane, "A", "a@a.test");
+    let organization = OrganizationId::try_new(org.clone()).unwrap();
+    provision_account(&billing, &organization);
+
+    let ws = session.create_workspace("/w").unwrap();
+    let sess = session
+        .create_session(ws, "t", "managed-provider", "m")
+        .unwrap();
+    sess.create_task(faktor_session::Task {
+        task_id: sess.task_id().unwrap(),
+        session_id: sess.id(),
+        goal: "metered".into(),
+        acceptance_criteria: vec![],
+        plan: vec![],
+        attachments: Vec::new(),
+        contract: Default::default(),
+        budget: Default::default(),
+        state: faktor_core::state::TaskState::Running,
+        created_ms: NOW_MS,
+        updated_ms: NOW_MS,
+    })
+    .unwrap();
+
+    let conn = rusqlite::Connection::open(dir.path().join("store").join("faktor-plus.db")).unwrap();
+    let changed = conn
+        .execute(
+            "UPDATE task SET plan = 'not-json' WHERE session_id = ?1",
+            rusqlite::params![sess.id().raw() as i64],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+
+    let response = client
+        .get(format!("{base}/native/usage?org={org}"))
+        .bearer_auth(&token)
+        .header("x-faktor-control-token", &control_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        500,
+        "a corrupt task row is a store failure, not a skippable absence"
+    );
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "store_error", "{body}");
+    assert_eq!(
+        session.store().billing_outbox_after(0, 10).unwrap().len(),
+        0,
+        "the refusal happens before any outbox write"
+    );
 }

@@ -14,12 +14,14 @@
 //!
 //! # Fingerprint coverage
 //!
-//! The stat-only fingerprint walk is capped too, but a capped fingerprint may
-//! NEVER report the workspace "fully clean". Its coverage is persisted
+//! The fingerprint walk is capped too, but a capped fingerprint may NEVER
+//! report the workspace "fully clean". Its coverage is persisted
 //! ([`FingerprintCoverage`]) and subsequent scans rotate through path shards
 //! so no suffix of the tree is perpetually ignored; while coverage is
 //! incomplete a "no differences seen" result keeps the workspace pending and
-//! schedules the next shard immediately.
+//! schedules the next shard immediately. Size/mtime/identity only shortlist
+//! suspects; a metadata-shortlist round always yields to an exact BLAKE3
+//! recovery round before the workspace can be declared clean.
 //!
 //! # Evidence freshness
 //!
@@ -161,7 +163,8 @@ impl ScanCursor {
     }
 }
 
-/// Durable coverage of the stat-only fingerprint scan of one generation.
+/// Durable coverage of the content-freshness fingerprint scan of one
+/// generation (metadata shortlist + exact BLAKE3 recovery).
 ///
 /// A verification ROUND is complete only when every shard was visited to
 /// exhaustion; while a round is incomplete the workspace can never be
@@ -193,6 +196,13 @@ pub struct FingerprintCoverage {
     /// being recorded, not compared).
     #[serde(default = "verify_default")]
     pub verify: bool,
+    /// True when the round hashes EVERY visited material file (exact BLAKE3
+    /// recovery sweep). False for a metadata-shortlist round: equal
+    /// size/mtime only selects suspects, so such a round is never proof of
+    /// unchanged bytes and transitions into an exact recovery round instead
+    /// of reporting clean. Defaults to true for pre-field envelopes.
+    #[serde(default = "exact_default")]
+    pub exact: bool,
     /// Continuation cursor PER SHARD (index = shard id). A single round
     /// cursor would advance past files belonging to other shards and then
     /// "complete" those shards with zero entries, silently losing their
@@ -208,6 +218,11 @@ pub struct FingerprintCoverage {
 /// Legacy/default verification flag: an existing complete fingerprint is a
 /// verified baseline.
 fn verify_default() -> bool {
+    true
+}
+
+/// Legacy/default exactness flag: pre-field rounds hashed every visited file.
+fn exact_default() -> bool {
     true
 }
 
@@ -231,6 +246,7 @@ impl FingerprintCoverage {
             epoch: 0,
             shards_done: (1u64 << FINGERPRINT_SHARDS) - 1,
             verify: true,
+            exact: true,
             cursors: Vec::new(),
             truncated_reason: None,
         }
@@ -275,6 +291,7 @@ impl FingerprintCoverage {
             epoch: 0,
             shards_done: 0,
             verify: true,
+            exact: true,
             cursors: Vec::new(),
             truncated_reason: Some("fingerprint_round_started".to_string()),
         }
@@ -287,6 +304,22 @@ impl FingerprintCoverage {
             epoch,
             ..Self::round(round_start)
         }
+    }
+
+    /// A metadata-SHORTLIST verification round: size/mtime/identity select
+    /// suspects, and only those are hashed. Completing such a round is never
+    /// clean proof; the service follows it with an exact recovery round.
+    pub fn shortlist_round_at_epoch(round_start: u32, epoch: u64) -> Self {
+        Self {
+            exact: false,
+            ..Self::round_at_epoch(round_start, epoch)
+        }
+    }
+
+    /// True only when the current round is complete AND content-exact.
+    /// Metadata-only completeness is explicitly not clean.
+    pub fn verified_complete(&self) -> bool {
+        self.complete && self.exact
     }
 
     /// The continuation cursor of one shard (empty = start of that shard).
@@ -399,10 +432,11 @@ impl FingerprintCoverage {
     }
 }
 
-/// Stable shard assignment of one workspace-relative path.
+/// Stable shard assignment of one workspace-relative path (the shared
+/// freshness authority owns the assignment so index and impact rotate over
+/// the same shards).
 pub fn fingerprint_shard(path: &str) -> u32 {
-    let hash = blake3::hash(path.as_bytes());
-    u32::from(hash.as_bytes()[0]) % FINGERPRINT_SHARDS
+    faktor_freshness::shard_of(path, FINGERPRINT_SHARDS)
 }
 
 /// Typed freshness of one evidence package (audit 16).
@@ -445,7 +479,7 @@ impl EvidenceFreshness {
     ) -> Self {
         if coverage.is_legacy_unknown() || fingerprint.is_legacy_unknown() {
             EvidenceFreshness::LegacyUnknown
-        } else if !coverage.complete || !fingerprint.complete {
+        } else if !coverage.complete || !fingerprint.verified_complete() {
             EvidenceFreshness::Partial
         } else if rebuilding {
             EvidenceFreshness::StaleWhileRebuilding

@@ -23,6 +23,7 @@ use faktor_mcp::remote::{
 };
 use faktor_mcp::{McpConfig, McpConnection, McpServer};
 use faktor_terminal::ProcessSupervisor;
+use tokio::sync::watch;
 
 use super::foundation::foundation_error;
 use super::foundation_ext::{conflict, foundation};
@@ -30,14 +31,44 @@ use super::*;
 
 // ------------------------------------------------------------------- MCP
 
-/// Owns the live MCP connections for this daemon. Stdio starts are
-/// serialized and explicit; stopping kills the child's process group through
-/// the daemon's ONE supervisor. Streamable HTTP connections are supervised by
-/// the checked egress client (destination allowlist, no environment proxy,
-/// full-body secret scan) and carry no local process.
+/// One server's lifecycle state. `Starting` is observed by every caller that
+/// joins the same in-flight connect (single-flight); the map lock is only
+/// held to reserve, observe or publish this value, never across I/O.
+#[derive(Clone)]
+enum SlotState {
+    Starting,
+    Ready(Arc<McpConnection>),
+    Failed(Error),
+}
+
+struct ServerSlot {
+    state: watch::Sender<SlotState>,
+}
+
+impl ServerSlot {
+    fn new() -> Arc<Self> {
+        let (state, _receiver) = watch::channel(SlotState::Starting);
+        Arc::new(Self { state })
+    }
+}
+
+fn ready_connection(slot: &ServerSlot) -> Option<Arc<McpConnection>> {
+    match &*slot.state.borrow() {
+        SlotState::Ready(connection) => Some(connection.clone()),
+        _ => None,
+    }
+}
+
+/// Owns the live MCP connections for this daemon. Stdio starts are explicit
+/// and single-flight per server; stopping kills the child's process group
+/// through the daemon's ONE supervisor. Streamable HTTP connections are
+/// supervised by the checked egress client (destination allowlist, no
+/// environment proxy, full-body secret scan) and carry no local process.
+/// Each server has its own slot, so a slow remote handshake never blocks a
+/// different server's start, stop or catalog read.
 pub struct McpRuntime {
     supervisor: Option<Arc<ProcessSupervisor>>,
-    live: tokio::sync::Mutex<HashMap<String, Arc<McpConnection>>>,
+    live: tokio::sync::Mutex<HashMap<String, Arc<ServerSlot>>>,
     /// TEST-ONLY loopback client (the production constructor always builds
     /// the checked external-address client inside `RemoteMcpServer`).
     #[cfg(test)]
@@ -78,17 +109,98 @@ impl McpRuntime {
                 "this MCP server is untrusted; review executable/origin and trust it before starting",
             ));
         }
-        let mut live = self.live.lock().await;
-        if let Some(connection) = live.get(&record.id) {
-            if connection.is_alive() {
-                let tools = connection.list_tools().await?;
-                let tools = tools_json_bounded(tools, record.output_cap_bytes)
-                    .map_err(|message| mcp_provider_error("mcp_tools_failed", message))?;
-                return Ok(tools);
-            }
-            live.remove(&record.id);
+        enum Role {
+            Reuse(Arc<McpConnection>),
+            Wait(watch::Receiver<SlotState>),
+            Connect(Arc<ServerSlot>),
         }
-        let connection = match record.transport.as_str() {
+        // Reserve or observe under the map lock, then release it before any
+        // connect/initialize/discovery I/O. Different servers never share a
+        // slot; concurrent starts of the same server share one connection.
+        let role = {
+            let mut live = self.live.lock().await;
+            match live.get(&record.id).cloned() {
+                Some(slot) => {
+                    let state = slot.state.borrow().clone();
+                    match state {
+                        SlotState::Ready(connection) if connection.is_alive() => {
+                            Role::Reuse(connection)
+                        }
+                        SlotState::Starting => Role::Wait(slot.state.subscribe()),
+                        _ => {
+                            live.remove(&record.id);
+                            let slot = ServerSlot::new();
+                            live.insert(record.id.clone(), slot.clone());
+                            Role::Connect(slot)
+                        }
+                    }
+                }
+                None => {
+                    let slot = ServerSlot::new();
+                    live.insert(record.id.clone(), slot.clone());
+                    Role::Connect(slot)
+                }
+            }
+        };
+        match role {
+            Role::Reuse(connection) => self.discover(&connection, record).await,
+            Role::Wait(mut receiver) => loop {
+                if receiver.changed().await.is_err() {
+                    return Err(Error::internal(format!(
+                        "MCP server {} start coordinator disappeared",
+                        record.id
+                    )));
+                }
+                let state = receiver.borrow_and_update().clone();
+                match state {
+                    SlotState::Starting => continue,
+                    SlotState::Ready(connection) => {
+                        return self.discover(&connection, record).await
+                    }
+                    SlotState::Failed(error) => return Err(error),
+                }
+            },
+            Role::Connect(slot) => {
+                let connection = match self.connect(record, env, vault).await {
+                    Ok(connection) => Arc::new(connection),
+                    Err(error) => {
+                        self.fail_slot(&record.id, &slot, error.clone()).await;
+                        return Err(error);
+                    }
+                };
+                if !self.is_current(&record.id, &slot).await {
+                    connection.close().await;
+                    return Err(Error::cancelled());
+                }
+                let tools = match self.discover(&connection, record).await {
+                    Ok(tools) => tools,
+                    Err(error) => {
+                        connection.close().await;
+                        self.fail_slot(&record.id, &slot, error.clone()).await;
+                        return Err(error);
+                    }
+                };
+                if !self
+                    .publish_ready(&record.id, &slot, connection.clone())
+                    .await
+                {
+                    // stop() won the race: never publish a connection the
+                    // runtime no longer tracks.
+                    connection.close().await;
+                    return Err(Error::cancelled());
+                }
+                Ok(tools)
+            }
+        }
+    }
+
+    async fn connect(
+        &self,
+        record: &McpServerRecord,
+        env: Vec<(String, String)>,
+        vault: Option<&faktor_foundation::SecretVault>,
+    ) -> Result<McpConnection, Error> {
+        match record.transport.as_str() {
             "stdio" => {
                 let supervisor = self.supervisor.clone().ok_or_else(|| {
                     mcp_provider_error(
@@ -106,7 +218,7 @@ impl McpRuntime {
                     supervisor,
                 )
                 .await?;
-                McpConnection::Stdio(server)
+                Ok(McpConnection::Stdio(server))
             }
             "streamable_http" => {
                 let endpoint = record.endpoint.clone().ok_or_else(|| {
@@ -157,45 +269,80 @@ impl McpRuntime {
                 };
                 #[cfg(not(test))]
                 let remote = RemoteMcpServer::connect(config).await?;
-                McpConnection::Remote(remote)
+                Ok(McpConnection::Remote(remote))
             }
-            other => {
-                return Err(mcp_provider_error(
-                    "mcp_transport_invalid",
-                    format!("unsupported MCP transport {other:?}"),
-                ))
-            }
-        };
-        let connection = Arc::new(connection);
-        let tools = match connection.list_tools().await {
-            Ok(tools) => tools,
-            Err(error) => {
-                connection.close().await;
-                return Err(error);
-            }
-        };
-        let tools = match tools_json_bounded(tools, record.output_cap_bytes) {
-            Ok(tools) => tools,
-            Err(message) => {
-                connection.close().await;
-                return Err(mcp_provider_error("mcp_tools_failed", message));
-            }
-        };
-        live.insert(record.id.clone(), connection);
-        Ok(tools)
+            other => Err(mcp_provider_error(
+                "mcp_transport_invalid",
+                format!("unsupported MCP transport {other:?}"),
+            )),
+        }
     }
 
-    pub(crate) async fn stop(&self, id: &str) -> bool {
-        let connection = {
-            let mut live = self.live.lock().await;
-            live.remove(id)
-        };
-        if let Some(connection) = connection {
-            connection.close().await;
+    async fn discover(
+        &self,
+        connection: &McpConnection,
+        record: &McpServerRecord,
+    ) -> Result<Vec<serde_json::Value>, Error> {
+        let tools = connection.list_tools().await?;
+        tools_json_bounded(tools, record.output_cap_bytes)
+            .map_err(|message| mcp_provider_error("mcp_tools_failed", message))
+    }
+
+    async fn is_current(&self, id: &str, slot: &Arc<ServerSlot>) -> bool {
+        let live = self.live.lock().await;
+        live.get(id)
+            .is_some_and(|current| Arc::ptr_eq(current, slot))
+    }
+
+    async fn publish_ready(
+        &self,
+        id: &str,
+        slot: &Arc<ServerSlot>,
+        connection: Arc<McpConnection>,
+    ) -> bool {
+        let live = self.live.lock().await;
+        if live
+            .get(id)
+            .is_some_and(|current| Arc::ptr_eq(current, slot))
+        {
+            slot.state.send_replace(SlotState::Ready(connection));
             true
         } else {
             false
         }
+    }
+
+    async fn fail_slot(&self, id: &str, slot: &Arc<ServerSlot>, error: Error) {
+        let mut live = self.live.lock().await;
+        if live
+            .get(id)
+            .is_some_and(|current| Arc::ptr_eq(current, slot))
+        {
+            slot.state.send_replace(SlotState::Failed(error));
+            live.remove(id);
+        }
+    }
+
+    pub(crate) async fn stop(&self, id: &str) -> bool {
+        let slot = {
+            let mut live = self.live.lock().await;
+            live.remove(id)
+        };
+        let Some(slot) = slot else {
+            return false;
+        };
+        let state = slot.state.borrow().clone();
+        match state {
+            SlotState::Ready(connection) => connection.close().await,
+            SlotState::Starting => {
+                // Wake single-flight waiters immediately. The owner sees that
+                // its reservation is gone and closes the connection it built.
+                slot.state
+                    .send_replace(SlotState::Failed(Error::cancelled()));
+            }
+            SlotState::Failed(_) => {}
+        }
+        true
     }
 
     pub(crate) async fn tools(
@@ -205,7 +352,7 @@ impl McpRuntime {
     ) -> Result<Option<Vec<serde_json::Value>>, Error> {
         let connection = {
             let live = self.live.lock().await;
-            live.get(id).cloned()
+            live.get(id).and_then(|slot| ready_connection(slot))
         };
         match connection {
             Some(connection) if connection.is_alive() => {
@@ -240,7 +387,7 @@ impl McpRuntime {
     ) -> Result<Option<serde_json::Value>, Error> {
         let connection = {
             let live = self.live.lock().await;
-            live.get(id).cloned()
+            live.get(id).and_then(|slot| ready_connection(slot))
         };
         let Some(connection) = connection.filter(|connection| connection.is_alive()) else {
             return Ok(None);
@@ -296,13 +443,19 @@ impl McpRuntime {
 
     pub(crate) async fn health(&self, id: &str) -> Option<bool> {
         let live = self.live.lock().await;
-        live.get(id).map(|connection| connection.is_alive())
+        let slot = live.get(id)?;
+        let state = slot.state.borrow().clone();
+        match state {
+            SlotState::Ready(connection) => Some(connection.is_alive()),
+            SlotState::Failed(_) => Some(false),
+            SlotState::Starting => None,
+        }
     }
 
     pub(crate) async fn capabilities(&self, id: &str) -> Option<RemoteCapabilities> {
         let connection = {
             let live = self.live.lock().await;
-            live.get(id).cloned()
+            live.get(id).and_then(|slot| ready_connection(slot))
         };
         match connection {
             Some(connection) if connection.is_alive() => connection.capabilities().await,

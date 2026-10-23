@@ -10,6 +10,7 @@ import dev.faktor.shared.NativeApiException
 import dev.faktor.shared.asciiLowerCase
 import java.nio.file.Files
 import java.nio.file.Paths
+import java.util.concurrent.TimeUnit
 
 /** Fake PasswordSafe rows keyed by "<service>|<account>" (endpoint|org). */
 private class FakePasswordSafe {
@@ -180,6 +181,7 @@ object ControlPlaneCredentialSmoke {
                 assertTrue(service.controlPlaneTokenConfigured(), "the running service picks the token up")
                 assertEquals("", panel.settingsView().controlPlaneTokenText())
                 panel.settingsView().submitControlPlaneLogout()
+                assertTrue(panel.awaitSignOutIdleForTest(), "the background sign-out must finish")
                 assertEquals(0, backing.rows.size, "sign-out removes the PasswordSafe row")
                 assertEquals(null, sessionStore.sessionId, "sign-out clears the dead session id")
                 assertTrue(!service.controlPlaneTokenConfigured())
@@ -289,6 +291,7 @@ object ControlPlaneCredentialSmoke {
                 service.setControlToken("old-token")
                 val panel = FaktorChatPanel(service, credentialStore, scopeStore, sessionStore)
                 panel.settingsView().submitControlPlaneLogout()
+                assertTrue(panel.awaitSignOutIdleForTest(), "the background sign-out must finish")
                 assertEquals(
                     listOf("old-token"), presented,
                     "the CAPTURED token must be presented, never the rotated one"
@@ -307,6 +310,158 @@ object ControlPlaneCredentialSmoke {
                     panel.settingsView().controlPlaneStatusText().contains("rotated"),
                     panel.settingsView().controlPlaneStatusText()
                 )
+                panel.shutdown()
+            } finally {
+                service.stop()
+                server.stop(0)
+                process.destroyForcibly()
+            }
+        }
+
+
+        step("dead daemon: sign-out runs off the EDT with a timeout and surfaces typed failure") {
+            val backing = FakePasswordSafe()
+            val credentialStore = ControlPlaneCredentialStore(backing.vault())
+            val scope = ControlPlaneScope("https://cp.example", "org-dead")
+            credentialStore.store(scope, "dead-daemon-token")
+            val scopeStore = FakeScopeStore(scope)
+            val sessionStore = FakeSessionStore("ses-dead")
+            val release = java.util.concurrent.CountDownLatch(1)
+            val server = com.sun.net.httpserver.HttpServer.create(
+                java.net.InetSocketAddress("127.0.0.1", 0), 0
+            )
+            server.createContext("/native/health") { exchange ->
+                respondJson(exchange, 200, "{\"ok\":true,\"version\":\"9.9.9\"}")
+            }
+            server.createContext("/native/ready") { exchange ->
+                respondJson(exchange, 200, "{\"ready\":true}")
+            }
+            server.createContext("/native/sso/logout") { exchange ->
+                // The daemon accepts the request but never answers: a dead
+                // daemon must not freeze the EDT.
+                release.await(5, TimeUnit.SECONDS)
+                try {
+                    respondJson(exchange, 200, "{\"ok\":true,\"revoked\":true}")
+                } catch (_: Exception) {
+                    // The client already timed out and closed the exchange.
+                }
+            }
+            server.start()
+            val java = Paths.get(
+                System.getProperty("java.home"), "bin",
+                if (asciiLowerCase(System.getProperty("os.name", "")).contains("win")) "java.exe" else "java"
+            ).toString()
+            val process = ProcessBuilder(java, "-version").start()
+            val service = FaktorFrontendService(
+                Paths.get("unused"),
+                Paths.get(System.getProperty("java.io.tmpdir"), "faktor-credential-dead")
+            )
+            try {
+                val connection = dev.faktor.backend.BackendConnection(
+                    server.address.port, "smoke-password", process,
+                    dev.faktor.backend.StdoutSink(process)
+                )
+                service.attachConnection(connection, stopAction = { process.destroyForcibly() })
+                service.setControlToken("dead-daemon-token")
+                val panel = FaktorChatPanel(
+                    service, credentialStore, scopeStore, sessionStore,
+                    signOutRevokeTimeoutMs = 1_200L
+                )
+                val started = System.nanoTime()
+                javax.swing.SwingUtilities.invokeAndWait {
+                    panel.settingsView().submitControlPlaneLogout()
+                }
+                val edtMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)
+                assertTrue(
+                    edtMillis < 600,
+                    "sign-out must return to the EDT immediately (a synchronous revoke would " +
+                        "block for the 1200ms timeout), took ${edtMillis}ms"
+                )
+                assertTrue(
+                    !panel.signOutEnabledForTest(),
+                    "the sign-out button is disabled while the worker is in flight"
+                )
+                assertTrue(panel.awaitSignOutIdleForTest(10_000), "the timed-out sign-out must finish")
+                val status = panel.settingsView().controlPlaneStatusText()
+                assertTrue(panel.signOutEnabledForTest(), "the button is re-enabled after completion")
+                assertTrue(
+                    status.contains("timeout") || status.contains("failed"),
+                    "the typed revoke failure must be surfaced: $status"
+                )
+                assertTrue(backing.rows.isEmpty(), "the local credential is still removed")
+                assertEquals(null, sessionStore.sessionId, "the dead session id is cleared")
+                assertTrue(!service.controlPlaneTokenConfigured(), "the live token is cleared")
+                panel.shutdown()
+            } finally {
+                release.countDown()
+                service.stop()
+                server.stop(0)
+                process.destroyForcibly()
+            }
+        }
+
+        step("rapid double-click sign-out is single-flight, off the EDT, and revokes once") {
+            val backing = FakePasswordSafe()
+            val credentialStore = ControlPlaneCredentialStore(backing.vault())
+            val scope = ControlPlaneScope("https://cp.example", "org-double")
+            credentialStore.store(scope, "double-click-token")
+            val scopeStore = FakeScopeStore(scope)
+            val sessionStore = FakeSessionStore("ses-double")
+            val logoutCalls = java.util.concurrent.atomic.AtomicInteger(0)
+            val server = com.sun.net.httpserver.HttpServer.create(
+                java.net.InetSocketAddress("127.0.0.1", 0), 0
+            )
+            server.createContext("/native/health") { exchange ->
+                respondJson(exchange, 200, "{\"ok\":true,\"version\":\"9.9.9\"}")
+            }
+            server.createContext("/native/ready") { exchange ->
+                respondJson(exchange, 200, "{\"ready\":true}")
+            }
+            server.createContext("/native/sso/logout") { exchange ->
+                logoutCalls.incrementAndGet()
+                // Hold the revoke long enough that a second click lands while
+                // the worker is in flight.
+                Thread.sleep(300)
+                respondJson(exchange, 200, "{\"ok\":true,\"revoked\":true}")
+            }
+            server.start()
+            val java = Paths.get(
+                System.getProperty("java.home"), "bin",
+                if (asciiLowerCase(System.getProperty("os.name", "")).contains("win")) "java.exe" else "java"
+            ).toString()
+            val process = ProcessBuilder(java, "-version").start()
+            val service = FaktorFrontendService(
+                Paths.get("unused"),
+                Paths.get(System.getProperty("java.io.tmpdir"), "faktor-credential-double")
+            )
+            try {
+                val connection = dev.faktor.backend.BackendConnection(
+                    server.address.port, "smoke-password", process,
+                    dev.faktor.backend.StdoutSink(process)
+                )
+                service.attachConnection(connection, stopAction = { process.destroyForcibly() })
+                service.setControlToken("double-click-token")
+                val panel = FaktorChatPanel(service, credentialStore, scopeStore, sessionStore)
+                val started = System.nanoTime()
+                javax.swing.SwingUtilities.invokeAndWait {
+                    panel.settingsView().submitControlPlaneLogout()
+                    panel.settingsView().submitControlPlaneLogout()
+                }
+                val edtMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)
+                assertTrue(
+                    edtMillis < 600,
+                    "two sign-out clicks must return to the EDT immediately, took ${edtMillis}ms"
+                )
+                assertTrue(
+                    !panel.signOutEnabledForTest(),
+                    "the sign-out control stays disabled while the worker is in flight"
+                )
+                assertTrue(panel.awaitSignOutIdleForTest(10_000), "the sign-out must finish")
+                assertTrue(panel.signOutEnabledForTest(), "the control is re-enabled once")
+                assertEquals(1, logoutCalls.get(), "two clicks must issue exactly one remote revoke")
+                assertTrue(backing.rows.isEmpty(), "the credential is removed exactly once")
+                assertEquals(null, sessionStore.sessionId, "the local session id is cleared")
+                assertTrue(!service.controlPlaneTokenConfigured(), "the live token is cleared")
                 panel.shutdown()
             } finally {
                 service.stop()
@@ -354,6 +509,7 @@ object ControlPlaneCredentialSmoke {
                     // The panel gesture still removes the local credential
                     // and clears the live client token.
                     panel.settingsView().submitControlPlaneLogout()
+                    assertTrue(panel.awaitSignOutIdleForTest(), "the background sign-out must finish")
                     assertEquals(0, backing.rows.size, "sign-out removes the PasswordSafe row")
                     assertEquals(null, sessionStore.sessionId)
                     assertTrue(!service.controlPlaneTokenConfigured())

@@ -65,8 +65,8 @@ use faktor_terminal::ProcessSupervisor;
 
 use crate::cold::ColdEvidenceProvider;
 use crate::coverage::{
-    fingerprint_shard, EvidenceFreshness, EvidencePackageMeta, FingerprintCoverage, IndexCoverage,
-    IndexCoverageSnapshot, ScanCursor, ScanFrame, FINGERPRINT_SHARDS,
+    EvidenceFreshness, EvidencePackageMeta, FingerprintCoverage, IndexCoverage,
+    IndexCoverageSnapshot, ScanCursor, ScanFrame,
 };
 use crate::embedding::{
     apply_embeddings, EmbeddingIndex, EmbeddingModel, EmbeddingSource,
@@ -80,6 +80,13 @@ use crate::state::{
     JOURNAL_VERIFY_DIRTY,
 };
 use crate::WorkspaceIndex;
+
+mod freshness;
+#[cfg(test)]
+use self::freshness::FingerprintRoundPass;
+use self::freshness::{
+    apply_fingerprint_round_pass, fingerprint_shared_pass, MAX_FAST_TOUCHED_PATHS,
+};
 
 /// Generations kept on disk: publishing `Ready{N}` prunes everything
 /// `<= N - KEEP_GENERATIONS`, so `N-1` and `N` remain.
@@ -149,11 +156,13 @@ pub const BATCH_MAX_BYTES: usize = 8 * 1024 * 1024;
 /// Largest single file a batch will index (content, not stat size).
 pub const SCAN_MAX_FILE_BYTES: u64 = 1_000_000;
 
-/// Per-pass fingerprint budgets (audit 6): one shard walk pass is bounded;
-/// the persisted [`FingerprintCoverage`] carries the round state and the
-/// next pass continues/rotates. A capped pass is NEVER reported clean.
+/// Per-pass fingerprint budgets (audit 6): one pass is bounded in files,
+/// directories and hashed bytes; the persisted [`FingerprintCoverage`]
+/// carries the round state and the next pass continues/rotates. A capped
+/// pass is NEVER reported clean.
 pub const FP_BATCH_FILES: usize = 4_096;
 pub const FP_BATCH_DIRS: usize = 2_048;
+pub const FP_BATCH_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Maximum generation-file bytes read back at load (bounded RAM).
 const MAX_GENERATION_FILE_BYTES: u64 = 512 * 1024 * 1024;
@@ -175,10 +184,12 @@ pub struct ServiceConfig {
     pub batch_dirs: usize,
     /// Content batch budget: maximum bytes one batch reads.
     pub batch_bytes: usize,
-    /// Fingerprint pass budget: maximum shard files one pass stats.
+    /// Fingerprint pass budget: maximum shard files one pass visits.
     pub fp_batch_files: usize,
     /// Fingerprint pass budget: maximum directories one pass opens.
     pub fp_batch_dirs: usize,
+    /// Fingerprint pass budget: maximum bytes one pass hashes.
+    pub fp_batch_bytes: u64,
 }
 
 impl Default for ServiceConfig {
@@ -192,6 +203,7 @@ impl Default for ServiceConfig {
             batch_bytes: BATCH_MAX_BYTES,
             fp_batch_files: FP_BATCH_FILES,
             fp_batch_dirs: FP_BATCH_DIRS,
+            fp_batch_bytes: FP_BATCH_BYTES,
         }
     }
 }
@@ -350,6 +362,16 @@ struct LiveWs {
     /// The published generation's content is not loaded yet.
     pending_load: bool,
     last_fp_check: Instant,
+    /// Workspace-relative paths named by watcher events since the last
+    /// drain. The fast path hashes exactly these on the event, before any
+    /// metadata-shortlist round can treat equal size/mtime as clean.
+    touched: std::collections::BTreeSet<String>,
+    /// More events arrived than the fast-path bound (or an unrepresentable
+    /// event): the next decision must run an exact recovery sweep.
+    touch_overflow: bool,
+    /// A caller (or a lost/unknown event source) demanded an exact sharded
+    /// BLAKE3 sweep rather than a metadata shortlist.
+    recovery_pending: bool,
 }
 
 struct Inner {
@@ -428,25 +450,6 @@ struct ContentBatch {
     truncated_reason: Option<String>,
     /// The cancellation token fired during the walk (audit 20): the batch
     /// is NOT indexed and the build is abandoned, never published.
-    cancelled: bool,
-}
-
-/// Outcome of one bounded fingerprint round pass (audit 6, interleaved):
-/// ONE physical walk collects the entries of every shard the current round
-/// still owes.
-struct FingerprintRoundPass {
-    /// Entries per shard id (only incomplete shards have buckets; every
-    /// bucket is sorted by path after the walk).
-    entries: Vec<Vec<FingerprintEntry>>,
-    /// True when the walk exhausted the tree: every remaining shard was
-    /// visited to exhaustion by THIS pass.
-    walk_completed: bool,
-    /// The shared continuation cursor (resume exactly after the last
-    /// consumed entry; the stopping entry is re-visited).
-    cursor: ScanCursor,
-    reason: Option<String>,
-    /// The cancellation token fired during the pass (audit 20): nothing is
-    /// merged and the build is abandoned, never published.
     cancelled: bool,
 }
 
@@ -1216,6 +1219,9 @@ impl IndexService {
                     dirty_now: false,
                     pending_load,
                     last_fp_check: Instant::now() - cfg.fingerprint_interval,
+                    touched: std::collections::BTreeSet::new(),
+                    touch_overflow: false,
+                    recovery_pending: false,
                 },
             );
         }
@@ -1366,6 +1372,9 @@ impl IndexService {
             let mut live = lock_recover(&self.inner.live);
             if let Some(l) = live.get_mut(&workspace) {
                 l.pending = true;
+                // An explicit kick has no trusted event path to hash: the
+                // next round must be the exact recovery sweep.
+                l.recovery_pending = true;
             }
         }
         self.inner.notify.notify_one();
@@ -1426,7 +1435,7 @@ impl IndexService {
                 let fingerprint_complete = l
                     .fingerprint_coverage
                     .as_ref()
-                    .map(|c| c.complete)
+                    .map(|c| c.verified_complete())
                     .unwrap_or(false);
                 ready_state
                     && !l.pending
@@ -1460,30 +1469,64 @@ impl IndexService {
         workspace: WorkspaceId,
         cancel: Option<&CancellationToken>,
     ) -> Result<(), IndexError> {
-        // 1. Drain this workspace's watcher channel (lossy by design; all
-        // events coalesce into ONE pending flag — a 1000-event storm is one
-        // dirty mark and one rebuild).
-        {
+        // 1. Drain this workspace's watcher channel. Events still coalesce
+        // for the durable machine, but their PATHS are retained (bounded) so
+        // the fast path can BLAKE3 exactly the touched files instead of
+        // trusting size/mtime.
+        let saw_events = {
             let mut live = lock_recover(&self.inner.live);
-            if let Some(l) = live.get_mut(&workspace) {
-                if let Some(handle) = &l.handle {
-                    let mut rx = lock_recover(handle.events());
+            match live.get_mut(&workspace) {
+                Some(l) => {
+                    let root = l.root.clone();
                     let mut saw = false;
-                    while let Ok(ev) = rx.try_recv() {
-                        if ev.workspace_id == workspace
-                            && matches!(
-                                ev.kind,
-                                FsEventKind::Created | FsEventKind::Modified | FsEventKind::Removed
-                            )
-                        {
+                    let mut touched = std::collections::BTreeSet::new();
+                    let mut overflow = false;
+                    if let Some(handle) = &l.handle {
+                        let mut rx = lock_recover(handle.events());
+                        while let Ok(ev) = rx.try_recv() {
+                            if ev.workspace_id != workspace
+                                || !matches!(
+                                    ev.kind,
+                                    FsEventKind::Created
+                                        | FsEventKind::Modified
+                                        | FsEventKind::Removed
+                                )
+                            {
+                                continue;
+                            }
                             saw = true;
+                            match root
+                                .as_deref()
+                                .and_then(|root| relative_event_path(root, &ev.path))
+                            {
+                                Some(rel) if !path_is_skipped(&rel) => {
+                                    if touched.len() < MAX_FAST_TOUCHED_PATHS {
+                                        touched.insert(rel);
+                                    } else {
+                                        overflow = true;
+                                    }
+                                }
+                                Some(_) => {}
+                                None => overflow = true,
+                            }
                         }
                     }
                     if saw {
                         l.pending = true;
+                        l.touched.extend(touched);
+                        if overflow || l.touched.len() > MAX_FAST_TOUCHED_PATHS {
+                            l.touch_overflow = true;
+                            l.recovery_pending = true;
+                            l.pending = true;
+                        }
                     }
+                    saw
                 }
+                None => false,
             }
+        };
+        if saw_events {
+            self.verify_touched(workspace, cancel)?;
         }
         // A bound shadow root deleted since the previous pass invalidates
         // the published generation BEFORE any fingerprint round can declare
@@ -1528,6 +1571,15 @@ impl IndexService {
             }
         }
         Ok(())
+    }
+
+    /// Fast watcher-event path (see [`freshness::verify_touched`]).
+    fn verify_touched(
+        &self,
+        workspace: WorkspaceId,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<(), IndexError> {
+        freshness::verify_touched(self, workspace, cancel)
     }
 
     /// Decide the next machine step from the mirrored state.
@@ -1601,7 +1653,7 @@ impl IndexService {
                 let fingerprint_complete = l
                     .fingerprint_coverage
                     .as_ref()
-                    .map(|c| c.complete)
+                    .map(|c| c.verified_complete())
                     .unwrap_or(false);
                 let fp_in_progress = !fingerprint_complete;
                 if l.pending_load || l.content_generation != gen || l.content.is_none() {
@@ -1638,10 +1690,28 @@ impl IndexService {
                     // and only a COMPLETE round can drop the event as stale.
                     l.last_fp_check = now;
                     let previous = l.fingerprint_coverage.clone().unwrap_or_default();
-                    l.fingerprint_coverage = Some(FingerprintCoverage::round_at_epoch(
-                        previous.round_start,
-                        previous.epoch.wrapping_add(1),
-                    ));
+                    // A metadata-only interval pass is a shortlist: equal
+                    // size/mtime never proves unchanged bytes. A pending
+                    // event with no fast-path proof, an overflowed event
+                    // storm or an explicit request demands the exact
+                    // sharded BLAKE3 recovery sweep immediately.
+                    let exact = l.recovery_pending
+                        || l.touch_overflow
+                        || (l.pending && l.touched.is_empty());
+                    l.fingerprint_coverage = Some(if exact {
+                        FingerprintCoverage::round_at_epoch(
+                            previous.round_start,
+                            previous.epoch.wrapping_add(1),
+                        )
+                    } else {
+                        FingerprintCoverage::shortlist_round_at_epoch(
+                            previous.round_start,
+                            previous.epoch.wrapping_add(1),
+                        )
+                    });
+                    l.recovery_pending = false;
+                    l.touch_overflow = false;
+                    l.touched.clear();
                     l.dirty_now = false;
                     Ok(Next::Claim {
                         target: gen,
@@ -1787,12 +1857,20 @@ impl IndexService {
             )) => {
                 l.content = Some(Arc::new(Mutex::new(idx)));
                 l.content_generation = gen;
+                let legacy_fingerprint = fingerprint.iter().any(|entry| entry.digest.is_none());
                 l.last_fingerprint = Some(fingerprint);
                 l.coverage = Some(coverage);
                 l.fingerprint_coverage = Some(fingerprint_coverage);
                 l.content_identity = content_identity;
                 l.fingerprint_identity = fp_identity;
                 l.pending_load = false;
+                // A fingerprint entry without a digest predates content
+                // freshness: it is dirty material, so force the exact
+                // recovery round instead of ever serving it as clean.
+                if legacy_fingerprint {
+                    l.pending = true;
+                    l.recovery_pending = true;
+                }
                 drop(live);
                 prune_generations(&self.inner.data_root, workspace, gen);
                 Ok(())
@@ -2222,32 +2300,23 @@ impl IndexService {
             // round restarts its walk; re-collecting entries is idempotent,
             // nothing can be lost).
             fp_cov.rebase_divergent_cursors();
-            // Each iteration is ONE physical walk advancing EVERY remaining
-            // shard; the loop bound keeps the per-call walk/entry budget
-            // identical to the former one-walk-per-shard rotation
-            // (`FINGERPRINT_SHARDS` passes), while a full round now needs a
-            // single tree enumeration instead of one per shard.
-            for _ in 0..FINGERPRINT_SHARDS {
-                if fp_cov.complete {
-                    break;
-                }
-                if cancel.is_some_and(CancellationToken::is_cancelled) {
-                    return Ok(self.abort_build(workspace));
-                }
+            // ONE physical walk per build call, advancing EVERY remaining
+            // shard. A pass is bounded by files/dirs/hashed bytes, so a
+            // recovery sweep over 10k files rotates across several polls
+            // instead of hashing the whole workspace in one poll.
+            if !fp_cov.complete && !cancel.is_some_and(CancellationToken::is_cancelled) {
                 let pass = match fingerprint_shared_pass(
                     &root,
                     &fp_cov,
+                    &fp_stored,
                     cfg.fp_batch_files,
                     cfg.fp_batch_dirs,
+                    cfg.fp_batch_bytes,
                     pace,
                     cancel,
                 ) {
-                    Ok(pass) => {
-                        if pass.cancelled {
-                            return Ok(self.abort_build(workspace));
-                        }
-                        pass
-                    }
+                    Ok(pass) if pass.cancelled => return Ok(self.abort_build(workspace)),
+                    Ok(pass) => Some(pass),
                     Err(e) => {
                         if self.rebind_lost_root(workspace, target, &root)? {
                             return Ok(BuildOutcome::Ran);
@@ -2265,19 +2334,30 @@ impl IndexService {
                         fp_cov.truncated_reason = Some(format!("fingerprint_error: {e}"));
                         fp_cov.complete = false;
                         dirty_now = true;
-                        break;
+                        None
                     }
                 };
-                dirty_now |=
-                    apply_fingerprint_round_pass(&mut fp_cov, &mut fp_stored, &mut fp_next, pass);
+                if let Some(pass) = pass {
+                    tracing::debug!(
+                        workspace = ws_raw,
+                        generation = target,
+                        exact = fp_cov.exact,
+                        hashed_files = pass.hashed_files,
+                        hashed_bytes = pass.hashed_bytes,
+                        "fingerprint pass"
+                    );
+                    dirty_now |= apply_fingerprint_round_pass(
+                        &mut fp_cov,
+                        &mut fp_stored,
+                        &mut fp_next,
+                        pass,
+                    );
+                }
                 fp_cov.scanned = if fp_cov.verify && !fp_cov.complete {
                     fp_next.len() as u64
                 } else {
                     fp_stored.len() as u64
                 };
-                if dirty_now {
-                    break;
-                }
             }
         }
 
@@ -3321,6 +3401,32 @@ fn log_sweep_summary(origin: &'static str, workspace: u64, summary: SweepSummary
 // ------------------------------------------------------------------ scanning
 
 /// Filesystem modification time in epoch milliseconds (0 when unavailable).
+/// Workspace-relative form of one watcher event path. Events outside the
+/// bound root (or containing traversal components) are not representable and
+/// force the conservative exact sweep.
+fn relative_event_path(root: &Path, path: &Path) -> Option<String> {
+    let relative = path.strip_prefix(root).ok()?;
+    if relative.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return None;
+    }
+    let relative = relative.to_string_lossy().replace('\\', "/");
+    (!relative.is_empty()).then_some(relative)
+}
+
+/// True for a path under one of the build's skipped VCS/dependency trees.
+fn path_is_skipped(relative: &str) -> bool {
+    relative
+        .split('/')
+        .any(|component| SKIP_DIRS.contains(&component))
+}
+
 fn modified_ms_of(meta: &fs::Metadata) -> i64 {
     meta.modified()
         .ok()
@@ -3585,132 +3691,6 @@ fn scan_content_batch(
         cursor: walked.cursor,
         complete: walked.complete,
         truncated_reason: walked.reason,
-        cancelled: walked.cancelled,
-    })
-}
-
-/// Apply one interleaved round pass to the durable round state: fold the
-/// pass's per-shard buckets, finish every owed shard when the walk exhausted
-/// the tree, or keep the SHARED STOP cursor when it was capped. Returns
-/// `true` when a verification round observed a difference (the caller
-/// supersedes the generation).
-fn apply_fingerprint_round_pass(
-    fp_cov: &mut FingerprintCoverage,
-    fp_stored: &mut BTreeMap<String, FingerprintEntry>,
-    fp_next: &mut BTreeMap<String, FingerprintEntry>,
-    pass: FingerprintRoundPass,
-) -> bool {
-    let mut dirty = false;
-    for bucket in pass.entries {
-        for entry in bucket {
-            match fp_stored.get(&entry.path) {
-                Some(previous) if *previous == entry => {}
-                // A baseline round RECORDS the fingerprint; only a
-                // verification round can call a difference a change.
-                _ => {
-                    if fp_cov.verify {
-                        dirty = true;
-                    }
-                }
-            }
-            fp_next.insert(entry.path.clone(), entry);
-        }
-    }
-    if pass.walk_completed {
-        // The walk exhausted the tree in ONE pass: every shard the round
-        // still owed was visited to exhaustion.
-        for shard in 0..FINGERPRINT_SHARDS {
-            if !fp_cov.shard_done(shard) {
-                fp_cov.finish_shard(shard);
-            }
-        }
-        if fp_cov.complete {
-            // A baseline round MERGES the observed map into the accumulation
-            // it has been publishing all along (nothing may be lost). A
-            // verification round must have seen every stored entry or the
-            // difference (a deletion) supersedes the generation; the observed
-            // map then becomes the new baseline.
-            if fp_cov.verify {
-                if fp_stored.len() != fp_next.len() {
-                    dirty = true;
-                }
-                *fp_stored = std::mem::take(fp_next);
-            } else {
-                for (path, entry) in std::mem::take(fp_next) {
-                    fp_stored.insert(path, entry);
-                }
-            }
-        }
-    } else {
-        // A capped walk keeps its STOP position: the stopping entry was not
-        // consumed and no incomplete shard was advanced past a file of its
-        // own.
-        for shard in 0..FINGERPRINT_SHARDS {
-            if !fp_cov.shard_done(shard) {
-                fp_cov.set_cursor(shard, pass.cursor.clone());
-            }
-        }
-        fp_cov.truncated_reason = Some(
-            pass.reason
-                .unwrap_or_else(|| "fingerprint_batch".to_string()),
-        );
-    }
-    dirty
-}
-
-/// One bounded INTERLEAVED fingerprint round pass (audit 6, revised): ONE
-/// physical walk over the round's shared cursor collects the entries of
-/// EVERY shard the round still owes, so a full round enumerates the tree
-/// once instead of once per shard (the former rotation paid one whole tree
-/// walk — and one per-directory re-sort — per shard; a 10k-file round cost
-/// 8 walks where 1 suffices). The rotation semantics are unchanged: a pass
-/// that exhausts the walk marks every remaining shard complete (the round
-/// then rotates `round_start`), a capped pass keeps the SHARED STOP cursor
-/// for every remaining shard, so no incomplete shard is ever advanced past
-/// a file of its own (no file can hide in a skipped suffix), and a capped
-/// fingerprint is never reported clean. `max_files` bounds the TOTAL
-/// entries collected in one pass (the former per-shard bound bounded the
-/// same total across its 8 passes). `pace`/`cancel` are the
-/// slow-filesystem seam and the caller's token (audit 20).
-fn fingerprint_shared_pass(
-    root: &Path,
-    fp_cov: &FingerprintCoverage,
-    max_files: usize,
-    max_dirs: usize,
-    pace: Option<Duration>,
-    cancel: Option<&CancellationToken>,
-) -> Result<FingerprintRoundPass, String> {
-    let mut entries: Vec<Vec<FingerprintEntry>> =
-        (0..FINGERPRINT_SHARDS).map(|_| Vec::new()).collect();
-    let mut total = 0usize;
-    let cursor = fp_cov.shared_round_cursor();
-    let walked = walk_batch(root, &cursor, max_dirs, pace, cancel, |rel, path| {
-        let shard = fingerprint_shard(rel);
-        if fp_cov.shard_done(shard) {
-            return WalkControl::Continue;
-        }
-        if total >= max_files {
-            return WalkControl::Stop("fingerprint_files");
-        }
-        let Ok(meta) = fs::metadata(path) else {
-            return WalkControl::Continue;
-        };
-        total += 1;
-        entries[shard as usize].push(FingerprintEntry {
-            path: rel.to_string(),
-            size: meta.len(),
-            modified_ms: modified_ms_of(&meta),
-        });
-        WalkControl::Continue
-    })?;
-    for bucket in &mut entries {
-        bucket.sort();
-    }
-    Ok(FingerprintRoundPass {
-        entries,
-        walk_completed: walked.complete,
-        cursor: walked.cursor,
-        reason: walked.reason,
         cancelled: walked.cancelled,
     })
 }

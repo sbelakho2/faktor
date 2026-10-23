@@ -22,6 +22,7 @@
 
 pub mod attachment;
 pub mod authority;
+pub mod billing;
 pub mod blocker;
 pub mod cancellation;
 pub mod capability;
@@ -56,6 +57,10 @@ pub use authority::{
     DOMAIN_CHECK_EXECUTION, DOMAIN_COMMAND_BINDING, DOMAIN_CRITERION_BINDING,
     DOMAIN_INTEGRATION_SOURCES, DOMAIN_RUN_BASE_MANIFEST, DOMAIN_SEMANTIC_FACT,
     DOMAIN_TASK_CONTRACT, MAX_AUTHORITY_FIELD_BYTES,
+};
+pub use billing::{
+    BillingPeriod, DEFAULT_BILLING_PERIOD_MS, MAX_BILLING_PERIOD_ID_BYTES, MAX_BILLING_PERIOD_MS,
+    UNCONFIGURED_PERIOD_ID,
 };
 pub use blocker::{
     child_lifecycle_tag_is_known, validate_child_runtime_state, BlockerKind, ChildBlocker,

@@ -101,6 +101,7 @@ fn legacy_generation_is_unknown_served_fallback_then_fully_rebuilt() {
                 path: rel,
                 size: body.len() as u64,
                 modified_ms: (i as i64) + 1,
+                ..FingerprintEntry::default()
             });
         }
     }

@@ -1,4 +1,5 @@
 use std::fmt;
+use std::time::{Duration, Instant};
 
 use ed25519_dalek::{Signature, Signer as _, Verifier as _, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -654,6 +655,9 @@ pub struct ApprovalToken {
     decision_key_id: String,
     decided_at_ms: u64,
     expires_at_ms: u64,
+    /// In-process monotonic deadline. Wall-clock changes cannot move it, so a
+    /// token minted before a backwards clock jump cannot be revived.
+    deadline: Instant,
 }
 
 impl fmt::Debug for ApprovalToken {
@@ -672,6 +676,7 @@ impl ApprovalToken {
     pub(crate) fn from_verified(
         request: &ApprovalRequest,
         decision: &ApprovalDecision,
+        now_ms: u64,
     ) -> Result<Self, ApprovalError> {
         if request.id != decision.request_id || request.digest()? != decision.request_digest {
             return Err(ApprovalError::Stale {
@@ -691,6 +696,13 @@ impl ApprovalToken {
             decision_key_id: decision.signature.key_id.clone(),
             decided_at_ms: decision.decided_at_ms,
             expires_at_ms: request.expires_at_ms,
+            deadline: Instant::now()
+                + Duration::from_millis(
+                    request
+                        .expires_at_ms
+                        .saturating_sub(now_ms)
+                        .min(MAX_REQUEST_LIFETIME_MS),
+                ),
         })
     }
 
@@ -713,6 +725,7 @@ impl ApprovalToken {
             decision_key_id: "test".to_string(),
             decided_at_ms: 0,
             expires_at_ms: u64::MAX,
+            deadline: Instant::now() + Duration::from_millis(MAX_REQUEST_LIFETIME_MS),
         }
     }
 
@@ -730,7 +743,10 @@ impl ApprovalToken {
     /// still within the request lifetime. The authority also checks expiry
     /// when minting; this closes the cached-token window.
     pub fn require(&self, expected: &ApprovalCheck) -> Result<(), ApprovalError> {
-        if crate::authority::unix_now_ms() > self.expires_at_ms {
+        // The Instant deadline is authoritative while the process is alive;
+        // the wall check is an additional fail-closed bound (a forward jump
+        // or sleep expires early, a backward jump can never extend).
+        if Instant::now() >= self.deadline || crate::authority::unix_now_ms() > self.expires_at_ms {
             return Err(ApprovalError::Expired {
                 request_id: self.request_id.clone(),
                 expired_at_ms: self.expires_at_ms,
@@ -1146,7 +1162,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_cached_token_is_refused_after_its_request_expires() {
+    fn a_cached_token_expires_on_its_instant_deadline_not_the_wall_clock() {
+        // The persisted expiry is far in the future, so a wall-clock check
+        // would accept this token; the Instant deadline is authoritative.
         let token = ApprovalToken {
             kind: ApprovalKind::SupplyPurchaseOrder,
             subject: "po-1".to_string(),
@@ -1155,7 +1173,8 @@ mod tests {
             request_id: "apr-".to_string() + &"b".repeat(32),
             decision_key_id: "c".repeat(64),
             decided_at_ms: 1,
-            expires_at_ms: 1,
+            expires_at_ms: u64::MAX,
+            deadline: Instant::now() - Duration::from_secs(1),
         };
         let check = ApprovalCheck::new(
             ApprovalKind::SupplyPurchaseOrder,

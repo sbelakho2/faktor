@@ -1238,6 +1238,8 @@ impl AgentRuntime {
         let machine = Arc::new(tokio::sync::Mutex::new(crate::AttemptAccounting::new(
             self.deps.budgets.clone(),
             handle.id(),
+            s.provider.id(),
+            s.model.clone(),
             Some(reservation),
         )));
         s.budget_marker = Some(BudgetDispatchMarker {

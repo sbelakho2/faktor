@@ -14,6 +14,7 @@
 
 pub mod api;
 pub mod auth;
+pub mod billing_projection;
 pub mod native;
 pub mod permission;
 /// The worker-plane deployment boundary: the dedicated second listener and
@@ -26,6 +27,10 @@ pub use api::{
     ServerDepsError, ServerHandle, ServerServeError, ServerShutdownError, ServerStatus,
 };
 pub use auth::{check_bearer, check_password, AuthConfigError, AuthToken, ServerPassword};
+pub use billing_projection::{
+    BillingSpendProjector, ProjectionError, ProjectionReport, MAX_ADMISSION_OUTBOX_ROWS,
+    MAX_CATCHUP_OUTBOX_ROWS, MAX_OUTBOX_PAGE,
+};
 pub use permission::{ChannelPermissionRequester, PendingPermission};
 pub use worker_plane::{
     serve_worker_plane, WorkerPlaneAuth, WorkerPlaneBindConfig, WorkerPlaneBoundaryRefusal,

@@ -35,6 +35,8 @@ use std::sync::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
+use faktor_core::billing::BillingPeriod;
+
 use crate::billing::{
     checked_append_domain, checked_ledger_sum, fold_credits, fold_usage, task_id_from_text,
     task_id_text, BillingAccount, CreditBalance, CreditEntry, CreditKind, CreditLedgerError,
@@ -53,6 +55,11 @@ use crate::store::{CloudStoreError, SqliteControlPlaneStore};
 /// only: migration [`BILLING_TASK_ID_TEXT_SCHEMA_V6`] rebuilds it as the
 /// reversible fixed-width TEXT encoding before any query runs, fresh
 /// databases included (see [`crate::billing::task_id_text`]).
+#[path = "billing_store_period.rs"]
+mod period;
+pub use period::BILLING_PERIOD_SCHEMA_V9;
+use period::*;
+
 pub const BILLING_SCHEMA_V2: &str = "
      CREATE TABLE IF NOT EXISTS billing_account (
         id TEXT PRIMARY KEY,
@@ -324,6 +331,8 @@ fn resolve_legacy_task_id(
 pub struct StoredUsageEvent {
     pub event_seq: i64,
     pub event: UsageEvent,
+    /// The durable billing period this event's settlement time fell in.
+    pub period_id: String,
 }
 
 /// The SQL schema of the durable billing-report schedule (migration v4 of
@@ -654,6 +663,50 @@ pub trait BillingStore: Send + Sync {
     /// row, no per-task materialization.
     fn usage_totals(&self, organization: &OrganizationId)
         -> Result<UsageTotals, BillingStoreError>;
+
+    /// The organization's usage fold for ONE billing period: only the events
+    /// whose durable settlement time fell in `period_id` (corrections stay in
+    /// their base event's period). Per-task buckets are keyed by
+    /// `(organization, period, task, run)`.
+    fn usage_fold_in_period(
+        &self,
+        organization: &OrganizationId,
+        period_id: &str,
+    ) -> Result<UsageFold, BillingStoreError>;
+
+    /// The organization's usage TOTALS for ONE billing period (the quota
+    /// gate's numerator: limits evaluate the CURRENT period only).
+    fn usage_totals_in_period(
+        &self,
+        organization: &OrganizationId,
+        period_id: &str,
+    ) -> Result<UsageTotals, BillingStoreError>;
+
+    /// Persist the deterministic period configuration (subscription anchor +
+    /// plan period length) usage events are stamped from.
+    fn put_period_config(
+        &self,
+        organization: &OrganizationId,
+        anchor_ms: i64,
+        period_ms: i64,
+    ) -> Result<(), BillingStoreError>;
+
+    /// The stored period configuration, if one was written.
+    fn period_config(
+        &self,
+        organization: &OrganizationId,
+    ) -> Result<Option<(i64, i64)>, BillingStoreError>;
+
+    /// The highest settlement-outbox id already projected into this
+    /// organization's usage ledger (0 = nothing projected yet).
+    fn outbox_watermark(&self, organization: &OrganizationId) -> Result<i64, BillingStoreError>;
+
+    /// Advance the settlement-outbox projection watermark monotonically.
+    fn advance_outbox_watermark(
+        &self,
+        organization: &OrganizationId,
+        last_outbox_id: i64,
+    ) -> Result<(), BillingStoreError>;
     /// Whether a correction already names `base` (used to refuse double
     /// corrections; the fold itself tolerates chains).
     fn correction_exists(
@@ -811,6 +864,8 @@ struct MemBilling {
     subscriptions: BTreeMap<String, Subscription>,
     usage: BTreeMap<String, StoredUsageEvent>,
     usage_order: BTreeMap<String, Vec<String>>,
+    period_configs: BTreeMap<String, (i64, i64)>,
+    outbox_watermarks: BTreeMap<String, i64>,
     credits: BTreeMap<String, StoredCreditEntry>,
     credit_order: BTreeMap<String, Vec<String>>,
     in_flight: BTreeMap<String, InFlightTxn>,
@@ -1131,12 +1186,25 @@ impl BillingStore for MemoryBillingStore {
             )));
         }
         let org = event.organization_id.as_str().to_string();
+        let period_id = match &event.correction_of {
+            Some(base) => state
+                .usage
+                .values()
+                .find(|row| {
+                    row.event.organization_id == event.organization_id
+                        && row.event.id.as_str() == base.as_str()
+                })
+                .map(|row| row.period_id.clone())
+                .unwrap_or_else(|| period::memory_event_period(&state, event)),
+            None => period::memory_event_period(&state, event),
+        };
         let seq = state.usage_order.get(&org).map(|v| v.len()).unwrap_or(0) as i64 + 1;
         state.usage.insert(
             event.id.as_str().to_string(),
             StoredUsageEvent {
                 event_seq: seq,
                 event: event.clone(),
+                period_id,
             },
         );
         state
@@ -1225,6 +1293,82 @@ impl BillingStore for MemoryBillingStore {
         organization: &OrganizationId,
     ) -> Result<UsageTotals, BillingStoreError> {
         Ok(self.usage_fold(organization)?.totals)
+    }
+
+    fn usage_fold_in_period(
+        &self,
+        organization: &OrganizationId,
+        period_id: &str,
+    ) -> Result<UsageFold, BillingStoreError> {
+        let state = self.lock()?;
+        let mut rows: Vec<&StoredUsageEvent> = state
+            .usage
+            .values()
+            .filter(|row| row.event.organization_id == *organization && row.period_id == period_id)
+            .collect();
+        rows.sort_by_key(|row| row.event_seq);
+        let events: Vec<UsageEvent> = rows.into_iter().map(|row| row.event.clone()).collect();
+        drop(state);
+        Ok(fold_usage(organization, &events)?)
+    }
+
+    fn usage_totals_in_period(
+        &self,
+        organization: &OrganizationId,
+        period_id: &str,
+    ) -> Result<UsageTotals, BillingStoreError> {
+        Ok(self.usage_fold_in_period(organization, period_id)?.totals)
+    }
+
+    fn put_period_config(
+        &self,
+        organization: &OrganizationId,
+        anchor_ms: i64,
+        period_ms: i64,
+    ) -> Result<(), BillingStoreError> {
+        if anchor_ms < 0 || period_ms <= 0 || period_ms > faktor_core::MAX_BILLING_PERIOD_MS {
+            return Err(BillingStoreError::Malformed(
+                "period configuration is outside the legal domain".into(),
+            ));
+        }
+        self.lock()?
+            .period_configs
+            .insert(organization.as_str().to_string(), (anchor_ms, period_ms));
+        Ok(())
+    }
+
+    fn period_config(
+        &self,
+        organization: &OrganizationId,
+    ) -> Result<Option<(i64, i64)>, BillingStoreError> {
+        Ok(self
+            .lock()?
+            .period_configs
+            .get(organization.as_str())
+            .copied())
+    }
+
+    fn outbox_watermark(&self, organization: &OrganizationId) -> Result<i64, BillingStoreError> {
+        Ok(self
+            .lock()?
+            .outbox_watermarks
+            .get(organization.as_str())
+            .copied()
+            .unwrap_or(0))
+    }
+
+    fn advance_outbox_watermark(
+        &self,
+        organization: &OrganizationId,
+        last_outbox_id: i64,
+    ) -> Result<(), BillingStoreError> {
+        let mut state = self.lock()?;
+        let entry = state
+            .outbox_watermarks
+            .entry(organization.as_str().to_string())
+            .or_insert(0);
+        *entry = (*entry).max(last_outbox_id);
+        Ok(())
     }
 
     fn correction_exists(
@@ -2153,11 +2297,16 @@ fn usage_event_by_id(
     conn: &Connection,
     organization: &OrganizationId,
     id: &str,
+    period: Option<&str>,
 ) -> Result<Option<UsageEvent>, BillingStoreError> {
     let payload: Option<String> = conn
         .query_row(
-            "SELECT payload FROM usage_event WHERE organization_id = ?1 AND id = ?2",
-            params![organization.as_str(), id],
+            "SELECT payload FROM usage_event ue
+             WHERE ue.organization_id = ?1 AND ue.id = ?2
+               AND (?3 IS NULL OR ue.id IN (
+                    SELECT event_id FROM usage_event_period
+                    WHERE organization_id = ?1 AND period_id = ?3))",
+            params![organization.as_str(), id, period],
             |row| row.get(0),
         )
         .optional()
@@ -2172,13 +2321,17 @@ fn correction_winner(
     organization: &OrganizationId,
     base: &str,
     before_seq: i64,
+    period: Option<&str>,
 ) -> Result<Option<UsageEvent>, BillingStoreError> {
     let payload: Option<String> = conn
         .query_row(
-            "SELECT payload FROM usage_event INDEXED BY idx_usage_event_correction_winner
-             WHERE organization_id = ?1 AND correction_of = ?2 AND event_seq < ?3
-             ORDER BY occurred_at_ms DESC, id DESC LIMIT 1",
-            params![organization.as_str(), base, before_seq],
+            "SELECT payload FROM usage_event ue INDEXED BY idx_usage_event_correction_winner
+             WHERE ue.organization_id = ?1 AND ue.correction_of = ?2 AND ue.event_seq < ?3
+               AND (?4 IS NULL OR ue.id IN (
+                    SELECT event_id FROM usage_event_period
+                    WHERE organization_id = ?1 AND period_id = ?4))
+             ORDER BY ue.occurred_at_ms DESC, ue.id DESC LIMIT 1",
+            params![organization.as_str(), base, before_seq, period],
             |row| row.get(0),
         )
         .optional()
@@ -2191,13 +2344,17 @@ fn correction_targets(
     organization: &OrganizationId,
     id: &str,
     before_seq: i64,
+    period: Option<&str>,
 ) -> Result<bool, BillingStoreError> {
     let present: Option<i64> = conn
         .query_row(
-            "SELECT 1 FROM usage_event INDEXED BY idx_usage_event_correction_winner
-             WHERE organization_id = ?1 AND correction_of = ?2 AND event_seq < ?3
+            "SELECT 1 FROM usage_event ue INDEXED BY idx_usage_event_correction_winner
+             WHERE ue.organization_id = ?1 AND ue.correction_of = ?2 AND ue.event_seq < ?3
+               AND (?4 IS NULL OR ue.id IN (
+                    SELECT event_id FROM usage_event_period
+                    WHERE organization_id = ?1 AND period_id = ?4))
              LIMIT 1",
-            params![organization.as_str(), id, before_seq],
+            params![organization.as_str(), id, before_seq, period],
             |row| row.get(0),
         )
         .optional()
@@ -2217,14 +2374,15 @@ fn node_contributes(
     organization: &OrganizationId,
     node: &UsageEvent,
     before_seq: i64,
+    period: Option<&str>,
 ) -> Result<bool, BillingStoreError> {
-    if correction_targets(conn, organization, node.id.as_str(), before_seq)? {
+    if correction_targets(conn, organization, node.id.as_str(), before_seq, period)? {
         return Ok(false);
     }
     let Some(base) = &node.correction_of else {
         return Ok(true);
     };
-    let winner = correction_winner(conn, organization, base.as_str(), before_seq)?;
+    let winner = correction_winner(conn, organization, base.as_str(), before_seq, period)?;
     Ok(winner
         .as_ref()
         .map(|winner| winner.id == node.id)
@@ -2245,11 +2403,13 @@ fn bucket_for<'a>(
 /// already appended (`event_seq < seq`): the new correction either becomes
 /// the winner (replacing the prior winner's or the target's contribution)
 /// or is itself superseded.
+#[allow(clippy::too_many_arguments)]
 fn apply_usage_event(
     conn: &Connection,
     organization: &OrganizationId,
     event: &UsageEvent,
     seq: i64,
+    period: Option<&str>,
     totals: &mut UsageTotals,
     buckets: &mut BTreeMap<UsageBucketKey, UsageTotals>,
     dirty: &mut std::collections::BTreeSet<UsageBucketKey>,
@@ -2261,7 +2421,7 @@ fn apply_usage_event(
         // dependency): it contributes only its corrected-event marker, never
         // its values. Without this check an out-of-order append would count
         // both the base and its correction.
-        if correction_targets(conn, organization, event.id.as_str(), seq)? {
+        if correction_targets(conn, organization, event.id.as_str(), seq, period)? {
             let corrected = UsageTotals {
                 corrected_events: 1,
                 ..UsageTotals::default()
@@ -2299,7 +2459,7 @@ fn apply_usage_event(
         "correction",
     )?;
 
-    let winner = correction_winner(conn, organization, base_id.as_str(), seq)?;
+    let winner = correction_winner(conn, organization, base_id.as_str(), seq, period)?;
     let wins = winner
         .as_ref()
         .map(|winner| {
@@ -2319,7 +2479,7 @@ fn apply_usage_event(
     )?;
     match winner {
         Some(winner) => {
-            if node_contributes(conn, organization, &winner, seq)? {
+            if node_contributes(conn, organization, &winner, seq, period)? {
                 let winner_key = (task_id_text(winner.task_id), winner.run_id.clone());
                 let winner_values = event_values(&winner);
                 combine_totals(totals, &winner_values, RollupSign::Subtract, "correction")?;
@@ -2332,9 +2492,9 @@ fn apply_usage_event(
             }
         }
         None => {
-            let target = usage_event_by_id(conn, organization, base_id.as_str())?;
+            let target = usage_event_by_id(conn, organization, base_id.as_str(), period)?;
             if let Some(target) = target {
-                if node_contributes(conn, organization, &target, seq)? {
+                if node_contributes(conn, organization, &target, seq, period)? {
                     let target_key = (task_id_text(target.task_id), target.run_id.clone());
                     let target_values = event_values(&target);
                     combine_totals(totals, &target_values, RollupSign::Subtract, "correction")?;
@@ -2513,14 +2673,14 @@ fn apply_usage_event_pointwise(
         buckets.insert(event_key.clone(), values);
     }
     if let Some(base_id) = &event.correction_of {
-        let winner = correction_winner(conn, organization, base_id.as_str(), seq)?;
+        let winner = correction_winner(conn, organization, base_id.as_str(), seq, None)?;
         if let Some(winner) = &winner {
             let key = (task_id_text(winner.task_id), winner.run_id.clone());
             if let Some(values) = read_usage_bucket(conn, organization, &key)? {
                 buckets.insert(key, values);
             }
         }
-        if let Some(target) = usage_event_by_id(conn, organization, base_id.as_str())? {
+        if let Some(target) = usage_event_by_id(conn, organization, base_id.as_str(), None)? {
             let key = (task_id_text(target.task_id), target.run_id.clone());
             if let Some(values) = read_usage_bucket(conn, organization, &key)? {
                 buckets.insert(key, values);
@@ -2532,6 +2692,7 @@ fn apply_usage_event_pointwise(
         organization,
         event,
         seq,
+        None,
         &mut totals,
         &mut buckets,
         &mut dirty,
@@ -2592,6 +2753,7 @@ fn ensure_usage_rollup_tx(
                 organization,
                 &event,
                 seq,
+                None,
                 &mut totals,
                 &mut buckets,
                 &mut dirty,
@@ -3141,6 +3303,7 @@ impl BillingStore for SqliteControlPlaneStore {
         if current.as_ref().map(|(_, watermark)| *watermark) != Some(target) {
             ensure_usage_rollup_tx(&tx, &event.organization_id)?;
         }
+        let period = ensure_event_period_tx(&tx, &event.organization_id, event)?;
         let seq: i64 = tx
             .query_row(
                 "INSERT INTO usage_event_seq (organization_id, next_seq) VALUES (?1, 1)
@@ -3174,6 +3337,21 @@ impl BillingStore for SqliteControlPlaneStore {
         )
         .map_err(backend)?;
         apply_usage_event_pointwise(&tx, &event.organization_id, event, seq)?;
+        // The per-period projection: steady state applies the new event
+        // pointwise; a projection that is behind (migration/restore) is
+        // caught up in the same transaction, never read through a prefix.
+        if period_rollup_watermark(&tx, &event.organization_id)? == seq - 1 {
+            apply_period_event_pointwise(&tx, &event.organization_id, event, seq, &period)?;
+            tx.execute(
+                "INSERT INTO billing_period_rollup_state (organization_id, watermark)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(organization_id) DO UPDATE SET watermark = excluded.watermark",
+                params![event.organization_id.as_str(), seq],
+            )
+            .map_err(backend)?;
+        } else {
+            ensure_period_rollup_tx(&tx, &event.organization_id)?;
+        }
         tx.commit().map_err(backend)?;
         Ok(UsageAppend::Appended)
     }
@@ -3186,8 +3364,8 @@ impl BillingStore for SqliteControlPlaneStore {
         let conn = self.lock_billing_conn()?;
         let row: Option<(i64, String)> = conn
             .query_row(
-                "SELECT event_seq, payload FROM usage_event
-                 WHERE organization_id = ?1 AND id = ?2",
+                "SELECT ue.event_seq, ue.payload FROM usage_event ue
+                 WHERE ue.organization_id = ?1 AND ue.id = ?2",
                 params![organization.as_str(), id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -3202,7 +3380,14 @@ impl BillingStore for SqliteControlPlaneStore {
                         event.id, organization, event.organization_id
                     )));
                 }
-                Ok(Some(StoredUsageEvent { event_seq, event }))
+                let period_id = read_event_period(&conn, organization, event.id.as_str())?
+                    .map(|p| p.id)
+                    .unwrap_or_else(|| BillingPeriod::unconfigured().id);
+                Ok(Some(StoredUsageEvent {
+                    event_seq,
+                    event,
+                    period_id,
+                }))
             }
             None => Ok(None),
         }
@@ -3242,6 +3427,90 @@ impl BillingStore for SqliteControlPlaneStore {
         Ok(read_usage_projection(&conn, organization)?
             .map(|(totals, _)| totals)
             .unwrap_or_default())
+    }
+
+    fn usage_fold_in_period(
+        &self,
+        organization: &OrganizationId,
+        period_id: &str,
+    ) -> Result<UsageFold, BillingStoreError> {
+        let mut conn = self.lock_billing_conn()?;
+        ensure_period_rollup(&mut conn, organization)?;
+        read_period_fold(&conn, organization, period_id)
+    }
+
+    fn usage_totals_in_period(
+        &self,
+        organization: &OrganizationId,
+        period_id: &str,
+    ) -> Result<UsageTotals, BillingStoreError> {
+        let mut conn = self.lock_billing_conn()?;
+        ensure_period_rollup(&mut conn, organization)?;
+        Ok(read_period_projection(&conn, organization, period_id)?.unwrap_or_default())
+    }
+
+    fn put_period_config(
+        &self,
+        organization: &OrganizationId,
+        anchor_ms: i64,
+        period_ms: i64,
+    ) -> Result<(), BillingStoreError> {
+        if anchor_ms < 0 || period_ms <= 0 || period_ms > faktor_core::MAX_BILLING_PERIOD_MS {
+            return Err(BillingStoreError::Malformed(
+                "period configuration is outside the legal domain".into(),
+            ));
+        }
+        let conn = self.lock_billing_conn()?;
+        conn.execute(
+            "INSERT INTO billing_period_config
+                (organization_id, anchor_ms, period_ms)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(organization_id) DO UPDATE SET
+                anchor_ms = excluded.anchor_ms,
+                period_ms = excluded.period_ms",
+            params![organization.as_str(), anchor_ms, period_ms],
+        )
+        .map_err(backend)?;
+        Ok(())
+    }
+
+    fn period_config(
+        &self,
+        organization: &OrganizationId,
+    ) -> Result<Option<(i64, i64)>, BillingStoreError> {
+        let conn = self.lock_billing_conn()?;
+        read_period_config(&conn, organization)
+    }
+
+    fn outbox_watermark(&self, organization: &OrganizationId) -> Result<i64, BillingStoreError> {
+        let conn = self.lock_billing_conn()?;
+        Ok(conn
+            .query_row(
+                "SELECT last_outbox_id FROM billing_outbox_watermark
+                 WHERE organization_id = ?1",
+                params![organization.as_str()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(backend)?
+            .unwrap_or(0))
+    }
+
+    fn advance_outbox_watermark(
+        &self,
+        organization: &OrganizationId,
+        last_outbox_id: i64,
+    ) -> Result<(), BillingStoreError> {
+        let conn = self.lock_billing_conn()?;
+        conn.execute(
+            "INSERT INTO billing_outbox_watermark (organization_id, last_outbox_id)
+             VALUES (?1, ?2)
+             ON CONFLICT(organization_id) DO UPDATE SET
+                last_outbox_id = MAX(billing_outbox_watermark.last_outbox_id, excluded.last_outbox_id)",
+            params![organization.as_str(), last_outbox_id],
+        )
+        .map_err(backend)?;
+        Ok(())
     }
 
     fn correction_exists(
@@ -3657,13 +3926,16 @@ impl SqliteControlPlaneStore {
         // `? IS NULL OR task_id = ?` predicate) keep the
         // `(organization_id, task_id, event_seq)` index applicable to the
         // filtered page.
-        let rows: Vec<(i64, String)> = match task_id {
+        let rows: Vec<(i64, String, Option<String>)> = match task_id {
             Some(task_id) => {
                 let mut stmt = conn
                     .prepare(
-                        "SELECT event_seq, payload FROM usage_event
-                         WHERE organization_id = ?1 AND task_id = ?2 AND event_seq > ?3
-                         ORDER BY event_seq LIMIT ?4",
+                        "SELECT ue.event_seq, ue.payload, ep.period_id
+                         FROM usage_event ue
+                         LEFT JOIN usage_event_period ep
+                           ON ep.event_id = ue.id AND ep.organization_id = ue.organization_id
+                         WHERE ue.organization_id = ?1 AND ue.task_id = ?2 AND ue.event_seq > ?3
+                         ORDER BY ue.event_seq LIMIT ?4",
                     )
                     .map_err(backend)?;
                 let mapped = stmt
@@ -3684,9 +3956,12 @@ impl SqliteControlPlaneStore {
             None => {
                 let mut stmt = conn
                     .prepare(
-                        "SELECT event_seq, payload FROM usage_event
-                         WHERE organization_id = ?1 AND event_seq > ?2
-                         ORDER BY event_seq LIMIT ?3",
+                        "SELECT ue.event_seq, ue.payload, ep.period_id
+                         FROM usage_event ue
+                         LEFT JOIN usage_event_period ep
+                           ON ep.event_id = ue.id AND ep.organization_id = ue.organization_id
+                         WHERE ue.organization_id = ?1 AND ue.event_seq > ?2
+                         ORDER BY ue.event_seq LIMIT ?3",
                     )
                     .map_err(backend)?;
                 let mapped = stmt
@@ -3698,7 +3973,7 @@ impl SqliteControlPlaneStore {
             }
         };
         let mut out = Vec::with_capacity(rows.len());
-        for (event_seq, payload) in rows {
+        for (event_seq, payload, period_id) in rows {
             let event: UsageEvent = parse(&payload)?;
             if event.organization_id != *organization {
                 return Err(BillingStoreError::Malformed(format!(
@@ -3706,13 +3981,17 @@ impl SqliteControlPlaneStore {
                     event.id, organization, event.organization_id
                 )));
             }
-            out.push(StoredUsageEvent { event_seq, event });
+            out.push(StoredUsageEvent {
+                event_seq,
+                event,
+                period_id: period_id.unwrap_or_else(|| BillingPeriod::unconfigured().id),
+            });
         }
         Ok(out)
     }
 }
 
 /// Decode one `(event_seq, payload)` usage row.
-fn usage_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, String)> {
-    Ok((r.get(0)?, r.get(1)?))
+fn usage_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, String, Option<String>)> {
+    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
 }

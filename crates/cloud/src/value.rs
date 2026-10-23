@@ -561,6 +561,7 @@ mod tests {
 
     fn plan(features: &[&str]) -> PlanConfig {
         PlanConfig {
+            period_ms: None,
             plan_id: "p".into(),
             features: features.iter().map(|f| f.to_string()).collect(),
             limits: BTreeMap::new(),

@@ -18,6 +18,32 @@ fn write(root: &Path, relative: &str, text: &str) {
     fs::write(path, text).unwrap();
 }
 
+/// Rewrite `relative` with same-length bytes and restore its exact mtime so
+/// size+mtime alone cannot observe the edit.
+fn write_same_size_same_mtime(root: &Path, relative: &str, text: &str) {
+    let path = root.join(relative);
+    let meta = fs::metadata(&path).unwrap();
+    let previous_size = meta.len();
+    let modified = meta.modified().unwrap();
+    let accessed = meta.accessed().unwrap();
+    fs::write(&path, text).unwrap();
+    assert_eq!(
+        fs::metadata(&path).unwrap().len(),
+        previous_size,
+        "fixture must keep the byte length"
+    );
+    let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+    file.set_times(
+        fs::FileTimes::new()
+            .set_modified(modified)
+            .set_accessed(accessed),
+    )
+    .unwrap();
+    let after = fs::metadata(&path).unwrap();
+    assert_eq!(after.len(), previous_size);
+    assert_eq!(after.modified().unwrap(), modified);
+}
+
 fn revision(commit: &str) -> Revision {
     Revision {
         commit: Some(commit.to_string()),
@@ -471,6 +497,121 @@ fn rebuild_budget_exhaustion_is_a_typed_degraded_flag() {
     );
 }
 
+/// The P1 stale-source case: same byte length, same mtime, different bytes.
+/// Metadata is not authority; the exact recovery sweep hashes the suspect
+/// (metadata cannot select it) and the graph reflects the new source.
+#[test]
+fn same_size_same_mtime_edit_is_found_by_recovery_sweep() {
+    let dir = workspace();
+    let root = dir.path();
+    let mut session = ImpactSession::build_material(root).unwrap();
+    let (affected_by_b, _) = affected_names(&session, "b/src/lib.rs", "target");
+    assert!(affected_by_b);
+
+    write_same_size_same_mtime(
+        root,
+        "app/src/lib.rs",
+        "use c::target;\n\npub fn dispatch() -> u32 { target() }\n",
+    );
+    let scan = session.scan_material_changes().unwrap();
+    assert!(
+        scan.seeds.iter().any(|path| path == "app/src/lib.rs"),
+        "the exact recovery sweep must find the stealth edit: {scan:?}"
+    );
+    assert!(
+        scan.files_hashed > 0 && scan.files_hashed <= faktor_impact::build::RECOVERY_BATCH_FILES,
+        "the sweep must be bounded but hash the suspect: {scan:?}"
+    );
+
+    let generation = MaterialGeneration::new();
+    generation.observe(scan.seeds);
+    let report = session
+        .refresh_from_generation(&generation.dirty_since(0), &RefreshPolicy::default())
+        .unwrap();
+    assert_eq!(report.mode, RefreshMode::Incremental);
+    assert_eq!(report.stats.files_reparsed, 1);
+    let (affected_by_c, names) = affected_names(&session, "c/src/lib.rs", "target");
+    assert!(
+        affected_by_c,
+        "the graph must reflect the new source: {names:?}"
+    );
+    let (affected_by_b_again, _) = affected_names(&session, "b/src/lib.rs", "target");
+    assert!(!affected_by_b_again);
+    assert!(session
+        .graph()
+        .graph()
+        .files
+        .iter()
+        .any(|file| file.path == "app/src/lib.rs" && file.hash != "blake3:stale"));
+}
+
+/// Watcher-overflow/lost-history recovery still finds the same-length,
+/// same-mtime edit because the rebuild is content authority, never a stamp.
+#[test]
+fn watcher_history_overflow_recovers_a_same_size_same_mtime_edit() {
+    let dir = workspace();
+    let root = dir.path();
+    let mut session = ImpactSession::build_material(root).unwrap();
+    let generation = MaterialGeneration::with_limits(GenerationLimits {
+        max_generations: 1,
+        max_dirty_paths: 1024,
+    });
+    write_same_size_same_mtime(
+        root,
+        "app/src/lib.rs",
+        "use c::target;\n\npub fn dispatch() -> u32 { target() }\n",
+    );
+    generation.observe(["app/src/lib.rs"]);
+    generation.observe(["b/src/lib.rs"]);
+    let dirty = generation.dirty_since(0);
+    assert!(dirty.lost, "the overflow must be typed lost");
+    let report = session
+        .refresh_from_generation(&dirty, &RefreshPolicy::default())
+        .unwrap();
+    assert_eq!(report.mode, RefreshMode::Rebuilt);
+    assert!(references(&session, "c/src/lib.rs"));
+    assert!(!references(&session, "b/src/lib.rs"));
+}
+
+/// Deleted and renamed inputs are seeds.
+#[test]
+fn deleted_and_renamed_inputs_are_seeded() {
+    let dir = workspace();
+    let root = dir.path();
+    let mut session = ImpactSession::build_material(root).unwrap();
+
+    fs::rename(root.join("b/src/lib.rs"), root.join("b/src/renamed.rs")).unwrap();
+    let scan = session.scan_material_changes().unwrap();
+    assert!(scan.seeds.iter().any(|path| path == "b/src/lib.rs"));
+    assert!(scan.seeds.iter().any(|path| path == "b/src/renamed.rs"));
+}
+
+/// An in-place identity replacement (same bytes, same mtime, new inode) is a
+/// shortlist suspect and stays dirty after the digest proves the bytes match.
+#[test]
+fn identity_replacement_is_seeded_even_when_bytes_match() {
+    let dir = workspace();
+    let root = dir.path();
+    let mut session = ImpactSession::build_material(root).unwrap();
+
+    let path = root.join("b/src/lib.rs");
+    let meta = fs::metadata(&path).unwrap();
+    let modified = meta.modified().unwrap();
+    let temp = root.join("b/src/lib.replacement");
+    fs::write(&temp, "pub fn target() -> u32 { 1 }\n").unwrap();
+    let file = fs::OpenOptions::new().write(true).open(&temp).unwrap();
+    file.set_times(fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+    fs::rename(&temp, &path).unwrap();
+
+    let scan = session.scan_material_changes().unwrap();
+    assert!(
+        scan.seeds.iter().any(|path| path == "b/src/lib.rs"),
+        "an identity change is dirty even when the bytes match: {scan:?}"
+    );
+    assert!(scan.files_hashed >= 1);
+}
+
 /// Bounded 10k-file probe: a single edit must re-parse a bounded set, and an
 /// unchanged generation must not rebuild. Ignored in CI long-test lanes.
 #[test]
@@ -505,6 +646,10 @@ fn perf_10k_files_incremental_refresh_is_bounded() {
     let started = std::time::Instant::now();
     let scan = session.scan_material_changes().unwrap();
     assert_eq!(scan.seeds, vec![changed.to_string()]);
+    assert!(
+        scan.files_hashed <= 8,
+        "a single edit may hash only the suspect plus the bounded manifests, not the workspace: {scan:?}"
+    );
     generation.observe(scan.seeds);
     let report = session
         .refresh_from_generation(&generation.dirty_since(0), &RefreshPolicy::default())
@@ -520,6 +665,7 @@ fn perf_10k_files_incremental_refresh_is_bounded() {
         .is_some());
 
     let noop_started = std::time::Instant::now();
+    let mut recovery_hashes = 0usize;
     for _ in 0..20 {
         let dirty = generation.dirty_since(generation.current());
         let report = session
@@ -527,9 +673,48 @@ fn perf_10k_files_incremental_refresh_is_bounded() {
             .unwrap();
         assert_eq!(report.mode, RefreshMode::Unchanged);
         assert_eq!(report.stats.files_reparsed, 0);
+        let scan = session.scan_material_changes().unwrap();
+        assert!(
+            scan.seeds.is_empty(),
+            "idle scan must not invent a change: {scan:?}"
+        );
+        assert!(
+            scan.files_hashed <= faktor_impact::build::RECOVERY_BATCH_FILES + 8,
+            "a recovery poll must stay bounded, never hash the whole workspace: {scan:?}"
+        );
+        recovery_hashes += scan.files_hashed;
     }
+    assert!(
+        recovery_hashes < 20 * 10_001,
+        "recovery polls must not be O(workspace) each: {recovery_hashes}"
+    );
+
+    // Stealth edit (same length, same mtime) is invisible to the shortlist;
+    // the rotating exact sweep must eventually find it without any poll
+    // hashing the whole workspace.
+    write_same_size_same_mtime(
+        root,
+        changed,
+        "pub fn f42() -> u32 { 42 }\npub fn extra() -> u32 { 44 }\n",
+    );
+    let mut found = false;
+    for _ in 0..64 {
+        let scan = session.scan_material_changes().unwrap();
+        assert!(
+            scan.files_hashed <= faktor_impact::build::RECOVERY_BATCH_FILES + 8,
+            "a recovery poll must stay bounded: {scan:?}"
+        );
+        if scan.seeds.iter().any(|path| path == changed) {
+            found = true;
+            break;
+        }
+    }
+    assert!(
+        found,
+        "the rotating exact sweep must eventually find the stealth edit"
+    );
     println!(
-        "[perf] 10k files: edit scan+refresh {:?}, 20 no-op generation checks {:?}",
+        "[perf] 10k files: edit scan+refresh {:?}, 20 bounded recovery polls {:?} ({recovery_hashes} hashes)",
         started.elapsed(),
         noop_started.elapsed()
     );

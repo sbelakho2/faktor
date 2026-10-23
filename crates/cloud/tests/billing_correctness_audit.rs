@@ -31,6 +31,7 @@ fn configured() -> BillingConfig {
     config.plans.insert(
         "pro".into(),
         PlanConfig {
+            period_ms: None,
             plan_id: "pro".into(),
             features: [
                 FEATURE_MANAGED_PROVIDERS.to_string(),

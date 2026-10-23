@@ -340,6 +340,7 @@ fn governance_capability_flags_are_gated_behind_the_base_entitlement() {
     config.plans.insert(
         "half".into(),
         faktor_cloud::PlanConfig {
+            period_ms: None,
             plan_id: "half".into(),
             features: [FEATURE_GOVERNANCE_SSO.to_string()].into_iter().collect(),
             limits: Default::default(),
@@ -368,6 +369,7 @@ fn governance_capability_flags_are_gated_behind_the_base_entitlement() {
     config.plans.insert(
         "gov".into(),
         faktor_cloud::PlanConfig {
+            period_ms: None,
             plan_id: "gov".into(),
             features: [FEATURE_ENTERPRISE_GOVERNANCE.to_string()]
                 .into_iter()
@@ -401,6 +403,7 @@ fn plan_validation_accepts_value_tags_and_refuses_unknown_names() {
     config.plans.insert(
         "value".into(),
         faktor_cloud::PlanConfig {
+            period_ms: None,
             plan_id: "value".into(),
             features: [
                 FEATURE_SHARED_INTELLIGENCE.to_string(),

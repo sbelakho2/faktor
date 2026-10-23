@@ -1,6 +1,7 @@
 //! Index service tests (mechanically split from `service`).
 
 use super::*;
+use crate::coverage::{fingerprint_shard, FINGERPRINT_SHARDS};
 use crate::state::WorkspaceIndexState as St;
 use tempfile::TempDir;
 
@@ -59,6 +60,28 @@ fn write(repo: &Path, rel: &str, content: &str) {
     let p = repo.join(rel);
     std::fs::create_dir_all(p.parent().unwrap()).unwrap();
     std::fs::write(p, content).unwrap();
+}
+
+/// Rewrite `rel` with the SAME byte length and restore its exact mtime, so
+/// size+mtime alone cannot observe the edit.
+fn write_same_size_same_mtime(repo: &Path, rel: &str, content: &str) {
+    let p = repo.join(rel);
+    let meta = std::fs::metadata(&p).unwrap();
+    let previous_len = meta.len();
+    let modified = meta.modified().unwrap();
+    let accessed = meta.accessed().unwrap();
+    std::fs::write(&p, content).unwrap();
+    assert_eq!(std::fs::metadata(&p).unwrap().len(), previous_len);
+    let file = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+    file.set_times(
+        std::fs::FileTimes::new()
+            .set_modified(modified)
+            .set_accessed(accessed),
+    )
+    .unwrap();
+    let after = std::fs::metadata(&p).unwrap();
+    assert_eq!(after.len(), previous_len);
+    assert_eq!(after.modified().unwrap(), modified);
 }
 
 fn fast_cfg() -> ServiceConfig {
@@ -2326,7 +2349,17 @@ fn fingerprint_round_loop(
             break;
         }
         coverage.rebase_divergent_cursors();
-        let pass = fingerprint_shared_pass(dir, coverage, max_files, max_dirs, None, None).unwrap();
+        let pass = fingerprint_shared_pass(
+            dir,
+            coverage,
+            &std::collections::BTreeMap::new(),
+            max_files,
+            max_dirs,
+            u64::MAX,
+            None,
+            None,
+        )
+        .unwrap();
         walks += 1;
         for bucket in &pass.entries {
             for entry in bucket {
@@ -3163,4 +3196,210 @@ fn index_rebinds_to_the_durable_root_when_the_live_shadow_is_deleted() {
         .unwrap()
         .files_for_token(ws, "durable", 10);
     assert!(!hits.is_empty(), "the durable root is indexed after rebind");
+}
+
+// ------------------------------------------- P1 content freshness
+
+/// Same-length, same-mtime source edit: the metadata shortlist cannot see
+/// it, so the exact sharded BLAKE3 recovery sweep must find it and the
+/// rebuilt generation must serve the NEW source.
+#[test]
+fn same_size_same_mtime_edit_is_found_by_exact_recovery_and_served() {
+    let _serial = serial();
+    let (env, _store, svc, ws) = first_fixture();
+    pub_view_asserts(&svc, ws, 1);
+    let old = "pub fn alpha() -> i64 { 1 }\npub struct Beta {}\n";
+    let new = "pub fn omega() -> i64 { 1 }\npub struct Beta {}\n";
+    assert_eq!(old.len(), new.len());
+    write_same_size_same_mtime(&env.repo, "src/lib.rs", new);
+
+    // No trusted event path: the exact recovery sweep is owed.
+    svc.request_build(ws).unwrap();
+    let view = svc.ensure_ready(ws, Instant::now() + DEADLINE).unwrap();
+    assert_eq!(view.generation(), 2);
+    assert!(view.fingerprint_coverage().verified_complete());
+    let index = view.index();
+    let index = index.lock().unwrap();
+    assert!(
+        !index.symbol_lookup(ws, "omega", 10).is_empty(),
+        "the new source symbol must be served"
+    );
+    assert!(
+        index.symbol_lookup(ws, "alpha", 10).is_empty(),
+        "the old source symbol must be gone"
+    );
+}
+
+/// The watcher fast path hashes exactly the touched file: an identical
+/// rewrite is a cheap no-op, while a same-length/same-mtime rewrite of
+/// different bytes marks the generation dirty without any full-tree scan.
+#[test]
+fn touched_fast_path_hashes_only_the_event_path() {
+    let _serial = serial();
+    let (env, _store, svc, ws) = first_fixture();
+    pub_view_asserts(&svc, ws, 1);
+
+    // Identical rewrite (mtime changes; bytes do not).
+    std::fs::write(
+        env.repo.join("src/lib.rs"),
+        "pub fn alpha() -> i64 { 1 }\npub struct Beta {}\n",
+    )
+    .unwrap();
+    {
+        let mut live = lock_recover(&svc.inner.live);
+        live.get_mut(&ws)
+            .unwrap()
+            .touched
+            .insert("src/lib.rs".into());
+    }
+    svc.verify_touched(ws, None).unwrap();
+    {
+        let live = lock_recover(&svc.inner.live);
+        let l = live.get(&ws).unwrap();
+        assert!(!l.dirty_now, "identical bytes are not a change");
+        assert!(!l.pending, "a proven-clean event is dropped");
+    }
+    svc.reconcile_now(ws).unwrap();
+    assert_eq!(svc.view(ws).unwrap().generation(), 1, "no rebuild");
+
+    // Same-length, same-mtime rewrite of different bytes.
+    write_same_size_same_mtime(
+        &env.repo,
+        "src/lib.rs",
+        "pub fn omega() -> i64 { 1 }\npub struct Beta {}\n",
+    );
+    {
+        let mut live = lock_recover(&svc.inner.live);
+        live.get_mut(&ws)
+            .unwrap()
+            .touched
+            .insert("src/lib.rs".into());
+    }
+    svc.verify_touched(ws, None).unwrap();
+    {
+        let live = lock_recover(&svc.inner.live);
+        assert!(
+            live.get(&ws).unwrap().dirty_now,
+            "the touched path digest must prove the change"
+        );
+    }
+    svc.reconcile_now(ws).unwrap();
+    let view = svc.ensure_ready(ws, Instant::now() + DEADLINE).unwrap();
+    assert_eq!(view.generation(), 2);
+    let index = view.index();
+    let index = index.lock().unwrap();
+    assert!(!index.symbol_lookup(ws, "omega", 10).is_empty());
+    assert!(index.symbol_lookup(ws, "alpha", 10).is_empty());
+}
+
+/// Legacy metadata-only fingerprint entries (no digest) are dirty, never
+/// clean; an exact round comparing them supersedes the generation.
+#[test]
+fn legacy_metadata_only_fingerprint_entry_is_dirty() {
+    let legacy = FingerprintEntry {
+        path: "src/lib.rs".into(),
+        size: 4,
+        modified_ms: 1,
+        ..FingerprintEntry::default()
+    };
+    let observed = FingerprintEntry {
+        digest: Some(faktor_freshness::ContentDigest::of(b"same")),
+        ..legacy.clone()
+    };
+    let mut coverage = FingerprintCoverage::round_at_epoch(0, 1);
+    let mut stored = std::collections::BTreeMap::new();
+    stored.insert(legacy.path.clone(), legacy);
+    let mut next = std::collections::BTreeMap::new();
+    let dirty = apply_fingerprint_round_pass(
+        &mut coverage,
+        &mut stored,
+        &mut next,
+        FingerprintRoundPass {
+            entries: vec![vec![observed]],
+            walk_completed: true,
+            cursor: ScanCursor::default(),
+            reason: None,
+            cancelled: false,
+            hashed_files: 1,
+            hashed_bytes: 4,
+        },
+    );
+    assert!(dirty, "an entry without a digest is dirty, not clean");
+}
+
+/// A deleted/renamed source path supersedes the generation and the rebuilt
+/// index serves only the new path.
+#[test]
+fn renamed_source_is_detected_and_the_old_path_is_dropped() {
+    let _serial = serial();
+    let (env, _store, svc, ws) = first_fixture();
+    pub_view_asserts(&svc, ws, 1);
+    std::fs::rename(env.repo.join("src/lib.rs"), env.repo.join("src/renamed.rs")).unwrap();
+    svc.request_build(ws).unwrap();
+    let view = svc.ensure_ready(ws, Instant::now() + DEADLINE).unwrap();
+    assert_eq!(view.generation(), 2);
+    let index = view.index();
+    let index = index.lock().unwrap();
+    assert!(index.file_paths(ws).iter().any(|p| p == "src/renamed.rs"));
+    assert!(!index.file_paths(ws).iter().any(|p| p == "src/lib.rs"));
+}
+
+/// Perf probe: a shortlist pass hashes ONLY the metadata suspects while an
+/// exact recovery pass hashes every visited file and stays bounded per poll.
+#[test]
+fn fingerprint_shortlist_hashes_only_suspects_and_exact_pass_is_bounded() {
+    let dir = TempDir::new().unwrap();
+    let files = 10_000usize;
+    for i in 0..files {
+        write(dir.path(), &format!("f{i:05}.rs"), "fn x() {}\n");
+    }
+    let mut baseline = std::collections::BTreeMap::new();
+    for i in 0..files {
+        let path = format!("f{i:05}.rs");
+        let meta = std::fs::metadata(dir.path().join(&path)).unwrap();
+        baseline.insert(
+            path.clone(),
+            FingerprintEntry::from_metadata(path, &meta)
+                .with_digest(faktor_freshness::ContentDigest::of(b"baseline")),
+        );
+    }
+    // One suspect: change the first file's size (metadata shortlist).
+    std::fs::write(dir.path().join("f00000.rs"), "fn changed() {}\n").unwrap();
+    let coverage = FingerprintCoverage::shortlist_round_at_epoch(0, 1);
+    let pass = fingerprint_shared_pass(
+        dir.path(),
+        &coverage,
+        &baseline,
+        FP_BATCH_FILES,
+        FP_BATCH_DIRS,
+        u64::MAX,
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        pass.hashed_files, 1,
+        "the incremental path must hash only the suspect, not the workspace"
+    );
+
+    let exact = FingerprintCoverage::round_at_epoch(0, 1);
+    let pass = fingerprint_shared_pass(
+        dir.path(),
+        &exact,
+        &baseline,
+        FP_BATCH_FILES,
+        FP_BATCH_DIRS,
+        u64::MAX,
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        pass.hashed_files, FP_BATCH_FILES,
+        "an exact recovery pass hashes at most its batch bound"
+    );
+    assert!(
+        pass.hashed_files < files,
+        "never the whole workspace per poll"
+    );
 }

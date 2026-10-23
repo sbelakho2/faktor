@@ -23,7 +23,8 @@
 //! ```text
 //! <data-dir>/approval/ledger.jsonl      append-only request/decision chain
 //! <data-dir>/approval/ledger.head       local committed tail head
-//! <data-dir>/approval-anchor/ledger.anchor  monotonic anchor (outside ledger dir)
+//! <data-dir>/approval-anchor/ledger.anchor  monotonic ledger anchor
+//! <data-dir>/approval-anchor/clock.anchor   max observed wall clock (expiry)
 //! <data-dir>/approval/operators.json    human-operator public-key registry
 //! <data-dir>/approval/operators/*.key   owner-only (0600) signing seeds
 //! ```
@@ -59,5 +60,6 @@ pub use operator::{
     save_operator_key, OperatorKey, OPERATOR_DIRECTORY, OPERATOR_REGISTRY_FILE,
 };
 pub use store::{
-    ledger_anchor_path, ledger_head_path, ledger_path, ApprovalLedger, LedgerBody, LedgerEntry,
+    clock_anchor_path, ledger_anchor_path, ledger_head_path, ledger_path, ApprovalLedger,
+    LedgerBody, LedgerEntry,
 };

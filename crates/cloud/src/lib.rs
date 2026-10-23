@@ -54,6 +54,11 @@ pub mod store;
 pub mod value;
 pub mod vendor;
 
+pub use faktor_core::billing::{
+    BillingPeriod, DEFAULT_BILLING_PERIOD_MS, MAX_BILLING_PERIOD_ID_BYTES, MAX_BILLING_PERIOD_MS,
+    UNCONFIGURED_PERIOD_ID,
+};
+
 pub use billing::{
     csv_field, fold_credits, fold_usage, Admission, AdmissionBoundary, AdmissionRequest,
     BillingAccount, BillingCapabilityState, BillingCapabilityStatus, BillingConfig,
@@ -72,8 +77,9 @@ pub use billing::{
 pub use billing_store::{
     BillingMutationClaim, BillingStore, BillingStoreError, CreditAppend, CreditAppendRefusal,
     MemoryBillingStore, ReportPeriodRow, ReportPeriodStatus, StoredCreditEntry, StoredUsageEvent,
-    UsageAppend, BILLING_REPORT_SCHEMA_V4, BILLING_ROLLUP_SCHEMA_V8, BILLING_SCHEMA_V2,
-    MAX_BILLING_MUTATIONS_PER_ORG, MAX_BILLING_MUTATION_BODY, MAX_REPORT_PERIODS_PER_ORG,
+    UsageAppend, BILLING_PERIOD_SCHEMA_V9, BILLING_REPORT_SCHEMA_V4, BILLING_ROLLUP_SCHEMA_V8,
+    BILLING_SCHEMA_V2, MAX_BILLING_MUTATIONS_PER_ORG, MAX_BILLING_MUTATION_BODY,
+    MAX_REPORT_PERIODS_PER_ORG,
 };
 pub use enterprise::config_layer_digest;
 pub use enterprise::{

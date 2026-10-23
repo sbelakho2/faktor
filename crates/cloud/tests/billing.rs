@@ -36,6 +36,7 @@ fn configured() -> BillingConfig {
     config.plans.insert(
         "pro".into(),
         PlanConfig {
+            period_ms: None,
             plan_id: "pro".into(),
             features: [
                 FEATURE_MANAGED_PROVIDERS.to_string(),
@@ -2228,6 +2229,7 @@ fn the_configured_default_plan_is_scoped_to_the_configured_organization() {
     config.plans.insert(
         "team".into(),
         PlanConfig {
+            period_ms: None,
             plan_id: "team".into(),
             features: [FEATURE_BYOK.to_string()].into_iter().collect(),
             limits: [(LIMIT_MAX_ACTIVE_TASKS.to_string(), 9)]
@@ -2417,6 +2419,7 @@ fn plan_change_and_cancel_are_durable_idempotent_effects() {
     config.plans.insert(
         "team".into(),
         PlanConfig {
+            period_ms: None,
             plan_id: "team".into(),
             features: [FEATURE_MANAGED_PROVIDERS.to_string()]
                 .into_iter()

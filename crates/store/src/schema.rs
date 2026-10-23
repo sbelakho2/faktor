@@ -1326,6 +1326,48 @@ pub(crate) const MIGRATIONS: &[&str] = &[
         ON session(listing_revision DESC, id DESC);
      CREATE INDEX IF NOT EXISTS idx_session_workspace_listing_revision_id
         ON session(workspace_id, listing_revision DESC, id DESC);",
+    // v45 — durable commercial settlement outbox. A reservation settlement
+    // writes ONE outbox row in the SAME transaction as the reservation row +
+    // folded task spend, carrying the exact usage split, the folded cost and
+    // the deterministic billing period. A projector drains the outbox
+    // incrementally (idempotent per reservation id) into the cloud usage
+    // ledger, so admission never needs to list sessions/tasks/reservations.
+    // `billing_period_config` is the daemon-wired (anchor, period length)
+    // pair the settlement uses to stamp the period; absent = all-time.
+    "CREATE TABLE IF NOT EXISTS billing_period_config (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        anchor_ms INTEGER NOT NULL,
+        period_ms INTEGER NOT NULL
+     );
+     CREATE TABLE IF NOT EXISTS billing_outbox (
+        outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        reservation_id INTEGER NOT NULL,
+        session_id INTEGER NOT NULL,
+        task_id INTEGER NOT NULL,
+        attempt_id TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        model TEXT NOT NULL,
+        uncached_input_tokens INTEGER NOT NULL,
+        cache_read_tokens INTEGER NOT NULL,
+        cache_write_tokens INTEGER NOT NULL,
+        output_tokens INTEGER NOT NULL,
+        reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+        provider_cost_micro INTEGER NOT NULL,
+        provider_reported_micro INTEGER,
+        state TEXT NOT NULL,
+        occurred_at_ms INTEGER NOT NULL,
+        source_operation TEXT NOT NULL,
+        period_id TEXT NOT NULL,
+        period_start_ms INTEGER NOT NULL,
+        period_end_ms INTEGER NOT NULL
+     );
+     CREATE INDEX IF NOT EXISTS idx_billing_outbox_reservation
+        ON billing_outbox(reservation_id);
+     CREATE TABLE IF NOT EXISTS billing_outbox_backfill (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        done INTEGER NOT NULL
+     );",
 ];
 
 /// Array index of the v9 block above (migration list position, not the

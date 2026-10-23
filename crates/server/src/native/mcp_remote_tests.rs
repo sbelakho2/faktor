@@ -28,6 +28,7 @@ struct State {
     always_expire: AtomicBool,
     oversize: AtomicBool,
     slow_tools_ms: AtomicU64,
+    slow_initialize_ms: AtomicU64,
     session_seq: AtomicU64,
     initialize_count: AtomicUsize,
     delete_count: AtomicUsize,
@@ -238,6 +239,10 @@ async fn serve(mut stream: TcpStream, state: Arc<State>) -> Option<()> {
         .unwrap_or("");
     if method == "initialize" {
         state.initialize_count.fetch_add(1, Ordering::SeqCst);
+        let delay = state.slow_initialize_ms.load(Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
         let session = format!("sess-{}", state.session_seq.fetch_add(1, Ordering::SeqCst));
         state.valid_sessions.lock().unwrap().insert(session.clone());
         write_json(
@@ -455,6 +460,39 @@ fn auth_error_code(error: &faktor_core::error::Error) -> &str {
     }
 }
 
+fn client_for(fixtures: &[&Fixture]) -> CheckedHttpClient {
+    CheckedHttpClient::with_policy_for_tests(
+        DestinationPolicy::parse_lines(
+            fixtures
+                .iter()
+                .map(|fixture| format!("http://127.0.0.1:{}", fixture.addr.port())),
+        )
+        .expect("loopback policy"),
+    )
+}
+
+async fn wait_for_initialize(state: &State, expected: usize) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while state.initialize_count.load(Ordering::SeqCst) < expected {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "initialize was not observed within the bound"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+async fn wait_for_delete(state: &State) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while state.delete_count.load(Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the cancelled connection was never closed"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn vault_bearer_initializes_and_discovers_every_catalog() {
     let state = State::with_token("sk-vault-token");
@@ -621,6 +659,179 @@ async fn slow_catalog_is_bounded_by_the_record_timeout() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slow_start_of_one_server_does_not_block_another() {
+    let slow_state = Arc::new(State::default());
+    slow_state.slow_initialize_ms.store(1_500, Ordering::SeqCst);
+    let slow_fixture = Fixture::start(slow_state.clone()).await;
+    let fast_state = Arc::new(State::default());
+    let fast_fixture = Fixture::start(fast_state.clone()).await;
+    let runtime = Arc::new(McpRuntime::with_remote_client(
+        None,
+        client_for(&[&slow_fixture, &fast_fixture]),
+    ));
+    let mut slow_record = record(&slow_fixture.endpoint(), None);
+    slow_record.id = "slow-a".into();
+    slow_record.name = "slow-a".into();
+    let mut fast_record = record(&fast_fixture.endpoint(), None);
+    fast_record.id = "fast-b".into();
+    fast_record.name = "fast-b".into();
+
+    let slow_task = tokio::spawn({
+        let runtime = runtime.clone();
+        let record = slow_record.clone();
+        async move { runtime.start(&record, Vec::new(), None).await }
+    });
+    wait_for_initialize(&slow_state, 1).await;
+
+    let started = std::time::Instant::now();
+    let tools = tokio::time::timeout(
+        Duration::from_secs(2),
+        runtime.start(&fast_record, Vec::new(), None),
+    )
+    .await
+    .expect("a fast server must not wait on a slow server's slot")
+    .expect("the fast server starts");
+    assert_eq!(tools[0]["name"], "echo");
+    assert!(
+        started.elapsed() < Duration::from_millis(1_000),
+        "the fast start was serialized behind the slow handshake: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        !slow_task.is_finished(),
+        "the slow start must still be in flight while B completes"
+    );
+    let catalogs =
+        tokio::time::timeout(Duration::from_millis(500), runtime.catalogs("fast-b", None))
+            .await
+            .expect("catalog reads stay short-locked")
+            .expect("catalog read")
+            .expect("started server");
+    assert_eq!(catalogs["transport"], "streamable_http");
+
+    tokio::time::timeout(Duration::from_secs(3), slow_task)
+        .await
+        .expect("the slow start completes")
+        .unwrap()
+        .expect("slow server starts");
+    assert_eq!(slow_state.initialize_count.load(Ordering::SeqCst), 1);
+    assert_eq!(fast_state.initialize_count.load(Ordering::SeqCst), 1);
+    assert!(runtime.stop("slow-a").await);
+    assert!(runtime.stop("fast-b").await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_same_server_starts_share_one_connection() {
+    let state = Arc::new(State::default());
+    state.slow_initialize_ms.store(200, Ordering::SeqCst);
+    let fixture = Fixture::start(state.clone()).await;
+    let runtime = Arc::new(McpRuntime::with_remote_client(
+        None,
+        client_for(&[&fixture]),
+    ));
+    let mut record = record(&fixture.endpoint(), None);
+    record.id = "shared".into();
+    record.name = "shared".into();
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let runtime = runtime.clone();
+        let record = record.clone();
+        tasks.push(tokio::spawn(async move {
+            runtime.start(&record, Vec::new(), None).await
+        }));
+    }
+    for task in tasks {
+        let tools = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("single-flight start must not deadlock")
+            .unwrap()
+            .expect("every joined start succeeds");
+        assert_eq!(tools[0]["name"], "echo");
+    }
+    assert_eq!(
+        state.initialize_count.load(Ordering::SeqCst),
+        1,
+        "concurrent starts of one server must share one connection"
+    );
+    assert_eq!(runtime.health("shared").await, Some(true));
+    assert!(runtime.stop("shared").await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_start_clears_the_slot_and_a_retry_connects() {
+    let state = State::with_token("right-token");
+    let fixture = Fixture::start(state.clone()).await;
+    let (_dir, foundation) = foundation();
+    let runtime = Arc::new(McpRuntime::with_remote_client(
+        None,
+        client_for(&[&fixture]),
+    ));
+    let wrong = foundation
+        .vault
+        .store("mcp_oauth", "wrong MCP OAuth token", b"wrong-token")
+        .unwrap();
+    let mut record = record(&fixture.endpoint(), Some(wrong.handle));
+    record.id = "retry".into();
+    record.name = "retry".into();
+    let error = runtime
+        .start(&record, Vec::new(), Some(&foundation.vault))
+        .await
+        .expect_err("a wrong bearer token must fail");
+    assert_eq!(auth_error_code(&error), AUTH_REQUIRED_CODE, "{error:?}");
+    assert_eq!(
+        runtime.health("retry").await,
+        None,
+        "a failed start must clear its slot"
+    );
+
+    let right = foundation
+        .vault
+        .store("mcp_oauth", "right MCP OAuth token", b"right-token")
+        .unwrap();
+    record.auth_token_ref = Some(right.handle);
+    let tools = runtime
+        .start(&record, Vec::new(), Some(&foundation.vault))
+        .await
+        .expect("a retry after a cleared failure connects");
+    assert_eq!(tools[0]["name"], "echo");
+    assert_eq!(state.initialize_count.load(Ordering::SeqCst), 1);
+    assert_eq!(runtime.health("retry").await, Some(true));
+    assert!(runtime.stop("retry").await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stop_during_start_cancels_and_closes_without_deadlock() {
+    let state = Arc::new(State::default());
+    state.slow_initialize_ms.store(800, Ordering::SeqCst);
+    let fixture = Fixture::start(state.clone()).await;
+    let runtime = Arc::new(McpRuntime::with_remote_client(
+        None,
+        client_for(&[&fixture]),
+    ));
+    let mut record = record(&fixture.endpoint(), None);
+    record.id = "stop-me".into();
+    record.name = "stop-me".into();
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let record = record.clone();
+        async move { runtime.start(&record, Vec::new(), None).await }
+    });
+    wait_for_initialize(&state, 1).await;
+    assert!(
+        runtime.stop("stop-me").await,
+        "a starting server is stoppable"
+    );
+    let error = tokio::time::timeout(Duration::from_secs(3), task)
+        .await
+        .expect("stop must not deadlock the in-flight start")
+        .unwrap()
+        .expect_err("stop cancels the in-flight start");
+    assert_eq!(error.kind, ErrorKind::Cancelled, "{error:?}");
+    assert_eq!(runtime.health("stop-me").await, None);
+    wait_for_delete(&state).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn remote_surface_is_not_fabricated_for_a_stdio_record() {
     let (_dir, _foundation) = foundation();
     let stdio = McpServerRecord {
@@ -637,4 +848,81 @@ async fn remote_surface_is_not_fabricated_for_a_stdio_record() {
     assert_eq!(view["remoteTransport"]["supported"], true);
     assert_eq!(view["remoteTransport"]["configured"], true);
     assert_eq!(view["capabilities"], Value::Null);
+}
+
+/// Independent final-wave probe: single-flight is per SERVER, and a failing
+/// sibling cannot poison it. Eight concurrent starts of one healthy server
+/// share exactly one initialize; a concurrent unauthorized start of another
+/// server fails typed and leaves the healthy connection untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failing_sibling_never_poisons_eight_single_flight_starts() {
+    let healthy_state = Arc::new(State::default());
+    healthy_state
+        .slow_initialize_ms
+        .store(250, Ordering::SeqCst);
+    let healthy_fixture = Fixture::start(healthy_state.clone()).await;
+    let guarded_state = State::with_token("right-token");
+    let guarded_fixture = Fixture::start(guarded_state.clone()).await;
+    let (_dir, foundation) = foundation();
+    let runtime = Arc::new(McpRuntime::with_remote_client(
+        None,
+        client_for(&[&healthy_fixture, &guarded_fixture]),
+    ));
+    let mut healthy_record = record(&healthy_fixture.endpoint(), None);
+    healthy_record.id = "healthy".into();
+    healthy_record.name = "healthy".into();
+    let wrong = foundation
+        .vault
+        .store("mcp_oauth", "wrong MCP OAuth token", b"wrong-token")
+        .unwrap();
+    let mut guarded_record = record(&guarded_fixture.endpoint(), Some(wrong.handle));
+    guarded_record.id = "guarded".into();
+    guarded_record.name = "guarded".into();
+
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let runtime = runtime.clone();
+        let record = healthy_record.clone();
+        tasks.push(tokio::spawn(async move {
+            runtime.start(&record, Vec::new(), None).await
+        }));
+    }
+    let failing = {
+        let runtime = runtime.clone();
+        let record = guarded_record.clone();
+        tokio::spawn(async move {
+            runtime
+                .start(&record, Vec::new(), Some(&foundation.vault))
+                .await
+        })
+    };
+
+    for task in tasks {
+        let tools = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("single-flight start must not deadlock")
+            .unwrap()
+            .expect("every healthy join succeeds");
+        assert_eq!(tools[0]["name"], "echo");
+    }
+    let error = tokio::time::timeout(Duration::from_secs(5), failing)
+        .await
+        .expect("the failing sibling must not hang behind the healthy single-flight")
+        .unwrap()
+        .expect_err("the wrong bearer token must be refused");
+    assert_eq!(auth_error_code(&error), AUTH_REQUIRED_CODE, "{error:?}");
+    assert_eq!(
+        healthy_state.initialize_count.load(Ordering::SeqCst),
+        1,
+        "eight concurrent starts of one server must initialize exactly once"
+    );
+    assert_eq!(
+        guarded_state.initialize_count.load(Ordering::SeqCst),
+        0,
+        "an unauthorized connection never initializes"
+    );
+    assert_eq!(runtime.health("healthy").await, Some(true));
+    assert_eq!(runtime.health("guarded").await, None);
+    assert!(runtime.stop("healthy").await);
+    assert!(!runtime.stop("guarded").await);
 }

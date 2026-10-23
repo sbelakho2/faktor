@@ -1764,6 +1764,7 @@ fn provision_cli_billing(dir: &std::path::Path) {
         plans: [(
             "pro".to_string(),
             faktor_cloud::PlanConfig {
+                period_ms: None,
                 plan_id: "pro".into(),
                 features: ["credits".to_string()].into_iter().collect(),
                 limits: Default::default(),

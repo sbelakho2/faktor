@@ -796,6 +796,7 @@ async fn enterprise_deps_with_billing(
         config.plans.insert(
             plan_id.to_string(),
             PlanConfig {
+                period_ms: None,
                 plan_id: plan_id.to_string(),
                 features: features.iter().map(|f| f.to_string()).collect(),
                 limits: Default::default(),

@@ -615,6 +615,37 @@ pub trait BudgetAuthority: Send + Sync {
         route_decision_json: Option<String>,
     ) -> BoxFut<'_, Result<Option<u64>, BudgetError>>;
 
+    /// [`BudgetAuthority::settle_usage`] plus the attempt's provider/model,
+    /// carried into the durable settlement outbox so the commercial
+    /// projection can classify spend without re-reading the session. The
+    /// default keeps older/mock authorities source-compatible (they record
+    /// no outbox).
+    #[allow(clippy::too_many_arguments)]
+    fn settle_usage_with_context(
+        &self,
+        session_id: SessionId,
+        _provider: &str,
+        _model: &str,
+        reservation: ReservationId,
+        uncached_input_tokens: u64,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
+        output_tokens: u64,
+        provider_reported_micro: Option<u64>,
+        route_decision_json: Option<String>,
+    ) -> BoxFut<'_, Result<Option<u64>, BudgetError>> {
+        self.settle_usage(
+            session_id,
+            reservation,
+            uncached_input_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            output_tokens,
+            provider_reported_micro,
+            route_decision_json,
+        )
+    }
+
     /// Release one reservation WITHOUT spending (RESERVED with a NULL
     /// dispatch marker -> REFUNDED, exactly-once). The pre-dispatch guard
     /// is enforced AT THE SQL LEVEL: a dispatched, settled, refunded or
@@ -1141,6 +1172,8 @@ impl DurableBudgetLedger {
     async fn settle_usage_inner(
         &self,
         reservation: ReservationId,
+        provider: String,
+        model: String,
         uncached_input_tokens: u64,
         cache_read_tokens: u64,
         cache_write_tokens: u64,
@@ -1163,7 +1196,7 @@ impl DurableBudgetLedger {
         // never recomputed here from a caller-supplied micro number: there
         // is no tokens x 1 microUSD fallback anywhere on this path.
         tokio::task::spawn_blocking(move || {
-            store.cost_settle_usage(
+            store.cost_settle_usage_with_context(
                 reservation.raw(),
                 uncached_input_tokens,
                 cache_read_tokens,
@@ -1172,6 +1205,8 @@ impl DurableBudgetLedger {
                 provider_reported_micro,
                 route_decision_json.as_deref(),
                 settled_ms,
+                &provider,
+                &model,
             )
         })
         .await
@@ -1722,15 +1757,51 @@ impl BudgetAuthority for DurableBudgetLedger {
         provider_reported_micro: Option<u64>,
         route_decision_json: Option<String>,
     ) -> BoxFut<'_, Result<Option<u64>, BudgetError>> {
-        Box::pin(self.settle_usage_inner(
-            reservation,
-            uncached_input_tokens,
-            cache_read_tokens,
-            cache_write_tokens,
-            output_tokens,
-            provider_reported_micro,
-            route_decision_json,
-        ))
+        Box::pin(async move {
+            self.settle_usage_inner(
+                reservation,
+                String::new(),
+                String::new(),
+                uncached_input_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+                output_tokens,
+                provider_reported_micro,
+                route_decision_json,
+            )
+            .await
+        })
+    }
+
+    fn settle_usage_with_context(
+        &self,
+        _session_id: SessionId,
+        provider: &str,
+        model: &str,
+        reservation: ReservationId,
+        uncached_input_tokens: u64,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
+        output_tokens: u64,
+        provider_reported_micro: Option<u64>,
+        route_decision_json: Option<String>,
+    ) -> BoxFut<'_, Result<Option<u64>, BudgetError>> {
+        let provider = provider.to_string();
+        let model = model.to_string();
+        Box::pin(async move {
+            self.settle_usage_inner(
+                reservation,
+                provider,
+                model,
+                uncached_input_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+                output_tokens,
+                provider_reported_micro,
+                route_decision_json,
+            )
+            .await
+        })
     }
 
     fn refund(

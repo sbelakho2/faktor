@@ -527,6 +527,8 @@ impl AgentRuntime {
         let mut acct = crate::AttemptAccounting::new(
             self.deps.budgets.clone(),
             st.handle.id(),
+            st.provider.id(),
+            st.model.clone(),
             Some(reservation),
         );
         // The additive commercial debit (Wave 5 residual): a

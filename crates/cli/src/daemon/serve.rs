@@ -1839,8 +1839,27 @@ fn wire_billing_plane(
     // or tokens.
     value_gate = service.enforcement_gate(&organization);
     graph.agent.set_value_gate(value_gate.clone());
-    let billing_gate: Arc<dyn faktor_orchestrator::admission::AdmissionGate> =
-        Arc::new(BillingAdmissionGate::new(service.clone(), organization));
+    // The settlement-outbox projector is the admission gate's quota feed:
+    // it drains only NEW settled rows (idempotent by reservation identity),
+    // never the whole session history.
+    let projector = Arc::new(faktor_server::BillingSpendProjector::new(
+        service.clone(),
+        organization.clone(),
+        graph.session.clone(),
+    ));
+    if let Some((anchor, period_ms)) = service
+        .period_config(&organization)
+        .map_err(|e| format!("billing period config: {e}"))?
+    {
+        graph
+            .session
+            .store()
+            .set_billing_period_config(anchor, period_ms)
+            .map_err(|e| format!("billing period config: {e}"))?;
+    }
+    let billing_gate: Arc<dyn faktor_orchestrator::admission::AdmissionGate> = Arc::new(
+        BillingAdmissionGate::new(service.clone(), organization, Some(projector)),
+    );
     deps = deps.with_billing(service);
     tracing::info!("commercial billing enabled");
     graph.orchestrator.set_admission_gate(billing_gate);
@@ -2215,16 +2234,22 @@ impl faktor_orchestrator::placement::WorkerPlacementSeam for WorkerPlaneAdapter 
 pub(crate) struct BillingAdmissionGate {
     pub(crate) service: Arc<faktor_cloud::EntitlementService>,
     pub(crate) organization: faktor_cloud::OrganizationId,
+    /// Drains the durable settlement outbox BEFORE the quota is evaluated:
+    /// admission either sees every settled row or refuses typed, so it never
+    /// depends on `/native/usage` (or any whole-history read-through).
+    pub(crate) projector: Option<Arc<faktor_server::BillingSpendProjector>>,
 }
 
 impl BillingAdmissionGate {
     pub(crate) fn new(
         service: Arc<faktor_cloud::EntitlementService>,
         organization: faktor_cloud::OrganizationId,
+        projector: Option<Arc<faktor_server::BillingSpendProjector>>,
     ) -> Self {
         Self {
             service,
             organization,
+            projector,
         }
     }
 }
@@ -2235,6 +2260,18 @@ impl faktor_orchestrator::admission::AdmissionGate for BillingAdmissionGate {
         request: &faktor_orchestrator::admission::AdmissionRequest,
     ) -> Result<(), faktor_orchestrator::admission::AdmissionRefusal> {
         use faktor_orchestrator::admission::AdmissionBoundary as Hook;
+        if let Some(projector) = &self.projector {
+            match projector.drain_for_admission() {
+                Ok(_) => {}
+                Err(error) => {
+                    return Err(faktor_orchestrator::admission::AdmissionRefusal::new(
+                        request.boundary,
+                        "usage_projection",
+                        format!("settlement outbox projection refused admission: {error}"),
+                    ));
+                }
+            }
+        }
         let hook_boundary = request.boundary;
         let boundary = match hook_boundary {
             Hook::NewTask => faktor_cloud::AdmissionBoundary::NewTask,
@@ -2661,6 +2698,7 @@ mod billing_subscription_tests {
         plans.insert(
             "live-plan".to_string(),
             faktor_cloud::PlanConfig {
+                period_ms: None,
                 plan_id: "live-plan".to_string(),
                 features: ["credits".to_string()].into_iter().collect(),
                 limits: BTreeMap::new(),
@@ -2770,5 +2808,148 @@ mod saved_provider_boot_tests {
                 .count(),
             1
         );
+    }
+}
+
+#[cfg(test)]
+mod billing_admission_outbox_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn admission_drains_the_settlement_outbox_without_the_usage_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let clock = std::sync::Arc::new(faktor_cloud::ManualClock::new(now));
+        let session =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let organization = faktor_cloud::OrganizationId::try_new("org_gate").unwrap();
+        let store = std::sync::Arc::new(
+            faktor_cloud::SqliteControlPlaneStore::open(&dir.path().join("billing.db")).unwrap(),
+        );
+        let mut plans = BTreeMap::new();
+        plans.insert(
+            "metered".to_string(),
+            faktor_cloud::PlanConfig {
+                period_ms: Some(30 * 24 * 60 * 60 * 1000),
+                plan_id: "metered".to_string(),
+                features: [faktor_cloud::FEATURE_MANAGED_PROVIDERS.to_string()]
+                    .into_iter()
+                    .collect(),
+                limits: [(
+                    faktor_cloud::LIMIT_MAX_TOKENS_PER_PERIOD.to_string(),
+                    50_000u64,
+                )]
+                .into_iter()
+                .collect(),
+            },
+        );
+        let service = faktor_cloud::EntitlementService::new_for_organization(
+            store,
+            clock,
+            faktor_cloud::BillingConfig {
+                default_plan: Some("metered".to_string()),
+                plans,
+                managed_providers: ["managed-provider".to_string()].into_iter().collect(),
+            },
+            Some(organization.clone()),
+        )
+        .unwrap();
+        let account = faktor_cloud::BillingAccountId::try_new("acct_gate").unwrap();
+        service
+            .ensure_account(&organization, &account, "local", true)
+            .unwrap();
+        service
+            .set_subscription(&faktor_cloud::Subscription {
+                id: faktor_cloud::SubscriptionId::try_new("sub_gate").unwrap(),
+                organization: organization.clone(),
+                plan_id: "metered".into(),
+                status: faktor_cloud::SubscriptionStatus::Active,
+                started_ms: now - 1_000,
+                expires_ms: None,
+                updated_ms: now,
+            })
+            .unwrap();
+
+        let ws = session.create_workspace("/w").unwrap();
+        let sess = session
+            .create_session(ws, "t", "managed-provider", "m")
+            .unwrap();
+        let task = faktor_core::id::TaskId::new(1);
+        session
+            .store()
+            .upsert_task(&faktor_store::TaskRow {
+                task_id: task,
+                session_id: sess.id(),
+                goal: "g".into(),
+                acceptance_criteria: vec![],
+                plan: vec![],
+                attachments: vec![],
+                contract: Default::default(),
+                max_tokens: None,
+                max_turns: None,
+                spent_tokens: 0,
+                spent_turns: 0,
+                state: faktor_core::state::TaskState::Running,
+                revision: faktor_core::id::TaskRevision::new(1),
+                created_ms: 1,
+                updated_ms: 1,
+            })
+            .unwrap();
+        let store = session.store();
+        let faktor_store::CostReserveOutcome::Granted(reservation) = store
+            .cost_reserve_priced(
+                sess.id(),
+                task,
+                faktor_core::id::OpId::new(1),
+                60_000,
+                now,
+                None,
+                faktor_core::model::ExecutionClass::Unknown,
+            )
+            .unwrap()
+        else {
+            panic!("reservation refused")
+        };
+        store.cost_mark_dispatched(reservation, now).unwrap();
+        store
+            .cost_settle_usage_with_context(
+                reservation,
+                60_000,
+                0,
+                0,
+                0,
+                Some(60_000),
+                None,
+                now,
+                "managed-provider",
+                "m",
+            )
+            .unwrap();
+
+        let projector = std::sync::Arc::new(faktor_server::BillingSpendProjector::new(
+            service.clone(),
+            organization.clone(),
+            session.clone(),
+        ));
+        let gate = super::BillingAdmissionGate::new(service, organization, Some(projector));
+        let request = faktor_orchestrator::admission::AdmissionRequest {
+            boundary: faktor_orchestrator::admission::AdmissionBoundary::NewTask,
+            parent_session: sess.id().raw(),
+            task_id: Some(1),
+            run_id: "1".into(),
+            provider: Some("managed-provider".into()),
+            model: Some("m".into()),
+            observed: faktor_orchestrator::admission::AdmissionObserved::default(),
+        };
+        let refusal =
+            <super::BillingAdmissionGate as faktor_orchestrator::admission::AdmissionGate>::check(
+                &gate, &request,
+            )
+            .expect_err("60k tokens exceed the 50k period limit");
+        assert_eq!(refusal.limit, faktor_cloud::LIMIT_MAX_TOKENS_PER_PERIOD);
     }
 }

@@ -1332,6 +1332,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "faktor-freshness"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "faktor-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "faktor-fs"
 version = "0.1.0"
 dependencies = [
@@ -1421,6 +1433,7 @@ dependencies = [
  "blake3",
  "faktor-cas",
  "faktor-core",
+ "faktor-freshness",
  "faktor-git",
  "faktor-terminal",
  "serde",
@@ -1435,6 +1448,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "faktor-core",
+ "faktor-freshness",
  "faktor-fs",
  "faktor-store",
  "faktor-terminal",
@@ -1804,6 +1818,7 @@ dependencies = [
  "hyper-util",
  "rand",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

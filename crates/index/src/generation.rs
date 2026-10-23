@@ -30,16 +30,12 @@ use crate::{FileEntry, Symbol, WorkspaceIndex};
 /// refused loudly and rebuilt, never partially decoded).
 pub const GENERATION_FILE_FORMAT: u32 = 2;
 
-/// One entry of a workspace fingerprint: the identity of a regular file the
-/// walker saw (relative path, size, mtime ms). Compared entry-wise after
-/// sorting; a difference means the filesystem changed and the generation is
-/// stale.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct FingerprintEntry {
-    pub path: String,
-    pub size: u64,
-    pub modified_ms: i64,
-}
+/// One entry of a workspace fingerprint: the shared content-freshness record
+/// (relative path, optional file identity, size, mtime ms and BLAKE3 digest).
+/// Size/mtime are a shortlist only: a same-length/same-mtime rewrite is
+/// decided by the digest, and an entry WITHOUT a digest is legacy
+/// metadata-only material and is always dirty, never clean.
+pub type FingerprintEntry = faktor_freshness::FileRecord;
 
 /// The durable generation file: everything needed to serve generation `g`
 /// after a restart without rescanning.
@@ -398,6 +394,7 @@ mod tests {
             path: "src/a.rs".into(),
             size: SRC.len() as u64,
             modified_ms: 123,
+            ..FingerprintEntry::default()
         }];
         let env = GenerationFile::capture(ws, 3, &idx, fp);
         let bytes = env.to_bytes().unwrap();
@@ -573,6 +570,7 @@ mod tests {
             path: "z.rs".into(),
             size: 1,
             modified_ms: 1,
+            ..FingerprintEntry::default()
         });
         assert_ne!(other.identity(), back.identity());
         assert_ne!(other.fingerprint_identity(), back.fingerprint_identity());
@@ -601,17 +599,46 @@ mod tests {
     }
 
     #[test]
+    fn fingerprint_digest_and_identity_persist_and_legacy_entries_stay_digestless() {
+        let (idx, ws) = sample();
+        let digest = faktor_freshness::ContentDigest::of(b"content");
+        let identity = faktor_freshness::FileIdentity {
+            device: Some(7),
+            inode: Some(11),
+        };
+        let fp = vec![FingerprintEntry {
+            path: "src/a.rs".into(),
+            identity: Some(identity),
+            size: 7,
+            modified_ms: 42,
+            digest: Some(digest),
+        }];
+        let env = GenerationFile::capture(ws, 4, &idx, fp);
+        let back = GenerationFile::from_bytes(&env.to_bytes().unwrap()).unwrap();
+        assert_eq!(back.fingerprint[0].digest, Some(digest));
+        assert_eq!(back.fingerprint[0].identity, Some(identity));
+        // A pre-digest entry decodes with `None` and is therefore dirty
+        // material, never a clean authority.
+        let legacy: FingerprintEntry =
+            serde_json::from_str(r#"{"path":"src/a.rs","size":7,"modified_ms":42}"#).unwrap();
+        assert_eq!(legacy.digest, None);
+        assert_eq!(legacy.identity, None);
+    }
+
+    #[test]
     fn fingerprint_order_is_canonical() {
         let mut fp = vec![
             FingerprintEntry {
                 path: "z.rs".into(),
                 size: 1,
                 modified_ms: 1,
+                ..FingerprintEntry::default()
             },
             FingerprintEntry {
                 path: "a.rs".into(),
                 size: 2,
                 modified_ms: 2,
+                ..FingerprintEntry::default()
             },
         ];
         fp.sort();

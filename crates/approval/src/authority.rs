@@ -16,7 +16,7 @@ use crate::model::{
     DecisionOutcome, Principal,
 };
 use crate::operator::{key_registered_for, load_registry, OperatorKey};
-use crate::store::{ApprovalLedger, LedgerBody, LedgerEntry};
+use crate::store::{ApprovalLedger, LedgerBody, LedgerEntry, MonotonicClock};
 
 /// Current wall-clock time in epoch milliseconds (0 only if the clock is
 /// before the epoch, which every gate then refuses).
@@ -63,15 +63,18 @@ pub struct ApprovalStatusView {
 #[derive(Debug, Clone)]
 pub struct ApprovalAuthority {
     root: PathBuf,
+    clock: MonotonicClock,
 }
 
 impl ApprovalAuthority {
-    /// Open the approval authority over `data_dir`. Read-only callers create
-    /// nothing: the ledger/registry are created lazily by `propose`, `decide`
-    /// or operator registration.
+    /// Open the approval authority over `data_dir`. Calls that observe time
+    /// (`propose`, `decide`, `authorize`, `status`) persist the wall-clock
+    /// high-water mark; ledger inspection (`list`, `audit`, `view`) creates
+    /// nothing, and the ledger/registry are created lazily.
     pub fn open(data_dir: &Path) -> Result<Self, ApprovalError> {
         Ok(Self {
             root: data_dir.to_path_buf(),
+            clock: MonotonicClock::new(data_dir),
         })
     }
 
@@ -87,6 +90,7 @@ impl ApprovalAuthority {
         draft: ApprovalDraft,
         now_ms: u64,
     ) -> Result<ApprovalRequest, ApprovalError> {
+        let now_ms = self.clock.effective_now(now_ms)?;
         let request = ApprovalRequest::propose(draft, now_ms)?;
         let mut transaction = ApprovalLedger::begin(&self.root)?;
         if let Some(existing) = transaction.ledger().requests.get(&request.id) {
@@ -120,6 +124,7 @@ impl ApprovalAuthority {
         now_ms: u64,
     ) -> Result<ApprovalDecision, ApprovalError> {
         principal.validate()?;
+        let now_ms = self.clock.effective_now(now_ms)?;
         if principal.kind != crate::model::PrincipalKind::HumanOperator {
             return Err(ApprovalError::AgentApproval {
                 principal: principal.id,
@@ -179,6 +184,7 @@ impl ApprovalAuthority {
         check: &ApprovalCheck,
         now_ms: u64,
     ) -> Result<ApprovalToken, ApprovalError> {
+        let now_ms = self.clock.effective_now(now_ms)?;
         let ledger = ApprovalLedger::load(&self.root)?;
         let mut exact: Vec<&ApprovalRequest> = ledger
             .requests
@@ -229,6 +235,7 @@ impl ApprovalAuthority {
         check: &ApprovalCheck,
         now_ms: u64,
     ) -> Result<ApprovalToken, ApprovalError> {
+        let now_ms = self.clock.effective_now(now_ms)?;
         let ledger = ApprovalLedger::load(&self.root)?;
         let request = ledger
             .requests
@@ -283,7 +290,7 @@ impl ApprovalAuthority {
         };
         verify_decision_with(request, decision, trusted, operators)?;
         match &decision.outcome {
-            DecisionOutcome::Approved => ApprovalToken::from_verified(request, decision),
+            DecisionOutcome::Approved => ApprovalToken::from_verified(request, decision, now_ms),
             DecisionOutcome::Denied { reason } => Err(ApprovalError::Denied {
                 request_id: request.id.clone(),
                 kind: request.kind,
@@ -337,6 +344,7 @@ impl ApprovalAuthority {
         subject: &str,
         now_ms: u64,
     ) -> Result<Option<ApprovalToken>, ApprovalError> {
+        let now_ms = self.clock.effective_now(now_ms)?;
         let ledger = ApprovalLedger::load(&self.root)?;
         let mut requests: Vec<&ApprovalRequest> = ledger
             .requests
@@ -385,9 +393,10 @@ impl ApprovalAuthority {
     /// Compact status for CLI/tool surfaces.
     pub fn status(&self, request_id: &str) -> Result<ApprovalStatusView, ApprovalError> {
         let view = self.view(request_id)?;
+        let now_ms = self.clock.effective_now(unix_now_ms())?;
         let status = match &view.decision {
             None => {
-                if unix_now_ms() > view.request.expires_at_ms {
+                if now_ms > view.request.expires_at_ms {
                     "expired"
                 } else {
                     "open"
@@ -395,7 +404,7 @@ impl ApprovalAuthority {
             }
             Some(decision) => match &decision.outcome {
                 DecisionOutcome::Approved => {
-                    if unix_now_ms() > view.request.expires_at_ms {
+                    if now_ms > view.request.expires_at_ms {
                         "expired"
                     } else {
                         "approved"

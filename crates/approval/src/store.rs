@@ -3,13 +3,16 @@
 //! One JSON object per line. Each entry commits to its sequence number, the
 //! previous entry digest, the recording time and the canonical JSON body, so
 //! deletion, reordering, truncation or in-place edits are detected on the
-//! next open instead of being read as absence. A bounded lock file serializes
-//! writers across processes.
+//! next open instead of being read as absence. An OS advisory lock on an open
+//! descriptor serializes writers across processes: the kernel releases it
+//! automatically when the holder crashes, and it is never a deletable file
+//! that another process could mistake for stale.
 
 use std::collections::BTreeMap;
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -24,18 +27,22 @@ pub const LEDGER_FILE: &str = "ledger.jsonl";
 pub const LEDGER_HEAD_FILE: &str = "ledger.head";
 /// Monotonic anchor filename outside the approval directory.
 pub const LEDGER_ANCHOR_FILE: &str = "ledger.anchor";
+/// Maximum wall clock observed so far (monotonic expiry anchor).
+pub const CLOCK_ANCHOR_FILE: &str = "clock.anchor";
 /// Anchor directory, a sibling of (never inside) the approval directory.
 pub const LEDGER_ANCHOR_DIR: &str = "approval-anchor";
 const LEDGER_DOMAIN: &[u8] = b"faktor.approval.ledger/v1";
 const LEDGER_SCHEMA: &str = "faktor.approval.ledger-entry/v1";
 const LEDGER_HEAD_SCHEMA: &str = "faktor.approval.ledger-head/v1";
 const LEDGER_ANCHOR_SCHEMA: &str = "faktor.approval.ledger-anchor/v1";
+const CLOCK_ANCHOR_SCHEMA: &str = "faktor.approval.clock-anchor/v1";
 const MAX_LEDGER_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_LEDGER_HEAD_BYTES: u64 = 1_024;
+const MAX_CLOCK_ANCHOR_BYTES: u64 = 1_024;
 const LOCK_FILE: &str = ".ledger.lock";
+const CLOCK_LOCK_FILE: &str = "clock.lock";
 const LOCK_WAIT: Duration = Duration::from_secs(5);
 const LOCK_POLL: Duration = Duration::from_millis(5);
-const STALE_LOCK: Duration = Duration::from_secs(30);
 
 /// The durable ledger path inside a data dir.
 pub fn ledger_path(data_dir: &Path) -> PathBuf {
@@ -51,6 +58,13 @@ pub fn ledger_head_path(data_dir: &Path) -> PathBuf {
 /// rolling back every file under `approval/` does not roll back this counter.
 pub fn ledger_anchor_path(data_dir: &Path) -> PathBuf {
     data_dir.join(LEDGER_ANCHOR_DIR).join(LEDGER_ANCHOR_FILE)
+}
+
+/// The persisted maximum wall clock observed by this data dir. Kept outside
+/// `approval/` next to the ledger anchor so resetting the ledger directory
+/// cannot reset expiry monotonicity.
+pub fn clock_anchor_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(LEDGER_ANCHOR_DIR).join(CLOCK_ANCHOR_FILE)
 }
 
 /// The last durably committed chain position. The hash chain detects edits
@@ -702,48 +716,56 @@ fn sync_directory(path: &Path) -> Result<(), ApprovalError> {
     Ok(())
 }
 
+/// An OS advisory exclusive lock held on an open descriptor. The lock file
+/// itself is a stable rendezvous inode and is intentionally never deleted:
+/// deleting it would let a third process create a new inode and overlap the
+/// still-live holder. The kernel releases the lock on crash, so there is no
+/// stale-lock heuristic and no stale-deletion race.
+#[derive(Debug)]
 struct LedgerLock {
-    path: PathBuf,
+    file: File,
 }
 
 impl LedgerLock {
     fn acquire(data_dir: &Path) -> Result<Self, ApprovalError> {
+        Self::acquire_with_wait(data_dir, LOCK_WAIT)
+    }
+
+    fn acquire_with_wait(data_dir: &Path, wait: Duration) -> Result<Self, ApprovalError> {
         let directory = approval_dir(data_dir);
         std::fs::create_dir_all(&directory)
             .map_err(|error| ApprovalError::Store(error.to_string()))?;
         let path = directory.join(LOCK_FILE);
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|error| ApprovalError::Store(error.to_string()))?;
         let started = Instant::now();
         loop {
-            match std::fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&path)
-            {
-                Ok(mut file) => {
-                    let _ = write!(file, "{}", std::process::id());
-                    let _ = file.sync_all();
-                    return Ok(Self { path });
+            match file.try_lock() {
+                Ok(()) => {
+                    // The descriptor is the lock; the file content is never
+                    // read, truncated or trusted, so a live lock cannot be
+                    // "cleaned" by age and no arbitrary symlink target is
+                    // mutated here.
+                    return Ok(Self { file });
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let stale = std::fs::metadata(&path)
-                        .and_then(|metadata| metadata.modified())
-                        .ok()
-                        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-                        .is_some_and(|age| age > STALE_LOCK);
-                    if stale {
-                        let _ = std::fs::remove_file(&path);
-                        continue;
-                    }
-                    if started.elapsed() >= LOCK_WAIT {
+                Err(TryLockError::WouldBlock) => {
+                    if started.elapsed() >= wait {
                         return Err(ApprovalError::Busy(format!(
                             "approval ledger lock {} held for more than {:?}",
                             path.display(),
-                            LOCK_WAIT
+                            wait
                         )));
                     }
                     std::thread::sleep(LOCK_POLL);
                 }
-                Err(error) => return Err(ApprovalError::Store(error.to_string())),
+                Err(TryLockError::Error(error)) => {
+                    return Err(ApprovalError::Store(error.to_string()))
+                }
             }
         }
     }
@@ -751,6 +773,213 @@ impl LedgerLock {
 
 impl Drop for LedgerLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        // Unlock only the descriptor this guard owns; the path is left alone.
+        let _ = self.file.unlock();
+    }
+}
+
+/// The persisted high-water mark of observed wall-clock time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClockAnchor {
+    schema: String,
+    max_seen_wall_ms: u64,
+}
+
+/// Monotonic wall-clock observation.
+///
+/// `max_seen_wall_ms` is persisted under the anchor directory and updated
+/// under an OS file lock. Effective time is `max(observed, persisted)`, so a
+/// backwards wall-clock jump can never move an approval back before its
+/// expiry. In-process tokens additionally carry an [`Instant`] deadline, so
+/// even a wall-clock change cannot extend a token already minted.
+#[derive(Debug, Clone)]
+pub(crate) struct MonotonicClock {
+    root: PathBuf,
+}
+
+impl MonotonicClock {
+    pub(crate) fn new(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+        }
+    }
+
+    /// Observe `observed_ms` and return the monotonic effective time.
+    pub(crate) fn effective_now(&self, observed_ms: u64) -> Result<u64, ApprovalError> {
+        let anchor_dir = self.root.join(LEDGER_ANCHOR_DIR);
+        std::fs::create_dir_all(&anchor_dir)
+            .map_err(|error| ApprovalError::Store(format!("clock anchor dir: {error}")))?;
+        let lock_path = anchor_dir.join(CLOCK_LOCK_FILE);
+        let lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|error| ApprovalError::Store(format!("clock lock: {error}")))?;
+        lock.lock()
+            .map_err(|error| ApprovalError::Store(format!("clock lock: {error}")))?;
+        let result = self.observe_locked(observed_ms);
+        let _ = lock.unlock();
+        result
+    }
+
+    fn observe_locked(&self, observed_ms: u64) -> Result<u64, ApprovalError> {
+        let path = clock_anchor_path(&self.root);
+        let persisted = match std::fs::read(&path) {
+            Ok(raw) => {
+                if raw.len() as u64 > MAX_CLOCK_ANCHOR_BYTES {
+                    return Err(ApprovalError::Store(
+                        "clock anchor exceeds its bound".to_string(),
+                    ));
+                }
+                let anchor: ClockAnchor = serde_json::from_slice(&raw)
+                    .map_err(|error| ApprovalError::Store(format!("clock anchor: {error}")))?;
+                if anchor.schema != CLOCK_ANCHOR_SCHEMA {
+                    return Err(ApprovalError::Store(format!(
+                        "clock anchor schema {:?} is not {CLOCK_ANCHOR_SCHEMA:?}",
+                        anchor.schema
+                    )));
+                }
+                anchor.max_seen_wall_ms
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(ApprovalError::Store(format!("clock anchor: {error}"))),
+        };
+        let effective = observed_ms.max(persisted);
+        if effective > persisted {
+            let anchor = ClockAnchor {
+                schema: CLOCK_ANCHOR_SCHEMA.to_string(),
+                max_seen_wall_ms: effective,
+            };
+            let bytes = serde_json::to_vec(&anchor)
+                .map_err(|error| ApprovalError::Store(format!("clock anchor encode: {error}")))?;
+            faktor_fs::atomic::atomic_replace(&path, &bytes)
+                .map_err(|error| ApprovalError::Store(format!("clock anchor: {error}")))?;
+        }
+        Ok(effective)
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+    use std::io::{BufRead as _, BufReader};
+    use std::process::{Child, ChildStdout, Command, Stdio};
+
+    const CHILD_ENV: &str = "FAKTOR_APPROVAL_LOCK_CHILD";
+    const CHILD_DIR_ENV: &str = "FAKTOR_APPROVAL_LOCK_DIR";
+    const CHILD_TEST: &str = "store::lock_tests::child_holds_the_lock";
+
+    /// Child process entry point: acquire the real ledger lock and hold it
+    /// until the parent closes stdin or kills this process. The parent is the
+    /// regular test harness re-invoked with `--exact`.
+    #[test]
+    fn child_holds_the_lock() {
+        if std::env::var_os(CHILD_ENV).is_none() {
+            return;
+        }
+        let dir = std::env::var_os(CHILD_DIR_ENV).expect("child data dir");
+        let _lock = LedgerLock::acquire(Path::new(&dir)).unwrap();
+        println!("LOCKED");
+        std::io::stdout().flush().unwrap();
+        let mut ignored = String::new();
+        let _ = std::io::stdin().read_line(&mut ignored);
+    }
+
+    fn spawn_holder(dir: &Path) -> (Child, BufReader<ChildStdout>) {
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", CHILD_TEST, "--nocapture", "--test-threads=1"])
+            .env(CHILD_ENV, "1")
+            .env(CHILD_DIR_ENV, dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn lock holder");
+        let stdout = child.stdout.take().expect("child stdout");
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let read = reader.read_line(&mut line).expect("read child output");
+            assert!(
+                read != 0,
+                "the lock-holder child exited before acquiring the lock"
+            );
+            if line.contains("LOCKED") {
+                break;
+            }
+        }
+        (child, reader)
+    }
+
+    fn reap(child: &mut Child) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn concurrent_processes_serialize_and_never_overlap() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut child, _reader) = spawn_holder(temp.path());
+        let error = LedgerLock::acquire_with_wait(temp.path(), Duration::from_millis(150))
+            .expect_err("a second process must not acquire a held ledger lock");
+        assert!(
+            matches!(error, ApprovalError::Busy(_)),
+            "expected a typed busy refusal, got {error:?}"
+        );
+        reap(&mut child);
+        let lock = LedgerLock::acquire_with_wait(temp.path(), Duration::from_secs(2))
+            .expect("the released lock must be acquirable");
+        drop(lock);
+    }
+
+    #[test]
+    fn a_crashed_holder_releases_the_os_lock_immediately() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut child, _reader) = spawn_holder(temp.path());
+        reap(&mut child);
+        let started = Instant::now();
+        let lock = LedgerLock::acquire_with_wait(temp.path(), Duration::from_secs(2))
+            .expect("a dead holder's lock is released by the kernel");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "crash release must not wait for a stale timeout"
+        );
+        drop(lock);
+    }
+
+    #[test]
+    fn a_live_holders_lock_file_is_never_deleted_or_bypassed() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut child, _reader) = spawn_holder(temp.path());
+        let path = approval_dir(temp.path()).join(LOCK_FILE);
+        assert!(path.exists(), "the rendezvous file exists while held");
+        // Forge the mtime far into the past: the old 30s stale heuristic
+        // would delete this live lock and let a second process overlap.
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_modified(std::time::SystemTime::now() - Duration::from_secs(3_600))
+            .unwrap();
+        let error = LedgerLock::acquire_with_wait(temp.path(), Duration::from_millis(150))
+            .expect_err("an old mtime must not make a live lock acquirable");
+        assert!(matches!(error, ApprovalError::Busy(_)), "{error:?}");
+        assert!(path.exists(), "the live lock file must not be removed");
+        reap(&mut child);
+    }
+
+    #[test]
+    fn repeated_lock_unlock_cycles_keep_the_rendezvous_stable() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = approval_dir(temp.path()).join(LOCK_FILE);
+        for _ in 0..64 {
+            let lock = LedgerLock::acquire_with_wait(temp.path(), Duration::from_millis(500))
+                .expect("an uncontended lock must acquire");
+            drop(lock);
+        }
+        assert!(path.exists(), "unlock must not delete the lock file");
+        let (mut child, _reader) = spawn_holder(temp.path());
+        reap(&mut child);
     }
 }

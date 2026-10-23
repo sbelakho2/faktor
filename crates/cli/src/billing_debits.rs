@@ -204,6 +204,7 @@ mod tests {
             plans: [(
                 "test".to_string(),
                 PlanConfig {
+                    period_ms: None,
                     plan_id: "test".into(),
                     features: Default::default(),
                     limits: Default::default(),

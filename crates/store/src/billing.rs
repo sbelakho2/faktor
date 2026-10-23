@@ -1,6 +1,7 @@
 //! `billing`: cohesive slice of the mechanically decomposed parent module.
 
 use super::*;
+use faktor_core::billing::BillingPeriod;
 
 /// One cost-reservation row whose task row is gone (P0-97 `doctor --deep`
 /// dangling-budget scan). Rows in this list can never be settled or refunded
@@ -207,6 +208,122 @@ pub struct CostReservationRow {
     /// `Unknown` on legacy/NULL rows and unpriced paths — never counted as
     /// local or hosted. A zero-cost hosted row keeps a non-local class.
     pub execution_class: ExecutionClass,
+}
+
+/// One durable settlement outbox row (schema v45). The settlement
+/// transaction writes it together with the reservation's terminal state and
+/// the task's folded spend; the commercial projector drains it incrementally
+/// and idempotently (one row per reservation).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BillingOutboxRow {
+    pub outbox_id: i64,
+    pub reservation_id: i64,
+    pub session_id: SessionId,
+    pub task_id: TaskId,
+    pub attempt_id: String,
+    pub provider: String,
+    pub model: String,
+    pub uncached_input_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub provider_cost_micro: u64,
+    pub provider_reported_micro: Option<u64>,
+    pub state: String,
+    pub occurred_at_ms: i64,
+    pub source_operation: String,
+    pub period_id: String,
+    pub period_start_ms: i64,
+    pub period_end_ms: i64,
+}
+
+/// The exact settlement fact one outbox row carries. Written in the SAME
+/// transaction as the reservation's `settled` transition and the task's
+/// folded spend, so a crash can never leave settled money outside the
+/// outbox (and a replay is idempotent by the reservation identity).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BillingOutboxFact {
+    pub reservation_id: i64,
+    pub session_id: SessionId,
+    pub task_id: TaskId,
+    pub attempt_id: String,
+    pub provider: String,
+    pub model: String,
+    pub uncached_input_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub provider_cost_micro: u64,
+    pub provider_reported_micro: Option<u64>,
+    pub occurred_at_ms: i64,
+    pub source_operation: String,
+}
+
+/// Bound on one outbox page read (bounded everything).
+pub const MAX_BILLING_OUTBOX_PAGE: i64 = 10_000;
+
+fn outbox_period(anchor_ms: Option<i64>, period_ms: i64, at_ms: i64) -> BillingPeriod {
+    BillingPeriod::derive_or_unconfigured(anchor_ms, period_ms, at_ms)
+}
+
+fn insert_billing_outbox_tx(
+    tx: &rusqlite::Transaction<'_>,
+    fact: &BillingOutboxFact,
+) -> StoreResult<bool> {
+    let period = {
+        let config: Option<(i64, i64)> = tx
+            .query_row(
+                "SELECT anchor_ms, period_ms FROM billing_period_config WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        match config {
+            Some((anchor, period_ms)) => {
+                outbox_period(Some(anchor), period_ms, fact.occurred_at_ms)
+            }
+            None => BillingPeriod::unconfigured(),
+        }
+    };
+    // INSERT OR IGNORE: a settlement is exactly-once, but a legacy backfill
+    // or a replayed reconciliation may present the same reservation fact
+    // again — the unique idempotency key makes the replay a no-op.
+    let changed = tx.execute(
+        "INSERT OR IGNORE INTO billing_outbox
+            (idempotency_key, reservation_id, session_id, task_id, attempt_id,
+             provider, model, uncached_input_tokens, cache_read_tokens,
+             cache_write_tokens, output_tokens, reasoning_tokens,
+             provider_cost_micro, provider_reported_micro, state,
+             occurred_at_ms, source_operation, period_id, period_start_ms,
+             period_end_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                 ?14, 'settled', ?15, ?16, ?17, ?18, ?19)",
+        params![
+            format!("reservation:{}", fact.reservation_id),
+            fact.reservation_id,
+            fact.session_id.raw() as i64,
+            fact.task_id.raw() as i64,
+            fact.attempt_id,
+            fact.provider,
+            fact.model,
+            fact.uncached_input_tokens.min(i64::MAX as u64) as i64,
+            fact.cache_read_tokens.min(i64::MAX as u64) as i64,
+            fact.cache_write_tokens.min(i64::MAX as u64) as i64,
+            fact.output_tokens.min(i64::MAX as u64) as i64,
+            fact.reasoning_tokens.min(i64::MAX as u64) as i64,
+            fact.provider_cost_micro.min(i64::MAX as u64) as i64,
+            fact.provider_reported_micro
+                .map(|m| m.min(i64::MAX as u64) as i64),
+            fact.occurred_at_ms,
+            fact.source_operation,
+            period.id,
+            period.start_ms,
+            period.end_ms,
+        ],
+    )?;
+    Ok(changed > 0)
 }
 
 /// One `cost_reservation` row from the canonical 23-column projection, with
@@ -918,6 +1035,155 @@ pub(crate) fn efficiency_counter(raw: Option<i64>, what: &str) -> StoreResult<Op
 }
 
 impl Store {
+    /// Install (or replace) the daemon-wired billing period anchor/length.
+    /// The settlement path stamps outbox rows from this pair; an absent pair
+    /// stamps the honest all-time bucket.
+    pub fn set_billing_period_config(&self, anchor_ms: i64, period_ms: i64) -> StoreResult<()> {
+        if anchor_ms < 0 || period_ms <= 0 || period_ms > faktor_core::MAX_BILLING_PERIOD_MS {
+            return Err(StoreError::Conflict(format!(
+                "billing period config ({anchor_ms}, {period_ms}) is outside the legal domain"
+            )));
+        }
+        self.writer
+            .execute("set_billing_period_config", move |conn| {
+                conn.execute(
+                    "INSERT INTO billing_period_config (id, anchor_ms, period_ms)
+                 VALUES (1, ?1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET
+                    anchor_ms = excluded.anchor_ms,
+                    period_ms = excluded.period_ms",
+                    params![anchor_ms, period_ms],
+                )?;
+                Ok(())
+            })
+    }
+
+    /// The daemon-wired billing period configuration, if any.
+    pub fn billing_period_config(&self) -> StoreResult<Option<(i64, i64)>> {
+        let conn = self.read()?;
+        conn.query_row(
+            "SELECT anchor_ms, period_ms FROM billing_period_config WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(StoreError::from)
+    }
+
+    /// One bounded ascending page of the durable settlement outbox strictly
+    /// after `after_id`.
+    pub fn billing_outbox_after(
+        &self,
+        after_id: i64,
+        limit: usize,
+    ) -> StoreResult<Vec<BillingOutboxRow>> {
+        let limit = i64::try_from(limit)
+            .unwrap_or(MAX_BILLING_OUTBOX_PAGE)
+            .clamp(0, MAX_BILLING_OUTBOX_PAGE);
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(
+            "SELECT outbox_id, reservation_id, session_id, task_id, attempt_id,
+                    provider, model, uncached_input_tokens, cache_read_tokens,
+                    cache_write_tokens, output_tokens, reasoning_tokens,
+                    provider_cost_micro, provider_reported_micro, state,
+                    occurred_at_ms, source_operation, period_id, period_start_ms,
+                    period_end_ms
+             FROM billing_outbox WHERE outbox_id > ?1
+             ORDER BY outbox_id ASC LIMIT ?2",
+        )?;
+        let mut rows = stmt.query(params![after_id, limit])?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next()? {
+            let outbox_id: i64 = r.get(0)?;
+            out.push(BillingOutboxRow {
+                outbox_id,
+                reservation_id: r.get(1)?,
+                session_id: id_field(&format!("billing_outbox {outbox_id} session_id"), r.get(2)?)?,
+                task_id: id_field(&format!("billing_outbox {outbox_id} task_id"), r.get(3)?)?,
+                attempt_id: r.get(4)?,
+                provider: r.get(5)?,
+                model: r.get(6)?,
+                uncached_input_tokens: efficiency_counter(
+                    r.get(7)?,
+                    "billing_outbox uncached_input_tokens",
+                )?
+                .unwrap_or(0),
+                cache_read_tokens: efficiency_counter(
+                    r.get(8)?,
+                    "billing_outbox cache_read_tokens",
+                )?
+                .unwrap_or(0),
+                cache_write_tokens: efficiency_counter(
+                    r.get(9)?,
+                    "billing_outbox cache_write_tokens",
+                )?
+                .unwrap_or(0),
+                output_tokens: efficiency_counter(r.get(10)?, "billing_outbox output_tokens")?
+                    .unwrap_or(0),
+                reasoning_tokens: efficiency_counter(
+                    r.get(11)?,
+                    "billing_outbox reasoning_tokens",
+                )?
+                .unwrap_or(0),
+                provider_cost_micro: efficiency_counter(
+                    r.get(12)?,
+                    "billing_outbox provider_cost_micro",
+                )?
+                .unwrap_or(0),
+                provider_reported_micro: efficiency_counter(
+                    r.get(13)?,
+                    "billing_outbox provider_reported_micro",
+                )?,
+                state: r.get(14)?,
+                occurred_at_ms: r.get(15)?,
+                source_operation: r.get(16)?,
+                period_id: r.get(17)?,
+                period_start_ms: r.get(18)?,
+                period_end_ms: r.get(19)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Whether the one-time legacy backfill scanned the pre-outbox
+    /// reservation ledger into the outbox.
+    pub fn billing_outbox_backfill_done(&self) -> StoreResult<bool> {
+        let conn = self.read()?;
+        Ok(conn
+            .query_row(
+                "SELECT done FROM billing_outbox_backfill WHERE id = 1",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(|done| done != 0)
+            .unwrap_or(false))
+    }
+
+    /// Mark the one-time legacy backfill complete (durable).
+    pub fn mark_billing_outbox_backfill_done(&self) -> StoreResult<()> {
+        self.writer
+            .execute("mark_billing_outbox_backfill_done", |conn| {
+                conn.execute(
+                    "INSERT INTO billing_outbox_backfill (id, done) VALUES (1, 1)
+                 ON CONFLICT(id) DO UPDATE SET done = 1",
+                    [],
+                )?;
+                Ok(())
+            })
+    }
+
+    /// Write one legacy/backfill settlement fact into the outbox through the
+    /// ordinary writer (idempotent by the reservation id).
+    pub fn billing_outbox_record(&self, fact: BillingOutboxFact) -> StoreResult<bool> {
+        self.writer.execute("billing_outbox_record", move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let inserted = insert_billing_outbox_tx(&tx, &fact)?;
+            tx.commit()?;
+            Ok(inserted)
+        })
+    }
+
     // Fixed-arity provider telemetry; the parameter list is a stable call
     // contract used across the workspace.
     #[allow(clippy::too_many_arguments)]
@@ -1791,6 +2057,18 @@ impl Store {
         settled_ms: i64,
     ) -> StoreResult<CostReservationState> {
         let route_decision_json = route_decision_json.map(|v| v.to_owned());
+        let prepared_attempt = {
+            let conn = self.read()?;
+            conn.query_row(
+                "SELECT op_id, attempt_op_id FROM cost_reservation WHERE reservation_id = ?1",
+                params![reservation_id],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?)),
+            )
+            .optional()?
+            .map(|(op_id, attempt_op_id)| attempt_op_id.unwrap_or(op_id).to_string())
+            .unwrap_or_default()
+        };
+        let source_operation = "cost_settle".to_owned();
         // Preparation BEFORE enqueueing: the refusal diagnostic (the task ids
         // are read inside the transaction, so the message is static).
         let task_missing =
@@ -1799,8 +2077,8 @@ impl Store {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let row: Option<(i64, i64, String)> = tx
                 .query_row(
-                    "SELECT session_id, task_id, status FROM cost_reservation
-                 WHERE reservation_id = ?1",
+                    "SELECT session_id, task_id, status
+                 FROM cost_reservation WHERE reservation_id = ?1",
                     params![reservation_id],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
@@ -1847,6 +2125,24 @@ impl Store {
                 tx.rollback()?;
                 return Err(StoreError::Conflict(task_missing));
             }
+            let fact = BillingOutboxFact {
+                reservation_id,
+                session_id: id_field("cost_settle session_id", session_id)?,
+                task_id: id_field("cost_settle task_id", task_id)?,
+                attempt_id: prepared_attempt.clone(),
+                provider: String::new(),
+                model: String::new(),
+                uncached_input_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                output_tokens: 0,
+                reasoning_tokens: 0,
+                provider_cost_micro: actual.max(0) as u64,
+                provider_reported_micro,
+                occurred_at_ms: settled_ms,
+                source_operation: source_operation.clone(),
+            };
+            insert_billing_outbox_tx(&tx, &fact)?;
             tx.commit()?;
             Ok(CostReservationState::Applied)
         })
@@ -1886,7 +2182,54 @@ impl Store {
         route_decision_json: Option<&str>,
         settled_ms: i64,
     ) -> StoreResult<CostSettleOutcome> {
+        self.cost_settle_usage_with_context(
+            reservation_id,
+            uncached_input_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            output_tokens,
+            provider_reported_micro,
+            route_decision_json,
+            settled_ms,
+            "",
+            "",
+        )
+    }
+
+    /// [`Store::cost_settle_usage`] with the attempt's provider/model, which
+    /// the outbox row carries so the commercial projection can classify the
+    /// spend without re-listing the session's calls.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cost_settle_usage_with_context(
+        &self,
+        reservation_id: i64,
+        uncached_input_tokens: u64,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
+        output_tokens: u64,
+        provider_reported_micro: Option<u64>,
+        route_decision_json: Option<&str>,
+        settled_ms: i64,
+        provider: &str,
+        model: &str,
+    ) -> StoreResult<CostSettleOutcome> {
+        #[allow(clippy::type_complexity)]
+        type CostReservationRow = (i64, i64, String, Option<String>);
         let route_decision_json = route_decision_json.map(|v| v.to_owned());
+        let provider = provider.to_string();
+        let model = model.to_string();
+        let prepared_attempt = {
+            let conn = self.read()?;
+            conn.query_row(
+                "SELECT op_id, attempt_op_id FROM cost_reservation WHERE reservation_id = ?1",
+                params![reservation_id],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?)),
+            )
+            .optional()?
+            .map(|(op_id, attempt_op_id)| attempt_op_id.unwrap_or(op_id).to_string())
+            .unwrap_or_default()
+        };
+        let source_operation = "cost_settle_usage".to_owned();
         // Preparation BEFORE enqueueing: every refusal diagnostic (the task
         // ids are read inside the transaction, so that message is static).
         let snapshot_context = format!("reservation {reservation_id} pricing_snapshot_json");
@@ -1894,10 +2237,10 @@ impl Store {
             "cost settle: task has no row; the task machine owns creation".to_owned();
         self.writer.execute("cost_settle_usage", move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let row: Option<(i64, i64, String, Option<String>)> = tx
+            let row: Option<CostReservationRow> = tx
                 .query_row(
                     "SELECT session_id, task_id, status, pricing_snapshot_json
-                 FROM cost_reservation WHERE reservation_id = ?1",
+                     FROM cost_reservation WHERE reservation_id = ?1",
                     params![reservation_id],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                 )
@@ -1905,6 +2248,23 @@ impl Store {
             let Some((session_id, task_id, status, snapshot_json)) = row else {
                 tx.rollback()?;
                 return Ok(CostSettleOutcome::Missing);
+            };
+            let outbox_fact = |cost_micro: u64| BillingOutboxFact {
+                reservation_id,
+                session_id: SessionId::new(session_id as u64),
+                task_id: TaskId::new(task_id as u64),
+                attempt_id: prepared_attempt.clone(),
+                provider: provider.clone(),
+                model: model.clone(),
+                uncached_input_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+                output_tokens,
+                reasoning_tokens: 0,
+                provider_cost_micro: cost_micro,
+                provider_reported_micro,
+                occurred_at_ms: settled_ms,
+                source_operation: source_operation.clone(),
             };
             if status != "reserved" && status != "dispatched" {
                 tx.rollback()?;
@@ -1977,6 +2337,7 @@ impl Store {
                             reservation_id
                         ],
                     )?;
+                    insert_billing_outbox_tx(&tx, &outbox_fact(0))?;
                     tx.commit()?;
                     return Ok(CostSettleOutcome::AppliedUnknown);
                 }
@@ -2016,6 +2377,7 @@ impl Store {
                 tx.rollback()?;
                 return Err(StoreError::Conflict(task_missing));
             }
+            insert_billing_outbox_tx(&tx, &outbox_fact(chosen_i64.max(0) as u64))?;
             tx.commit()?;
             Ok(CostSettleOutcome::Applied {
                 actual_micro: chosen_i64.max(0) as u64,
@@ -2194,10 +2556,10 @@ impl Store {
         at_ms: i64,
     ) -> StoreResult<CostReconcileReport> {
         let mut report = CostReconcileReport::default();
-        let candidates: Vec<i64> = {
+        let candidates: Vec<(i64, String)> = {
             let conn = self.read()?;
             let mut stmt = conn.prepare(
-                "SELECT cr.reservation_id
+                "SELECT cr.reservation_id, cr.op_id, cr.attempt_op_id
                  FROM cost_reservation cr
                  WHERE cr.session_id = ?1 AND cr.task_id = ?2 AND cr.status = 'uncertain'
                    AND EXISTS (
@@ -2215,11 +2577,18 @@ impl Store {
             )?;
             let rows = stmt.query_map(
                 params![session_id.raw() as i64, task_id.raw() as i64],
-                |r| r.get::<_, i64>(0),
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, Option<i64>>(2)?,
+                    ))
+                },
             )?;
             let mut out = Vec::new();
             for row in rows {
-                out.push(row?);
+                let (reservation_id, op_id, attempt_op_id) = row?;
+                out.push((reservation_id, attempt_op_id.unwrap_or(op_id).to_string()));
             }
             out
         };
@@ -2228,9 +2597,16 @@ impl Store {
         // function docs). The report still folds OUTSIDE the job. The
         // per-candidate snapshot context is materialized HERE (the caller's
         // thread), never inside the single writer owner.
-        let candidates: Vec<(i64, String)> = candidates
+        let source_operation = "cost_reconcile_uncertain".to_owned();
+        let candidates: Vec<(i64, String, String)> = candidates
             .into_iter()
-            .map(|id| (id, format!("reservation {id} pricing_snapshot_json")))
+            .map(|(id, attempt_id)| {
+                (
+                    id,
+                    format!("reservation {id} pricing_snapshot_json"),
+                    attempt_id,
+                )
+            })
             .collect();
         let candidate_count = candidates.len();
         let outcomes: Vec<CostReconcileOutcome> = if candidate_count == 0 {
@@ -2239,7 +2615,7 @@ impl Store {
             self.writer.execute("cost_reconcile_uncertain", move |conn| {
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 let mut outcomes = Vec::with_capacity(candidate_count);
-                for (reservation_id, snapshot_context) in candidates {
+                for (reservation_id, snapshot_context, attempt_id) in candidates {
                     // ONE fixed savepoint name: each candidate's savepoint is
                     // released before the next begins, and the constant text
                     // lets the connection's statement cache reuse the
@@ -2250,7 +2626,8 @@ impl Store {
                 // a previous pass may have closed it).
                 let row: Option<(u64, Option<String>)> = tx
                     .query_row(
-                        "SELECT predicted_micro, pricing_snapshot_json FROM cost_reservation
+                        "SELECT predicted_micro, pricing_snapshot_json
+                         FROM cost_reservation
                          WHERE reservation_id = ?1 AND status = 'uncertain'",
                         params![reservation_id],
                         |r| Ok((r.get::<_, i64>(0)?.max(0) as u64, r.get(1)?)),
@@ -2268,9 +2645,10 @@ impl Store {
                 // row. Audit-13 primary counters; cache/reasoning detail is not
                 // persisted on the provider-call row, so the settled basis is
                 // input + output.
-                let tokens: Option<(i64, i64)> = tx
+                let tokens: Option<(i64, i64, String, String)> = tx
                     .query_row(
-                        "SELECT COALESCE(p.tokens_in, 0), COALESCE(p.tokens_out, 0)
+                        "SELECT COALESCE(p.tokens_in, 0), COALESCE(p.tokens_out, 0),
+                                p.provider, p.model
                          FROM provider_call p
                          JOIN cost_reservation cr ON cr.reservation_id = ?1
                            AND p.session_id = cr.session_id
@@ -2283,11 +2661,28 @@ impl Store {
                               AND p.op_id = cr.op_id))
                          ORDER BY p.id DESC LIMIT 1",
                         params![reservation_id],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                     )
                     .optional()?;
-                let Some((tokens_in, tokens_out)) = tokens else {
+                let Some((tokens_in, tokens_out, call_provider, call_model)) = tokens else {
                     return Ok(CostReconcileOutcome::LeftUncertain);
+                };
+                let outbox_fact = |cost_micro: u64| BillingOutboxFact {
+                    reservation_id,
+                    session_id,
+                    task_id,
+                    attempt_id: attempt_id.clone(),
+                    provider: call_provider.clone(),
+                    model: call_model.clone(),
+                    uncached_input_tokens: tokens_in.max(0) as u64,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                    output_tokens: tokens_out.max(0) as u64,
+                    reasoning_tokens: 0,
+                    provider_cost_micro: cost_micro,
+                    provider_reported_micro: None,
+                    occurred_at_ms: at_ms,
+                    source_operation: source_operation.clone(),
                 };
                 let actual = snapshot.and_then(|s| {
                     s.settle_cost(tokens_in.max(0) as u64, 0, 0, tokens_out.max(0) as u64)
@@ -2317,6 +2712,7 @@ impl Store {
                             // dangling scan.
                             return Ok(CostReconcileOutcome::LeftUncertain);
                         }
+                        insert_billing_outbox_tx(&tx, &outbox_fact(cost.max(0) as u64))?;
                         CostReconcileOutcome::Settled(cost.max(0) as u64)
                     }
                     None => {
@@ -2343,6 +2739,7 @@ impl Store {
                                  WHERE reservation_id = ?2",
                                 params![at_ms, reservation_id, COST_BASIS_UNKNOWN],
                             )?;
+                            insert_billing_outbox_tx(&tx, &outbox_fact(0))?;
                             CostReconcileOutcome::ClosedUnknown
                         }
                     }
@@ -2406,20 +2803,27 @@ impl Store {
         at_ms: i64,
     ) -> StoreResult<CostFinalizeReport> {
         let mut report = CostFinalizeReport::default();
-        let candidates: Vec<i64> = {
+        let candidates: Vec<(i64, String)> = {
             let conn = self.read()?;
             let mut stmt = conn.prepare(
-                "SELECT reservation_id FROM cost_reservation
+                "SELECT reservation_id, op_id, attempt_op_id FROM cost_reservation
                  WHERE session_id = ?1 AND task_id = ?2 AND status = 'uncertain'
                  ORDER BY reservation_id ASC",
             )?;
             let rows = stmt.query_map(
                 params![session_id.raw() as i64, task_id.raw() as i64],
-                |r| r.get::<_, i64>(0),
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, Option<i64>>(2)?,
+                    ))
+                },
             )?;
             let mut out = Vec::new();
             for row in rows {
-                out.push(row?);
+                let (reservation_id, op_id, attempt_op_id) = row?;
+                out.push((reservation_id, attempt_op_id.unwrap_or(op_id).to_string()));
             }
             out
         };
@@ -2427,6 +2831,7 @@ impl Store {
         // inside its own SAVEPOINT and the pass commits ONCE. A candidate
         // that must write nothing is rolled back to its savepoint
         // (row-local, exactly like the former per-candidate `rollback()`).
+        let source_operation = "cost_finalize_uncertain".to_owned();
         let outcomes: Vec<CostFinalizeOutcome> = if candidates.is_empty() {
             Vec::new()
         } else {
@@ -2434,20 +2839,22 @@ impl Store {
                 .execute("cost_finalize_uncertain", move |conn| {
                     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                     let mut outcomes = Vec::with_capacity(candidates.len());
-                    for reservation_id in candidates.iter() {
+                    for (reservation_id, attempt_id) in candidates {
                         tx.execute_batch("SAVEPOINT cost_finalize_candidate")?;
                         let outcome = (|| -> StoreResult<CostFinalizeOutcome> {
-                            let predicted: Option<u64> = tx
+                            let row: Option<(i64,)> = tx
                                 .query_row(
-                                    "SELECT predicted_micro FROM cost_reservation
+                                    "SELECT predicted_micro
+                                     FROM cost_reservation
                                      WHERE reservation_id = ?1 AND status = 'uncertain'",
                                     params![reservation_id],
-                                    |r| r.get::<_, i64>(0).map(|v| v.max(0) as u64),
+                                    |r| Ok((r.get(0)?,)),
                                 )
                                 .optional()?;
-                            let Some(predicted) = predicted else {
+                            let Some((predicted,)) = row else {
                                 return Ok(CostFinalizeOutcome::Skipped);
                             };
+                            let predicted = predicted.max(0) as u64;
                             let predicted_i64 = predicted.min(i64::MAX as u64) as i64;
                             tx.execute(
                                 "UPDATE cost_reservation
@@ -2482,6 +2889,36 @@ impl Store {
                                 // see the row.
                                 return Ok(CostFinalizeOutcome::LeftUncertain);
                             }
+                            let call: Option<(String, String)> = tx
+                                .query_row(
+                                    "SELECT provider, model FROM provider_call
+                                     WHERE session_id = ?1 AND reservation_id = ?2
+                                     ORDER BY id DESC LIMIT 1",
+                                    params![session_id.raw() as i64, reservation_id],
+                                    |r| Ok((r.get(0)?, r.get(1)?)),
+                                )
+                                .optional()?;
+                            let (provider, model) = call.unwrap_or_default();
+                            insert_billing_outbox_tx(
+                                &tx,
+                                &BillingOutboxFact {
+                                    reservation_id,
+                                    session_id,
+                                    task_id,
+                                    attempt_id: attempt_id.clone(),
+                                    provider,
+                                    model,
+                                    uncached_input_tokens: 0,
+                                    cache_read_tokens: 0,
+                                    cache_write_tokens: 0,
+                                    output_tokens: 0,
+                                    reasoning_tokens: 0,
+                                    provider_cost_micro: predicted,
+                                    provider_reported_micro: None,
+                                    occurred_at_ms: at_ms,
+                                    source_operation: source_operation.clone(),
+                                },
+                            )?;
                             Ok(CostFinalizeOutcome::Settled(predicted))
                         })();
                         match outcome {

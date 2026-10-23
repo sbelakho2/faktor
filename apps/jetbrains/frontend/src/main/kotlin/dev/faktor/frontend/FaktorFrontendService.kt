@@ -215,10 +215,16 @@ class FaktorFrontendService(
      * sign-out always presents the exact credential it captured and means to
      * delete.
      */
-    fun revokeControlPlaneSessionWithToken(organization: String, sessionId: String, token: String) {
+    fun revokeControlPlaneSessionWithToken(
+        organization: String,
+        sessionId: String,
+        token: String,
+        timeoutMs: Long = NativeClient.DEFAULT_TIMEOUT_MS
+    ) {
         val conn = synchronized(lifecycleLock) { connection }
             ?: throw BackendException("the daemon is not running, so the control plane is unreachable")
-        NativeClient.forConnection(conn, token).revokeControlSession(organization, sessionId)
+        NativeClient.forConnection(conn, token, timeoutMs = timeoutMs)
+            .revokeControlSession(organization, sessionId)
     }
 
     fun currentSessionId(): String? = sessionId
