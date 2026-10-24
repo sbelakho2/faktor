@@ -861,19 +861,25 @@ async function main() {
       const sessionId = String(created.json.id);
       const createSamples = [];
       const idsList = [];
+      const createdIds = new Set();
       for (let index = 0; index < MEMORY_FACTS; index += 1) {
         const started = performance.now();
+        const subject = `svc-${String(index).padStart(5, '0')}`;
         const body = await postJson(base, token, '/native/memory/records', {
           session: sessionId,
           scope: 'session',
-          subject: `svc-${String(index).padStart(5, '0')}`,
+          subject,
           predicate: 'port',
           value: { type: 'number', value: index },
           provenance: { origin: 'user' },
         });
         createSamples.push(performance.now() - started);
         assert('memory-5000', body.status === 200, `memory create ${index} -> ${body.status} ${body.text.slice(0, 200)}`);
-        idsList.push(body.json.record.id);
+        const record = body.json.record;
+        assert('memory-5000', record.subject === subject, `memory create ${index} returned subject ${record.subject}`);
+        assert('memory-5000', !createdIds.has(record.id), `memory create ${index} reused id ${record.id}`);
+        createdIds.add(record.id);
+        idsList.push(record.id);
       }
       if (MEMORY_FACTS >= 5000) {
         const over = await postJson(base, token, '/native/memory/records', {
@@ -917,6 +923,7 @@ async function main() {
         assert('memory-5000', edited.status === 200 && edited.json.record.version === 2, `memory edit ${index} -> ${edited.status}`);
       }
       const deleteSamples = [];
+      const deletedIds = new Set();
       for (let index = 0; index < Math.min(1000, MEMORY_FACTS); index += 1) {
         const started = performance.now();
         const deleted = await fetch(
@@ -926,7 +933,9 @@ async function main() {
         const text = await deleted.text();
         deleteSamples.push(performance.now() - started);
         assert('memory-5000', deleted.status === 200, `memory delete ${index} -> ${deleted.status} ${text.slice(0, 200)}`);
+        deletedIds.add(idsList[index]);
       }
+      assert('memory-5000', deletedIds.size === Math.min(1000, MEMORY_FACTS), `deleted ${deletedIds.size} distinct rows`);
 
       let before = null;
       let live = 0;
@@ -951,7 +960,14 @@ async function main() {
         before = page.json.nextCursor;
         assert('memory-5000', before !== null, 'memory hasMore without cursor');
       }
-      assert('memory-5000', live === MEMORY_FACTS - Math.min(1000, MEMORY_FACTS), `live memory ${live}`);
+      const expectedLive = [...createdIds].filter((id) => !deletedIds.has(id));
+      if (live !== expectedLive.length) {
+        const missing = expectedLive.filter((id) => !seen.has(id));
+        console.error(
+          `[scale] memory-5000: live=${live} expected=${expectedLive.length} created=${createdIds.size} deleted=${deletedIds.size} missing=${missing.length} ${missing.slice(0, 5).join(',')}`,
+        );
+      }
+      assert('memory-5000', live === expectedLive.length, `live memory ${live} != expected ${expectedLive.length}`);
 
       const all = await getJson(base, token, `/native/memory/records?session=${sessionId}&limit=200&scope=session&includeDeleted=true`);
       assert('memory-5000', all.status === 200 && all.json.records.length === 200, 'tombstone page size');
@@ -999,44 +1015,52 @@ async function main() {
     // -------------------------------------------------------------- history
     await probe('history-2000', async () => {
       let before = null;
+      let snapshotRevision = null;
       let snapshotMs = null;
       let total = 0;
       const seen = new Set();
       const pageSamples = [];
-      let lastCreated = Number.MAX_SAFE_INTEGER;
+      let lastRevision = Number.MAX_SAFE_INTEGER;
       let lastId = Number.MAX_SAFE_INTEGER;
       for (;;) {
         const query = new URLSearchParams({ limit: '200' });
         if (before !== null) {
-          query.set('beforeMs', String(before.beforeMs));
+          // The durable cursor is the monotonic `(listing_revision, id)`
+          // pair; wall-clock `beforeMs`/`snapshotMs` are presentation
+          // metadata and never bound the page.
+          assert('history-2000', snapshotRevision !== null, 'cursored page without a snapshot');
+          assert('history-2000', before.beforeRevision !== undefined, 'nextBefore lacks beforeRevision');
+          query.set('beforeRevision', String(before.beforeRevision));
           query.set('beforeId', String(before.beforeId));
-          // A cursored walk is bound to the first page's snapshot: updates
-          // during the walk cannot re-surface or skip a conversation.
-          assert('history-2000', snapshotMs !== null, 'cursored page without a snapshot');
-          query.set('snapshotMs', String(snapshotMs));
+          query.set('snapshotRevision', String(snapshotRevision));
+          if (before.beforeMs !== undefined) query.set('beforeMs', String(before.beforeMs));
+          if (snapshotMs !== null) query.set('snapshotMs', String(snapshotMs));
         }
         const started = performance.now();
         const page = await getJson(base, token, `/native/sessions?${query}`);
         pageSamples.push(performance.now() - started);
         assert('history-2000', page.status === 200, `history page ${page.status}`);
         assert('history-2000', page.json.sessions.length <= 200, `history page ${page.json.sessions.length} > 200`);
-        if (snapshotMs === null) {
+        if (snapshotRevision === null) {
+          snapshotRevision = Number(page.json.snapshotRevision);
           snapshotMs = Number(page.json.snapshotMs);
+          assert('history-2000', Number.isFinite(snapshotRevision) && snapshotRevision >= 0, 'first page carries no snapshotRevision');
           assert('history-2000', Number.isFinite(snapshotMs) && snapshotMs >= 0, 'first page carries no snapshotMs');
         } else {
-          assert('history-2000', Number(page.json.snapshotMs) === snapshotMs, 'snapshot changed mid-walk');
+          assert('history-2000', Number(page.json.snapshotRevision) === snapshotRevision, 'snapshot revision changed mid-walk');
+          assert('history-2000', Number(page.json.snapshotMs) === snapshotMs, 'snapshot ms changed mid-walk');
         }
         for (const row of page.json.sessions) {
           assert('history-2000', !seen.has(row.id), `duplicate history session ${row.id}`);
           seen.add(row.id);
-          const created = Number(row.updated_ms);
+          const revision = Number(row.listing_revision);
           const id = Number(row.id);
           assert(
             'history-2000',
-            created < lastCreated || (created === lastCreated && id < lastId),
+            revision < lastRevision || (revision === lastRevision && id < lastId),
             'history listing is not newest-first/stable',
           );
-          lastCreated = created;
+          lastRevision = revision;
           lastId = id;
         }
         total += page.json.sessions.length;
