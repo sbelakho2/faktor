@@ -171,6 +171,41 @@ process.stdout.write(JSON.stringify(out, null, 2) + "\n");
             FAILED=1
         }
         [ -s "$SBOM" ] && SBOM_WRITTEN=1
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 -c '
+import json
+import sys
+
+metadata = json.load(open(sys.argv[1], encoding="utf-8"))
+packages = sorted(
+    (
+        {
+            "name": package["name"],
+            "version": package["version"],
+            "license": package.get("license"),
+            "source": package.get("source"),
+        }
+        for package in metadata["packages"]
+    ),
+    key=lambda package: (package["name"], package["version"]),
+)
+json.dump(
+    {
+        "schema": "faktor-sbom/1",
+        "generated_at_ms": int(sys.argv[2]),
+        "source": "cargo metadata --format-version 1 --locked",
+        "package_count": len(metadata["packages"]),
+        "workspace_members": len(metadata["workspace_members"]),
+        "packages": packages,
+    },
+    sys.stdout,
+    indent=2,
+)
+' "$TMP_DIR/metadata.json" "$(now_ms)" >"$SBOM" || {
+            record_tool sbom fail "python3 projection failed"
+            FAILED=1
+        }
+        [ -s "$SBOM" ] && SBOM_WRITTEN=1
     elif [ -x "$CI_TOOLS" ]; then
         "$CI_TOOLS" sbom "$TMP_DIR/metadata.json" "$(now_ms)" >"$SBOM" || {
             record_tool sbom fail "faktor-ci-tools projection failed"
@@ -184,7 +219,7 @@ process.stdout.write(JSON.stringify(out, null, 2) + "\n");
         }
         [ -s "$SBOM" ] && SBOM_WRITTEN=1
         record_skip sbom-projection \
-            "neither jq, node nor faktor-ci-tools on PATH; raw cargo metadata written to sbom.json (valid JSON, unprojected)"
+            "neither jq, node, python3 nor faktor-ci-tools on PATH; raw cargo metadata written to sbom.json (valid JSON, unprojected)"
     fi
     if [ "$SBOM_WRITTEN" = "1" ]; then
         if command -v jq >/dev/null 2>&1; then
@@ -195,6 +230,13 @@ process.stdout.write(JSON.stringify(out, null, 2) + "\n");
             }
         elif command -v node >/dev/null 2>&1; then
             node -e 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"))' "$SBOM" \
+                >/dev/null 2>&1 || {
+                record_tool sbom-validate fail "sbom.json is not valid JSON"
+                FAILED=1
+                SBOM_WRITTEN=0
+            }
+        elif command -v python3 >/dev/null 2>&1; then
+            python3 -c 'import json, sys; json.load(open(sys.argv[1], encoding="utf-8"))' "$SBOM" \
                 >/dev/null 2>&1 || {
                 record_tool sbom-validate fail "sbom.json is not valid JSON"
                 FAILED=1
