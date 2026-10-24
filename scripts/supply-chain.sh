@@ -35,11 +35,15 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT" || exit 2
 CI_TOOLS="${FAKTOR_CI_TOOLS:-}"
 if [ -z "$CI_TOOLS" ]; then
-    if [ -n "${CARGO_TARGET_DIR:-}" ]; then
-        CI_TOOLS="$CARGO_TARGET_DIR/release/faktor-ci-tools"
-    else
-        CI_TOOLS="$ROOT/target/release/faktor-ci-tools"
-    fi
+    target_dir="${CARGO_TARGET_DIR:-$ROOT/target}"
+    for profile in release debug; do
+        candidate="$target_dir/$profile/faktor-ci-tools"
+        if [ -x "$candidate" ]; then
+            CI_TOOLS="$candidate"
+            break
+        fi
+    done
+    [ -n "$CI_TOOLS" ] || CI_TOOLS="$target_dir/release/faktor-ci-tools"
 fi
 
 OUT_DIR="${SUPPLY_CHAIN_OUT_DIR:-target/certification}"
@@ -171,41 +175,6 @@ process.stdout.write(JSON.stringify(out, null, 2) + "\n");
             FAILED=1
         }
         [ -s "$SBOM" ] && SBOM_WRITTEN=1
-    elif command -v python3 >/dev/null 2>&1; then
-        python3 -c '
-import json
-import sys
-
-metadata = json.load(open(sys.argv[1], encoding="utf-8"))
-packages = sorted(
-    (
-        {
-            "name": package["name"],
-            "version": package["version"],
-            "license": package.get("license"),
-            "source": package.get("source"),
-        }
-        for package in metadata["packages"]
-    ),
-    key=lambda package: (package["name"], package["version"]),
-)
-json.dump(
-    {
-        "schema": "faktor-sbom/1",
-        "generated_at_ms": int(sys.argv[2]),
-        "source": "cargo metadata --format-version 1 --locked",
-        "package_count": len(metadata["packages"]),
-        "workspace_members": len(metadata["workspace_members"]),
-        "packages": packages,
-    },
-    sys.stdout,
-    indent=2,
-)
-' "$TMP_DIR/metadata.json" "$(now_ms)" >"$SBOM" || {
-            record_tool sbom fail "python3 projection failed"
-            FAILED=1
-        }
-        [ -s "$SBOM" ] && SBOM_WRITTEN=1
     elif [ -x "$CI_TOOLS" ]; then
         "$CI_TOOLS" sbom "$TMP_DIR/metadata.json" "$(now_ms)" >"$SBOM" || {
             record_tool sbom fail "faktor-ci-tools projection failed"
@@ -219,7 +188,7 @@ json.dump(
         }
         [ -s "$SBOM" ] && SBOM_WRITTEN=1
         record_skip sbom-projection \
-            "neither jq, node, python3 nor faktor-ci-tools on PATH; raw cargo metadata written to sbom.json (valid JSON, unprojected)"
+            "neither jq, node nor faktor-ci-tools on PATH; raw cargo metadata written to sbom.json (valid JSON, unprojected)"
     fi
     if [ "$SBOM_WRITTEN" = "1" ]; then
         if command -v jq >/dev/null 2>&1; then
@@ -230,13 +199,6 @@ json.dump(
             }
         elif command -v node >/dev/null 2>&1; then
             node -e 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"))' "$SBOM" \
-                >/dev/null 2>&1 || {
-                record_tool sbom-validate fail "sbom.json is not valid JSON"
-                FAILED=1
-                SBOM_WRITTEN=0
-            }
-        elif command -v python3 >/dev/null 2>&1; then
-            python3 -c 'import json, sys; json.load(open(sys.argv[1], encoding="utf-8"))' "$SBOM" \
                 >/dev/null 2>&1 || {
                 record_tool sbom-validate fail "sbom.json is not valid JSON"
                 FAILED=1

@@ -273,6 +273,10 @@ steps:
       - node scripts/programme/release-gate.mjs --status
   - name: static
     image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
+    # The SBOM projection prefers jq/node, then the in-repo Rust tool. The
+    # impact-graph step builds faktor-ci-tools in this same workspace, so
+    # serialize after it instead of racing the static lane.
+    depends_on: [impact-graph]
     environment:
       RUST_BACKTRACE: "1"
     commands:
