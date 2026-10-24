@@ -302,8 +302,9 @@ function authorityModel(document) {
         unitIdByPath.set(dir, node.id);
       }
     }
-    // A package node WITH a path is a local unit (npm/Gradle/Maven/Python);
-    // a package node without a path is an external dependency.
+    // A package node WITH a path is a local unit (npm/Gradle/Maven and
+    // other user-language packages); a package node without a path is an
+    // external dependency.
     if (node.kind === 'package' && node.path) {
       const dir = node.path === '.' ? '' : String(node.path).replace(/\/+$/, '');
       const unit = { name: node.name, dir, kind: 'package', nodeId: node.id, deps: new Set() };
@@ -692,8 +693,9 @@ function testCommandsFor(tests, limit = 256, graph = null) {
   const commands = new Set();
   for (const test of tests.slice(0, limit)) {
     if (!test.crate || !test.name) continue;
-    // Only Cargo crates have `cargo test -p` commands; npm/Gradle/Maven/
-    // Python units are still reported in `tests` and select their surfaces.
+    // Only Cargo crates have `cargo test -p` commands; npm/Gradle/Maven and
+    // other user-language units are still reported in `tests` and select
+    // their surfaces.
     if (graph && !graph.crates.has(test.crate)) continue;
     if (!/^[A-Za-z0-9_:.-]+$/.test(test.name)) continue;
     if (!/^[A-Za-z0-9_-]+$/.test(test.crate)) continue;

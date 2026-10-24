@@ -319,7 +319,7 @@ anchored bound; do not invent a spec SLO.
 A missing baseline is `not_certified`; a budget miss fails the gate. An
 absolute p95 number must be adopted by the product owner; the PDF gives none.
 
-**Gate `edition8-perf`:** `{workloads:7, failed:0, baseline_present:true}` per
+**Gate `edition8-perf`:** `{workloads:11, failed:0, baseline_present:true}` per
 host, with per-platform records.
 
 ## 8. Phase 7 — isolated dogfood

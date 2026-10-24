@@ -153,6 +153,15 @@ pub(crate) struct InvoiceQuery {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct ReconcileQuery {
+    #[serde(default)]
+    pub(crate) org: Option<String>,
+    #[serde(default)]
+    pub(crate) limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct PaymentListQuery {
     #[serde(default)]
     pub(crate) org: Option<String>,
@@ -230,6 +239,12 @@ pub(crate) struct RefundBody {
     pub(crate) payment_id: String,
     pub(crate) amount_minor: i64,
     pub(crate) reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RotatePaymentMethodBody {
+    pub(crate) token: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -370,8 +385,74 @@ pub(crate) async fn native_billing_invoice(
             service.export_invoice_csv(&invoice),
         )
             .into_response(),
-        "json" => json(serde_json::json!({"ok": true, "invoice": invoice})),
+        "json" => {
+            let provider_observations =
+                match service.provider_invoice_observations(&organization, &invoice.id) {
+                    Ok(observations) => observations,
+                    Err(e) => return wire_status(payments_err(e)),
+                };
+            let provider_payments =
+                match service.provider_payment_observations(&organization, &invoice.id) {
+                    Ok(observations) => observations,
+                    Err(e) => return wire_status(payments_err(e)),
+                };
+            let provider_refunds =
+                match service.provider_refund_observations(&organization, &invoice.id) {
+                    Ok(observations) => observations,
+                    Err(e) => return wire_status(payments_err(e)),
+                };
+            json(serde_json::json!({
+                "ok": true,
+                "invoice": invoice,
+                "providerObservations": provider_observations,
+                "providerPayments": provider_payments,
+                "providerRefunds": provider_refunds,
+            }))
+        }
         _ => wire_status(malformed_body("format must be json or csv")),
+    }
+}
+
+/// `POST /native/billing/reconcile` — one bounded, read-only provider fetch
+/// pass. It records linked observations and typed reconciliation states; it
+/// never rewrites a Faktor invoice total or status.
+pub(crate) async fn native_billing_reconcile(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    query: Result<Query<ReconcileQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let principal = match require_principal(&state, &headers) {
+        Ok(principal) => principal,
+        Err(e) => return wire_status(e),
+    };
+    if let Err(denied) = faktor_cloud::authorize(
+        &principal,
+        &principal.organization,
+        faktor_cloud::Resource::Billing,
+        faktor_cloud::Action::BillingWrite,
+    ) {
+        return wire_status(denied_err(denied));
+    }
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(_) => return wire_status(malformed_body("invalid reconcile query (strict DTO)")),
+    };
+    let organization = match scoped_org(&principal, query.org.as_deref()) {
+        Ok(organization) => organization,
+        Err(e) => return wire_status(e),
+    };
+    let Some(service) = state.deps.payments.as_ref() else {
+        return wire_status(payments_disabled());
+    };
+    match service
+        .reconcile(&organization, page_limit(query.limit))
+        .await
+    {
+        Ok(report) => json(serde_json::json!({"ok": true, "reconciliation": report})),
+        Err(e) => wire_status(payments_err(e)),
     }
 }
 
@@ -891,6 +972,68 @@ pub(crate) async fn native_billing_add_payment_method(
     }
 }
 
+pub(crate) async fn native_billing_rotate_payment_method(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Result<Json<RotatePaymentMethodBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let (principal, service) = match authorized(&state, &headers, true) {
+        Ok(value) => value,
+        Err(e) => return wire_status(e),
+    };
+    let idempotency_key = match require_idempotency_key(&headers) {
+        Ok(key) => key,
+        Err(e) => return wire_status(e),
+    };
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(_) => {
+            return wire_status(malformed_body(
+                "invalid payment-method rotate body (strict DTO)",
+            ))
+        }
+    };
+    match service.rotate_payment_method_token(
+        &principal.organization,
+        &id,
+        &body.token,
+        &idempotency_key,
+    ) {
+        Ok(outcome) => json(serde_json::json!({
+            "ok": true,
+            "paymentMethod": outcome.payment_method,
+            "replayed": outcome.replayed,
+        })),
+        Err(e) => wire_status(payments_err(e)),
+    }
+}
+
+pub(crate) async fn native_billing_remove_payment_method(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let (principal, service) = match authorized(&state, &headers, true) {
+        Ok(value) => value,
+        Err(e) => return wire_status(e),
+    };
+    let idempotency_key = match require_idempotency_key(&headers) {
+        Ok(key) => key,
+        Err(e) => return wire_status(e),
+    };
+    match service.remove_payment_method(&principal.organization, &id, &idempotency_key) {
+        Ok(removed) => json(serde_json::json!({"ok": true, "removed": removed})),
+        Err(e) => wire_status(payments_err(e)),
+    }
+}
+
 /// `POST /native/billing/webhook` — the provider ingress. There is no daemon
 /// password: the HMAC signature is the credential. The body is verified
 /// before the event id/order/store is consulted.
@@ -915,6 +1058,9 @@ pub(crate) async fn native_billing_webhook(
                 faktor_payments::WebhookDisposition::Duplicate => "duplicate",
                 faktor_payments::WebhookDisposition::StaleIgnored => "stale_ignored",
                 faktor_payments::WebhookDisposition::Ignored => "ignored",
+                faktor_payments::WebhookDisposition::ReconciliationConflict => {
+                    "reconciliation_conflict"
+                }
             },
             "eventId": outcome.event_id,
             "eventType": outcome.event_type,

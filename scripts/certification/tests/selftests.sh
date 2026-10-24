@@ -40,6 +40,12 @@
 #                                           with explicit scrub/plant child
 #                                           envs; ambient os.environ never read
 #                                           or mutated)
+#   target/release/faktor-ci-tools tcp-connect selftest
+#                                           Rust loopback probe used by the
+#                                           macOS confinement certification
+#                                           (replaces the former interpreter
+#                                           one-liner; the tooling has no
+#                                           interpreter dependency)
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
@@ -85,6 +91,7 @@ run "faktor-ci-tools publish-status selftest" "$CI_TOOLS" publish-status selftes
 run "faktor-ci-tools capability-tests selftest" "$CI_TOOLS" capability-tests selftest
 run "faktor-ci-tools visual-baseline selftest" "$CI_TOOLS" visual-baseline selftest
 run "faktor-ci-tools iana-table --check" "$CI_TOOLS" iana-table --check
+run "faktor-ci-tools tcp-connect selftest" "$CI_TOOLS" tcp-connect selftest
 run "compile-and-smoke.sh checksum reconcile selftest" bash apps/jetbrains/compile-and-smoke.sh --selftest-checksum
 
 printf '\n=====================\n'

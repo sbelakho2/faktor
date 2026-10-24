@@ -1,0 +1,7 @@
+{
+  "id": "re_test_pending",
+  "object": "refund",
+  "status": "pending",
+  "amount": 2500,
+  "currency": "usd"
+}

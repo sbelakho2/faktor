@@ -1,0 +1,26 @@
+{
+  "id": "sub_test_1",
+  "object": "subscription",
+  "status": "active",
+  "quantity": 2,
+  "cancel_at_period_end": false,
+  "current_period_start": 1700000000,
+  "current_period_end": 1702592000,
+  "items": {
+    "object": "list",
+    "data": [
+      {
+        "id": "si_test_1",
+        "object": "subscription_item",
+        "quantity": 2,
+        "price": {
+          "id": "price_test_2",
+          "object": "price",
+          "product": "prod_test_1",
+          "unit_amount": 20000,
+          "recurring": {"interval": "month"}
+        }
+      }
+    ]
+  }
+}

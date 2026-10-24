@@ -1,0 +1,7 @@
+{
+  "id": "re_test_failed",
+  "object": "refund",
+  "status": "failed",
+  "amount": 2500,
+  "currency": "usd"
+}

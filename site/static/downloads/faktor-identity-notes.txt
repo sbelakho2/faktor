@@ -1,0 +1,31 @@
+Faktor visual identity — usage rules and source analysis
+Edition 4 / 12 October 2026
+
+Source: Faktor_Website.pdf, pages 29–33 (current identity) and 46–50 (retained identity).
+
+LOGO
+- Fixed outlined artwork. Do not retype, stretch, rotate or add effects.
+- Preferred symbol size: 24 px. Use the supplied icon-only mark below that context.
+- Clear space: at least one quarter of the symbol height (H/4) on every side.
+- Ink on Paper and Ochre on Ink are the two production masters.
+
+PALETTE
+Ink #08110C — primary surface, type and dark bands.
+Forest #143D2B — structural dark surface.
+Paper #F3F5EF — reading surface.
+Sage #92AA99 — metadata on Ink.
+Ochre #D9BA75 — accent on Ink and warm highlight.
+Ochre Deep #72541E — readable accent on Paper.
+State colours (success, warning, danger) keep semantic meaning; they are not brand accents.
+
+TYPOGRAPHY
+Barlow Semi Condensed 600 for display and page headings.
+Barlow 400–600 for the reading surface.
+IBM Plex Mono 400–500 for technical metadata, labels and commands.
+The logo wordmark is fixed artwork; host editors retain their own typography.
+
+APPLICATION
+- The marketing site is server-rendered with no JavaScript.
+- The editor prototype uses CSS-only radio state for host, theme and evidence state.
+- Work / Inspect / History are the shared vocabulary across native host surfaces.
+- The identity does not overwrite the host's theme, focus tokens or editor typography.

@@ -153,38 +153,6 @@ const ALLOWLIST = [
   },
   {
     file: 'crates/orchestrator/src/runtime.rs',
-    line_contains: 'let handle = manager.get_session(session_id).ok().flatten()?;',
-    count: 1,
-    reason:
-      'child_task_budget_cap mirror derivation: documented derive-only projection of the task row\'s token cap (None = no task row / unlimited); the DURABLE budget patch already landed on the child through the enqueued+acked control, enforcement lives in the child session, and registry reads re-derive through derive_child_projection.',
-    owner: 'orchestrator child registry projection',
-  },
-  {
-    file: 'crates/orchestrator/src/runtime.rs',
-    line_contains: 'let task_id = handle.task_id().ok()?;',
-    count: 1,
-    reason:
-      'child_task_budget_cap mirror derivation (id leg): an unreadable id yields no mirror derivation; never a fabricated cap, never an uncapped claim.',
-    owner: 'orchestrator child registry projection',
-  },
-  {
-    file: 'crates/orchestrator/src/runtime.rs',
-    line_contains: '.and_then(|id| manager.get_session(id).ok().flatten())',
-    count: 1,
-    reason:
-      'child_execution_phase mirror projection: documented presentational projection (Planning when no drive-state row exists); an unreadable session derives the conservative default, the durable drive-state row is re-derived on every registry read, and the phase is never a lifecycle transition.',
-    owner: 'orchestrator child registry projection',
-  },
-  {
-    file: 'crates/orchestrator/src/runtime.rs',
-    line_contains: '.and_then(|h| h.orchestrator_drive_state_get().ok())',
-    count: 1,
-    reason:
-      'child_execution_phase mirror projection (drive-state leg): same reviewed presentational semantics as the session leg above; re-derived on every registry read.',
-    owner: 'orchestrator child registry projection',
-  },
-  {
-    file: 'crates/orchestrator/src/runtime.rs',
     line_contains: '.ok()',
     count: 1,
     reason:
@@ -240,14 +208,6 @@ const ALLOWLIST = [
     owner: 'agent retrieval authority',
   },
   {
-    file: 'crates/agent/src/runtime/retrieval.rs',
-    line_contains: 'let prompt_hint = handle.title().unwrap_or_default();',
-    count: 1,
-    reason:
-      'prompt hint title: display-only context, never an authority or identity input.',
-    owner: 'agent retrieval authority',
-  },
-  {
     file: 'crates/agent/src/runtime/settlement.rs',
     line_contains: '.ok()',
     count: 1,
@@ -261,14 +221,6 @@ const ALLOWLIST = [
     count: 1,
     reason:
       'settlement budget view: an unreadable live counter falls back to the DURABLE task-row budget value (itself an authority), never to zero or a fabricated number.',
-    owner: 'agent settlement authority',
-  },
-  {
-    file: 'crates/agent/src/runtime/settlement.rs',
-    line_contains: 'let facts = handle.memory_facts().unwrap_or_default();',
-    count: 1,
-    reason:
-      'review-context support read: an unreadable fact table yields no goal fact; the caller still carries the durable typed criteria rows and the goal text, so the reviewer never receives a silently empty package when a goal exists (this helper never gates completion).',
     owner: 'agent settlement authority',
   },
   {
@@ -289,14 +241,6 @@ const ALLOWLIST = [
   },
   {
     file: 'crates/agent/src/runtime/shell_changes.rs',
-    line_contains: 'let Ok(facts) = handle.memory_facts() else {',
-    count: 1,
-    reason:
-      'an unreadable fact table is never read as "no shell changes": the caller refuses certification (conservative) — the comment states the fail-closed intent.',
-    owner: 'agent shell-change authority',
-  },
-  {
-    file: 'crates/agent/src/runtime/shell_changes.rs',
     line_contains: 'Err(_) => None,',
     count: 1,
     reason:
@@ -309,22 +253,6 @@ const ALLOWLIST = [
     count: 1,
     reason:
       'an unreadable tool-run scan returns false ("no manifest-backed runs observed") which REFUSES the change-set claim, never fabricates one.',
-    owner: 'agent shell-change authority',
-  },
-  {
-    file: 'crates/agent/src/runtime/shell_changes.rs',
-    line_contains: 'let row = handle.row().ok()?;',
-    count: 1,
-    reason:
-      'workspace resolution helper: the Option chain resolves a workspace for a verdict that refuses typed when it is absent; an unreadable row cannot certify anything.',
-    owner: 'agent shell-change authority',
-  },
-  {
-    file: 'crates/agent/src/runtime/shell_changes.rs',
-    line_contains: '.ok()',
-    count: 1,
-    reason:
-      'same workspace-resolution helper continuation: unreadable row/root yields no workspace, and the caller treats None as "cannot observe" (conservative).',
     owner: 'agent shell-change authority',
   },
   {
@@ -378,9 +306,9 @@ const ALLOWLIST = [
   {
     file: 'crates/agent/src/runtime/turn/state.rs',
     line_contains: '.unwrap_or_default()',
-    count: 1,
+    count: 2,
     reason:
-      'Option::unwrap_or_default after a positive position selection on a non-empty task list: unreachable default kept for the total function shape.',
+      'Two reviewed Option projections: (a) after a positive position selection on a non-empty task list, an unreachable default kept for the total function shape; (b) the task-create template goal, used only when the preflight proved no task row exists, so an unreadable projection yields the documented empty goal instead of fabricating a task identity (the existing-row path patches under a revision CAS and never takes this arm).',
     owner: 'agent turn state',
   },
   {
@@ -409,34 +337,10 @@ const ALLOWLIST = [
   },
   {
     file: 'crates/agent/src/runtime/verification_attribution.rs',
-    line_contains: 'let row = handle.row().ok()?;',
-    count: 1,
-    reason:
-      'fingerprint_workspace auxiliary observation (documented): no manifest observation degrades the ENVIRONMENT projection; the reusable proof basis refuses separately when the content identity is unavailable.',
-    owner: 'agent verification attribution',
-  },
-  {
-    file: 'crates/agent/src/runtime/verification_attribution.rs',
-    line_contains: '.ok()??;',
-    count: 1,
-    reason:
-      'fingerprint_workspace root read (same auxiliary function): an unreadable root yields NO observation, never a fabricated one; the proof basis refuses separately when identity is required.',
-    owner: 'agent verification attribution',
-  },
-  {
-    file: 'crates/agent/src/runtime/verification_attribution.rs',
-    line_contains: 'self.deps.workspaces.open(row.workspace_id, root).ok()',
-    count: 1,
-    reason:
-      'fingerprint_workspace workspace open (same auxiliary function): an unopenable workspace yields no manifest observation; the proof basis refuses separately.',
-    owner: 'agent verification attribution',
-  },
-  {
-    file: 'crates/agent/src/runtime/verification_attribution.rs',
     line_contains: '.unwrap_or_default()',
-    count: 1,
+    count: 2,
     reason:
-      'Option::unwrap_or_default AFTER a typed read (`handle.get_task(task_id)?`): a missing task row is legal absence (empty criteria), and the read error already propagated with `?`.',
+      'Two Option projections AFTER typed reads: (a) the proof-basis criteria fold over `handle.get_task(task_id)?` — a missing task row is legal absence (empty criteria) and the read error already propagated with `?`; (b) `row.map(|t| t.acceptance_criteria)` after `self.session_task(handle)?` — the option only distinguishes a not-yet-seeded row from a seeded one, and a store failure is a typed refusal above.',
     owner: 'agent verification attribution',
   },
   {
@@ -641,14 +545,6 @@ const ALLOWLIST = [
   },
   {
     file: 'crates/server/src/native/session.rs',
-    line_contains: 'Err(_) => Vec::new(),',
-    count: 1,
-    reason:
-      'tool-result payload parse for the transcript read model: an unparseable payload renders no structured content (the raw row still carries its own text), never fabricated tool output.',
-    owner: 'server session surface',
-  },
-  {
-    file: 'crates/server/src/native/session.rs',
     line_contains: 'let row = handle.row().ok();',
     count: 1,
     reason:
@@ -742,6 +638,486 @@ const ALLOWLIST = [
     reason:
       'window-matched Option: `conflicts.get_mut(index).map(take).unwrap_or_default()` — the index was just produced by the conflict scan above; an out-of-range index yields an empty CONFLICT MESSAGE, and the Conflict error is still returned.',
     owner: 'store writer tasks',
+  },
+  {
+    file: 'crates/agent/src/runtime/goal.rs',
+    line_contains: 'let title = handle.title().unwrap_or_default();',
+    count: 1,
+    reason:
+      'goal label detection: the session title is only a comparison value for detecting a label/empty goal; an unreadable title yields the empty string, so the check treats the goal as needing heal from the durable ledger and never fabricates an objective.',
+    owner: 'agent goal authority',
+  },
+  {
+    file: 'crates/agent/src/runtime/goal.rs',
+    line_contains: 'clear_label_task_goal(handle, &handle.title().unwrap_or_default());',
+    count: 1,
+    reason:
+      'clear_label_task_goal call after a typed goal_unavailable_after_redaction: the title fallback only decides whether a stale TASK label equals the title; an unreadable title clears nothing, and the typed error above is returned unchanged.',
+    owner: 'agent goal authority',
+  },
+  {
+    file: 'crates/agent/src/runtime/goal.rs',
+    line_contains: 'let Ok(task_id) = handle.task_id() else {',
+    count: 1,
+    reason:
+      'clear_label_task_goal is a best-effort display cleanup of the task label: an unreadable task id returns without clearing; it never gates completion and the durable goal/criteria ledger remains authoritative.',
+    owner: 'agent goal authority',
+  },
+  {
+    file: 'crates/agent/src/runtime/goal.rs',
+    line_contains: 'let Ok(Some(task)) = handle.get_task(task_id) else {',
+    count: 1,
+    reason:
+      'same best-effort label cleanup: an unreadable/absent task row leaves the label untouched; the durable task row is read typed by every completion path.',
+    owner: 'agent goal authority',
+  },
+  {
+    file: 'crates/agent/src/runtime/retrieval.rs',
+    line_contains: 'let page = handle.messages_before(None, 8).ok()?;',
+    count: 1,
+    reason:
+      'latest_user_prompt_message is a display/context helper returning Option; an unreadable transcript page yields no prompt hint, and instruction resolution still reads the durable bundle.',
+    owner: 'agent retrieval authority',
+  },
+  {
+    file: 'crates/agent/src/runtime/retrieval.rs',
+    line_contains: '.or_else(|| handle.title().ok())',
+    count: 1,
+    reason:
+      'prompt hint falls back from the newest user message to the session title; both are display-only content for instruction matching, never an identity or authority read.',
+    owner: 'agent retrieval authority',
+  },
+  {
+    file: 'crates/agent/src/runtime/retrieval.rs',
+    line_contains: '.unwrap_or_default();',
+    count: 1,
+    reason:
+      'empty prompt hint when neither the latest message nor the title is readable; the compiler still resolves the durable instruction bundle.',
+    owner: 'agent retrieval authority',
+  },
+  {
+    file: 'crates/agent/src/runtime/retrieval.rs',
+    line_contains: '.ok()',
+    count: 2,
+    reason:
+      'Two optional instruction-context reads: the shadow liveness probe treats an unreadable active root as no live shadow (so the ordinary captured bundle is pinned), and the captured binding read yields no pinned bundle on failure while the resolver falls back to the durable bundle. Neither is an identity claim.',
+    owner: 'agent retrieval authority',
+  },
+  {
+    file: 'crates/agent/src/runtime/retrieval.rs',
+    line_contains: 'if let Ok(row) = handle.row() {',
+    count: 1,
+    reason:
+      'workspace memory facts are an optional enrichment of the review context; an unreadable session row skips the workspace scope while the session-scope facts above are still rendered.',
+    owner: 'agent retrieval authority',
+  },
+  {
+    file: 'crates/agent/src/runtime/settlement.rs',
+    line_contains: 'let title = handle.title().unwrap_or_default();',
+    count: 1,
+    reason:
+      'the title is a comparison value for the label-goal heal; an unreadable title cannot match a non-empty label, so the heal is skipped and the durable goal is left unchanged (secret detection still runs independently).',
+    owner: 'agent settlement authority',
+  },
+  {
+    file: 'crates/agent/src/runtime/settlement.rs',
+    line_contains: 'let goal_fact = handle.memory_fact_get("task", "goal").unwrap_or_default();',
+    count: 1,
+    reason:
+      'goal memory fact read used to detect drift; an unreadable read is treated as not-yet-matching and the canonical fact is upserted, never a completion decision.',
+    owner: 'agent settlement authority',
+  },
+  {
+    file: 'crates/agent/src/runtime/settlement.rs',
+    line_contains: 'let criteria_fact = handle.memory_fact_get("criteria", "0").unwrap_or_default();',
+    count: 1,
+    reason:
+      'criteria memory fact read used to detect drift; an unreadable read is treated as not-yet-matching and the canonical fact is upserted, never a completion decision.',
+    owner: 'agent settlement authority',
+  },
+  {
+    file: 'crates/agent/src/runtime/test_rebind.rs',
+    line_contains: 'if let Ok(edges) = git_rename_edges(supervisor.clone(), root, handle.id()).await {',
+    count: 1,
+    reason:
+      'git rename edges are optional rebind evidence; an unreadable supervisor/git query yields no rename edges and the evidence reports its own basis; changed test-bearing paths are still processed.',
+    owner: 'agent test rebind',
+  },
+  {
+    file: 'crates/agent/src/runtime/turn/drive.rs',
+    line_contains: 'view.head.goal.is_empty() || view.head.goal == handle.title().unwrap_or_default();',
+    count: 1,
+    reason:
+      'legacy head label test: the title is a comparison value; an unreadable title yields no label match, so the head is only rewritten when it is empty or carries a secret (the secret test is independent).',
+    owner: 'agent turn drive',
+  },
+  {
+    file: 'crates/agent/src/runtime/turn/drive_phases.rs',
+    line_contains: 'let Ok(Some(raw)) = handle.memory_fact_get("session_settings", "contextWindow") else {',
+    count: 1,
+    reason:
+      'durable per-session context-window override: an unreadable/missing setting leaves the model window unchanged; the override can only lower the budget.',
+    owner: 'agent turn planning',
+  },
+  {
+    file: 'crates/agent/src/runtime/turn/state.rs',
+    line_contains: 'let row = handle.row().ok()?;',
+    count: 1,
+    reason:
+      'workspace open helper: an unreadable session row yields no workspace handle; callers treat None as cannot-observe and refuse the relevant proof/change claim.',
+    owner: 'agent turn state',
+  },
+  {
+    file: 'crates/cli/src/daemon/semantic.rs',
+    line_contains: 'Err(_) => {}',
+    count: 2,
+    reason:
+      'bounded LSP readiness polling: a failed probe is retried; at the deadline readiness proceeds to the real request, whose own typed result is authoritative (no fabricated success).',
+    owner: 'cli semantic readiness',
+  },
+  {
+    file: 'crates/cli/src/supply.rs',
+    line_contains: 'Err(_) => None,',
+    count: 1,
+    reason:
+      'approval lookup for qualification: errors that are not hard failures/Denials mean no token; assess_qualification then refuses when approval is required (conservative).',
+    owner: 'cli supply actions',
+  },
+  {
+    file: 'crates/cli/src/supply.rs',
+    line_contains: 'Err(_) => {}',
+    count: 1,
+    reason:
+      'classification approval loop: a non-hard, non-Denied authorization error contributes no token, so the decision cannot claim approval.',
+    owner: 'cli supply actions',
+  },
+  {
+    file: 'crates/cloud/src/entitlements.rs',
+    line_contains: 'let started_ms = current.as_ref().map(|s| s.started_ms).unwrap_or(now);',
+    count: 1,
+    reason:
+      'subscription ensure: absence of an existing subscription starts the period now; a store error propagates with `?` above, so `now` is only the documented first-subscription start.',
+    owner: 'cloud entitlements',
+  },
+  {
+    file: 'crates/foundation/src/providers.rs',
+    line_contains: 'Err(_) => None,',
+    count: 1,
+    reason:
+      'proxy URL parse: a malformed proxy URL means no proxy rule is added; the checked transport then refuses the proxy/connection rather than bypassing policy.',
+    owner: 'foundation providers',
+  },
+  {
+    file: 'crates/impact/src/lsp.rs',
+    line_contains: 'let Ok(symbols) = session.document_symbols(&absolute) else {',
+    count: 1,
+    reason:
+      'document symbols probe: a failed request marks the impact stats degraded and continues; degraded output is surfaced, never presented as complete.',
+    owner: 'impact lsp',
+  },
+  {
+    file: 'crates/impact/src/lsp.rs',
+    line_contains: 'if let Ok(locations) = session.references(&absolute, symbol.line, symbol.character) {',
+    count: 1,
+    reason:
+      'references request failure is recorded as degraded (stats.degraded) and the scan continues; no fabricated edges.',
+    owner: 'impact lsp',
+  },
+  {
+    file: 'crates/impact/src/lsp.rs',
+    line_contains: 'let Ok(incoming) = session.incoming_calls(&item) else {',
+    count: 1,
+    reason:
+      'incoming-calls failure marks degraded and continues; the impact graph surfaces degradation instead of claiming completeness.',
+    owner: 'impact lsp',
+  },
+  {
+    file: 'crates/memory/src/management.rs',
+    line_contains: '.ok()',
+    count: 1,
+    reason:
+      'MemoryRecordStore constructor: an unreadable session row yields workspace scope 0; session-scope reads stay keyed by the session id, and workspace facts require the later typed workspace resolution.',
+    owner: 'memory management',
+  },
+  {
+    file: 'crates/memory/src/management.rs',
+    line_contains: '.unwrap_or(u64::MAX)),',
+    count: 1,
+    reason:
+      'u64 conversion of a count saturates at u64::MAX; it is an overflow bound, not an error→absence read.',
+    owner: 'memory management',
+  },
+  {
+    file: 'crates/orchestrator/src/runtime_handoff.rs',
+    line_contains: 'let Ok(Some(handle)) = self.manager.get_session(parent) else {',
+    count: 1,
+    reason:
+      'heal_pending_child_handoffs is documented best-effort: a vanished/unreadable parent logs and skips; the run\'s own durable rows remain the authority and the next re-attach retries.',
+    owner: 'orchestrator child recovery',
+  },
+  {
+    file: 'crates/orchestrator/src/runtime_helpers.rs',
+    line_contains: 'let handle = manager.get_session(session_id).ok().flatten()?;',
+    count: 1,
+    reason:
+      'child_task_budget_cap mirror derivation: documented derive-only projection of the task row token cap (None = no task row / unlimited); the durable budget patch already landed on the child through the enqueued+acked control, enforcement lives in the child session, and registry reads re-derive through derive_child_projection.',
+    owner: 'orchestrator child registry projection',
+  },
+  {
+    file: 'crates/orchestrator/src/runtime_helpers.rs',
+    line_contains: 'let task_id = handle.task_id().ok()?;',
+    count: 1,
+    reason:
+      'child_task_budget_cap mirror derivation (id leg): an unreadable id yields no mirror derivation; never a fabricated cap, never an uncapped claim.',
+    owner: 'orchestrator child registry projection',
+  },
+  {
+    file: 'crates/orchestrator/src/runtime_helpers.rs',
+    line_contains: '.and_then(|id| manager.get_session(id).ok().flatten())',
+    count: 1,
+    reason:
+      'child_execution_phase mirror projection: documented presentational projection (Planning when no drive-state row exists); an unreadable session derives the conservative default, the durable drive-state row is re-derived on every registry read, and the phase is never a lifecycle transition.',
+    owner: 'orchestrator child registry projection',
+  },
+  {
+    file: 'crates/orchestrator/src/runtime_helpers.rs',
+    line_contains: '.and_then(|h| h.orchestrator_drive_state_get().ok())',
+    count: 1,
+    reason:
+      'child_execution_phase mirror projection (drive-state leg): same reviewed presentational semantics as the session leg above; re-derived on every registry read.',
+    owner: 'orchestrator child registry projection',
+  },
+  {
+    file: 'crates/orchestrator/src/runtime_helpers.rs',
+    line_contains: '.ok()',
+    count: 1,
+    reason:
+      'child_task_budget_cap mirror derivation (task row leg): an unreadable task row yields no mirror value; the durable child-side budget remains the enforcement authority and registry reads re-derive.',
+    owner: 'orchestrator child registry projection',
+  },
+  {
+    file: 'crates/orchestrator/src/task_executor/mod.rs',
+    line_contains: 'task_id: handle.task_id().ok().map(|t| t.raw()),',
+    count: 1,
+    reason:
+      'run receipt projection: an unreadable task id renders null in the refused-isolation run row; the task id is not the enforcement authority and the row is otherwise durable.',
+    owner: 'orchestrator task executor',
+  },
+  {
+    file: 'crates/server/src/native/foundation.rs',
+    line_contains: 'let path = std::env::current_exe().ok()?;',
+    count: 1,
+    reason:
+      'binary checksum helper: current_exe unavailability yields no checksum (None) rather than a fabricated digest; the caller reports checksum unavailable.',
+    owner: 'server foundation surface',
+  },
+  {
+    file: 'crates/server/src/native/foundation.rs',
+    line_contains: 'let metadata = std::fs::metadata(&path).ok()?;',
+    count: 1,
+    reason:
+      'binary checksum helper: metadata unavailability yields no checksum (None) rather than a fabricated digest; the caller reports checksum unavailable.',
+    owner: 'server foundation surface',
+  },
+  {
+    file: 'crates/server/src/native/foundation.rs',
+    line_contains: '.ok()',
+    count: 1,
+    reason:
+      'task ledger projection: an unreadable/absent ledger renders the default empty ledger for this read model; the authoritative task row and ledger writes stay typed elsewhere.',
+    owner: 'server foundation surface',
+  },
+  {
+    file: 'crates/server/src/native/foundation_ext.rs',
+    line_contains: 'if let Ok(Some(root)) = state.deps.session.resolve_workspace_root(handle.id()) {',
+    count: 1,
+    reason:
+      'workspace skill registry discovery: an unavailable workspace root yields no workspace-installed skill candidates; installed records remain and no skill is invented.',
+    owner: 'server foundation surface',
+  },
+  {
+    file: 'crates/server/src/native/foundation_ext.rs',
+    line_contains: 'source.row().map(|r| r.title).unwrap_or_default()',
+    count: 1,
+    reason:
+      'fork default title: an unreadable source row falls back to the literal "(fork)" label; fork_session then performs the typed durable operation.',
+    owner: 'server foundation surface',
+  },
+  {
+    file: 'crates/server/src/native/foundation_ext.rs',
+    line_contains: 'Err(_) => None,',
+    count: 1,
+    reason:
+      'checkpoint restore preimage hash: any read failure yields None, which is compared against the expected hash and REFUSES with checkpoint_conflict.',
+    owner: 'server foundation surface',
+  },
+  {
+    file: 'crates/server/src/native/foundation_ext.rs',
+    line_contains: 'for row in handle.checkpoints_of().ok().unwrap_or_default() {',
+    count: 1,
+    reason:
+      'review-comment latest-change map: an unreadable checkpoint list yields no change hashes; comments still render without a fabricated identity.',
+    owner: 'server foundation surface',
+  },
+  {
+    file: 'crates/server/src/native/foundation_ext.rs',
+    line_contains: '.ok()',
+    count: 3,
+    reason:
+      'Three optional export/projection reads: workspace root resolution for the latest diff, workspace open for that diff, and the snapshot diff lookup itself. Absence renders no diff text; the checkpoint identity list and transcript are read typed, so no change identity is fabricated.',
+    owner: 'server foundation surface',
+  },
+  {
+    file: 'crates/server/src/native/foundation_r8.rs',
+    line_contains: 'Ok(head) => head.map(|seq| seq.raw()).unwrap_or(0),',
+    count: 1,
+    reason:
+      'event window anchor: `last_event_seq` propagates errors typed; Ok(None) means no events yet, so 0 is the documented empty head.',
+    owner: 'server compaction surface',
+  },
+  {
+    file: 'crates/server/src/native/instructions.rs',
+    line_contains: '.ok()',
+    count: 1,
+    reason:
+      'optional instruction binding capture read: absence means no captured bundle; the resolver re-resolves the durable bundle.',
+    owner: 'server instructions surface',
+  },
+  {
+    file: 'crates/server/src/native/instructions.rs',
+    line_contains: '.unwrap_or_else(|| handle.title().unwrap_or_default());',
+    count: 2,
+    reason:
+      'instruction preview prompt: the session title is the documented display fallback when the request carries no explicit prompt; never an identity/authority input.',
+    owner: 'server instructions surface',
+  },
+  {
+    file: 'crates/server/src/native/longtask.rs',
+    line_contains: 'Ok(latest) => latest.map(|m| m.revision).unwrap_or(0),',
+    count: 1,
+    reason:
+      'manifest revision check: Ok(None) from a typed read means no manifest exists yet, so 0 is the empty revision base.',
+    owner: 'server compaction surface',
+  },
+  {
+    file: 'crates/server/src/native/longtask.rs',
+    line_contains: '.and_then(|f| f.context.latest(session_u64(handle.id())).ok().flatten())',
+    count: 1,
+    reason:
+      'optional latest manifest for the expected-revision comparison; a missing manifest leaves the check to the None arm, and store errors are handled in the neighboring typed branch.',
+    owner: 'server compaction surface',
+  },
+  {
+    file: 'crates/server/src/native/longtask.rs',
+    line_contains: 'req.target_tokens.unwrap_or(0) as i64,',
+    count: 1,
+    reason:
+      'target_tokens is an optional request field; 0 is the documented "no explicit target" value passed to the typed begin operation.',
+    owner: 'server compaction surface',
+  },
+  {
+    file: 'crates/server/src/native/longtask.rs',
+    line_contains: 'if let Ok(Some(current)) = handle.compaction_operation(&operation_id) {',
+    count: 1,
+    reason:
+      'late terminal-race re-read: if the operation row is unreadable, the response reports the already-returned cancel outcome without fabricating an operation body.',
+    owner: 'server compaction surface',
+  },
+  {
+    file: 'crates/server/src/native/longtask.rs',
+    line_contains: 'Ok(Some(checkpoint)) => serde_json::from_slice(&checkpoint.payload).unwrap_or_else(|e| {',
+    count: 1,
+    reason:
+      'malformed checkpoint payload logs a typed error and falls back to the durable transcript (documented manual-compaction fallback), never fabricated turns.',
+    owner: 'server compaction surface',
+  },
+  {
+    file: 'crates/server/src/native/longtask.rs',
+    line_contains: 'let mut newest_seq = base_seq.unwrap_or(0);',
+    count: 1,
+    reason:
+      'base_seq absence means the window starts at the beginning; 0 is the documented initial sequence.',
+    owner: 'server compaction surface',
+  },
+  {
+    file: 'crates/server/src/native/longtask.rs',
+    line_contains: 'let auto_compaction = handle.runtime_compaction().ok().flatten().map(|marker| {',
+    count: 1,
+    reason:
+      'runtime compaction marker optional; absence means no auto-compaction marker, never fabricated progress.',
+    owner: 'server compaction surface',
+  },
+  {
+    file: 'crates/server/src/native/longtask.rs',
+    line_contains: '.ok()',
+    count: 2,
+    reason:
+      'Two optional compaction projections: the manual-compaction baseline ledger and the latest context manifest both render absent when unreadable, and the durable transcript/manifest reads remain the authority.',
+    owner: 'server compaction surface',
+  },
+  {
+    file: 'crates/server/src/native/plan_api.rs',
+    line_contains: '"artifactId": format!("plan-{}-v{}", handle.id().raw(), meta.get("version").and_then(|v| v.as_u64()).unwrap_or(0)),',
+    count: 1,
+    reason:
+      'artifact id version component: a plan artifact without a numeric version renders version 0; the artifact body itself is returned unchanged and approval is keyed by the frozen artifact.',
+    owner: 'server plan surface',
+  },
+  {
+    file: 'crates/server/src/native/usage.rs',
+    line_contains: '"budget" => entry.0 = value.parse::<i64>().ok(),',
+    count: 1,
+    reason:
+      'session budget/spent facts are model/tool-writable data; an unparsable value is treated as absent in the usage display, and the billing fold remains the settlement authority.',
+    owner: 'server usage surface',
+  },
+  {
+    file: 'crates/server/src/native/worktrees_api.rs',
+    line_contains: '.ok()',
+    count: 1,
+    reason:
+      'worktree transfer target check: an unreadable target session is refused as session_not_found (no transfer is attempted), never treated as an existing owner.',
+    owner: 'server worktree surface',
+  },
+  {
+    file: 'crates/session/src/manager.rs',
+    line_contains: 'if verified.get(&handle.id()).copied().unwrap_or(0) >= max_seq {',
+    count: 1,
+    reason:
+      'ledger verification watermark is an in-memory fast path; a missing entry starts at 0 and the durable ledger rows below remain authoritative.',
+    owner: 'session manager',
+  },
+  {
+    file: 'crates/session/src/manager.rs',
+    line_contains: 'let from = verified.get(&handle.id()).copied().unwrap_or(0);',
+    count: 1,
+    reason:
+      'same in-memory verification watermark: absence starts from the beginning, and the durable ledger read is the authority.',
+    owner: 'session manager',
+  },
+  {
+    file: 'crates/site/src/auth.rs',
+    line_contains: 'hash_password("dummy password for timing equalization").unwrap_or_default()',
+    count: 1,
+    reason:
+      'timing-equalization dummy hash: the hash is fixed content and only burns comparable time; if hashing were to fail, an empty hash still fails verification and no credential decision changes.',
+    owner: 'site auth',
+  },
+  {
+    file: 'crates/store/src/queue_store.rs',
+    line_contains: 'row.get::<_, i64>(0).unwrap_or(-1)',
+    count: 1,
+    reason:
+      'corruption error message: a failed seq extraction renders -1 inside the Corrupt diagnostic only; the error itself is still returned.',
+    owner: 'store queue',
+  },
+  {
+    file: 'crates/terminal/src/sandbox/macos.rs',
+    line_contains: 'Err(_) => false,',
+    count: 1,
+    reason:
+      'executability probe: metadata failure means not executable (false), the conservative direction for confinement checks.',
+    owner: 'terminal macos sandbox',
   },
 ];
 

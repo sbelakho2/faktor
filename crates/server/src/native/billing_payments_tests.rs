@@ -81,7 +81,9 @@ fn payments_config() -> PaymentsConfig {
             grace_ms: 10_000,
         },
         webhook_secret_env: "FAKTOR_ROUTE_WEBHOOK_SECRET".into(),
+        vault_key_env: faktor_payments::catalog::default_vault_key_env(),
         stripe: Default::default(),
+        adyen: Default::default(),
     }
 }
 
@@ -230,6 +232,13 @@ async fn payments_routes_are_real_and_overview_states_are_wired() {
         .await
         .unwrap();
     assert_eq!(response.status(), 200);
+    let detail: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(detail["invoice"]["reconciliation"], "matched");
+    assert_eq!(detail["providerObservations"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        detail["providerObservations"][0]["invoice_id"],
+        invoice_id.as_str()
+    );
 
     let response = client
         .get(format!("{base}/native/billing/invoices?format=csv"))
@@ -302,6 +311,145 @@ async fn payments_routes_are_real_and_overview_states_are_wired() {
         "local"
     );
     assert_eq!(overview["billing"]["payments"]["paid_minor"], 17_645);
+
+    // Manual provider reconciliation is a read-only fetch pass over Faktor
+    // truth: it records the observation and never rewrites the total.
+    let response = client
+        .post(format!("{base}/native/billing/reconcile?org={org}"))
+        .bearer_auth(&token)
+        .header("x-faktor-control-token", &owner)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let report: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(report["reconciliation"]["checked"], 1);
+    assert_eq!(report["reconciliation"]["matched"], 1);
+    assert_eq!(report["reconciliation"]["conflicts"], 0);
+    let response = client
+        .get(format!("{base}/native/billing/invoices/{invoice_id}"))
+        .bearer_auth(&token)
+        .header("x-faktor-control-token", &owner)
+        .send()
+        .await
+        .unwrap();
+    let detail: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(detail["invoice"]["total_minor"], 17_645);
+    assert_eq!(detail["invoice"]["status"], "paid");
+    assert_eq!(detail["invoice"]["reconciliation"], "matched");
+}
+
+#[tokio::test]
+async fn payment_method_routes_reject_raw_pan_and_never_return_the_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let (handle, control_plane, token) = payments_deps(dir.path()).await;
+    let base = format!("http://{}", handle.addr);
+    let client = reqwest::Client::new();
+    let (_, owner) = bootstrap(&control_plane, "PAN", "pan@a.test");
+    let _ = subscribe(&client, &base, &token, &owner).await;
+
+    for (index, pan) in [
+        "4242424242424242",
+        "pm_4242424242424242",
+        "tok_4111111111111111",
+        "tok_4242 4242 4242 4242",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let response = client
+            .post(format!("{base}/native/billing/payment-methods"))
+            .bearer_auth(&token)
+            .header("x-faktor-control-token", &owner)
+            .header("Idempotency-Key", format!("route-pan-{index}"))
+            .json(&serde_json::json!({
+                "token": pan,
+                "brand": "visa",
+                "last4": "4242",
+                "exp_month": 12,
+                "exp_year": 2030,
+                "set_default": true,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400, "raw PAN {pan:?} must be refused");
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "malformed");
+        assert!(!body.to_string().contains(pan));
+    }
+
+    let response = client
+        .post(format!("{base}/native/billing/payment-methods"))
+        .bearer_auth(&token)
+        .header("x-faktor-control-token", &owner)
+        .header("Idempotency-Key", "route-valid-method")
+        .json(&serde_json::json!({
+            "token": "pm_route_valid_token",
+            "brand": "visa",
+            "last4": "4242",
+            "exp_month": 12,
+            "exp_year": 2030,
+            "set_default": true,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let method: serde_json::Value = response.json().await.unwrap();
+    let id = method["paymentMethod"]["id"].as_str().unwrap().to_string();
+    assert!(!method.to_string().contains("pm_route_valid_token"));
+
+    let response = client
+        .post(format!("{base}/native/billing/payment-methods/{id}/rotate"))
+        .bearer_auth(&token)
+        .header("x-faktor-control-token", &owner)
+        .header("Idempotency-Key", "route-rotate-pan")
+        .json(&serde_json::json!({"token": "tok_4111111111111111"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "malformed");
+
+    let response = client
+        .post(format!("{base}/native/billing/payment-methods/{id}/rotate"))
+        .bearer_auth(&token)
+        .header("x-faktor-control-token", &owner)
+        .header("Idempotency-Key", "route-rotate-valid")
+        .json(&serde_json::json!({"token": "pm_route_rotated_token"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let response = client
+        .get(format!("{base}/native/billing/payment-methods"))
+        .bearer_auth(&token)
+        .header("x-faktor-control-token", &owner)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let listed: serde_json::Value = response.json().await.unwrap();
+    let text = listed.to_string();
+    assert!(!text.contains("pm_route_valid_token"));
+    assert!(!text.contains("pm_route_rotated_token"));
+    assert!(!text.contains("token_ciphertext"));
+
+    let response = client
+        .request(
+            reqwest::Method::DELETE,
+            format!("{base}/native/billing/payment-methods/{id}"),
+        )
+        .bearer_auth(&token)
+        .header("x-faktor-control-token", &owner)
+        .header("Idempotency-Key", "route-remove")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
 }
 
 #[tokio::test]

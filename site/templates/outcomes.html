@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block title %}Outcomes — Faktor{% endblock %}
+{% block content %}
+
+<section class="page-hero shell" aria-labelledby="outcomes-title">
+  <div class="hero-copy">
+    <p class="kicker">Outcomes / Measured records</p>
+    <h1 class="page-title" id="outcomes-title">Count the attempts.<br>Keep the basis.</h1>
+    <p class="lead">Cost and performance mean more when failed and cancelled work remains in the denominator’s context.</p>
+  </div>
+</section>
+
+<section class="section shell" aria-labelledby="measures-title">
+  <p class="kicker">Current source definitions</p>
+  <h2 class="h2" id="measures-title">Three different measurements.</h2>
+  <div class="table-panel">
+    <table class="data-table measures-table">
+      <caption class="sr-only">Outcome measures, definitions and reading rules.</caption>
+      <thead><tr><th scope="col">Measure</th><th scope="col">Definition</th><th scope="col">Reading rule</th></tr></thead>
+      <tbody>
+        <tr><td>Verified Cost per Successful Change</td><td>All eligible attempted spend divided by verified changes. Failed and cancelled attempts remain eligible where recorded.</td><td>Keep period and cohort together; an absent denominator is not zero.</td></tr>
+        <tr><td>Successful-run cost</td><td>Spend associated with successful runs.</td><td>A separate measure from VCSC; do not silently substitute it.</td></tr>
+        <tr><td>Local execution cohort</td><td>Count of runs whose model steps met the local definition.</td><td>Keep the cohort visible in aggregate comparisons.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="section shell" aria-labelledby="cohorts-title">
+  <p class="kicker">Local execution cohorts</p>
+  <h2 class="h2" id="cohorts-title">Keep the comparison like for like.</h2>
+  <div class="cohorts">
+    <article class="cohort">
+      <span class="num">01</span>
+      <h3>Local-only</h3>
+      <p>Runs whose model steps stayed local.</p>
+    </article>
+    <article class="cohort">
+      <span class="num">02</span>
+      <h3>Local-final</h3>
+      <p>Runs with a local final path under the current ledger definition.</p>
+    </article>
+    <article class="cohort">
+      <span class="num">03</span>
+      <h3>Local-first with fallback</h3>
+      <p>Runs beginning locally and using a hosted fallback. Keep escalation visible in comparison.</p>
+    </article>
+  </div>
+  <p class="note-box">The current recorder does not establish avoided hosted inference, token savings or a general cost guarantee.</p>
+</section>
+
+<section class="section shell" aria-labelledby="record-title">
+  <p class="kicker">What the interface should show</p>
+  <h2 class="h2" id="record-title">A run record you can inspect.</h2>
+  <div class="table-panel">
+    <table class="data-table record-table">
+      <caption class="sr-only">Run record fields and presentation.</caption>
+      <thead><tr><th scope="col">Field</th><th scope="col">Presentation</th></tr></thead>
+      <tbody>
+        <tr><td>Outcome and final basis</td><td>Accepted, integrated and verification basis in separate labelled rows.</td></tr>
+        <tr><td>Spend</td><td>Recorded values where available; “Cost unavailable” when not recorded.</td></tr>
+        <tr><td>Rework and first-pass result</td><td>Initial verification and repair attempts remain distinct.</td></tr>
+        <tr><td>Eligible attempted spend</td><td>Available in outcome context, not hidden because a run failed.</td></tr>
+        <tr><td>Cohort and period</td><td>Visible alongside aggregate comparisons.</td></tr>
+      </tbody>
+    </table>
+    <p class="table-summary">Current source: outcome-ledger.md. The prior edition’s metric wording is retained as dated reference.</p>
+  </div>
+</section>
+
+{% endblock %}

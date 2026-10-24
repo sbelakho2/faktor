@@ -1,0 +1,6 @@
+{
+  "resultCode": "Received",
+  "pspReference": "PSP_payment_pending",
+  "merchantReference": "faktor:org_1:invoice:inv_1",
+  "amount": {"currency": "USD", "value": 10000}
+}

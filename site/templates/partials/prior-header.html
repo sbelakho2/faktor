@@ -1,0 +1,28 @@
+<header class="site-header prior-header">
+  <div class="header-inner">
+    <a class="brand" href="/prior/" aria-label="Faktor prior edition home">
+      {% include "partials/mark.html" %}
+      <span class="wordmark">faktor</span>
+    </a>
+    <nav class="prior-nav" aria-label="Prior edition">
+      <a href="/prior/approach/"{% if current_path is starting_with("/prior/approach/") %} aria-current="page"{% endif %}>Approach</a>
+      <a href="/prior/#prior-evidence">Evidence</a>
+      <a href="/prior/identity/"{% if current_path is starting_with("/prior/identity/") %} aria-current="page"{% endif %}>Identity</a>
+    </nav>
+    <details class="nav-disclosure">
+      <summary>Menu</summary>
+      <nav aria-label="Prior edition mobile">
+        <a href="/prior/approach/">Approach</a>
+        <a href="/prior/#prior-evidence">Evidence</a>
+        <a href="/prior/identity/">Identity</a>
+      </nav>
+    </details>
+  </div>
+</header>
+<div class="prior-banner">
+  <div class="prior-banner-inner">
+    <strong class="prior-stamp">Prior edition / 11 October 2026</strong>
+    <span class="prior-copy">Retained design and pinned research. Current source and expanded experience are in the updated edition.</span>
+    <a class="prior-open" href="/">Open current website <span aria-hidden="true">→</span></a>
+  </div>
+</div>

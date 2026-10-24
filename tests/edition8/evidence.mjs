@@ -438,7 +438,7 @@ export function verifyGates({ allowDirty = false, requireDogfood = false, allowU
 
   const perf = docs.perf;
   if (perf) {
-    requireCount(perf, 'workloads', 9, 'workloads', problems);
+    requireCount(perf, 'workloads', 11, 'workloads', problems);
     requireCount(perf, 'failed', 0, 'failed', problems);
     requireCount(perf, 'baseline_present', 1, 'baseline present', problems);
     const budget = perf.detail?.budget ?? {};

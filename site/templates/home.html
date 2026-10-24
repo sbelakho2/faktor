@@ -1,0 +1,227 @@
+{% extends "base.html" %}
+{% block title %}Faktor — Make the change. Show the evidence.{% endblock %}
+{% block content %}
+
+<section class="shell hero-screen" aria-labelledby="home-title">
+  <div class="hero-grid">
+    <div class="hero-copy">
+      <p class="kicker">01 / Native engineering agent</p>
+      <h1 class="display" id="home-title">Make the<br>change.<br>Show the<br>evidence.</h1>
+      <p class="hero-lead">Faktor plans the task, works in an isolated candidate workspace, and checks what changed before the run can finish.</p>
+      <div class="btn-row">
+        <a class="btn btn-ink btn-split" href="https://github.com/sbelakho2/faktor"><span>View the<br>source</span><span aria-hidden="true">↗</span></a>
+        <a class="btn btn-outline" href="/approach/">See the engineering loop</a>
+      </div>
+    </div>
+    <aside class="candidate-card" aria-label="Illustrative run record">
+      <div class="candidate-top">
+        <span class="mono">CANDIDATE / LOCAL WORKSPACE</span>
+        <svg class="candidate-logo" viewBox="0 0 64 64" aria-hidden="true"><path fill="currentColor" d="M5 2h55v16H32v12h23v16H32v28H5z"/></svg>
+      </div>
+      <p class="candidate-heading">Rotate refresh tokens.<br>Preserve active sessions.</p>
+      <ul class="candidate-list">
+        <li><span class="state" aria-hidden="true">✓</span><div><span class="sr-only">Passed.</span><div class="task">Reject token replay</div><div class="basis">Required test result / passed</div></div></li>
+        <li><span class="state" aria-hidden="true">✓</span><div><span class="sr-only">Passed.</span><div class="task">Preserve existing sessions</div><div class="basis">Required compatibility check / passed</div></div></li>
+        <li><span class="state pending" aria-hidden="true">◇</span><div><span class="sr-only">Needs evidence.</span><div class="task">Handle concurrent refresh</div><div class="basis">Required result / needs evidence</div></div></li>
+      </ul>
+      <div class="candidate-foot"><span>Completion pending</span><span class="meta">02 / 03</span></div>
+      <div class="candidate-foot candidate-foot-sub"><span class="meta">Illustrative run</span><span class="meta">Integration not started</span></div>
+    </aside>
+  </div>
+  <div class="tech-strip"><span>VS Code / JetBrains / CLI</span><span class="pulse">·</span><span>Native Rust runtime</span></div>
+</section>
+
+<section class="section shell" aria-labelledby="define-title">
+  <div class="split-head">
+    <div>
+      <p class="kicker section-index">02 / Define what must hold</p>
+      <h2 class="h2" id="define-title">A task needs<br>more than a<br>prompt.</h2>
+    </div>
+    <p class="lead">Keep the goal, acceptance criteria, invariants and proof obligations together. The plan orders the work; the checks evaluate the change.</p>
+  </div>
+  <div class="card-grid">
+    <article class="card">
+      <span class="index">01 / Plan</span>
+      <h3 class="h3">Give the work conditions.</h3>
+      <p>Translate the objective into ordered tasks and observable criteria. Keep the risks and dependencies in view.</p>
+    </article>
+    <article class="card">
+      <span class="index">02 / Change</span>
+      <h3 class="h3">Work in a candidate.</h3>
+      <p>Use an isolated workspace with transactions and checkpoints. Separate editing from integration.</p>
+    </article>
+    <article class="card">
+      <span class="index">03 / Check</span>
+      <h3 class="h3">Keep the basis visible.</h3>
+      <p>Connect required checks and named claims to the candidate they actually evaluated.</p>
+    </article>
+  </div>
+  <div class="section-cta"><a class="link-arrow" href="/approach/">Explore the approach</a></div>
+  <p class="kicker next-label">03 / A result belongs to a claim</p>
+</section>
+
+<section class="section shell" aria-labelledby="see-title">
+  <div class="split-head">
+    <div>
+      <h2 class="h2" id="see-title">See what<br>passed.<br>See what is<br>missing.</h2>
+    </div>
+    <p class="lead">Inspect connects criteria, candidate state, check results and review. A missing required result keeps completion pending.</p>
+  </div>
+  <div class="run-table">
+    <p class="run-caption">Illustrative run / Rotate refresh tokens without breaking active sessions</p>
+    <table class="data-table">
+      <caption class="sr-only">Illustrative criteria, states and evidence basis for a refresh-token change.</caption>
+      <thead><tr><th scope="col" class="criterion">Criterion</th><th scope="col" class="state-cell">State</th><th scope="col">Evidence basis</th></tr></thead>
+      <tbody>
+        <tr><td>Replayed refresh tokens fail</td><td><span class="status passed"><span class="glyph" aria-hidden="true">✓</span>Passed</span></td><td>Required test result</td></tr>
+        <tr><td>Existing sessions remain valid</td><td><span class="status passed"><span class="glyph" aria-hidden="true">✓</span>Passed</span></td><td>Required compatibility check</td></tr>
+        <tr><td>Concurrent refresh yields one valid result</td><td><span class="status pending"><span class="glyph" aria-hidden="true">◇</span>Needs evidence</span></td><td>Required result not recorded</td></tr>
+      </tbody>
+    </table>
+    <p class="table-summary">2 criteria passed / 1 needs evidence / Candidate not integrated</p>
+  </div>
+  <p class="kicker next-label">04 / Done has conditions</p>
+</section>
+
+<section class="dark-band" aria-labelledby="finish-title">
+  <div class="shell">
+    <div class="split-head">
+      <div>
+        <h2 class="h2" id="finish-title">Choose where<br>the run stops.</h2>
+        <p class="lead">Leave the changes locally, commit, push or open a pull request. Requested finish actions are recorded and checked as part of completion.</p>
+      </div>
+      <div class="finish-steps">
+        <div class="finish-step"><span class="mono">01</span><h3>Local change</h3></div>
+        <div class="finish-step"><span class="mono">02</span><h3>Commit</h3></div>
+        <div class="finish-step"><span class="mono">03</span><h3>Push</h3></div>
+        <div class="finish-step"><span class="mono">04</span><h3>Pull request</h3></div>
+      </div>
+    </div>
+    <p class="finish-note">Native pull requests use the configured SCM integration. Missing configuration stays visible as a blocker.</p>
+  </div>
+</section>
+
+<section class="section shell" aria-labelledby="work-title">
+  <p class="design-note">Expanded editor flow / design proposal</p>
+  <p class="kicker section-index">05 / In your editor</p>
+  <div class="split-head">
+    <h2 class="h2" id="work-title">Work stays<br>in front.</h2>
+    <p class="lead">Conversation, current run, composer. Open Inspect for the plan and evidence. History keeps durable outcomes within reach.</p>
+  </div>
+  <div class="tabs">
+    <input class="tab-input" type="radio" name="home-tabs" id="tab-work" checked>
+    <input class="tab-input" type="radio" name="home-tabs" id="tab-inspect">
+    <input class="tab-input" type="radio" name="home-tabs" id="tab-history">
+    <div class="tab-labels">
+      <label for="tab-work">Work</label>
+      <label for="tab-inspect">Inspect</label>
+      <label for="tab-history">History</label>
+    </div>
+    <div class="tab-panels">
+      <div class="tab-panel" id="panel-work">
+        <p class="label">You / Task</p>
+        <p class="task-line">Rotate refresh tokens without breaking active sessions.</p>
+        <p class="label">Faktor / Current run</p>
+        <p class="tab-copy">The candidate is ready for review. Two required criteria passed. The concurrent refresh result is still missing.</p>
+        <div class="composer">Add a constraint or inspect the evidence...</div>
+      </div>
+      <div class="tab-panel" id="panel-inspect">
+        <p class="label">Inspect / Evidence</p>
+        <ul class="check-list">
+          <li><span class="glyph" aria-hidden="true">✓</span><span>Reject token replay — required test result passed.</span></li>
+          <li><span class="glyph" aria-hidden="true">✓</span><span>Preserve existing sessions — compatibility check passed.</span></li>
+          <li><span class="glyph pending" aria-hidden="true">◇</span><span>Concurrent refresh — required result not recorded.</span></li>
+        </ul>
+        <p class="tab-copy top-rule-sm"><strong>Completion remains pending.</strong> A passing empty check set does not establish a verified change.</p>
+      </div>
+      <div class="tab-panel" id="panel-history">
+        <p class="label">History / Durable outcomes</p>
+        <div class="history-rows">
+          <div><span>Accepted</span><span>Candidate ready for review</span></div>
+          <div><span>Integrated</span><span>Not started</span></div>
+          <div><span>Final basis</span><span>Not available</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <p class="command-note">Illustrative interface. Tabs switch examples locally.</p>
+  <p class="kicker next-label">06 / The run leaves a record</p>
+</section>
+
+<section class="section shell" aria-labelledby="record-title">
+  <h2 class="h2" id="record-title">Spend. Rework. Outcome.</h2>
+  <div class="metric-grid">
+    <div class="metric"><h3>Verified cost</h3><p>Recorded model and verification spend per successful change.</p></div>
+    <div class="metric"><h3>First-pass result</h3><p>Keep initial verification and repair attempts distinct.</p></div>
+    <div class="metric"><h3>Final basis</h3><p>Record acceptance, integration and the verification basis together.</p></div>
+  </div>
+  <div class="section-block">
+    <p class="kicker">A full editor experience</p>
+    <div class="split-head mt-24">
+      <h2 class="h2">One task.<br>Two native hosts.</h2>
+      <p class="lead">Explore the complete proposed Faktor experience in VS Code and JetBrains: setup, planning, permissions, evidence, diff review, recovery and history.</p>
+    </div>
+    <div class="editor-preview-grid">
+      <figure class="editor-figure">
+        <img src="{{ get_url(path='images/editor-vscode-dark.png') }}" width="1440" height="940" alt="VS Code editor prototype showing the Faktor Work, Inspect and History views with evidence pending." loading="lazy">
+        <figcaption class="editor-caption">VS CODE / EVIDENCE PENDING / DESIGN PROTOTYPE</figcaption>
+      </figure>
+      <figure class="editor-figure">
+        <img src="{{ get_url(path='images/editor-jetbrains-dark.png') }}" width="1440" height="940" alt="JetBrains editor prototype showing the Faktor tool window with evidence pending." loading="lazy">
+        <figcaption class="editor-caption">JETBRAINS / EVIDENCE PENDING / DESIGN PROTOTYPE</figcaption>
+      </figure>
+    </div>
+    <div class="btn-row editor-actions"><a class="btn btn-ink" href="/editor/">Explore both editor flows →</a><a class="btn btn-outline" href="{{ get_url(path='downloads/faktor-editor-ui-ux.pdf') }}">Download the UI/UX specification</a></div>
+  </div>
+  <p class="kicker next-label">Concrete engineering work</p>
+</section>
+
+<section class="section shell" aria-labelledby="review-title">
+  <h2 class="h2" id="review-title">Choose a task worth reviewing.</h2>
+  <ol class="work-list">
+    <li><span class="num">01</span><h3>Preserve behavior during a migration.</h3><p>Define compatibility criteria and invariants before a session, schema or API change. The evidence remains attached to the candidate that was checked.</p></li>
+    <li><span class="num">02</span><h3>Repair a failure with a visible basis.</h3><p>Start with the failed check or counterexample. Keep the repair scoped and inspect the candidate before choosing an integration or finish action.</p></li>
+    <li><span class="num">03</span><h3>Work with deliberate model choice.</h3><p>Keep model configuration separate from the engineering contract. Review native, local or hosted steps through their recorded outcomes and spend.</p></li>
+  </ol>
+  <div class="section-cta"><a class="link-arrow" href="/patterns/">Explore task patterns</a></div>
+  <p class="kicker next-label">07 / Start in your workspace</p>
+</section>
+
+<section class="section shell" aria-labelledby="start-title">
+  <div class="start-grid">
+    <div>
+      <h2 class="h2" id="start-title">Source, setup<br>and the runtime.</h2>
+      <p class="lead mt-22">Explore the native runtime and its IDE surfaces. Start with the source workspace and its setup guide.</p>
+      <div class="btn-row"><a class="btn btn-ink" href="/documentation/">Read setup ↗</a></div>
+    </div>
+    <div>
+      <div class="command-panel">
+        <p class="command-label">Source-workspace command</p>
+        <pre class="command"><code>cargo run -p faktor-cli -- run --data-dir /tmp/faktor-demo "explain this repo"</code></pre>
+        <span class="copy-button">Copy command</span>
+        <p class="ide-lines">VS Code: Faktor: Open<br>JetBrains: Faktor tool window</p>
+      </div>
+    </div>
+  </div>
+  <p class="kicker next-label">Useful boundaries</p>
+</section>
+
+<section class="section shell" aria-labelledby="faq-title">
+  <h2 class="h2" id="faq-title">Before you begin.</h2>
+  <div class="faq">
+    <details open>
+      <summary>Does Faktor require another Bel Consulting product?</summary>
+      <p>No. Native intelligence and verification form the baseline. Optional providers can enrich neutral interfaces.</p>
+    </details>
+    <details open>
+      <summary>Does a passing check mean the whole change is verified?</summary>
+      <p>A result has a scope. Inspect the required criteria, named claims, candidate identity, integration state and final basis together. An empty set of required checks can pass without establishing a verified change.</p>
+    </details>
+    <details open>
+      <summary>What stays in the IDE?</summary>
+      <p>The product uses the host’s theme and typography. Work, Inspect and History are shared vocabulary across its native surfaces.</p>
+    </details>
+  </div>
+</section>
+
+{% endblock %}

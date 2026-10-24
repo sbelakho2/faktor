@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+{% block title %}Identity — Faktor{% endblock %}
+{% block content %}
+
+<section class="page-hero shell" aria-labelledby="identity-title">
+  <div class="hero-copy">
+    <p class="kicker">Faktor / Visual identity</p>
+    <h1 class="page-title" id="identity-title">Built for a<br>clear finish.</h1>
+    <p class="lead">Clipped terminals. A clear initial. Deliberate evidence.</p>
+  </div>
+</section>
+
+<section class="section shell identity-masters" aria-labelledby="masters-title">
+  <p class="kicker" id="masters-title">The fixed logo masters</p>
+  <div class="logo-masters">
+    <figure class="logo-master-card paper">
+      <img src="{{ get_url(path='downloads/faktor-logo-ink.svg') }}" width="360" height="96" alt="Faktor logo in ink on paper.">
+      <figcaption><span>INK / PAPER</span><a href="{{ get_url(path='downloads/faktor-logo-ink.svg') }}">Download SVG</a></figcaption>
+    </figure>
+    <figure class="logo-master-card ink">
+      <img src="{{ get_url(path='downloads/faktor-logo-ochre.svg') }}" width="360" height="96" alt="Faktor logo in ochre on ink.">
+      <figcaption><span>OCHRE / INK</span><a href="{{ get_url(path='downloads/faktor-logo-ochre.svg') }}">Download SVG</a></figcaption>
+    </figure>
+  </div>
+  <p class="mono-note">Fixed outlined artwork. Preserve letter spacing and H/4 clear space. Preferred symbol size: 24 px; tiny icons supplied separately.</p>
+</section>
+
+<section class="section shell" aria-labelledby="palette-title">
+  <p class="kicker">Palette / Family foundations, own accent</p>
+  <h2 class="h2" id="palette-title">Ink, Paper and Ochre.</h2>
+  <div class="palette">
+    <div class="swatch"><div class="chip chip-ink"></div><div class="meta"><strong>Ink</strong><span>#08110C</span></div></div>
+    <div class="swatch"><div class="chip chip-forest"></div><div class="meta"><strong>Forest</strong><span>#143D2B</span></div></div>
+    <div class="swatch"><div class="chip chip-paper"></div><div class="meta"><strong>Paper</strong><span>#F3F5EF</span></div></div>
+    <div class="swatch"><div class="chip chip-sage"></div><div class="meta"><strong>Sage</strong><span>#92AA99</span></div></div>
+    <div class="swatch"><div class="chip chip-ochre"></div><div class="meta"><strong>Ochre</strong><span>#D9BA75</span></div></div>
+    <div class="swatch"><div class="chip chip-ochre-deep"></div><div class="meta"><strong>Ochre Deep</strong><span>#72541E</span></div></div>
+  </div>
+  <p class="mono-note">Use the soft accent on Ink; the deeper accent for readable text on Paper. State colors keep their own semantic meaning.</p>
+</section>
+
+<section class="section shell" aria-labelledby="type-title">
+  <p class="kicker">Typography / Its own voice</p>
+  <div class="type-specimen">
+    <p class="type-display" id="type-title">Make the change.<br>Show the evidence.</p>
+    <p class="type-body">Barlow Semi Condensed for headings.<br>Barlow for the reading surface.</p>
+    <p class="type-mono">IBM Plex Mono for technical metadata. The logo is fixed outlined artwork; host interfaces retain their own typography.</p>
+  </div>
+</section>
+
+<section class="section shell" aria-labelledby="in-use-title">
+  <p class="kicker">The identity in use</p>
+  <h2 class="h2" id="in-use-title">A complete application system.</h2>
+  <figure class="application-figure">
+    <img src="{{ get_url(path='images/application-system.png') }}" width="1440" height="991" alt="Faktor application system board: logo, palette, typography, website and component specimens." loading="lazy">
+  </figure>
+  <p class="mono-note">Application concept. Use the native SVG masters for production artwork.</p>
+</section>
+
+<section class="section shell identity-package" aria-labelledby="downloads-title">
+  <div class="downloads-grid">
+    <div>
+      <p class="kicker">Downloads</p>
+      <h2 class="h2" id="downloads-title">Everything in<br>its own project.</h2>
+      <p class="lead">Logo suite, source analysis, usage rules, design tokens, font licenses, applications and generation briefs.</p>
+    </div>
+    <nav class="download-list" aria-label="Identity downloads">
+      <a href="{{ get_url(path='downloads/faktor-identity-guide.pdf') }}"><span>Visual identity guide</span><span class="mono">PDF</span></a>
+      <a href="{{ get_url(path='downloads/faktor-identity-kit.zip') }}"><span>Complete identity kit</span><span class="mono">ZIP</span></a>
+      <a href="{{ get_url(path='downloads/faktor-mark.svg') }}"><span>Standalone symbol</span><span class="mono">SVG</span></a>
+      <a href="{{ get_url(path='downloads/faktor-logo-ink.svg') }}"><span>Stacked logo</span><span class="mono">SVG</span></a>
+      <a href="{{ get_url(path='downloads/faktor-mark.svg') }}"><span>Application icon</span><span class="mono">SVG</span></a>
+      <a href="{{ get_url(path='downloads/faktor-design-tokens.json') }}"><span>Design tokens</span><span class="mono">JSON</span></a>
+    </nav>
+  </div>
+</section>
+
+<section class="section shell identity-package" aria-labelledby="package-title">
+  <div class="downloads-grid">
+    <div>
+      <p class="kicker">Current application package</p>
+      <h2 class="h2" id="package-title">The websites, in PDF form.</h2>
+    </div>
+    <div>
+      <nav class="download-list" aria-label="Application package">
+        <a href="{{ get_url(path='downloads/faktor-website.pdf') }}"><span>Complete website edition</span><span class="mono">PDF / ALL PRODUCT PAGES</span></a>
+        <a href="{{ get_url(path='downloads/faktor-editor-assets.zip') }}"><span>All editor visual assets</span><span class="mono">SVG + PNG / BOTH HOSTS / BOTH THEMES</span></a>
+      </nav>
+      <nav class="download-list second-list" aria-label="Design handoff">
+        <a href="{{ get_url(path='downloads/faktor-editor-ui-ux.pdf') }}"><span>VS Code &amp; JetBrains UI/UX</span><span class="mono">PDF / FLOWS, STATES AND HANDOFF</span></a>
+        <a href="/prior/"><span>Retained prior content</span><span class="mono">DATED RESEARCH &amp; WEBSITE</span></a>
+      </nav>
+    </div>
+  </div>
+</section>
+
+{% endblock %}

@@ -121,6 +121,21 @@ function rssKb(pid) {
   }
 }
 
+// A real project workspace is a git worktree. Shadowed task runs build a
+// canonical tree manifest from the workspace root; an empty non-repo makes
+// the shadow watch settle against a tree it cannot re-read. Seed one file
+// and one commit so the scale turns exercise the same shape as the dogfood.
+function initWorkspace(dir) {
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'README.md'), '# Edition 8 scale workspace\n');
+  const git = (args) => spawnSync('git', args, { cwd: dir, encoding: 'utf8' });
+  git(['init', '-q']);
+  git(['config', 'user.email', 'scale@faktor.invalid']);
+  git(['config', 'user.name', 'Faktor Scale']);
+  git(['add', '.']);
+  git(['commit', '-q', '-m', 'scale workspace']);
+}
+
 const failures = [];
 const probes = [];
 function fail(probe, message) {
@@ -242,6 +257,22 @@ async function waitForTurn(collector, fromIndex, timeoutMs) {
   throw new Error(`turn did not complete within ${timeoutMs}ms (${seen || 'no events'})`);
 }
 
+async function waitSessionIdle(base, token, sessionId, deadlineMs = 20_000) {
+  const terminal = new Set(['Done', 'Completed', 'Cancelled', 'Failed']);
+  const deadline = Date.now() + deadlineMs;
+  while (Date.now() < deadline) {
+    const agents = await getJson(base, token, `/native/agents?session=${sessionId}`);
+    const rows = Array.isArray(agents.json) ? agents.json : [];
+    const runs = await getJson(base, token, `/native/session/${sessionId}/task-runs`);
+    const runRows = Array.isArray(runs.json) ? runs.json : [];
+    const active = rows.filter((row) => !terminal.has(row.state));
+    const activeRuns = runRows.filter((row) => !terminal.has(row.state));
+    if (active.length === 0 && activeRuns.length === 0) return true;
+    await new Promise((done) => setTimeout(done, 100));
+  }
+  return false;
+}
+
 async function settleSessionRuns(base, token, sessionId, deadlineMs = 20_000) {
   const terminal = new Set(['Done', 'Completed', 'Cancelled', 'Failed']);
   const deadline = Date.now() + deadlineMs;
@@ -249,12 +280,28 @@ async function settleSessionRuns(base, token, sessionId, deadlineMs = 20_000) {
     const agents = await getJson(base, token, `/native/agents?session=${sessionId}`);
     const rows = Array.isArray(agents.json) ? agents.json : [];
     const active = rows.filter((row) => !terminal.has(row.state));
-    if (rows.length > 0 && active.length === 0) return true;
+    // The live shadow is owned by a durable task run; the agent projection
+    // can settle before the run row does. Cancel both views so the next
+    // shadowed task does not answer the typed "interrupted run" 409.
+    const runs = await getJson(base, token, `/native/session/${sessionId}/task-runs`);
+    const runRows = Array.isArray(runs.json) ? runs.json : [];
+    const activeRuns = runRows.filter((row) => !terminal.has(row.state));
+    if ((rows.length > 0 || runRows.length > 0) && active.length === 0 && activeRuns.length === 0) {
+      return true;
+    }
     for (const row of active) {
       await postJson(
         base,
         token,
         `/native/session/${sessionId}/task-runs/${row.agent_id}/cancel`,
+        {},
+      );
+    }
+    for (const row of activeRuns) {
+      await postJson(
+        base,
+        token,
+        `/native/session/${sessionId}/task-runs/${row.id}/cancel`,
         {},
       );
     }
@@ -443,7 +490,7 @@ async function main() {
     if (!SKIP_TURNS) {
       await probe('turns-compaction', async () => {
         const turnWorkspace = join(tmp, 'turn-workspace');
-        mkdirSync(turnWorkspace, { recursive: true });
+        initWorkspace(turnWorkspace);
         const created = await postJson(base, token, '/native/session', {
           provider: 'p1',
           model: 'm',
@@ -482,11 +529,30 @@ async function main() {
               observedNewest = Number(appendedRow.assistantSeq);
             } else {
               const before = collector.events.length;
-              const prompted = await postJson(base, token, `/native/session/${sessionId}/prompt`, {
+              const promptBody = () => ({
                 session_id: sessionId,
                 submission_id: randomUUID(),
                 prompt: text,
               });
+              let prompted = await postJson(base, token, `/native/session/${sessionId}/prompt`, promptBody());
+              // A prior turn can settle its assistant row before the drive
+              // and its live shadow reach a terminal state. The prompt route
+              // then answers the typed 409 "interrupted run must be resumed
+              // or cancelled". Settle that drive through the same cancel
+              // route the runtime exposes, then retry the same prompt once
+              // with a fresh submission id (the refused one never ran).
+              if (prompted.status === 409 && String(prompted.text).includes('live shadow')) {
+                // Prefer natural settlement (the run watch integrates or
+                // discards its shadow); cancelling immediately races that
+                // watcher and can leave a Discarded shadow pointer.
+                let settled = await waitSessionIdle(base, token, sessionId, 20_000);
+                if (!settled) {
+                  settled = await settleSessionRuns(base, token, sessionId, 30_000);
+                  await new Promise((done) => setTimeout(done, 250));
+                }
+                assert('turns-compaction', settled, `prompt ${turn} live shadow did not settle`);
+                prompted = await postJson(base, token, `/native/session/${sessionId}/prompt`, promptBody());
+              }
               assert('turns-compaction', prompted.status === 200, `prompt ${turn} -> ${prompted.status} ${prompted.text.slice(0, 300)}`);
               try {
                 await waitForTurn(collector, before, 60_000);
@@ -663,14 +729,19 @@ async function main() {
         ['failed', 'refused'].includes(compact.json.state),
         `tiny compaction state ${compact.json.state}`,
       );
+      // A refused/failed compaction must carry a typed reason. The runtime
+      // reports validation refusals as `result.rejectedReason` and malformed
+      // plans as `error.{code,message}`; both are typed, neither is a panic.
+      const rejectedReason = compact.json.result?.rejectedReason ??
+        compact.json.error?.message ?? null;
       assert(
         'compaction-tiny-history-typed',
-        typeof compact.json.result?.rejectedReason === 'string' && compact.json.result.rejectedReason.length > 0,
+        typeof rejectedReason === 'string' && rejectedReason.length > 0,
         `tiny compaction refusal is not typed: ${compact.text.slice(0, 300)}`,
       );
       const alive = await getJson(base, token, '/native/ready');
       assert('compaction-tiny-history-typed', alive.status === 200, 'daemon died on tiny compaction');
-      return { state: compact.json.state, rejected_reason: compact.json.result?.rejectedReason ?? null };
+      return { state: compact.json.state, rejected_reason: rejectedReason };
     });
 
     // ----------------------------------------------------------- transcript

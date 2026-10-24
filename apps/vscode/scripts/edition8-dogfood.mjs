@@ -322,13 +322,22 @@ await flow('rev8-field-contracts', async () => {
   await expect('GET', `/native/session/${encodeURIComponent(sessionId)}/review/comments`, undefined, [200], 'review-list');
   await expect('DELETE', `/native/session/${encodeURIComponent(sessionId)}/review/comments/${encodeURIComponent(comment.comment.id)}`, undefined, [200], 'review-delete');
 
-  // V-03/V-05: no staged shadow/checkpoint in this fixture, so both answer
-  // a typed refusal; nothing is fabricated.
+  // V-03/V-05: no staged shadow/checkpoint in this fixture, so a typed
+  // refusal is the normal answer; nothing is fabricated.
   // 503 = the host did not wire the shadow authority; 404 = it is wired but
   // this session has no staged change set; 409 = the change set was already
-  // decided differently. All are typed refusals; no acceptance is claimed.
-  await expect('POST', `/native/session/${encodeURIComponent(sessionId)}/changes/accept`,
-    { approved: [], rejected: [] }, [404, 409, 503], 'accept');
+  // decided differently. 200 is the idempotent empty-subset acceptance a
+  // current daemon may return when an earlier flow created a change set; it
+  // must apply nothing, reject nothing and be idempotent.
+  const accept = await expect('POST', `/native/session/${encodeURIComponent(sessionId)}/changes/accept`,
+    { approved: [], rejected: [] }, [200, 404, 409, 503], 'accept');
+  if (accept.status === 200) {
+    const body = JSON.parse(accept.text);
+    if (body.accepted !== true || body.idempotent !== true ||
+      (body.applied ?? []).length !== 0 || (body.rejected ?? []).length !== 0) {
+      throw new Error(`accept 200 was not an empty idempotent acceptance: ${accept.text}`);
+    }
+  }
   await expect('POST', `/native/session/${encodeURIComponent(sessionId)}/checkpoints/1/restore/preview`,
     { direction: 'undo' }, [404, 503], 'restore-preview');
 

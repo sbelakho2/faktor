@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}Evidence — Faktor{% endblock %}
+{% block content %}
+
+<section class="page-hero shell" aria-labelledby="evidence-title">
+  <div class="hero-copy">
+    <p class="kicker">Evidence / Claim, candidate and result</p>
+    <h1 class="page-title" id="evidence-title">A result belongs<br>to a change.</h1>
+    <p class="lead">Review what was requested, which candidate was checked and what can still prevent completion.</p>
+  </div>
+</section>
+
+<section class="section shell" aria-labelledby="questions-title">
+  <p class="kicker">The completion chain</p>
+  <h2 class="h2" id="questions-title">Four questions before the finish.</h2>
+  <ol class="question-list">
+    <li><span class="num">01</span><div><h3 class="question">Did the required criteria pass?</h3><p>Pass requires present, passing required results. A missing required check stays Pending; an observed failure is Fail. An empty set is not a complete proof of a verified change.</p></div></li>
+    <li><span class="num">02</span><div><h3 class="question">What claim did the evidence answer?</h3><p>Keep the named claim bound to the candidate snapshot. Unavailable evidence means no verdict; a refusal is a separate outcome.</p></div></li>
+    <li><span class="num">03</span><div><h3 class="question">Is this the state that will land?</h3><p>Expose verified and landed identities. A different landed snapshot cannot use a result for another candidate as its evidence basis; a result for earlier code cannot certify later integration.</p></div></li>
+    <li><span class="num">04</span><div><h3 class="question">Did the requested actions succeed?</h3><p>Local changes, commit, push and native pull request carry distinct outcomes. Missing SCM configuration, skipped work and unsuccessful steps stay visible.</p></div></li>
+  </ol>
+</section>
+
+<section class="section shell" aria-labelledby="unresolved-title">
+  <p class="kicker">Illustrative refresh-token task</p>
+  <h2 class="h2" id="unresolved-title">Keep the unresolved result.</h2>
+  <div class="table-panel">
+    <table class="data-table evidence-table">
+      <caption class="sr-only">Illustrative criteria, required results and next useful action.</caption>
+      <thead><tr><th scope="col">Criterion</th><th scope="col">Required result</th><th scope="col">Next useful action</th></tr></thead>
+      <tbody>
+        <tr><td>Reject replayed refresh tokens</td><td>Passed / test result</td><td>Inspect the recorded basis.</td></tr>
+        <tr><td>Preserve active sessions</td><td>Passed / compatibility check</td><td>Review the candidate identity.</td></tr>
+        <tr><td>Concurrent refresh yields one valid result</td><td>Missing / Pending</td><td>Run or acquire the required result.</td></tr>
+      </tbody>
+    </table>
+    <p class="table-summary">Illustrative task. No live run or verification request is made by this website.</p>
+  </div>
+</section>
+
+<section class="section shell" aria-labelledby="basis-title">
+  <p class="kicker">From a result to an outcome</p>
+  <h2 class="h2" id="basis-title">The final basis stays in the record.</h2>
+  <p class="lead">The verified-change definition requires accepted and integrated with a deterministic-checks final basis. Metrics retain this boundary instead of counting every green check as a successful engineering change.</p>
+  <p class="link-line"><a class="link-arrow" href="/outcomes/">Explore outcome and cost definitions →</a> <a class="link-arrow" href="/editor/">Inspect the interface design →</a></p>
+</section>
+
+{% endblock %}

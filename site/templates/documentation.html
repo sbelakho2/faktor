@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% block title %}Documentation — Faktor{% endblock %}
+{% block content %}
+
+<section class="page-hero shell" aria-labelledby="docs-title">
+  <div class="hero-copy">
+    <p class="kicker">Documentation / Source to workspace</p>
+    <h1 class="page-title" id="docs-title">Start with a workspace.<br>Keep the finish explicit.</h1>
+    <p class="lead">Runtime setup, editor configuration, task criteria, evidence and recorded outcomes in one practical guide.</p>
+  </div>
+</section>
+
+<div class="shell docs-layout">
+  <aside class="docs-side">
+    <p class="kicker">ON THIS PAGE</p>
+    <nav aria-label="On this page">
+      <a href="#source-quickstart">Source quickstart</a>
+      <a href="#editor-setup">Editor setup</a>
+      <a href="#task-contract">Task contract</a>
+      <a href="#completion">Completion</a>
+      <a href="#recovery">Recovery</a>
+    </nav>
+  </aside>
+  <div class="docs-body">
+    <section id="source-quickstart">
+      <h2 class="h2">Source quickstart</h2>
+      <p>Build and run from the Faktor source workspace. These commands are source-development entry points; use the repository’s current installation notes for packaged releases.</p>
+      <div class="command-panel">
+        <pre class="command"><code>cargo build --workspace</code></pre>
+        <span class="copy-button">Copy build command</span>
+      </div>
+      <div class="command-panel">
+        <pre class="command"><code>cargo run -p faktor-cli -- doctor</code></pre>
+        <span class="copy-button">Copy doctor command</span>
+      </div>
+      <div class="command-panel">
+        <pre class="command"><code>cargo run -p faktor-cli -- run --data-dir /tmp/faktor-demo "explain this repo"</code></pre>
+        <span class="copy-button">Copy run command</span>
+      </div>
+    </section>
+
+    <section id="editor-setup">
+      <h2 class="h2">Choose the host.</h2>
+      <p>VS Code opens Faktor through its command and webview. JetBrains uses a right-anchored tool window. Keep binary discovery, daemon transport and project binding understandable before the first run.</p>
+      <p>The expanded design introduces a consistent Work / Inspect / History structure while retaining host-specific behavior. The current VS Code History surface and common finish selector are proposed additions; JetBrains already has the three top-level views.</p>
+      <p class="link-line"><a class="link-arrow" href="/editor/">Open the complete editor design →</a></p>
+    </section>
+
+    <section id="task-contract">
+      <h2 class="h2">Give the task conditions.</h2>
+      <p>Record the goal, acceptance criteria, invariants, risks and requested finish action. An isolated candidate separates editing from integration. Context and permissions stay scoped to the task.</p>
+    </section>
+
+    <section id="completion">
+      <h2 class="h2">Completion has a chain.</h2>
+      <p>Required acceptance, claim evidence, candidate identity, integration and requested finish actions are distinct. Missing data stays visible. An empty required-check set can pass without establishing a verified change.</p>
+      <p class="link-line"><a class="link-arrow" href="/evidence/">Read the evidence contract →</a></p>
+    </section>
+
+    <section id="recovery">
+      <h2 class="h2">Recover without losing the task.</h2>
+      <p>Preserve the draft, attached context and finish choice when a start fails. Explain daemon, provider, verification and SCM blockers separately. A reconnect must not silently skip malformed durable frames or advance beyond unseen events.</p>
+      <p class="link-line"><a class="link-arrow" href="/workflow/">Runtime and provider configuration →</a></p>
+      <p class="note-box">Reviewed source: Faktor README at 16e8bd4cf283. Detailed source and proposed-control mapping are supplied in the UI/UX specification.</p>
+    </section>
+  </div>
+</div>
+
+{% endblock %}

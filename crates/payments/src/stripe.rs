@@ -19,9 +19,10 @@ use crate::error::PaymentError;
 use crate::model::ProviderStatus;
 use crate::provider::{
     PaymentProvider, ProviderCancelRequest, ProviderChangePlanRequest, ProviderCharge,
-    ProviderChargeRequest, ProviderCustomer, ProviderCustomerRequest, ProviderInvoice,
-    ProviderInvoiceRequest, ProviderRefund, ProviderRefundRequest, ProviderSubscribeRequest,
-    ProviderSubscription, VerifiedWebhookEvent, WebhookHeaders,
+    ProviderChargeRequest, ProviderCheckout, ProviderCheckoutRequest, ProviderCustomer,
+    ProviderCustomerRequest, ProviderInvoice, ProviderInvoiceRequest, ProviderInvoiceSnapshot,
+    ProviderRefund, ProviderRefundRequest, ProviderSubscribeRequest, ProviderSubscription,
+    VerifiedWebhookEvent, WebhookHeaders,
 };
 use crate::secrets::SecretString;
 use crate::webhook::{verify_webhook, DEFAULT_WEBHOOK_WINDOW_MS};
@@ -228,36 +229,54 @@ impl PaymentProvider for StripePaymentProvider {
             "/v1/subscriptions/{}",
             encode_segment(&request.subscription_id)
         );
-        let form = vec![
-            (
-                "items[0][price_data][currency]".into(),
-                request.currency.to_lowercase(),
-            ),
-            (
-                "items[0][price_data][product_data][name]".into(),
-                request.plan_id.clone(),
-            ),
-            (
-                "items[0][price_data][unit_amount]".into(),
-                request.unit_amount_minor.to_string(),
-            ),
-            (
-                "items[0][price_data][recurring][interval]".into(),
-                match request.interval {
-                    BillingInterval::Monthly => "month".to_string(),
-                    BillingInterval::Annual => "year".to_string(),
-                },
-            ),
-            ("items[0][quantity]".into(), request.quantity.to_string()),
-            (
-                "proration_behavior".into(),
-                if request.prorate {
-                    "create_prorations".to_string()
-                } else {
-                    "none".to_string()
-                },
-            ),
-        ];
+        // Stripe updates address the EXISTING subscription item by id;
+        // omitting it would create a second item and silently double the
+        // subscription. The item id is durable provider identity and is
+        // never recomputed from local plan data.
+        let item_id = request.provider_item_id.as_deref().ok_or_else(|| {
+            PaymentError::Provider(
+                "stripe subscription has no durable item id; refusing to guess or create one"
+                    .into(),
+            )
+        })?;
+        let mut form = vec![("items[0][id]".into(), item_id.to_string())];
+        if request.plan_changed {
+            let product_id = request.provider_product_id.as_deref().ok_or_else(|| {
+                PaymentError::Provider(
+                    "stripe subscription has no durable product id for the inline price".into(),
+                )
+            })?;
+            form.extend([
+                (
+                    "items[0][price_data][currency]".into(),
+                    request.currency.to_lowercase(),
+                ),
+                (
+                    "items[0][price_data][product]".into(),
+                    product_id.to_string(),
+                ),
+                (
+                    "items[0][price_data][unit_amount]".into(),
+                    request.unit_amount_minor.to_string(),
+                ),
+                (
+                    "items[0][price_data][recurring][interval]".into(),
+                    match request.interval {
+                        BillingInterval::Monthly => "month".to_string(),
+                        BillingInterval::Annual => "year".to_string(),
+                    },
+                ),
+            ]);
+        }
+        form.push(("items[0][quantity]".into(), request.quantity.to_string()));
+        form.push((
+            "proration_behavior".into(),
+            if request.prorate {
+                "create_prorations".to_string()
+            } else {
+                "none".to_string()
+            },
+        ));
         let value = self
             .request(
                 "POST",
@@ -300,6 +319,57 @@ impl PaymentProvider for StripePaymentProvider {
         parse_subscription(&value)
     }
 
+    async fn create_checkout(
+        &self,
+        request: ProviderCheckoutRequest,
+    ) -> Result<ProviderCheckout, PaymentError> {
+        let mut form = vec![
+            ("mode".into(), "payment".into()),
+            ("success_url".into(), request.success_url.clone()),
+            ("cancel_url".into(), request.cancel_url.clone()),
+            (
+                "line_items[0][price_data][currency]".into(),
+                request.currency.to_lowercase(),
+            ),
+            (
+                "line_items[0][price_data][product_data][name]".into(),
+                request.description.clone(),
+            ),
+            (
+                "line_items[0][price_data][unit_amount]".into(),
+                request.amount_minor.to_string(),
+            ),
+            ("line_items[0][quantity]".into(), "1".into()),
+            (
+                "metadata[organization_id]".into(),
+                request.organization_id.clone(),
+            ),
+        ];
+        if let Some(invoice_id) = &request.local_invoice_id {
+            form.push(("metadata[local_invoice_id]".into(), invoice_id.clone()));
+        }
+        let value = self
+            .request(
+                "POST",
+                "/v1/checkout/sessions",
+                &form,
+                Some(&request.idempotency_key),
+                RouteLabel::PaymentProvider,
+            )
+            .await?;
+        Ok(ProviderCheckout {
+            id: text(&value, "id")?,
+            status: text_or(&value, "status", "open"),
+            url: value
+                .get("url")
+                .and_then(Value::as_str)
+                .filter(|url| !url.is_empty() && url.len() <= 2048)
+                .map(str::to_string),
+            amount_minor: number_or(&value, "amount_total", request.amount_minor),
+            currency: text_or(&value, "currency", &request.currency.to_lowercase()).to_uppercase(),
+        })
+    }
+
     async fn create_invoice(
         &self,
         request: ProviderInvoiceRequest,
@@ -335,46 +405,87 @@ impl PaymentProvider for StripePaymentProvider {
         })
     }
 
+    async fn fetch_invoice(
+        &self,
+        provider_invoice_id: &str,
+    ) -> Result<ProviderInvoiceSnapshot, PaymentError> {
+        let path = format!("/v1/invoices/{}", encode_segment(provider_invoice_id));
+        let value = self
+            .request("GET", &path, &[], None, RouteLabel::PaymentProvider)
+            .await?;
+        let status = text_or(&value, "status", "open");
+        let amount_minor = number_or(&value, "total", 0);
+        let mut amount_paid_minor = number_or(&value, "amount_paid", 0);
+        if amount_paid_minor == 0 && status == "paid" {
+            amount_paid_minor = amount_minor;
+        }
+        let paid_at_ms = value
+            .pointer("/status_transitions/paid_at")
+            .and_then(Value::as_i64)
+            .map(|seconds| seconds.saturating_mul(1000));
+        Ok(ProviderInvoiceSnapshot {
+            id: text(&value, "id")?,
+            status,
+            amount_minor,
+            amount_paid_minor,
+            amount_refunded_minor: number_or(&value, "amount_refunded", 0),
+            currency: text_or(&value, "currency", "usd").to_uppercase(),
+            paid_at_ms,
+        })
+    }
+
     async fn charge(&self, request: ProviderChargeRequest) -> Result<ProviderCharge, PaymentError> {
+        let mut form = vec![
+            ("amount".into(), request.amount_minor.to_string()),
+            ("currency".into(), request.currency.to_lowercase()),
+            ("customer".into(), request.customer_id.clone()),
+            (
+                "payment_method".into(),
+                request.payment_method_token.expose().to_string(),
+            ),
+            ("confirm".into(), "true".into()),
+            ("off_session".into(), "true".into()),
+            (
+                "metadata[organization_id]".into(),
+                request.organization_id.clone(),
+            ),
+        ];
+        if let Some(invoice_ref) = &request.invoice_ref {
+            form.push(("metadata[local_invoice_id]".into(), invoice_ref.clone()));
+        }
         let value = self
             .request(
                 "POST",
                 "/v1/payment_intents",
-                &[
-                    ("amount".into(), request.amount_minor.to_string()),
-                    ("currency".into(), request.currency.to_lowercase()),
-                    ("customer".into(), request.customer_id.clone()),
-                    (
-                        "payment_method".into(),
-                        request.payment_method_token.expose().to_string(),
-                    ),
-                    ("confirm".into(), "true".into()),
-                    ("off_session".into(), "true".into()),
-                    (
-                        "metadata[organization_id]".into(),
-                        request.organization_id.clone(),
-                    ),
-                ],
+                &form,
                 Some(&request.idempotency_key),
                 RouteLabel::PaymentProvider,
             )
             .await?;
-        let status = text_or(&value, "status", "failed");
-        let charge = ProviderCharge {
+        let intent_status = text(&value, "status")?;
+        let status = match intent_status.as_str() {
+            "succeeded" => "succeeded",
+            // A processing intent is NOT money collected yet: keep it
+            // pending locally until the provider reports success.
+            "processing" | "requires_capture" => "pending",
+            "requires_action" => "requires_action",
+            "requires_payment_method" | "canceled" => {
+                return Err(PaymentError::Declined(format!(
+                    "stripe payment intent status {intent_status:?}"
+                )))
+            }
+            other => {
+                return Err(PaymentError::Provider(format!(
+                    "stripe payment intent returned an unsupported status {other:?}"
+                )))
+            }
+        };
+        Ok(ProviderCharge {
             id: text(&value, "id")?,
-            status: status.clone(),
+            status: status.to_string(),
             amount_minor: number_or(&value, "amount", request.amount_minor),
             currency: text_or(&value, "currency", &request.currency.to_lowercase()).to_uppercase(),
-        };
-        match status.as_str() {
-            "succeeded" | "processing" => Ok(charge),
-            "requires_action" => Err(PaymentError::Declined(
-                "the payment intent requires additional customer action".into(),
-            )),
-            other => Err(PaymentError::Declined(format!(
-                "stripe payment intent status {other:?}"
-            ))),
-        }
+        })
     }
 
     async fn refund(&self, request: ProviderRefundRequest) -> Result<ProviderRefund, PaymentError> {
@@ -396,9 +507,20 @@ impl PaymentProvider for StripePaymentProvider {
                 RouteLabel::PaymentProvider,
             )
             .await?;
+        let status = text(&value, "status")?;
+        let status = match status.as_str() {
+            "succeeded" => "succeeded",
+            "pending" | "requires_action" => "pending",
+            "failed" | "canceled" => "failed",
+            other => {
+                return Err(PaymentError::Provider(format!(
+                    "stripe refund returned an unsupported status {other:?}"
+                )))
+            }
+        };
         Ok(ProviderRefund {
             id: text(&value, "id")?,
-            status: text_or(&value, "status", "succeeded"),
+            status: status.to_string(),
             amount_minor: number_or(&value, "amount", request.amount_minor),
             currency: text_or(&value, "currency", &request.currency.to_lowercase()).to_uppercase(),
         })
@@ -469,7 +591,7 @@ fn parse_subscription(value: &Value) -> Result<ProviderSubscription, PaymentErro
         .unwrap_or(1);
     Ok(ProviderSubscription {
         id: text(value, "id")?,
-        status: text_or(value, "status", "active"),
+        status: text(value, "status")?,
         quantity: u32::try_from(quantity).unwrap_or(u32::MAX),
         current_period_start_ms: seconds_to_ms(start),
         current_period_end_ms: seconds_to_ms(end),
@@ -477,6 +599,10 @@ fn parse_subscription(value: &Value) -> Result<ProviderSubscription, PaymentErro
             .get("cancel_at_period_end")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        item_id: optional_path_text(value, "/items/data/0/id"),
+        product_id: optional_path_text(value, "/items/data/0/price/product")
+            .or_else(|| optional_path_text(value, "/items/data/0/price/product/id")),
+        price_id: optional_path_text(value, "/items/data/0/price/id"),
     })
 }
 
@@ -503,6 +629,14 @@ fn text_or(value: &Value, field: &str, default: &str) -> String {
         .and_then(Value::as_str)
         .map(str::to_string)
         .unwrap_or_else(|| default.to_string())
+}
+
+fn optional_path_text(value: &Value, pointer: &str) -> Option<String> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty() && text.len() <= 256)
+        .map(str::to_string)
 }
 
 fn number_or(value: &Value, field: &str, default: i64) -> i64 {

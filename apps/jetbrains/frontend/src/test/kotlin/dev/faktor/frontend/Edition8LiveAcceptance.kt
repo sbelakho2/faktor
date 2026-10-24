@@ -84,13 +84,7 @@ object Edition8LiveAcceptance {
                         SwingUtilities.invokeAndWait { button.doClick() }
                         host.work.awaitIdle(30_000)
                         val state = row.stateText()
-                        val kind = when {
-                            state.startsWith("Read") -> "read"
-                            state.startsWith("Disabled") || state.startsWith("Refused") -> "typed"
-                            state.startsWith("Failed") -> "typed"
-                            else -> "missing"
-                        }
-                        statuses[control.id] = kind to state
+                        statuses[control.id] = liveStateKind(state) to state
                     }
                     when (val kind = statuses[control.id]?.first) {
                         "read" -> scenarioRead.add(control.id)
@@ -173,6 +167,30 @@ object Edition8LiveAcceptance {
             kotlin.system.exitProcess(1)
         }
         println("EDITION8 LIVE ACCEPTANCE: scenarios=${records.size}/40 read=$read typed=$typed failed=0")
+    }
+
+    // The row state after a live activation: a daemon-backed read/host
+    // receipt, a typed refusal, or a missing observation. Config controls
+    // stage one atomic draft patch (the Rev8 UX contract: no save-shaped
+    // read); the daemon snapshot was read to render the field, so Staged is
+    // a real live receipt and Apply is exercised by the fixture control
+    // matrix with valid per-field values.
+    private fun liveStateKind(state: String): String = when {
+        state.startsWith("Read") ||
+            state.startsWith("Host —") ||
+            state.startsWith("Connected") ||
+            state.startsWith("Captured") ||
+            state.startsWith("Applied") ||
+            state.startsWith("Staged") ||
+            state.startsWith("Unchanged ·") ||
+            state.startsWith("Loaded ·") -> "read"
+        state.startsWith("Disabled") ||
+            state.startsWith("Refused") ||
+            state.startsWith("Failed") ||
+            state.startsWith("Locked by organization") ||
+            state.startsWith("Not loaded") ||
+            state.startsWith("Loading") -> "typed"
+        else -> "missing"
     }
 
     private fun findButton(root: Component, name: String): AbstractButton? {

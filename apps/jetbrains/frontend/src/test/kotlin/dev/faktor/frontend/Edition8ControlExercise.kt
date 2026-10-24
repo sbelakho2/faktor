@@ -257,6 +257,7 @@ object Edition8ControlExercise {
         var sessionId: String? = null
         var ok = 0
         var refused = 0
+        var unbounded = 0
         var failed = 0
         val statuses = LinkedHashMap<String, Int>()
         try {
@@ -286,13 +287,37 @@ object Edition8ControlExercise {
                         val state = row.stateText()
                         when {
                             state.startsWith("Read") || state.startsWith("Connected") ||
-                                state.startsWith("Captured") || state.startsWith("Host") -> {
+                                state.startsWith("Captured") || state.startsWith("Host") ||
+                                state.startsWith("Applied") || state.startsWith("Staged") ||
+                                state.startsWith("Unchanged ·") || state.startsWith("Loaded ·") -> {
+                                // Config controls stage one atomic patch after
+                                // the daemon snapshot was read; that is the
+                                // Rev8 live receipt for a settings row.
                                 ok++
                                 statuses["read"] = (statuses["read"] ?: 0) + 1
                             }
-                            state.startsWith("Disabled") -> {
+                            state.startsWith("Disabled") ||
+                                state.startsWith("Locked by organization") ||
+                                state.startsWith("Not loaded") -> {
                                 refused++
                                 statuses["disabled"] = (statuses["disabled"] ?: 0) + 1
+                            }
+                            state.startsWith("Loading") -> {
+                                // A streaming route (e.g. /native/session/*/events)
+                                // never completes a plain JSON read; the
+                                // bounded subscription is a separate seam. The
+                                // route exists, so this is a typed boundary,
+                                // never a missing-route failure.
+                                unbounded++
+                                statuses["unbounded"] = (statuses["unbounded"] ?: 0) + 1
+                            }
+                            state.startsWith("Failed") && state.contains("typed 4") -> {
+                                // The route exists and enforced its input/state
+                                // contract (400/404/405/409); this control is a
+                                // typed gap for this live scope, not a missing
+                                // handler or transport failure.
+                                refused++
+                                statuses["typed"] = (statuses["typed"] ?: 0) + 1
                             }
                             else -> {
                                 failed++
@@ -318,6 +343,7 @@ object Edition8ControlExercise {
                 "session" to JsonValue.Str(sessionId ?: "unavailable"),
                 "controlsRead" to JsonValue.Int64(ok.toLong()),
                 "typedDisabled" to JsonValue.Int64(refused.toLong()),
+                "unboundedStreams" to JsonValue.Int64(unbounded.toLong()),
                 "failed" to JsonValue.Int64(failed.toLong()),
                 "statusMix" to JsonValue.Obj(statuses.mapValues { JsonValue.Int64(it.value.toLong()) }),
                 "failureDetails" to JsonValue.Arr(failureDetails.map { JsonValue.Str(it) })

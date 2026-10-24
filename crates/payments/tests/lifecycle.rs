@@ -84,7 +84,9 @@ fn config() -> PaymentsConfig {
             grace_ms: 10_000,
         },
         webhook_secret_env: SECRET_ENV.into(),
+        vault_key_env: faktor_payments::catalog::default_vault_key_env(),
         stripe: StripeConfig::default(),
+        adyen: Default::default(),
     }
 }
 
@@ -231,7 +233,14 @@ async fn full_local_provider_lifecycle_is_durable_and_exact() {
         )
         .await
         .unwrap();
-    assert_eq!(refunded.credit_note.number, "CN-000001");
+    assert_eq!(
+        refunded
+            .credit_note
+            .as_ref()
+            .expect("settled refund has a credit note")
+            .number,
+        "CN-000001"
+    );
     assert_eq!(
         refunded.payment.status,
         faktor_payments::PaymentStatus::PartiallyRefunded
@@ -613,7 +622,14 @@ async fn refunds_are_bounded_by_paid_and_credit_notes_number() {
         )
         .await
         .unwrap();
-    assert_eq!(first.credit_note.number, "CN-000001");
+    assert_eq!(
+        first
+            .credit_note
+            .as_ref()
+            .expect("settled refund has a credit note")
+            .number,
+        "CN-000001"
+    );
     let too_much = service
         .refund(
             &organization,
@@ -639,7 +655,14 @@ async fn refunds_are_bounded_by_paid_and_credit_notes_number() {
         )
         .await
         .unwrap();
-    assert_eq!(second.credit_note.number, "CN-000002");
+    assert_eq!(
+        second
+            .credit_note
+            .as_ref()
+            .expect("settled refund has a credit note")
+            .number,
+        "CN-000002"
+    );
     assert_eq!(
         second.payment.status,
         faktor_payments::PaymentStatus::Refunded

@@ -1062,6 +1062,7 @@ object ProtocolErrorCodes {
         "malformed",
         "oversized",
         "rate_limited",
+        "goal_unavailable_after_redaction",
         "deadlock",
         "internal_error"
     )
@@ -1079,6 +1080,7 @@ object ProtocolErrorCodes {
         "malformed" to 400,
         "oversized" to 413,
         "rate_limited" to 429,
+        "goal_unavailable_after_redaction" to 409,
         "deadlock" to 409,
         "internal_error" to 500
     )
@@ -1096,6 +1098,7 @@ object ProtocolErrorCodes {
         "malformed" to false,
         "oversized" to false,
         "rate_limited" to true,
+        "goal_unavailable_after_redaction" to false,
         "deadlock" to true,
         "internal_error" to false
     )

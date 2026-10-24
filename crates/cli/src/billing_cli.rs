@@ -19,7 +19,8 @@ use faktor_cloud::{
     OrganizationId, SubscriptionStatus, SystemClock,
 };
 use faktor_payments::{
-    BillingInterval, ChangeSeatsRequest, PaymentService, SqlitePaymentStore, SubscribeRequest,
+    AddPaymentMethodRequest, BillingInterval, ChangeSeatsRequest, PaymentService,
+    SqlitePaymentStore, SubscribeRequest,
 };
 use serde_json::{json, Value};
 
@@ -75,6 +76,13 @@ pub(crate) enum BillingAction {
         #[arg(long, default_value = "json")]
         format: String,
     },
+    /// Fetch linked provider invoices read-only and record typed
+    /// reconciliation states (Faktor totals are never rewritten).
+    Reconcile {
+        /// Maximum invoices checked in this pass (1..=5000, default 200).
+        #[arg(long)]
+        limit: Option<u64>,
+    },
     /// List durable payments and their refund state.
     Payments {
         #[arg(long)]
@@ -113,6 +121,50 @@ pub(crate) enum BillingAction {
     },
     /// The configured tax jurisdictions and exact plan price catalogue.
     Tax,
+    /// Vault-backed payment-method tokens (never a raw card number).
+    Method {
+        #[command(subcommand)]
+        action: BillingMethodAction,
+    },
+}
+
+/// The `faktor billing method` subcommands.
+#[derive(Subcommand)]
+pub(crate) enum BillingMethodAction {
+    /// Store one provider token (vault-sealed at rest).
+    Add {
+        /// Opaque provider token (`pm_...`, `tok_...`, Adyen stored id).
+        #[arg(long)]
+        token: String,
+        #[arg(long, default_value = "card")]
+        brand: String,
+        #[arg(long)]
+        last4: String,
+        #[arg(long)]
+        exp_month: u8,
+        #[arg(long)]
+        exp_year: u16,
+        #[arg(long)]
+        set_default: bool,
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
+    /// Rotate the token of an existing method (old ciphertext replaced).
+    Rotate {
+        id: String,
+        #[arg(long)]
+        token: String,
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
+    /// Remove a stored method and its ciphertext.
+    Remove {
+        id: String,
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
+    /// List the safe token-free projections.
+    List,
 }
 
 /// The `faktor billing credits` subcommands.
@@ -219,7 +271,10 @@ fn payments_service(
         SqlitePaymentStore::open(&path)
             .map_err(|e| format!("payment store {}: {e}", path.display()))?,
     );
-    let transport = if runtime.provider == faktor_payments::ProviderKind::Stripe {
+    let transport = if matches!(
+        runtime.provider,
+        faktor_payments::ProviderKind::Stripe | faktor_payments::ProviderKind::Adyen
+    ) {
         let policy = config
             .sandbox_policy()
             .map_err(|e| format!("billing payments: sandbox policy: {e}"))?
@@ -547,7 +602,29 @@ async fn render_impl(
             if format != "json" {
                 return Err("invoice: --format must be json or csv".into());
             }
-            Ok(json!({ "invoice": invoice }))
+            let provider_observations = service
+                .provider_invoice_observations(&organization, &invoice.id)
+                .map_err(|e| format!("invoice: {e}"))?;
+            let provider_payments = service
+                .provider_payment_observations(&organization, &invoice.id)
+                .map_err(|e| format!("invoice: {e}"))?;
+            let provider_refunds = service
+                .provider_refund_observations(&organization, &invoice.id)
+                .map_err(|e| format!("invoice: {e}"))?;
+            Ok(json!({
+                "invoice": invoice,
+                "providerObservations": provider_observations,
+                "providerPayments": provider_payments,
+                "providerRefunds": provider_refunds,
+            }))
+        }
+        BillingAction::Reconcile { limit } => {
+            let (service, organization) = payments_service(&config, data_dir)?;
+            let report = service
+                .reconcile(&organization, payment_limit(limit, "reconcile")?)
+                .await
+                .map_err(|e| format!("reconcile: {e}"))?;
+            Ok(json!({ "reconciliation": report }))
         }
         BillingAction::Payments { limit } => {
             let (service, organization) = payments_service(&config, data_dir)?;
@@ -622,6 +699,76 @@ async fn render_impl(
                 "proration": outcome.proration,
                 "prorationText": service.preview_text(&outcome.proration),
             }))
+        }
+        BillingAction::Method { action } => {
+            let (service, organization) = payments_service(&config, data_dir)?;
+            match action {
+                BillingMethodAction::Add {
+                    token,
+                    brand,
+                    last4,
+                    exp_month,
+                    exp_year,
+                    set_default,
+                    idempotency_key,
+                } => {
+                    let outcome = service
+                        .add_payment_method(
+                            &organization,
+                            AddPaymentMethodRequest {
+                                token,
+                                brand,
+                                last4,
+                                exp_month,
+                                exp_year,
+                                set_default,
+                                idempotency_key: idempotency_key
+                                    .unwrap_or_else(|| new_idempotency_key(None, "method")),
+                            },
+                        )
+                        .map_err(|e| format!("method add: {e}"))?;
+                    Ok(json!({
+                        "replayed": outcome.replayed,
+                        "paymentMethod": outcome.payment_method,
+                    }))
+                }
+                BillingMethodAction::Rotate {
+                    id,
+                    token,
+                    idempotency_key,
+                } => {
+                    let outcome = service
+                        .rotate_payment_method_token(
+                            &organization,
+                            &id,
+                            &token,
+                            &idempotency_key.unwrap_or_else(|| new_idempotency_key(None, "rotate")),
+                        )
+                        .map_err(|e| format!("method rotate: {e}"))?;
+                    Ok(json!({
+                        "replayed": outcome.replayed,
+                        "paymentMethod": outcome.payment_method,
+                    }))
+                }
+                BillingMethodAction::Remove {
+                    id,
+                    idempotency_key,
+                } => {
+                    service
+                        .remove_payment_method(
+                            &organization,
+                            &id,
+                            &idempotency_key.unwrap_or_else(|| new_idempotency_key(None, "remove")),
+                        )
+                        .map_err(|e| format!("method remove: {e}"))?;
+                    Ok(json!({"removed": true}))
+                }
+                BillingMethodAction::List => Ok(json!({
+                    "paymentMethods": service
+                        .payment_methods(&organization)
+                        .map_err(|e| format!("method list: {e}"))?,
+                })),
+            }
         }
         BillingAction::Tax => {
             let (service, organization) = payments_service(&config, data_dir)?;

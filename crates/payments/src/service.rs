@@ -11,29 +11,51 @@ use std::sync::Arc;
 use faktor_cloud::{Clock, OrganizationId};
 use sha2::{Digest, Sha256};
 
+use crate::authority::{
+    InvoiceReconciliationState, ProviderInvoiceObservation, ProviderObservationSource,
+    ProviderPaymentObservation, ProviderRefundObservation, ReconciliationItem,
+    ReconciliationReport, MAX_RECONCILIATION_INVOICES,
+};
 use crate::catalog::{
     BillingInterval, DunningConfig, PaymentsConfig, PlanPrice, ProviderKind, TaxConfig, TaxRate,
 };
 use crate::error::{PaymentError, PaymentErrorBody};
 use crate::model::{
     AddPaymentMethodRequest, CancelRequest, CapabilityStatus, ChangePlanRequest,
-    ChangeSeatsRequest, CreditNote, Invoice, InvoiceLine, InvoiceLineKind, InvoiceOutcome,
-    InvoicePage, InvoiceStatus, IssueInvoiceRequest, LifecycleOutcome, PayInvoiceOutcome,
-    PayInvoiceRequest, Payment, PaymentCustomer, PaymentMethod, PaymentMethodOutcome,
-    PaymentMethodView, PaymentStatus, PaymentSubscription, PaymentsOverview, PendingProration,
-    PlanChangeOutcome, PreviewPlanRequest, PreviewSeatsRequest, ProrationPreview, ProviderStatus,
-    Refund, RefundOutcome, RefundRequest, SeatChangeOutcome, SubscribeRequest, SubscriptionOutcome,
-    SubscriptionState, TaxSurface, WebhookDisposition, WebhookOutcome,
+    ChangeSeatsRequest, ClaimAcquisition, CreditNote, FinancialResourceType, Invoice, InvoiceLine,
+    InvoiceLineKind, InvoiceOutcome, InvoicePage, InvoiceStatus, IssueInvoiceRequest,
+    LifecycleOutcome, OperationClaim, OperationClaimDraft, PayInvoiceOutcome, PayInvoiceRequest,
+    Payment, PaymentCustomer, PaymentMethod, PaymentMethodOutcome, PaymentMethodView,
+    PaymentStatus, PaymentSubscription, PaymentsOverview, PendingProration, PlanChangeOutcome,
+    PreviewPlanRequest, PreviewSeatsRequest, ProrationPreview, ProviderStatus, Refund,
+    RefundOutcome, RefundRequest, RefundStatus, SeatChangeOutcome, StoredPaymentMethod,
+    SubscribeRequest, SubscriptionOutcome, SubscriptionState, TaxSurface, WebhookDisposition,
+    WebhookOutcome,
 };
 use crate::money::{checked_add, checked_mul, exclusive_tax, format_minor, inclusive_tax, prorate};
-use crate::provider::{PaymentProvider, VerifiedWebhookEvent, WebhookHeaders};
+use crate::provider::{
+    PaymentProvider, ProviderInvoiceSnapshot, ProviderObjectKind, ProviderReconcileRequest,
+    ProviderReconciled, VerifiedWebhookEvent, WebhookHeaders,
+};
 use crate::secrets::SecretSource;
 use crate::store::{
-    consume_proration_tx, insert_credit_note_tx, insert_invoice_tx, insert_payment_tx,
-    insert_pending_proration_tx, insert_refund_tx, next_sequence_tx, put_customer_tx,
-    put_payment_method_tx, put_subscription_tx, update_invoice_tx, IdempotencyWrite, InvoiceStats,
-    SqlitePaymentStore, WebhookEffects, WebhookRecord,
+    consume_proration_tx, customer_tx, insert_credit_note_tx, insert_invoice_tx, insert_payment_tx,
+    insert_pending_proration_tx, insert_refund_tx, invoice_by_provider_id_tx, invoice_tx,
+    next_sequence_tx, payment_by_provider_id_tx, payment_tx, put_customer_tx,
+    put_payment_method_tx, put_subscription_tx, refund_by_id_tx, refund_by_provider_id_conn,
+    subscription_by_id_tx, subscription_by_provider_id_tx, update_invoice_tx,
+    upsert_provider_invoice_conn, upsert_provider_payment_conn, upsert_provider_refund_conn,
+    watermark_tx, IdempotencyWrite, InvoiceStats, SqlitePaymentStore, WebhookDecision,
+    WebhookEffects, WebhookPlan, WebhookRecord,
 };
+use crate::vault::PaymentTokenVault;
+
+mod export;
+mod tokens;
+mod webhooks;
+
+use export::{invoice_csv, invoices_csv};
+pub use tokens::validate_payment_token;
 
 /// Bound on one invoice page / export.
 pub const MAX_INVOICE_PAGE: usize = 5_000;
@@ -56,22 +78,59 @@ pub struct PaymentService {
     provider: Arc<dyn PaymentProvider>,
     config: PaymentsConfig,
     clock: Arc<dyn Clock>,
+    vault: PaymentTokenVault,
 }
 
 impl PaymentService {
-    pub fn new(
+    fn new(
         store: Arc<SqlitePaymentStore>,
         provider: Arc<dyn PaymentProvider>,
         config: PaymentsConfig,
         clock: Arc<dyn Clock>,
+        vault: PaymentTokenVault,
     ) -> Result<Self, PaymentError> {
         config.validate()?;
-        Ok(Self {
+        let service = Self {
             store,
             provider,
             config,
             clock,
-        })
+            vault,
+        };
+        service.migrate_plaintext_payment_tokens()?;
+        service.recover_dispatch_claims()?;
+        Ok(service)
+    }
+
+    /// Startup recovery: claims that crossed the provider boundary in a
+    /// previous process become `unknown`; claims that never dispatched are
+    /// released (no provider effect can exist).
+    fn recover_dispatch_claims(&self) -> Result<(), PaymentError> {
+        self.store.recover_claims(self.now_ms())?;
+        Ok(())
+    }
+
+    /// Build a service around a caller-supplied provider (used by adapters
+    /// and adversarial reconciliation tests). The provider still owns every
+    /// external side effect; the service owns claims and durable state.
+    pub fn with_provider(
+        store: Arc<SqlitePaymentStore>,
+        provider: Arc<dyn PaymentProvider>,
+        config: PaymentsConfig,
+        clock: Arc<dyn Clock>,
+        secrets: Arc<dyn SecretSource>,
+    ) -> Result<Self, PaymentError> {
+        let vault =
+            PaymentTokenVault::resolve(secrets.as_ref(), &config.vault_key_env, store.db_path())?;
+        Self::new(store, provider, config, clock, vault)
+    }
+
+    fn open_vault(
+        store: &SqlitePaymentStore,
+        config: &PaymentsConfig,
+        secrets: &dyn SecretSource,
+    ) -> Result<PaymentTokenVault, PaymentError> {
+        PaymentTokenVault::resolve(secrets, &config.vault_key_env, store.db_path())
     }
 
     /// Construct the local provider. The webhook secret is optional (billing
@@ -84,12 +143,13 @@ impl PaymentService {
         secrets: Arc<dyn SecretSource>,
     ) -> Result<Self, PaymentError> {
         let secret = secrets.get(&config.webhook_secret_env);
+        let vault = Self::open_vault(&store, &config, secrets.as_ref())?;
         let provider: Arc<dyn PaymentProvider> = Arc::new(crate::local::LocalPaymentProvider::new(
             store.clone(),
             secret,
             clock.clone(),
         ));
-        Self::new(store, provider, config, clock)
+        Self::new(store, provider, config, clock, vault)
     }
 
     /// Construct the Stripe adapter. A missing API key is NOT a construction
@@ -105,6 +165,7 @@ impl PaymentService {
     ) -> Result<Self, PaymentError> {
         let api_key = secrets.get(&config.stripe.api_key_env);
         let webhook_secret = secrets.get(&config.stripe.webhook_secret_env);
+        let vault = Self::open_vault(&store, &config, secrets.as_ref())?;
         let provider: Arc<dyn PaymentProvider> = match (api_key, transport) {
             (Some(api_key), Some(transport)) if !api_key.is_empty() => {
                 Arc::new(crate::stripe::StripePaymentProvider::new(
@@ -128,7 +189,46 @@ impl PaymentService {
                 ),
             )),
         };
-        Self::new(store, provider, config, clock)
+        Self::new(store, provider, config, clock, vault)
+    }
+
+    /// Construct the Adyen Checkout adapter. A missing API key is not a
+    /// construction failure: the honest unconfigured provider is installed
+    /// so reads work and every paid operation refuses typed.
+    pub fn open_adyen(
+        store: Arc<SqlitePaymentStore>,
+        config: PaymentsConfig,
+        clock: Arc<dyn Clock>,
+        secrets: Arc<dyn SecretSource>,
+        transport: Option<Arc<dyn faktor_provider::egress::HttpTransport>>,
+    ) -> Result<Self, PaymentError> {
+        let api_key = secrets.get(&config.adyen.api_key_env);
+        let webhook_key = secrets.get(&config.adyen.webhook_hmac_key_env);
+        let vault = Self::open_vault(&store, &config, secrets.as_ref())?;
+        let provider: Arc<dyn PaymentProvider> = match (api_key, transport) {
+            (Some(api_key), Some(transport)) if !api_key.is_empty() => {
+                Arc::new(crate::adyen::AdyenPaymentProvider::new(
+                    &config.adyen,
+                    api_key,
+                    webhook_key,
+                    transport,
+                )?)
+            }
+            (Some(api_key), None) if !api_key.is_empty() => {
+                Arc::new(crate::provider::UnconfiguredPaymentProvider::new(
+                    "adyen",
+                    "no checked egress transport is wired",
+                ))
+            }
+            _ => Arc::new(crate::provider::UnconfiguredPaymentProvider::new(
+                "adyen",
+                format!(
+                    "the environment variable {} does not resolve to an API key",
+                    config.adyen.api_key_env
+                ),
+            )),
+        };
+        Self::new(store, provider, config, clock, vault)
     }
 
     pub fn now_ms(&self) -> i64 {
@@ -173,6 +273,7 @@ impl PaymentService {
         let customer = self.store.customer(org)?;
         let subscription = self.store.subscription(org)?;
         let stats = self.store.invoice_stats(org)?;
+        let reconciliation = self.store.reconciliation_summary(org)?;
         let methods = self.store.payment_methods(org)?;
         let plan_price = subscription
             .as_ref()
@@ -214,6 +315,7 @@ impl PaymentService {
             open_invoice_count: stats.open_invoice_count,
             outstanding_minor: stats.outstanding_minor,
             paid_minor: stats.paid_minor,
+            reconciliation,
             payment_method_count: methods.len() as u64,
             tax,
             payment,
@@ -291,11 +393,39 @@ impl PaymentService {
             }
         }
         let now = self.now_ms();
+        let subscription_id =
+            operation_resource_id("sub", org, "subscribe", &request.idempotency_key);
+        let provider_key = format!("{}:subscribe", request.idempotency_key);
+        match self.acquire_claim(
+            org,
+            &request.idempotency_key,
+            "subscribe",
+            FinancialResourceType::Subscription,
+            &subscription_id,
+            &hash,
+            &provider_key,
+            &serde_json::json!({"request": &request}),
+        )? {
+            ClaimAcquisition::Acquired => {}
+            ClaimAcquisition::Recorded(claim) => {
+                let (response, _) = self.claim_replay(&claim, true)?;
+                return Ok(SubscriptionOutcome {
+                    subscription: self.subscription_from_replay(org, &response)?,
+                    replayed: true,
+                });
+            }
+            ClaimAcquisition::InFlight(claim) => return Err(Self::claim_in_flight_error(&claim)),
+            ClaimAcquisition::Unresolved(claim) => {
+                return Err(Self::claim_unresolved_error(&claim))
+            }
+        }
+        self.store
+            .mark_claim_dispatched(org, &request.idempotency_key, now)?;
         let existing_customer = self.store.customer(org)?;
         let customer = match existing_customer {
             Some(customer) => customer,
             None => {
-                let remote = self
+                let remote = match self
                     .provider
                     .create_customer(crate::provider::ProviderCustomerRequest {
                         organization_id: org.to_string(),
@@ -303,7 +433,14 @@ impl PaymentService {
                         email: request.customer_email.clone(),
                         name: request.customer_name.clone(),
                     })
-                    .await?;
+                    .await
+                {
+                    Ok(remote) => remote,
+                    Err(error) => {
+                        self.fail_dispatch(org, &request.idempotency_key, &error)?;
+                        return Err(error);
+                    }
+                };
                 PaymentCustomer {
                     id: format!("cus_{}", uuid::Uuid::new_v4()),
                     organization_id: org.to_string(),
@@ -319,11 +456,11 @@ impl PaymentService {
             .trial_days
             .filter(|days| *days > 0)
             .map(|days| now.saturating_add(i64::from(days) * 86_400_000));
-        let remote = self
+        let remote = match self
             .provider
             .subscribe(crate::provider::ProviderSubscribeRequest {
                 organization_id: org.to_string(),
-                idempotency_key: format!("{}:subscribe", request.idempotency_key),
+                idempotency_key: provider_key,
                 customer_id: customer.provider_customer_id.clone(),
                 plan_id: request.plan_id.clone(),
                 interval: request.interval,
@@ -332,7 +469,14 @@ impl PaymentService {
                 currency: plan.currency.clone(),
                 unit_amount_minor: price,
             })
-            .await?;
+            .await
+        {
+            Ok(remote) => remote,
+            Err(error) => {
+                self.fail_dispatch(org, &request.idempotency_key, &error)?;
+                return Err(error);
+            }
+        };
         let period_start = if remote.current_period_start_ms > 0 {
             remote.current_period_start_ms
         } else {
@@ -343,17 +487,29 @@ impl PaymentService {
         } else {
             period_start.saturating_add(request.interval.period_ms())
         };
-        let state = if trial_end_ms.is_some_and(|trial| trial > now) || remote.status == "trialing"
-        {
-            SubscriptionState::Trialing
-        } else {
-            SubscriptionState::Active
+        let state = match provider_subscription_state(&remote.status, trial_end_ms, now) {
+            Ok(state) => state,
+            Err(error) => {
+                self.store
+                    .mark_claim_unknown(org, &request.idempotency_key, now)?;
+                return Err(error);
+            }
         };
+        if state == SubscriptionState::Canceled {
+            self.store
+                .mark_claim_unknown(org, &request.idempotency_key, now)?;
+            return Err(PaymentError::Provider(
+                "provider created an already-canceled subscription".into(),
+            ));
+        }
         let subscription = PaymentSubscription {
-            id: format!("sub_{}", uuid::Uuid::new_v4()),
+            id: subscription_id,
             organization_id: org.to_string(),
             customer_id: customer.id.clone(),
             provider_subscription_id: remote.id,
+            provider_item_id: remote.item_id,
+            provider_product_id: remote.product_id,
+            provider_price_id: remote.price_id,
             plan_id: request.plan_id.clone(),
             interval: request.interval,
             quantity: request.seats,
@@ -403,7 +559,11 @@ impl PaymentService {
                     "subscription was recorded concurrently".into(),
                 ))
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                self.store
+                    .mark_claim_unknown(org, &request.idempotency_key, self.now_ms())?;
+                Err(e)
+            }
         }
     }
 
@@ -445,11 +605,39 @@ impl PaymentService {
             self.compute_plan_proration(&subscription, &request.plan_id, interval, self.now_ms())?;
         let unit_amount =
             self.plan_amount_in(&request.plan_id, interval, &subscription.currency)?;
-        self.provider
+        let provider_key = format!("{}:change-plan", request.idempotency_key);
+        match self.acquire_claim(
+            org,
+            &request.idempotency_key,
+            "change_plan",
+            FinancialResourceType::Subscription,
+            &subscription.id,
+            &hash,
+            &provider_key,
+            &serde_json::json!({"request": &request, "proration": &proration}),
+        )? {
+            ClaimAcquisition::Acquired => {}
+            ClaimAcquisition::Recorded(claim) => {
+                let (response, _) = self.claim_replay(&claim, true)?;
+                return self.plan_change_from_replay(org, &response, true);
+            }
+            ClaimAcquisition::InFlight(claim) => return Err(Self::claim_in_flight_error(&claim)),
+            ClaimAcquisition::Unresolved(claim) => {
+                return Err(Self::claim_unresolved_error(&claim))
+            }
+        }
+        self.store
+            .mark_claim_dispatched(org, &request.idempotency_key, self.now_ms())?;
+        let remote = match self
+            .provider
             .change_plan(crate::provider::ProviderChangePlanRequest {
                 organization_id: org.to_string(),
-                idempotency_key: format!("{}:change-plan", request.idempotency_key),
+                idempotency_key: provider_key,
                 subscription_id: subscription.provider_subscription_id.clone(),
+                provider_item_id: subscription.provider_item_id.clone(),
+                provider_product_id: subscription.provider_product_id.clone(),
+                provider_price_id: subscription.provider_price_id.clone(),
+                plan_changed: true,
                 plan_id: request.plan_id.clone(),
                 interval,
                 quantity: subscription.quantity,
@@ -457,8 +645,20 @@ impl PaymentService {
                 unit_amount_minor: unit_amount,
                 prorate: true,
             })
-            .await?;
+            .await
+        {
+            Ok(remote) => remote,
+            Err(error) => {
+                self.fail_dispatch(org, &request.idempotency_key, &error)?;
+                return Err(error);
+            }
+        };
         let mut updated = subscription.clone();
+        updated.provider_subscription_id = remote.id;
+        updated.provider_item_id = remote.item_id;
+        updated.provider_product_id = remote.product_id;
+        updated.provider_price_id = remote.price_id;
+        updated.quantity = remote.quantity;
         updated.plan_id = request.plan_id.clone();
         updated.interval = interval;
         updated.updated_ms = self.now_ms();
@@ -497,7 +697,11 @@ impl PaymentService {
                     })?;
                 self.plan_change_from_replay(org, &response, true)
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                self.store
+                    .mark_claim_unknown(org, &request.idempotency_key, self.now_ms())?;
+                Err(e)
+            }
         }
     }
 
@@ -519,14 +723,45 @@ impl PaymentService {
         if subscription.state == SubscriptionState::Canceled {
             return Err(PaymentError::IllegalState("canceled".into()));
         }
-        self.provider
+        let provider_key = format!("{}:cancel", request.idempotency_key);
+        match self.acquire_claim(
+            org,
+            &request.idempotency_key,
+            "cancel",
+            FinancialResourceType::Subscription,
+            &subscription.id,
+            &hash,
+            &provider_key,
+            &serde_json::json!({"request": &request}),
+        )? {
+            ClaimAcquisition::Acquired => {}
+            ClaimAcquisition::Recorded(claim) => {
+                let (response, _) = self.claim_replay(&claim, true)?;
+                return Ok(SubscriptionOutcome {
+                    subscription: self.subscription_from_replay(org, &response)?,
+                    replayed: true,
+                });
+            }
+            ClaimAcquisition::InFlight(claim) => return Err(Self::claim_in_flight_error(&claim)),
+            ClaimAcquisition::Unresolved(claim) => {
+                return Err(Self::claim_unresolved_error(&claim))
+            }
+        }
+        self.store
+            .mark_claim_dispatched(org, &request.idempotency_key, self.now_ms())?;
+        if let Err(error) = self
+            .provider
             .cancel(crate::provider::ProviderCancelRequest {
                 organization_id: org.to_string(),
-                idempotency_key: format!("{}:cancel", request.idempotency_key),
+                idempotency_key: provider_key,
                 subscription_id: subscription.provider_subscription_id.clone(),
                 at_period_end: request.at_period_end,
             })
-            .await?;
+            .await
+        {
+            self.fail_dispatch(org, &request.idempotency_key, &error)?;
+            return Err(error);
+        }
         let now = self.now_ms();
         let mut updated = subscription;
         updated.updated_ms = now;
@@ -565,7 +800,11 @@ impl PaymentService {
                     replayed: true,
                 })
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                self.store
+                    .mark_claim_unknown(org, &request.idempotency_key, self.now_ms())?;
+                Err(e)
+            }
         }
     }
 
@@ -603,11 +842,39 @@ impl PaymentService {
         }
         let proration =
             self.compute_seat_proration(&subscription, request.quantity, self.now_ms())?;
-        self.provider
+        let provider_key = format!("{}:seats", request.idempotency_key);
+        match self.acquire_claim(
+            org,
+            &request.idempotency_key,
+            "change_seats",
+            FinancialResourceType::Subscription,
+            &subscription.id,
+            &hash,
+            &provider_key,
+            &serde_json::json!({"request": &request, "proration": &proration}),
+        )? {
+            ClaimAcquisition::Acquired => {}
+            ClaimAcquisition::Recorded(claim) => {
+                let (response, _) = self.claim_replay(&claim, true)?;
+                return self.seat_change_from_replay(org, &response, true);
+            }
+            ClaimAcquisition::InFlight(claim) => return Err(Self::claim_in_flight_error(&claim)),
+            ClaimAcquisition::Unresolved(claim) => {
+                return Err(Self::claim_unresolved_error(&claim))
+            }
+        }
+        self.store
+            .mark_claim_dispatched(org, &request.idempotency_key, self.now_ms())?;
+        let remote = match self
+            .provider
             .change_plan(crate::provider::ProviderChangePlanRequest {
                 organization_id: org.to_string(),
-                idempotency_key: format!("{}:seats", request.idempotency_key),
+                idempotency_key: provider_key,
                 subscription_id: subscription.provider_subscription_id.clone(),
+                provider_item_id: subscription.provider_item_id.clone(),
+                provider_product_id: subscription.provider_product_id.clone(),
+                provider_price_id: subscription.provider_price_id.clone(),
+                plan_changed: false,
                 plan_id: subscription.plan_id.clone(),
                 interval: subscription.interval,
                 quantity: request.quantity,
@@ -619,9 +886,20 @@ impl PaymentService {
                 )?,
                 prorate: true,
             })
-            .await?;
+            .await
+        {
+            Ok(remote) => remote,
+            Err(error) => {
+                self.fail_dispatch(org, &request.idempotency_key, &error)?;
+                return Err(error);
+            }
+        };
         let now = self.now_ms();
         let mut updated = subscription;
+        updated.provider_subscription_id = remote.id;
+        updated.provider_item_id = remote.item_id;
+        updated.provider_product_id = remote.product_id;
+        updated.provider_price_id = remote.price_id;
         updated.quantity = request.quantity;
         updated.updated_ms = now;
         let pending = self.pending_from_preview(org, &updated.id, &proration, now);
@@ -658,7 +936,11 @@ impl PaymentService {
                     })?;
                 self.seat_change_from_replay(org, &response, true)
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                self.store
+                    .mark_claim_unknown(org, &request.idempotency_key, self.now_ms())?;
+                Err(e)
+            }
         }
     }
 
@@ -834,33 +1116,17 @@ impl PaymentService {
             .ok_or_else(|| PaymentError::NotFound("payment customer".into()))?;
         let now = self.now_ms();
         let due_days = request.due_in_days.unwrap_or(7).clamp(1, MAX_DUE_DAYS);
-        let provider_invoice = self
-            .provider
-            .create_invoice(crate::provider::ProviderInvoiceRequest {
-                organization_id: org.to_string(),
-                idempotency_key: format!("{}:invoice", request.idempotency_key),
-                customer_id: customer.provider_customer_id.clone(),
-                subscription_id: Some(subscription.provider_subscription_id.clone()),
-                description: format!("{} invoice", subscription.plan_id),
-                amount_minor: total_minor,
-                currency: subscription.currency.clone(),
-            })
-            .await?;
-        let invoice_id = format!("inv_{}", uuid::Uuid::new_v4());
-        let write = self.write(
-            org,
-            &request.idempotency_key,
-            "issue_invoice",
-            hash.clone(),
-            &serde_json::json!({"invoice_id": invoice_id}),
-            now,
-        )?;
-        let mut invoice = Invoice {
+        let invoice_id =
+            operation_resource_id("inv", org, "issue_invoice", &request.idempotency_key);
+        let pending_ids: Vec<String> = pending.iter().map(|line| line.id.clone()).collect();
+        let invoice = Invoice {
             id: invoice_id.clone(),
             organization_id: org.to_string(),
             number: String::new(),
             subscription_id: Some(subscription.id.clone()),
-            provider_invoice_id: Some(provider_invoice.id),
+            provider_invoice_id: None,
+            provider_idempotency_key: Some(format!("{}:invoice", request.idempotency_key)),
+            reconciliation: Default::default(),
             currency: subscription.currency.clone(),
             status: InvoiceStatus::Open,
             lines: lines.clone(),
@@ -884,12 +1150,91 @@ impl PaymentService {
             voided_ms: None,
             created_ms: now,
         };
-        let pending_ids: Vec<String> = pending.iter().map(|line| line.id.clone()).collect();
+        let provider_key = format!("{}:invoice", request.idempotency_key);
+        match self.acquire_claim(
+            org,
+            &request.idempotency_key,
+            "issue_invoice",
+            FinancialResourceType::Invoice,
+            &invoice_id,
+            &hash,
+            &provider_key,
+            &serde_json::json!({
+                "request": &request,
+                "invoice": &invoice,
+                "pending_ids": &pending_ids,
+            }),
+        )? {
+            ClaimAcquisition::Acquired => {}
+            ClaimAcquisition::Recorded(claim) => {
+                let (response, _) = self.claim_replay(&claim, true)?;
+                return Ok(InvoiceOutcome {
+                    invoice: self.invoice_from_replay(org, &response)?,
+                    replayed: true,
+                });
+            }
+            ClaimAcquisition::InFlight(claim) => return Err(Self::claim_in_flight_error(&claim)),
+            ClaimAcquisition::Unresolved(claim) => {
+                return Err(Self::claim_unresolved_error(&claim))
+            }
+        }
+        self.store
+            .mark_claim_dispatched(org, &request.idempotency_key, now)?;
+        let provider_invoice = match self
+            .provider
+            .create_invoice(crate::provider::ProviderInvoiceRequest {
+                organization_id: org.to_string(),
+                idempotency_key: provider_key,
+                customer_id: customer.provider_customer_id.clone(),
+                subscription_id: Some(subscription.provider_subscription_id.clone()),
+                description: format!("{} invoice", subscription.plan_id),
+                amount_minor: total_minor,
+                currency: subscription.currency.clone(),
+            })
+            .await
+        {
+            Ok(invoice) => invoice,
+            Err(error) => {
+                self.fail_dispatch(org, &request.idempotency_key, &error)?;
+                return Err(error);
+            }
+        };
+        let mut invoice = invoice;
+        invoice.provider_invoice_id = Some(provider_invoice.id.clone());
+        let provider_snapshot = ProviderInvoiceSnapshot {
+            id: provider_invoice.id.clone(),
+            status: provider_invoice.status.clone(),
+            amount_minor: provider_invoice.amount_minor,
+            amount_paid_minor: if provider_invoice.status == "paid" {
+                provider_invoice.amount_minor
+            } else {
+                0
+            },
+            amount_refunded_minor: 0,
+            currency: provider_invoice.currency.clone(),
+            paid_at_ms: (provider_invoice.status == "paid").then_some(now),
+        };
+        let write = self.write(
+            org,
+            &request.idempotency_key,
+            "issue_invoice",
+            hash.clone(),
+            &serde_json::json!({"invoice_id": invoice_id}),
+            now,
+        )?;
         let cloned_lines = lines.clone();
         let effect_value = self.store.record_atomic(&write, |tx| {
             let sequence = next_sequence_tx(tx, org, "invoice")?;
             invoice.number = format!("INV-{sequence:06}");
+            let observation = self.invoice_observation(
+                &invoice,
+                &provider_snapshot,
+                ProviderObservationSource::Issue,
+                now,
+            );
+            invoice.reconciliation = observation.reconciliation;
             insert_invoice_tx(tx, &invoice, &cloned_lines)?;
+            upsert_provider_invoice_conn(tx, &observation)?;
             for pending_id in &pending_ids {
                 consume_proration_tx(tx, pending_id, &invoice_id)?;
             }
@@ -911,7 +1256,11 @@ impl PaymentService {
                     replayed: true,
                 })
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                self.store
+                    .mark_claim_unknown(org, &request.idempotency_key, self.now_ms())?;
+                Err(e)
+            }
         }
     }
 
@@ -975,25 +1324,57 @@ impl PaymentService {
             .store
             .payment_method(org, &request.payment_method_id)?
             .ok_or_else(|| PaymentError::NotFound("payment method".into()))?;
-        if method.organization_id != org {
+        if method.method.organization_id != org {
             return Err(PaymentError::NotFound("payment method".into()));
         }
-        if method.provider != self.provider.name() {
+        if method.method.provider != self.provider.name() {
             return Err(PaymentError::Malformed(
                 "the payment method belongs to a different payment provider".into(),
             ));
         }
+        let token = self.payment_method_token(org, &method.method.id)?;
+        let payment_id = operation_resource_id("pay", org, "pay_invoice", &request.idempotency_key);
+        let provider_key = format!("{}:charge", request.idempotency_key);
+        let claim_context = serde_json::json!({
+            "request": &request,
+            "payment_id": &payment_id,
+            "amount_minor": balance,
+            "payment_method_id": &request.payment_method_id,
+            "currency": &invoice.currency,
+        });
+        match self.acquire_claim(
+            org,
+            &request.idempotency_key,
+            "pay_invoice",
+            FinancialResourceType::Payment,
+            &payment_id,
+            &hash,
+            &provider_key,
+            &claim_context,
+        )? {
+            ClaimAcquisition::Acquired => {}
+            ClaimAcquisition::Recorded(claim) => {
+                let (response, _) = self.claim_replay(&claim, true)?;
+                return self.pay_from_replay(org, &response, true);
+            }
+            ClaimAcquisition::InFlight(claim) => return Err(Self::claim_in_flight_error(&claim)),
+            ClaimAcquisition::Unresolved(claim) => {
+                return Err(Self::claim_unresolved_error(&claim))
+            }
+        }
+        self.store
+            .mark_claim_dispatched(org, &request.idempotency_key, self.now_ms())?;
         let charge = match self
             .provider
             .charge(crate::provider::ProviderChargeRequest {
                 organization_id: org.to_string(),
-                idempotency_key: format!("{}:charge", request.idempotency_key),
+                idempotency_key: provider_key,
                 customer_id: self
                     .store
                     .customer(org)?
                     .ok_or_else(|| PaymentError::NotFound("payment customer".into()))?
                     .provider_customer_id,
-                payment_method_token: crate::secrets::SecretString::new(method.token.clone()),
+                payment_method_token: token,
                 amount_minor: balance,
                 currency: invoice.currency.clone(),
                 invoice_ref: Some(invoice.id.clone()),
@@ -1002,39 +1383,73 @@ impl PaymentService {
         {
             Ok(charge) => charge,
             Err(PaymentError::Declined(reason)) => {
+                self.store.fail_claim(
+                    org,
+                    &request.idempotency_key,
+                    "payment_declined",
+                    &reason,
+                    self.now_ms(),
+                )?;
                 let _ = self.record_payment_failure(organization, &invoice.id);
                 return Err(PaymentError::Declined(reason));
             }
-            Err(e) => return Err(e),
+            Err(error) => {
+                self.fail_dispatch(org, &request.idempotency_key, &error)?;
+                return Err(error);
+            }
         };
         let now = self.now_ms();
+        let status = match payment_status_from_provider(&charge.status) {
+            Ok(status) => status,
+            Err(error) => {
+                self.store
+                    .mark_claim_unknown(org, &request.idempotency_key, now)?;
+                return Err(error);
+            }
+        };
         let payment = Payment {
-            id: format!("pay_{}", uuid::Uuid::new_v4()),
+            id: payment_id,
             organization_id: org.to_string(),
             invoice_id: invoice.id.clone(),
             provider: self.provider.name().to_string(),
-            provider_payment_id: charge.id,
+            provider_payment_id: charge.id.clone(),
             payment_method_id: Some(request.payment_method_id.clone()),
             amount_minor: balance,
             refunded_minor: 0,
             currency: invoice.currency.clone(),
-            status: PaymentStatus::Succeeded,
+            status,
             created_ms: now,
         };
-        invoice.amount_paid_minor = checked_add(invoice.amount_paid_minor, balance)?;
-        invoice.status = InvoiceStatus::Paid;
-        invoice.paid_ms = Some(now);
-        let updated_invoice = invoice.clone();
         let mut subscription = self
             .store
             .subscription(org)?
-            .filter(|sub| updated_invoice.subscription_id.as_deref() == Some(sub.id.as_str()));
-        if let Some(sub) = subscription.as_mut() {
-            sub.state = SubscriptionState::Active;
-            sub.dunning_attempts = 0;
-            sub.grace_end_ms = None;
-            sub.updated_ms = now;
+            .filter(|sub| invoice.subscription_id.as_deref() == Some(sub.id.as_str()));
+        if status == PaymentStatus::Succeeded {
+            invoice.amount_paid_minor = checked_add(invoice.amount_paid_minor, balance)?;
+            invoice.status = InvoiceStatus::Paid;
+            invoice.paid_ms = Some(now);
+            if let Some(sub) = subscription.as_mut() {
+                sub.state = SubscriptionState::Active;
+                sub.dunning_attempts = 0;
+                sub.grace_end_ms = None;
+                sub.updated_ms = now;
+            }
         }
+        let updated_invoice = invoice.clone();
+        let provider_payment = ProviderPaymentObservation {
+            provider: self.provider.name().to_string(),
+            provider_payment_id: payment.provider_payment_id.clone(),
+            organization_id: org.to_string(),
+            invoice_id: updated_invoice.id.clone(),
+            payment_id: Some(payment.id.clone()),
+            status: charge.status.clone(),
+            amount_minor: charge.amount_minor,
+            refunded_minor: 0,
+            currency: charge.currency.clone(),
+            paid_at_ms: status.is_settled().then_some(now),
+            observed_ms: now,
+            source: ProviderObservationSource::Payment,
+        };
         let write = self.write(
             org,
             &request.idempotency_key,
@@ -1049,9 +1464,11 @@ impl PaymentService {
         let cloned_payment = payment.clone();
         let cloned_invoice = updated_invoice.clone();
         let cloned_subscription = subscription.clone();
+        let cloned_provider_payment = provider_payment.clone();
         match self.store.record_atomic(&write, |tx| {
             insert_payment_tx(tx, &cloned_payment)?;
             update_invoice_tx(tx, &cloned_invoice)?;
+            upsert_provider_payment_conn(tx, &cloned_provider_payment)?;
             if let Some(subscription) = &cloned_subscription {
                 put_subscription_tx(tx, subscription)?;
             }
@@ -1071,7 +1488,11 @@ impl PaymentService {
                     })?;
                 self.pay_from_replay(org, &response, true)
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                self.store
+                    .mark_claim_unknown(org, &request.idempotency_key, self.now_ms())?;
+                Err(e)
+            }
         }
     }
 
@@ -1087,10 +1508,10 @@ impl PaymentService {
             .ok_or_else(|| PaymentError::NotFound("invoice".into()))?;
         invoice.status = InvoiceStatus::PastDue;
         let now = self.now_ms();
-        let mut subscription = invoice
-            .subscription_id
-            .as_deref()
-            .and_then(|id| self.store.subscription_by_id(org, id).ok().flatten());
+        let mut subscription = match invoice.subscription_id.as_deref() {
+            Some(id) => self.store.subscription_by_id(org, id)?,
+            None => None,
+        };
         if let Some(sub) = subscription.as_mut() {
             sub.dunning_attempts = sub.dunning_attempts.saturating_add(1);
             sub.updated_ms = now;
@@ -1142,13 +1563,13 @@ impl PaymentService {
         if let Some(response) = self.replay("refund", org, &request.idempotency_key, &hash)? {
             return self.refund_from_replay(org, &response, true);
         }
-        let mut payment = self
+        let payment = self
             .store
             .payment(org, &request.payment_id)?
             .ok_or_else(|| PaymentError::NotFound("payment".into()))?;
         let refunded = self
             .store
-            .refunded_for_payment(org, &payment.id)?
+            .committed_refunds_for_payment(org, &payment.id)?
             .max(payment.refunded_minor);
         let available = payment.amount_minor - refunded;
         if request.amount_minor > available {
@@ -1158,71 +1579,145 @@ impl PaymentService {
                 requested: request.amount_minor,
             });
         }
-        let remote = self
+        let refund_id = operation_resource_id("re", org, "refund", &request.idempotency_key);
+        let provider_key = format!("{}:refund", request.idempotency_key);
+        match self.acquire_claim(
+            org,
+            &request.idempotency_key,
+            "refund",
+            FinancialResourceType::Refund,
+            &refund_id,
+            &hash,
+            &provider_key,
+            &serde_json::json!({"request": &request, "refund_id": &refund_id}),
+        )? {
+            ClaimAcquisition::Acquired => {}
+            ClaimAcquisition::Recorded(claim) => {
+                let (response, _) = self.claim_replay(&claim, true)?;
+                return self.refund_from_replay(org, &response, true);
+            }
+            ClaimAcquisition::InFlight(claim) => return Err(Self::claim_in_flight_error(&claim)),
+            ClaimAcquisition::Unresolved(claim) => {
+                return Err(Self::claim_unresolved_error(&claim))
+            }
+        }
+        self.store
+            .mark_claim_dispatched(org, &request.idempotency_key, self.now_ms())?;
+        let remote = match self
             .provider
             .refund(crate::provider::ProviderRefundRequest {
                 organization_id: org.to_string(),
-                idempotency_key: format!("{}:refund", request.idempotency_key),
+                idempotency_key: provider_key,
                 provider_payment_id: payment.provider_payment_id.clone(),
                 amount_minor: request.amount_minor,
                 currency: payment.currency.clone(),
                 reason: request.reason.clone(),
             })
-            .await?;
+            .await
+        {
+            Ok(remote) => remote,
+            Err(error) => {
+                self.fail_dispatch(org, &request.idempotency_key, &error)?;
+                return Err(error);
+            }
+        };
         let now = self.now_ms();
-        let mut invoice = self
-            .store
-            .invoice(org, &payment.invoice_id)?
-            .ok_or_else(|| PaymentError::NotFound("invoice".into()))?;
+        if remote.amount_minor != request.amount_minor {
+            self.store
+                .mark_claim_unknown(org, &request.idempotency_key, now)?;
+            return Err(PaymentError::Provider(format!(
+                "provider refund amount {} does not match the requested {}",
+                remote.amount_minor, request.amount_minor
+            )));
+        }
+        let status = match RefundStatus::parse(&remote.status) {
+            Some(status) => status,
+            None => {
+                self.store
+                    .mark_claim_unknown(org, &request.idempotency_key, now)?;
+                return Err(PaymentError::Provider(format!(
+                    "provider refund returned an unsupported status {:?}",
+                    remote.status
+                )));
+            }
+        };
         let refund = Refund {
-            id: format!("re_{}", uuid::Uuid::new_v4()),
+            id: refund_id.clone(),
             organization_id: org.to_string(),
             payment_id: payment.id.clone(),
+            provider_refund_id: remote.id.clone(),
+            amount_minor: request.amount_minor,
+            currency: payment.currency.clone(),
+            reason: request.reason.clone(),
+            status,
+            credit_note_id: None,
+            invoice_line_seq: None,
+            created_ms: now,
+        };
+        let provider_refund = ProviderRefundObservation {
+            provider: self.provider.name().to_string(),
             provider_refund_id: remote.id,
-            amount_minor: request.amount_minor,
-            currency: payment.currency.clone(),
-            reason: request.reason.clone(),
-            created_ms: now,
-        };
-        payment.refunded_minor = checked_add(payment.refunded_minor, request.amount_minor)?;
-        payment.status = if payment.refunded_minor >= payment.amount_minor {
-            PaymentStatus::Refunded
-        } else {
-            PaymentStatus::PartiallyRefunded
-        };
-        invoice.amount_refunded_minor =
-            checked_add(invoice.amount_refunded_minor, request.amount_minor)?;
-        let sequence = self.store.next_sequence(org, "credit_note")?;
-        let credit_note = CreditNote {
-            id: format!("cn_{}", uuid::Uuid::new_v4()),
             organization_id: org.to_string(),
-            number: format!("CN-{sequence:06}"),
-            invoice_id: invoice.id.clone(),
+            invoice_id: payment.invoice_id.clone(),
             payment_id: payment.id.clone(),
+            status: status.as_str().to_string(),
             amount_minor: request.amount_minor,
             currency: payment.currency.clone(),
-            reason: request.reason.clone(),
-            created_ms: now,
+            observed_ms: now,
+            source: ProviderObservationSource::Refund,
+        };
+        let credit_note_id = if status == RefundStatus::Succeeded {
+            Some(format!("cn_{}", uuid::Uuid::new_v4()))
+        } else {
+            None
         };
         let write = self.write(
             org,
             &request.idempotency_key,
             "refund",
             hash.clone(),
-            &serde_json::json!({"refund_id": refund.id, "credit_note_id": credit_note.id}),
+            &serde_json::json!({
+                "refund_id": refund.id,
+                "credit_note_id": credit_note_id,
+            }),
             now,
         )?;
-        let cloned_refund = refund.clone();
-        let cloned_note = credit_note.clone();
-        let cloned_payment = payment.clone();
-        let cloned_invoice = invoice.clone();
-        match self.store.record_atomic(&write, |tx| {
-            insert_refund_tx(tx, &cloned_refund)?;
-            insert_credit_note_tx(tx, &cloned_note)?;
-            insert_payment_tx(tx, &cloned_payment)?;
-            update_invoice_tx(tx, &cloned_invoice)
-        }) {
-            Ok(()) => Ok(RefundOutcome {
+        let cloned_provider_refund = provider_refund.clone();
+        let result = self.store.record_atomic(&write, |tx| {
+            let mut current_payment = payment_tx(tx, org, &refund.payment_id)?
+                .ok_or_else(|| PaymentError::NotFound("payment".into()))?;
+            let mut current_invoice = invoice_tx(tx, org, &current_payment.invoice_id)?
+                .ok_or_else(|| PaymentError::NotFound("invoice".into()))?;
+            let mut current_refund = refund.clone();
+            current_refund.invoice_line_seq = bind_refund_invoice_line(&current_invoice);
+            let mut note = None;
+            if current_refund.status == RefundStatus::Succeeded {
+                let note_id = credit_note_id.clone().ok_or_else(|| {
+                    PaymentError::Store("settled refund has no credit-note id".into())
+                })?;
+                let mut settled = settle_refund_ledger(
+                    &mut current_payment,
+                    &mut current_invoice,
+                    &mut current_refund,
+                    org,
+                    note_id,
+                    now,
+                )?;
+                let sequence = next_sequence_tx(tx, org, "credit_note")?;
+                settled.number = format!("CN-{sequence:06}");
+                insert_credit_note_tx(tx, &settled)?;
+                note = Some(settled);
+            }
+            insert_refund_tx(tx, &current_refund)?;
+            upsert_provider_refund_conn(tx, &cloned_provider_refund)?;
+            if current_refund.status == RefundStatus::Succeeded {
+                insert_payment_tx(tx, &current_payment)?;
+                update_invoice_tx(tx, &current_invoice)?;
+            }
+            Ok((note, current_payment, current_invoice, current_refund))
+        });
+        match result {
+            Ok((credit_note, payment, invoice, refund)) => Ok(RefundOutcome {
                 refund,
                 credit_note,
                 payment,
@@ -1237,101 +1732,12 @@ impl PaymentService {
                     })?;
                 self.refund_from_replay(org, &response, true)
             }
-            Err(e) => Err(e),
-        }
-    }
-
-    pub fn add_payment_method(
-        &self,
-        organization: &OrganizationId,
-        request: AddPaymentMethodRequest,
-    ) -> Result<PaymentMethodOutcome, PaymentError> {
-        self.validate_idempotency(&request.idempotency_key)?;
-        validate_payment_token(&request.token)?;
-        bounded_text("payment brand", &request.brand, 64)?;
-        if request.last4.len() != 4 || !request.last4.bytes().all(|b| b.is_ascii_digit()) {
-            return Err(PaymentError::Malformed(
-                "last4 must be exactly four digits".into(),
-            ));
-        }
-        if !(1..=12).contains(&request.exp_month) {
-            return Err(PaymentError::Malformed("exp_month must be 1..=12".into()));
-        }
-        if !(2000..=2100).contains(&request.exp_year) {
-            return Err(PaymentError::Malformed(
-                "exp_year must be 2000..=2100".into(),
-            ));
-        }
-        let org = organization.as_str();
-        let hash = request_hash(&request)?;
-        if let Some(response) =
-            self.replay("add_payment_method", org, &request.idempotency_key, &hash)?
-        {
-            let method = self.method_from_replay(org, &response)?;
-            return Ok(PaymentMethodOutcome {
-                payment_method: method,
-                replayed: true,
-            });
-        }
-        let now = self.now_ms();
-        let existing = self.store.payment_methods(org)?;
-        let is_default = request.set_default || existing.is_empty();
-        let method = PaymentMethod {
-            id: format!("pm_{}", uuid::Uuid::new_v4()),
-            organization_id: org.to_string(),
-            provider: self.provider.name().to_string(),
-            token: request.token,
-            brand: request.brand,
-            last4: request.last4,
-            exp_month: request.exp_month,
-            exp_year: request.exp_year,
-            is_default,
-            created_ms: now,
-        };
-        let write = self.write(
-            org,
-            &request.idempotency_key,
-            "add_payment_method",
-            hash.clone(),
-            &serde_json::json!({"payment_method_id": method.id}),
-            now,
-        )?;
-        let cloned = method.clone();
-        match self
-            .store
-            .record_atomic(&write, |tx| put_payment_method_tx(tx, &cloned))
-        {
-            Ok(()) => Ok(PaymentMethodOutcome {
-                payment_method: PaymentMethodView::from(&method),
-                replayed: false,
-            }),
-            Err(PaymentError::IdempotencyConflict(_)) | Err(PaymentError::Conflict(_)) => {
-                let response =
-                    self.replay("add_payment_method", org, &request.idempotency_key, &hash)?;
-                let method = response
-                    .ok_or_else(|| {
-                        PaymentError::Conflict("payment method was recorded concurrently".into())
-                    })
-                    .and_then(|response| self.method_from_replay(org, &response))?;
-                Ok(PaymentMethodOutcome {
-                    payment_method: method,
-                    replayed: true,
-                })
+            Err(e) => {
+                self.store
+                    .mark_claim_unknown(org, &request.idempotency_key, self.now_ms())?;
+                Err(e)
             }
-            Err(e) => Err(e),
         }
-    }
-
-    pub fn payment_methods(
-        &self,
-        organization: &OrganizationId,
-    ) -> Result<Vec<PaymentMethodView>, PaymentError> {
-        Ok(self
-            .store
-            .payment_methods(organization.as_str())?
-            .iter()
-            .map(PaymentMethodView::from)
-            .collect())
     }
 
     // ------------------------------------------------------------ lifecycle
@@ -1398,6 +1804,122 @@ impl PaymentService {
         })
     }
 
+    /// Open one provider-hosted checkout for an already-recorded invoice.
+    /// Provider creation is idempotent by `idempotency_key`; the service does
+    /// not mutate local billing state here. Only a verified provider webhook
+    /// may settle the invoice.
+    pub async fn create_checkout(
+        &self,
+        organization: &OrganizationId,
+        request: crate::provider::ProviderCheckoutRequest,
+    ) -> Result<crate::provider::ProviderCheckout, PaymentError> {
+        if request.organization_id != organization.as_str() {
+            return Err(PaymentError::Malformed(
+                "checkout organization does not match the authorized organization".into(),
+            ));
+        }
+        self.validate_idempotency(&request.idempotency_key)?;
+        bounded_text("checkout description", &request.description, MAX_TEXT_BYTES)?;
+        if request.amount_minor <= 0 || !crate::money::valid_amount(request.amount_minor) {
+            return Err(PaymentError::Malformed(
+                "checkout amount must be a positive bounded minor amount".into(),
+            ));
+        }
+        if !crate::money::valid_currency(&request.currency) {
+            return Err(PaymentError::Malformed(
+                "checkout currency must be three uppercase letters".into(),
+            ));
+        }
+        if let Some(invoice_id) = &request.local_invoice_id {
+            if invoice_id.is_empty() || invoice_id.len() > 128 {
+                return Err(PaymentError::Malformed(
+                    "checkout local_invoice_id must be 1..=128 bytes".into(),
+                ));
+            }
+            let invoice = self.invoice(organization, invoice_id)?;
+            if invoice.status != crate::model::InvoiceStatus::Open {
+                return Err(PaymentError::IllegalState(invoice.status.as_str().into()));
+            }
+            if invoice.balance_minor() != request.amount_minor
+                || invoice.currency != request.currency
+            {
+                return Err(PaymentError::Malformed(
+                    "checkout amount or currency does not match the invoice balance".into(),
+                ));
+            }
+        }
+        let org = organization.as_str();
+        let hash = request_hash(&request)?;
+        if let Some(response) =
+            self.replay("create_checkout", org, &request.idempotency_key, &hash)?
+        {
+            return serde_json::from_str(&response)
+                .map_err(|e| PaymentError::Store(format!("checkout replay: {e}")));
+        }
+        let checkout_id =
+            operation_resource_id("cs", org, "create_checkout", &request.idempotency_key);
+        let provider_key = format!("{}:checkout", request.idempotency_key);
+        match self.acquire_claim(
+            org,
+            &request.idempotency_key,
+            "create_checkout",
+            FinancialResourceType::Checkout,
+            &checkout_id,
+            &hash,
+            &provider_key,
+            &serde_json::json!({}),
+        )? {
+            ClaimAcquisition::Acquired => {}
+            ClaimAcquisition::Recorded(claim) => {
+                let (response, _) = self.claim_replay(&claim, true)?;
+                return serde_json::from_str(&response)
+                    .map_err(|e| PaymentError::Store(format!("checkout claim replay: {e}")));
+            }
+            ClaimAcquisition::InFlight(claim) => return Err(Self::claim_in_flight_error(&claim)),
+            ClaimAcquisition::Unresolved(claim) => {
+                return Err(Self::claim_unresolved_error(&claim))
+            }
+        }
+        let now = self.now_ms();
+        let idempotency_key = request.idempotency_key.clone();
+        self.store
+            .mark_claim_dispatched(org, &idempotency_key, now)?;
+        let checkout = match self.provider.create_checkout(request).await {
+            Ok(checkout) => checkout,
+            Err(error) => {
+                self.fail_dispatch(org, &idempotency_key, &error)?;
+                return Err(error);
+            }
+        };
+        let response = serde_json::to_value(&checkout)
+            .map_err(|e| PaymentError::Store(format!("checkout encoding: {e}")))?;
+        let write = self.write(
+            org,
+            &idempotency_key,
+            "create_checkout",
+            hash.clone(),
+            &response,
+            now,
+        )?;
+        match self.store.record_atomic(&write, |_| Ok(())) {
+            Ok(()) => Ok(checkout),
+            Err(PaymentError::IdempotencyConflict(_)) | Err(PaymentError::Conflict(_)) => {
+                let response = self
+                    .replay("create_checkout", org, &idempotency_key, &hash)?
+                    .ok_or_else(|| {
+                        PaymentError::Conflict("checkout was recorded concurrently".into())
+                    })?;
+                serde_json::from_str(&response)
+                    .map_err(|e| PaymentError::Store(format!("checkout replay: {e}")))
+            }
+            Err(e) => {
+                self.store
+                    .mark_claim_unknown(org, &idempotency_key, self.now_ms())?;
+                Err(e)
+            }
+        }
+    }
+
     // -------------------------------------------------------------- webhook
 
     pub fn handle_webhook(
@@ -1408,58 +1930,62 @@ impl PaymentService {
     ) -> Result<WebhookOutcome, PaymentError> {
         let event = self.provider.verify_webhook(headers, body, now_ms)?;
         let provider = self.provider.name();
-        if self.store.webhook_seen(provider, &event.id)?.is_some() {
-            return Ok(WebhookOutcome {
-                disposition: WebhookDisposition::Duplicate,
-                event_id: event.id,
-                event_type: event.event_type,
-            });
-        }
         let organization = self.webhook_organization(&event)?;
         let org = organization.as_str();
         let digest = sha256_hex(body);
-        if let Some((last_created, last_id)) = self.store.webhook_watermark(org)? {
-            if event.created_ms < last_created
-                || (event.created_ms == last_created && event.id.as_str() <= last_id.as_str())
-            {
-                self.store.record_webhook_only(&WebhookRecord {
-                    provider: provider.to_string(),
-                    event_id: event.id.clone(),
-                    organization_id: org.to_string(),
-                    created_ms: event.created_ms,
-                    event_type: event.event_type.clone(),
-                    disposition: "stale_ignored".into(),
-                    payload_digest: digest,
-                })?;
-                return Ok(WebhookOutcome {
-                    disposition: WebhookDisposition::StaleIgnored,
-                    event_id: event.id,
-                    event_type: event.event_type,
-                });
-            }
-        }
-        let effects = self.webhook_effects(org, &event, now_ms)?;
-        let applied = effects.subscription.is_some()
-            || effects.invoice.is_some()
-            || effects.payment.is_some();
-        let disposition = if applied {
-            WebhookDisposition::Applied
-        } else {
-            WebhookDisposition::Ignored
+        let record = |disposition: &str| WebhookRecord {
+            provider: provider.to_string(),
+            event_id: event.id.clone(),
+            organization_id: org.to_string(),
+            created_ms: event.created_ms,
+            event_type: event.event_type.clone(),
+            disposition: disposition.to_string(),
+            payload_digest: digest.clone(),
         };
-        self.store.record_webhook(
-            &WebhookRecord {
-                provider: provider.to_string(),
-                event_id: event.id.clone(),
-                organization_id: org.to_string(),
-                created_ms: event.created_ms,
-                event_type: event.event_type.clone(),
-                disposition: disposition_string(disposition).to_string(),
-                payload_digest: digest,
-            },
-            &effects,
-            true,
-        )?;
+        let decision = self.store.apply_webhook(provider, &event.id, |tx| {
+            if let Some((last_created, last_id)) = watermark_tx(tx, org)? {
+                if event.created_ms < last_created
+                    || (event.created_ms == last_created && event.id.as_str() <= last_id.as_str())
+                {
+                    return Ok(WebhookPlan {
+                        record: record("stale_ignored"),
+                        effects: WebhookEffects::default(),
+                        advance_watermark: false,
+                        value: WebhookDisposition::StaleIgnored,
+                    });
+                }
+            }
+            let effects = self.webhook_effects_tx(tx, org, &event, now_ms)?;
+            let conflict = effects
+                .provider_invoice
+                .as_ref()
+                .is_some_and(|observation| observation.reconciliation.is_conflict());
+            let applied = effects.subscription.is_some()
+                || effects.invoice.is_some()
+                || effects.payment.is_some()
+                || effects.refund.is_some()
+                || effects.credit_note.is_some()
+                || effects.provider_invoice.is_some()
+                || effects.provider_payment.is_some()
+                || effects.provider_refund.is_some();
+            let disposition = if conflict {
+                WebhookDisposition::ReconciliationConflict
+            } else if applied {
+                WebhookDisposition::Applied
+            } else {
+                WebhookDisposition::Ignored
+            };
+            Ok(WebhookPlan {
+                record: record(disposition_string(disposition)),
+                effects,
+                advance_watermark: true,
+                value: disposition,
+            })
+        })?;
+        let disposition = match decision {
+            WebhookDecision::Duplicate(_) => WebhookDisposition::Duplicate,
+            WebhookDecision::Applied(disposition) => disposition,
+        };
         Ok(WebhookOutcome {
             disposition,
             event_id: event.id,
@@ -1497,7 +2023,216 @@ impl PaymentService {
         invoice_csv(invoice)
     }
 
+    // ------------------------------------------------- provider observations
+
+    /// The linked provider observations for one Faktor invoice. These are
+    /// upstream records; callers must not treat them as invoice totals.
+    pub fn provider_invoice_observations(
+        &self,
+        organization: &OrganizationId,
+        invoice_id: &str,
+    ) -> Result<Vec<ProviderInvoiceObservation>, PaymentError> {
+        self.store
+            .provider_invoice_observations(organization.as_str(), invoice_id)
+    }
+
+    pub fn provider_payment_observations(
+        &self,
+        organization: &OrganizationId,
+        invoice_id: &str,
+    ) -> Result<Vec<ProviderPaymentObservation>, PaymentError> {
+        self.store
+            .provider_payment_observations(organization.as_str(), invoice_id)
+    }
+
+    pub fn provider_refund_observations(
+        &self,
+        organization: &OrganizationId,
+        invoice_id: &str,
+    ) -> Result<Vec<ProviderRefundObservation>, PaymentError> {
+        self.store
+            .provider_refund_observations(organization.as_str(), invoice_id)
+    }
+
+    /// Run one bounded, read-only provider reconciliation pass. The Faktor
+    /// invoice totals/status are never modified here: only its typed
+    /// reconciliation state and the linked observation are recorded.
+    pub async fn reconcile(
+        &self,
+        organization: &OrganizationId,
+        limit: usize,
+    ) -> Result<ReconciliationReport, PaymentError> {
+        if limit == 0 || limit > MAX_RECONCILIATION_INVOICES {
+            return Err(PaymentError::Malformed(format!(
+                "reconciliation limit must be 1..={MAX_RECONCILIATION_INVOICES}"
+            )));
+        }
+        let org = organization.as_str();
+        let invoices = self.store.invoices_for_reconciliation(org, limit)?;
+        let observed_ms = self.now_ms();
+        let mut report = ReconciliationReport {
+            organization_id: org.to_string(),
+            checked: 0,
+            matched: 0,
+            conflicts: 0,
+            missing: 0,
+            unreconciled: 0,
+            observed_ms,
+            items: Vec::new(),
+        };
+        for invoice in invoices {
+            let Some(provider_invoice_id) = invoice.provider_invoice_id.clone() else {
+                continue;
+            };
+            report.checked = report.checked.saturating_add(1);
+            let fetched = self.provider.fetch_invoice(&provider_invoice_id).await;
+            let snapshot = match fetched {
+                Ok(snapshot) => Some(snapshot),
+                Err(PaymentError::NotFound(_)) => None,
+                Err(fetch_error) => {
+                    // Fall back to the idempotency-key lookup when the
+                    // provider cannot fetch by invoice id. This remains
+                    // read-only: it never dispatches a new operation.
+                    match self.reconcile_by_key(&invoice).await {
+                        Ok(snapshot) => snapshot,
+                        Err(_) => return Err(fetch_error),
+                    }
+                }
+            };
+            let observation = match snapshot {
+                Some(snapshot) => self.invoice_observation(
+                    &invoice,
+                    &snapshot,
+                    ProviderObservationSource::Reconciliation,
+                    observed_ms,
+                ),
+                None => ProviderInvoiceObservation {
+                    provider: self.provider.name().to_string(),
+                    provider_invoice_id: provider_invoice_id.clone(),
+                    organization_id: org.to_string(),
+                    invoice_id: invoice.id.clone(),
+                    status: "absent".into(),
+                    amount_minor: 0,
+                    amount_paid_minor: 0,
+                    amount_refunded_minor: 0,
+                    currency: invoice.currency.clone(),
+                    paid_at_ms: None,
+                    observed_ms,
+                    source: ProviderObservationSource::Reconciliation,
+                    reconciliation: InvoiceReconciliationState::ProviderInvoiceMissing,
+                },
+            };
+            let mut updated = invoice.clone();
+            updated.reconciliation = observation.reconciliation;
+            self.store.record_reconciliation(&updated, &observation)?;
+            report.items.push(ReconciliationItem {
+                invoice_id: invoice.id,
+                number: invoice.number,
+                provider_invoice_id,
+                state: observation.reconciliation,
+                observed_amount_minor: Some(observation.amount_minor),
+                observed_currency: Some(observation.currency),
+                observed_status: Some(observation.status),
+            });
+            match observation.reconciliation {
+                InvoiceReconciliationState::Matched => {
+                    report.matched = report.matched.saturating_add(1);
+                }
+                InvoiceReconciliationState::Unreconciled => {
+                    report.unreconciled = report.unreconciled.saturating_add(1);
+                }
+                InvoiceReconciliationState::AmountMismatch
+                | InvoiceReconciliationState::CurrencyMismatch => {
+                    report.conflicts = report.conflicts.saturating_add(1);
+                }
+                InvoiceReconciliationState::ProviderInvoiceMissing => {
+                    report.missing = report.missing.saturating_add(1);
+                    report.conflicts = report.conflicts.saturating_add(1);
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    /// Read-only fallback lookup by the provider idempotency key recorded on
+    /// the Faktor invoice. It never creates or resends an operation.
+    async fn reconcile_by_key(
+        &self,
+        invoice: &Invoice,
+    ) -> Result<Option<ProviderInvoiceSnapshot>, PaymentError> {
+        let Some(key) = invoice.provider_idempotency_key.as_deref() else {
+            return Err(PaymentError::Provider(
+                "no provider idempotency key is recorded for this invoice".into(),
+            ));
+        };
+        match self
+            .provider
+            .reconcile(ProviderReconcileRequest {
+                organization_id: invoice.organization_id.clone(),
+                kind: ProviderObjectKind::Invoice,
+                idempotency_key: key.to_string(),
+            })
+            .await?
+        {
+            ProviderReconciled::Invoice(provider_invoice) => {
+                let paid = provider_invoice.status == "paid";
+                Ok(Some(ProviderInvoiceSnapshot {
+                    id: provider_invoice.id,
+                    status: provider_invoice.status,
+                    amount_minor: provider_invoice.amount_minor,
+                    amount_paid_minor: if paid {
+                        provider_invoice.amount_minor
+                    } else {
+                        0
+                    },
+                    amount_refunded_minor: 0,
+                    currency: provider_invoice.currency,
+                    paid_at_ms: paid.then(|| self.now_ms()),
+                }))
+            }
+            ProviderReconciled::NotApplied => Ok(None),
+            ProviderReconciled::Unresolved(reason) => Err(PaymentError::Provider(reason)),
+            _ => Err(PaymentError::Provider(
+                "the provider reconciled a different object kind".into(),
+            )),
+        }
+    }
+
     // --------------------------------------------------------------- helpers
+
+    /// Build the linked observation and derive its typed reconciliation
+    /// state. The observation's amount is provider truth; the invoice's
+    /// authored total is never read from it.
+    fn invoice_observation(
+        &self,
+        invoice: &Invoice,
+        snapshot: &ProviderInvoiceSnapshot,
+        source: ProviderObservationSource,
+        observed_ms: i64,
+    ) -> ProviderInvoiceObservation {
+        let reconciliation = if snapshot.currency != invoice.currency {
+            InvoiceReconciliationState::CurrencyMismatch
+        } else if snapshot.amount_minor != invoice.total_minor {
+            InvoiceReconciliationState::AmountMismatch
+        } else {
+            InvoiceReconciliationState::Matched
+        };
+        ProviderInvoiceObservation {
+            provider: self.provider.name().to_string(),
+            provider_invoice_id: snapshot.id.clone(),
+            organization_id: invoice.organization_id.clone(),
+            invoice_id: invoice.id.clone(),
+            status: snapshot.status.clone(),
+            amount_minor: snapshot.amount_minor,
+            amount_paid_minor: snapshot.amount_paid_minor,
+            amount_refunded_minor: snapshot.amount_refunded_minor,
+            currency: snapshot.currency.clone(),
+            paid_at_ms: snapshot.paid_at_ms,
+            observed_ms,
+            source,
+            reconciliation,
+        }
+    }
 
     fn require_subscription(
         &self,
@@ -1652,6 +2387,533 @@ impl PaymentService {
             });
         }
         lines
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn acquire_claim(
+        &self,
+        organization_id: &str,
+        key: &str,
+        operation: &str,
+        resource_type: FinancialResourceType,
+        resource_id: &str,
+        request_digest: &str,
+        provider_idempotency_key: &str,
+        context: &serde_json::Value,
+    ) -> Result<ClaimAcquisition, PaymentError> {
+        let draft = OperationClaimDraft {
+            organization_id: organization_id.to_string(),
+            idempotency_key: key.to_string(),
+            operation: operation.to_string(),
+            resource_type,
+            resource_id: resource_id.to_string(),
+            request_digest: request_digest.to_string(),
+            provider_idempotency_key: provider_idempotency_key.to_string(),
+            context: serde_json::to_string(context)
+                .map_err(|e| PaymentError::Store(format!("claim context encoding: {e}")))?,
+            created_ms: self.now_ms(),
+        };
+        self.store.claim_operation(&draft)
+    }
+
+    fn claim_replay(
+        &self,
+        claim: &OperationClaim,
+        replayed: bool,
+    ) -> Result<(String, bool), PaymentError> {
+        match claim.state {
+            crate::model::OperationClaimState::Succeeded => {
+                let response = claim.response.clone().ok_or_else(|| {
+                    PaymentError::Conflict("a succeeded claim has no recorded response".into())
+                })?;
+                Ok((response, true))
+            }
+            crate::model::OperationClaimState::Failed => Err(PaymentError::from_recorded(
+                claim.failure_code.as_deref().unwrap_or("conflict"),
+                claim
+                    .failure_message
+                    .as_deref()
+                    .unwrap_or("the recorded operation failed"),
+            )),
+            _ => Err(PaymentError::Conflict(format!(
+                "operation claim {} is {} and cannot be replayed",
+                claim.idempotency_key,
+                claim.state.as_str()
+            ))),
+        }
+        .map(|(response, _)| (response, replayed))
+    }
+
+    fn claim_in_flight_error(claim: &OperationClaim) -> PaymentError {
+        PaymentError::Conflict(format!(
+            "operation {} is already {}; outcomes are recorded, never re-dispatched",
+            claim.idempotency_key,
+            claim.state.as_str()
+        ))
+    }
+
+    fn claim_unresolved_error(claim: &OperationClaim) -> PaymentError {
+        PaymentError::Conflict(format!(
+            "operation {} is unknown after dispatch; provider reconciliation is required",
+            claim.idempotency_key
+        ))
+    }
+
+    fn fail_dispatch(
+        &self,
+        organization_id: &str,
+        key: &str,
+        error: &PaymentError,
+    ) -> Result<(), PaymentError> {
+        let now = self.now_ms();
+        if error.is_definitive_dispatch_failure() {
+            self.store
+                .fail_claim(organization_id, key, error.code(), &error.to_string(), now)?;
+        } else {
+            self.store.mark_claim_unknown(organization_id, key, now)?;
+        }
+        Ok(())
+    }
+
+    /// Resolve every `unknown` claim for one organization by a read-only
+    /// provider lookup. A missing provider object proves the attempt did not
+    /// apply; an applied object is rebuilt into the local ledger exactly
+    /// once. Anything the adapter cannot look up stays unknown.
+    pub async fn reconcile_unknown_claims(
+        &self,
+        organization: &OrganizationId,
+    ) -> Result<Vec<OperationClaim>, PaymentError> {
+        let org = organization.as_str();
+        let mut resolved = Vec::new();
+        for claim in self.store.operation_claims(org)? {
+            if claim.state != crate::model::OperationClaimState::Unknown {
+                continue;
+            }
+            let kind = match claim.operation.as_str() {
+                "subscribe" => ProviderObjectKind::Subscription,
+                "change_plan" | "change_seats" => ProviderObjectKind::Change,
+                "cancel" => ProviderObjectKind::Cancel,
+                "issue_invoice" => ProviderObjectKind::Invoice,
+                "pay_invoice" => ProviderObjectKind::Charge,
+                "refund" => ProviderObjectKind::Refund,
+                "create_checkout" => ProviderObjectKind::Checkout,
+                other => {
+                    return Err(PaymentError::Conflict(format!(
+                        "operation {other} has no reconciliation rule"
+                    )))
+                }
+            };
+            let reconciled = self
+                .provider
+                .reconcile(ProviderReconcileRequest {
+                    organization_id: org.to_string(),
+                    kind,
+                    idempotency_key: claim.provider_idempotency_key.clone(),
+                })
+                .await?;
+            match reconciled {
+                ProviderReconciled::NotApplied => {
+                    self.store.fail_unknown_claim(
+                        org,
+                        &claim.idempotency_key,
+                        "payment_provider_error",
+                        "provider reconciliation found no effect for the dispatched key",
+                        self.now_ms(),
+                    )?;
+                }
+                ProviderReconciled::Unresolved(_) => {}
+                other => {
+                    if let Some(updated) = self
+                        .apply_reconciled_claim(&claim, other, self.now_ms())
+                        .await?
+                    {
+                        resolved.push(updated);
+                    }
+                }
+            }
+        }
+        Ok(resolved)
+    }
+
+    async fn apply_reconciled_claim(
+        &self,
+        claim: &OperationClaim,
+        reconciled: ProviderReconciled,
+        now: i64,
+    ) -> Result<Option<OperationClaim>, PaymentError> {
+        let context: serde_json::Value = serde_json::from_str(&claim.context)
+            .map_err(|e| PaymentError::Store(format!("claim context decoding: {e}")))?;
+        let org = claim.organization_id.as_str();
+        match (claim.operation.as_str(), reconciled) {
+            ("subscribe", ProviderReconciled::Subscription(remote)) => {
+                let request: SubscribeRequest = decode_field(&context, "request")?;
+                let plan = self
+                    .config
+                    .catalogue
+                    .plan(&request.plan_id)
+                    .ok_or_else(|| PaymentError::PlanPriceUnconfigured(request.plan_id.clone()))?;
+                let customer = match self.store.customer(org)? {
+                    Some(customer) => customer,
+                    None => {
+                        let reconciled_customer = self
+                            .provider
+                            .reconcile(ProviderReconcileRequest {
+                                organization_id: org.to_string(),
+                                kind: ProviderObjectKind::Customer,
+                                idempotency_key: claim
+                                    .provider_idempotency_key
+                                    .replace(":subscribe", ":customer"),
+                            })
+                            .await?;
+                        let ProviderReconciled::Customer(customer) = reconciled_customer else {
+                            return Ok(None);
+                        };
+                        PaymentCustomer {
+                            id: format!("cus_{}", uuid::Uuid::new_v4()),
+                            organization_id: org.to_string(),
+                            provider: self.provider.name().to_string(),
+                            provider_customer_id: customer.id,
+                            email: customer.email,
+                            name: customer.name,
+                            created_ms: claim.created_ms,
+                        }
+                    }
+                };
+                let period_start = if remote.current_period_start_ms > 0 {
+                    remote.current_period_start_ms
+                } else {
+                    claim.created_ms
+                };
+                let period_end = if remote.current_period_end_ms > period_start {
+                    remote.current_period_end_ms
+                } else {
+                    period_start.saturating_add(request.interval.period_ms())
+                };
+                let trial_end_ms = request.trial_days.filter(|days| *days > 0).map(|days| {
+                    claim
+                        .created_ms
+                        .saturating_add(i64::from(days) * 86_400_000)
+                });
+                let state = if trial_end_ms.is_some_and(|trial| trial > claim.created_ms)
+                    || remote.status == "trialing"
+                {
+                    SubscriptionState::Trialing
+                } else {
+                    SubscriptionState::Active
+                };
+                let subscription = PaymentSubscription {
+                    id: claim.resource_id.clone(),
+                    organization_id: org.to_string(),
+                    customer_id: customer.id.clone(),
+                    provider_subscription_id: remote.id,
+                    provider_item_id: remote.item_id,
+                    provider_product_id: remote.product_id,
+                    provider_price_id: remote.price_id,
+                    plan_id: request.plan_id.clone(),
+                    interval: request.interval,
+                    quantity: remote.quantity,
+                    state,
+                    currency: plan.currency.clone(),
+                    current_period_start_ms: period_start,
+                    current_period_end_ms: period_end,
+                    trial_end_ms,
+                    cancel_at_period_end: false,
+                    canceled_ms: None,
+                    dunning_attempts: 0,
+                    grace_end_ms: None,
+                    created_ms: claim.created_ms,
+                    updated_ms: now,
+                };
+                let response = serde_json::json!({"subscription_id": subscription.id});
+                self.complete_reconciled(
+                    claim,
+                    &response,
+                    |tx| {
+                        if customer_tx(tx, org)?.is_none() {
+                            put_customer_tx(tx, &customer)?;
+                        }
+                        put_subscription_tx(tx, &subscription)
+                    },
+                    now,
+                )?;
+            }
+            ("change_plan", ProviderReconciled::Subscription(remote)) => {
+                let request: ChangePlanRequest = decode_field(&context, "request")?;
+                let proration: ProrationPreview = decode_field(&context, "proration")?;
+                let mut subscription = self.require_subscription(org, &request.subscription_id)?;
+                subscription.plan_id = request.plan_id;
+                subscription.interval = request.interval.unwrap_or(subscription.interval);
+                subscription.quantity = remote.quantity;
+                subscription.updated_ms = now;
+                let pending = self.pending_from_preview(org, &subscription.id, &proration, now);
+                let response = serde_json::json!({
+                    "subscription_id": subscription.id,
+                    "proration": proration,
+                });
+                self.complete_reconciled(
+                    claim,
+                    &response,
+                    |tx| {
+                        put_subscription_tx(tx, &subscription)?;
+                        for line in &pending {
+                            insert_pending_proration_tx(tx, line)?;
+                        }
+                        Ok(())
+                    },
+                    now,
+                )?;
+            }
+            ("change_seats", ProviderReconciled::Subscription(remote)) => {
+                let request: ChangeSeatsRequest = decode_field(&context, "request")?;
+                let proration: ProrationPreview = decode_field(&context, "proration")?;
+                let mut subscription = self.require_subscription(org, &request.subscription_id)?;
+                subscription.quantity = remote.quantity;
+                subscription.updated_ms = now;
+                let pending = self.pending_from_preview(org, &subscription.id, &proration, now);
+                let response = serde_json::json!({
+                    "subscription_id": subscription.id,
+                    "proration": proration,
+                });
+                self.complete_reconciled(
+                    claim,
+                    &response,
+                    |tx| {
+                        put_subscription_tx(tx, &subscription)?;
+                        for line in &pending {
+                            insert_pending_proration_tx(tx, line)?;
+                        }
+                        Ok(())
+                    },
+                    now,
+                )?;
+            }
+            ("cancel", ProviderReconciled::Subscription(_)) => {
+                let request: CancelRequest = decode_field(&context, "request")?;
+                let mut subscription = self.require_subscription(org, &request.subscription_id)?;
+                subscription.updated_ms = now;
+                if request.at_period_end {
+                    subscription.cancel_at_period_end = true;
+                } else {
+                    subscription.state = SubscriptionState::Canceled;
+                    subscription.canceled_ms = Some(now);
+                    subscription.cancel_at_period_end = false;
+                }
+                let response = serde_json::json!({"subscription_id": subscription.id});
+                self.complete_reconciled(
+                    claim,
+                    &response,
+                    |tx| put_subscription_tx(tx, &subscription),
+                    now,
+                )?;
+            }
+            ("issue_invoice", ProviderReconciled::Invoice(remote)) => {
+                let request: IssueInvoiceRequest = decode_field(&context, "request")?;
+                let draft: Invoice = decode_field(&context, "invoice")?;
+                let pending_ids: Vec<String> = decode_field(&context, "pending_ids")?;
+                let mut invoice = draft;
+                invoice.provider_invoice_id = Some(remote.id);
+                let response = serde_json::json!({"invoice_id": invoice.id});
+                self.complete_reconciled(
+                    claim,
+                    &response,
+                    |tx| {
+                        let sequence = next_sequence_tx(tx, org, "invoice")?;
+                        invoice.number = format!("INV-{sequence:06}");
+                        insert_invoice_tx(tx, &invoice, &invoice.lines)?;
+                        for pending_id in &pending_ids {
+                            consume_proration_tx(tx, pending_id, &invoice.id)?;
+                        }
+                        Ok(())
+                    },
+                    now,
+                )?;
+                let _ = request;
+            }
+            ("pay_invoice", ProviderReconciled::Charge(remote)) => {
+                let request: PayInvoiceRequest = decode_field(&context, "request")?;
+                let payment_id: String = decode_field(&context, "payment_id")?;
+                let amount_minor: i64 = decode_field(&context, "amount_minor")?;
+                let payment_method_id: String = decode_field(&context, "payment_method_id")?;
+                let currency: String = decode_field(&context, "currency")?;
+                let status = payment_status_from_provider(&remote.status)?;
+                if let Some(existing) = self
+                    .store
+                    .payment(org, &payment_id)?
+                    .or(self.store.payment_by_provider_id(org, &remote.id)?)
+                {
+                    let invoice = self
+                        .store
+                        .invoice(org, &existing.invoice_id)?
+                        .ok_or_else(|| PaymentError::NotFound("invoice".into()))?;
+                    let response = serde_json::json!({
+                        "payment_id": existing.id,
+                        "invoice_id": invoice.id,
+                    });
+                    self.complete_reconciled(claim, &response, |_| Ok(()), now)?;
+                } else {
+                    let mut invoice = self
+                        .store
+                        .invoice(org, &request.invoice_id)?
+                        .ok_or_else(|| PaymentError::NotFound("invoice".into()))?;
+                    let payment = Payment {
+                        id: payment_id.clone(),
+                        organization_id: org.to_string(),
+                        invoice_id: invoice.id.clone(),
+                        provider: self.provider.name().to_string(),
+                        provider_payment_id: remote.id,
+                        payment_method_id: Some(payment_method_id),
+                        amount_minor,
+                        refunded_minor: 0,
+                        currency,
+                        status,
+                        created_ms: claim.created_ms,
+                    };
+                    let mut subscription = self
+                        .store
+                        .subscription(org)?
+                        .filter(|sub| invoice.subscription_id.as_deref() == Some(sub.id.as_str()));
+                    if status == PaymentStatus::Succeeded {
+                        let credited = amount_minor.clamp(0, invoice.balance_minor());
+                        invoice.amount_paid_minor =
+                            checked_add(invoice.amount_paid_minor, credited)?;
+                        if invoice.amount_paid_minor >= invoice.total_minor
+                            && invoice.status.can_transition_to(InvoiceStatus::Paid)
+                        {
+                            invoice.status = InvoiceStatus::Paid;
+                            invoice.paid_ms = Some(now);
+                        }
+                        if let Some(sub) = subscription.as_mut() {
+                            if sub.state.can_transition_to(SubscriptionState::Active) {
+                                sub.state = SubscriptionState::Active;
+                            }
+                            sub.dunning_attempts = 0;
+                            sub.grace_end_ms = None;
+                            sub.updated_ms = now;
+                        }
+                    }
+                    let response = serde_json::json!({
+                        "payment_id": payment.id,
+                        "invoice_id": invoice.id,
+                    });
+                    self.complete_reconciled(
+                        claim,
+                        &response,
+                        |tx| {
+                            insert_payment_tx(tx, &payment)?;
+                            update_invoice_tx(tx, &invoice)?;
+                            if let Some(subscription) = &subscription {
+                                put_subscription_tx(tx, subscription)?;
+                            }
+                            Ok(())
+                        },
+                        now,
+                    )?;
+                }
+            }
+            ("create_checkout", ProviderReconciled::Checkout(checkout)) => {
+                let response = serde_json::to_value(&checkout)
+                    .map_err(|e| PaymentError::Store(format!("checkout encoding: {e}")))?;
+                self.complete_reconciled(claim, &response, |_| Ok(()), now)?;
+            }
+            ("refund", ProviderReconciled::Refund(remote)) => {
+                let request: RefundRequest = decode_field(&context, "request")?;
+                let refund_id: String = decode_field(&context, "refund_id")?;
+                let refund_status = RefundStatus::parse(&remote.status).ok_or_else(|| {
+                    PaymentError::Provider(format!(
+                        "provider refund returned an unsupported status {:?}",
+                        remote.status
+                    ))
+                })?;
+                if let Some(existing) = self.store.refund_by_provider_id(org, &remote.id)? {
+                    let response = serde_json::json!({
+                        "refund_id": existing.id,
+                        "credit_note_id": existing.credit_note_id,
+                    });
+                    self.complete_reconciled(claim, &response, |_| Ok(()), now)?;
+                    return self.store.operation_claim(org, &claim.idempotency_key);
+                }
+                let mut payment = self
+                    .store
+                    .payment(org, &request.payment_id)?
+                    .ok_or_else(|| PaymentError::NotFound("payment".into()))?;
+                let mut invoice = self
+                    .store
+                    .invoice(org, &payment.invoice_id)?
+                    .ok_or_else(|| PaymentError::NotFound("invoice".into()))?;
+                let mut refund = Refund {
+                    id: refund_id.clone(),
+                    organization_id: org.to_string(),
+                    payment_id: payment.id.clone(),
+                    provider_refund_id: remote.id,
+                    amount_minor: request.amount_minor,
+                    currency: payment.currency.clone(),
+                    reason: request.reason.clone(),
+                    status: refund_status,
+                    credit_note_id: None,
+                    invoice_line_seq: None,
+                    created_ms: claim.created_ms,
+                };
+                if refund_status == RefundStatus::Succeeded {
+                    refund.invoice_line_seq = bind_refund_invoice_line(&invoice);
+                }
+                let credit_note = if refund_status == RefundStatus::Succeeded {
+                    Some(settle_refund_ledger(
+                        &mut payment,
+                        &mut invoice,
+                        &mut refund,
+                        org,
+                        format!("cn_{}", uuid::Uuid::new_v4()),
+                        now,
+                    )?)
+                } else {
+                    None
+                };
+                let response = serde_json::json!({
+                    "refund_id": refund.id,
+                    "credit_note_id": credit_note.as_ref().map(|note| note.id.clone()),
+                });
+                self.complete_reconciled(
+                    claim,
+                    &response,
+                    |tx| {
+                        let mut note = credit_note.clone();
+                        if let Some(note) = note.as_mut() {
+                            let sequence = next_sequence_tx(tx, org, "credit_note")?;
+                            note.number = format!("CN-{sequence:06}");
+                            insert_credit_note_tx(tx, note)?;
+                        }
+                        insert_refund_tx(tx, &refund)?;
+                        insert_payment_tx(tx, &payment)?;
+                        update_invoice_tx(tx, &invoice)
+                    },
+                    now,
+                )?;
+            }
+            _ => return Ok(None),
+        }
+        self.store.operation_claim(org, &claim.idempotency_key)
+    }
+
+    fn complete_reconciled(
+        &self,
+        claim: &OperationClaim,
+        response: &serde_json::Value,
+        effect: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<(), PaymentError>,
+        now: i64,
+    ) -> Result<(), PaymentError> {
+        let response = serde_json::to_string(response)
+            .map_err(|e| PaymentError::Store(format!("claim response encoding: {e}")))?;
+        self.store.record_atomic(
+            &IdempotencyWrite {
+                organization_id: claim.organization_id.clone(),
+                key: claim.idempotency_key.clone(),
+                operation: claim.operation.clone(),
+                request_hash: claim.request_digest.clone(),
+                response: response.clone(),
+                created_ms: now,
+            },
+            effect,
+        )
     }
 
     fn validate_idempotency(&self, key: &str) -> Result<(), PaymentError> {
@@ -1834,25 +3096,33 @@ impl PaymentService {
             .get("refund_id")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| PaymentError::Store("refund replay has no id".into()))?;
-        let note_id = value
-            .get("credit_note_id")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| PaymentError::Store("refund replay has no credit note".into()))?;
         let refund = self
             .store
             .refund_by_id(org, refund_id)?
             .ok_or_else(|| PaymentError::NotFound("refund".into()))?;
-        let note = self
-            .store
-            .credit_note(org, note_id)?
-            .ok_or_else(|| PaymentError::NotFound("credit note".into()))?;
+        let note_id = value
+            .get("credit_note_id")
+            .and_then(serde_json::Value::as_str)
+            .or(refund.credit_note_id.as_deref());
+        let note = match note_id {
+            Some(note_id) => Some(
+                self.store
+                    .credit_note(org, note_id)?
+                    .ok_or_else(|| PaymentError::NotFound("credit note".into()))?,
+            ),
+            None => None,
+        };
         let payment = self
             .store
             .payment(org, &refund.payment_id)?
             .ok_or_else(|| PaymentError::NotFound("payment".into()))?;
+        let invoice_id = note
+            .as_ref()
+            .map(|note| note.invoice_id.clone())
+            .unwrap_or_else(|| payment.invoice_id.clone());
         let invoice = self
             .store
-            .invoice(org, &note.invoice_id)?
+            .invoice(org, &invoice_id)?
             .ok_or_else(|| PaymentError::NotFound("invoice".into()))?;
         Ok(RefundOutcome {
             refund,
@@ -1891,8 +3161,9 @@ impl PaymentService {
         OrganizationId::try_new(raw).map_err(|e| PaymentError::WebhookMalformed(e.to_string()))
     }
 
-    fn webhook_effects(
+    fn webhook_effects_tx(
         &self,
+        tx: &rusqlite::Transaction<'_>,
         org: &str,
         event: &VerifiedWebhookEvent,
         now: i64,
@@ -1901,22 +3172,26 @@ impl PaymentService {
             .payload
             .get("data")
             .and_then(|data| data.get("object"));
+        let object_id = || {
+            object
+                .and_then(|object| object.get("id"))
+                .and_then(serde_json::Value::as_str)
+        };
+        let local_invoice_id = || {
+            object
+                .and_then(|object| object.pointer("/metadata/local_invoice_id"))
+                .and_then(serde_json::Value::as_str)
+        };
         match event.event_type.as_str() {
-            "invoice.paid" => {
-                let Some(object) = object else {
+            "payment.succeeded" | "payment_intent.succeeded" | "charge.succeeded" => {
+                let Some(provider_payment_id) = object_id() else {
                     return Ok(WebhookEffects::default());
                 };
-                let provider_invoice_id = object.get("id").and_then(serde_json::Value::as_str);
-                let local_id = object
-                    .get("metadata")
-                    .and_then(|metadata| metadata.get("local_invoice_id"))
-                    .and_then(serde_json::Value::as_str);
-                let mut invoice = if let Some(local_id) = local_id {
-                    self.store.invoice(org, local_id)?
-                } else if let Some(provider_invoice_id) = provider_invoice_id {
-                    self.store.invoice_by_provider_id(provider_invoice_id)?
-                } else {
-                    None
+                let mut payment = payment_by_provider_id_tx(tx, org, provider_payment_id)?;
+                let mut invoice = match (payment.as_ref(), local_invoice_id()) {
+                    (Some(payment), _) => invoice_tx(tx, org, &payment.invoice_id)?,
+                    (None, Some(local_id)) => invoice_tx(tx, org, local_id)?,
+                    (None, None) => None,
                 };
                 let Some(invoice_ref) = invoice.as_mut() else {
                     return Ok(WebhookEffects::default());
@@ -1924,38 +3199,61 @@ impl PaymentService {
                 if invoice_ref.organization_id != org {
                     return Ok(WebhookEffects::default());
                 }
-                let paid = object
-                    .get("amount_paid")
-                    .and_then(serde_json::Value::as_i64)
-                    .or_else(|| object.get("amount").and_then(serde_json::Value::as_i64))
-                    .unwrap_or(invoice_ref.balance_minor());
-                let paid = paid.clamp(0, invoice_ref.balance_minor());
-                let mut payment = None;
-                if paid > 0 {
-                    invoice_ref.amount_paid_minor =
-                        checked_add(invoice_ref.amount_paid_minor, paid)?;
+                let amount = object.and_then(|object| {
+                    object
+                        .get("amount_minor")
+                        .and_then(serde_json::Value::as_i64)
+                        .or_else(|| object.get("amount").and_then(serde_json::Value::as_i64))
+                        .or_else(|| {
+                            object
+                                .get("amount_received")
+                                .and_then(serde_json::Value::as_i64)
+                        })
+                });
+                if let Some(payment) = payment.as_mut() {
+                    if !payment.status.can_transition_to(PaymentStatus::Succeeded)
+                        && payment.status != PaymentStatus::Succeeded
+                    {
+                        return Ok(WebhookEffects::default());
+                    }
+                    payment.status = PaymentStatus::Succeeded;
+                } else {
+                    let recorded = amount.unwrap_or_else(|| invoice_ref.balance_minor());
                     payment = Some(Payment {
                         id: format!("pay_{}", uuid::Uuid::new_v4()),
                         organization_id: org.to_string(),
                         invoice_id: invoice_ref.id.clone(),
                         provider: self.provider.name().to_string(),
-                        provider_payment_id: format!("{}:payment", event.id),
+                        provider_payment_id: provider_payment_id.to_string(),
                         payment_method_id: None,
-                        amount_minor: paid,
+                        amount_minor: recorded,
                         refunded_minor: 0,
                         currency: invoice_ref.currency.clone(),
                         status: PaymentStatus::Succeeded,
                         created_ms: now,
                     });
                 }
-                if invoice_ref.amount_paid_minor >= invoice_ref.total_minor {
+                let credited = amount
+                    .or_else(|| payment.as_ref().map(|payment| payment.amount_minor))
+                    .unwrap_or_else(|| invoice_ref.balance_minor())
+                    .clamp(0, invoice_ref.balance_minor());
+                invoice_ref.amount_paid_minor =
+                    checked_add(invoice_ref.amount_paid_minor, credited)?;
+                if invoice_ref.amount_paid_minor >= invoice_ref.total_minor
+                    && invoice_ref.status.can_transition_to(InvoiceStatus::Paid)
+                {
                     invoice_ref.status = InvoiceStatus::Paid;
                     invoice_ref.paid_ms = Some(now);
                 }
                 let subscription = invoice_ref
                     .subscription_id
                     .as_deref()
-                    .and_then(|id| self.store.subscription_by_id(org, id).ok().flatten())
+                    .and_then(|id| subscription_by_id_tx(tx, org, id).ok().flatten())
+                    .filter(|subscription| {
+                        subscription
+                            .state
+                            .can_transition_to(SubscriptionState::Active)
+                    })
                     .map(|mut subscription| {
                         subscription.state = SubscriptionState::Active;
                         subscription.dunning_attempts = 0;
@@ -1967,35 +3265,228 @@ impl PaymentService {
                     subscription,
                     invoice: Some(invoice_ref.clone()),
                     payment,
+                    refund: None,
+                    credit_note: None,
+                    ..WebhookEffects::default()
                 })
             }
-            "invoice.payment_failed" => {
-                let Some(object) = object else {
+            "payment.processing"
+            | "payment_intent.processing"
+            | "charge.processing"
+            | "payment.requires_action"
+            | "payment_intent.requires_action"
+            | "charge.requires_action"
+            | "payment.pending" => {
+                let Some(provider_payment_id) = object_id() else {
                     return Ok(WebhookEffects::default());
                 };
-                let provider_invoice_id = object.get("id").and_then(serde_json::Value::as_str);
-                let local_id = object
-                    .get("metadata")
-                    .and_then(|metadata| metadata.get("local_invoice_id"))
+                let Some(mut payment) = payment_by_provider_id_tx(tx, org, provider_payment_id)?
+                else {
+                    return Ok(WebhookEffects::default());
+                };
+                let next = match event.event_type.as_str() {
+                    "payment.requires_action"
+                    | "payment_intent.requires_action"
+                    | "charge.requires_action" => PaymentStatus::RequiresAction,
+                    "payment.pending" => PaymentStatus::Pending,
+                    _ => PaymentStatus::Processing,
+                };
+                if !payment.status.can_transition_to(next) {
+                    return Ok(WebhookEffects::default());
+                }
+                payment.status = next;
+                Ok(WebhookEffects {
+                    subscription: None,
+                    invoice: None,
+                    payment: Some(payment),
+                    refund: None,
+                    credit_note: None,
+                    ..WebhookEffects::default()
+                })
+            }
+            "payment.failed" | "payment_intent.payment_failed" | "charge.failed" => {
+                let Some(provider_payment_id) = object_id() else {
+                    return Ok(WebhookEffects::default());
+                };
+                let Some(mut payment) = payment_by_provider_id_tx(tx, org, provider_payment_id)?
+                else {
+                    return Ok(WebhookEffects::default());
+                };
+                if !payment.status.can_transition_to(PaymentStatus::Failed) {
+                    return Ok(WebhookEffects::default());
+                }
+                payment.status = PaymentStatus::Failed;
+                let Some(mut invoice) = invoice_tx(tx, org, &payment.invoice_id)? else {
+                    return Ok(WebhookEffects {
+                        subscription: None,
+                        invoice: None,
+                        payment: Some(payment),
+                        refund: None,
+                        credit_note: None,
+                        ..WebhookEffects::default()
+                    });
+                };
+                if invoice.organization_id != org
+                    || !invoice.status.can_transition_to(InvoiceStatus::PastDue)
+                {
+                    return Ok(WebhookEffects {
+                        subscription: None,
+                        invoice: None,
+                        payment: Some(payment),
+                        refund: None,
+                        credit_note: None,
+                        ..WebhookEffects::default()
+                    });
+                }
+                invoice.status = InvoiceStatus::PastDue;
+                let mut subscription = invoice
+                    .subscription_id
+                    .as_deref()
+                    .and_then(|id| subscription_by_id_tx(tx, org, id).ok().flatten());
+                if let Some(sub) = subscription.as_mut() {
+                    if sub.state.can_transition_to(SubscriptionState::PastDue) {
+                        sub.state = SubscriptionState::PastDue;
+                    }
+                    sub.dunning_attempts = sub.dunning_attempts.saturating_add(1);
+                    sub.updated_ms = now;
+                    if sub.grace_end_ms.is_none() {
+                        sub.grace_end_ms =
+                            Some(now.saturating_add(self.config.dunning.grace_ms.max(0)));
+                    }
+                    if sub.dunning_attempts >= self.config.dunning.max_attempts
+                        && sub.state != SubscriptionState::Canceled
+                    {
+                        sub.state = SubscriptionState::Canceled;
+                        sub.canceled_ms = Some(now);
+                    }
+                }
+                Ok(WebhookEffects {
+                    subscription,
+                    invoice: Some(invoice),
+                    payment: Some(payment),
+                    refund: None,
+                    credit_note: None,
+                    ..WebhookEffects::default()
+                })
+            }
+            "refund.succeeded" | "refund.updated" | "refund.failed" | "charge.refund.updated" => {
+                let provider_refund_id = object_id();
+                let local_refund_id = object
+                    .and_then(|object| object.pointer("/metadata/local_refund_id"))
                     .and_then(serde_json::Value::as_str);
+                let mut refund = match local_refund_id {
+                    Some(local_id) => refund_by_id_tx(tx, org, local_id)?,
+                    None => {
+                        let Some(provider_refund_id) = provider_refund_id else {
+                            return Ok(WebhookEffects::default());
+                        };
+                        refund_by_provider_id_conn(tx, org, provider_refund_id)?
+                    }
+                };
+                let Some(refund_ref) = refund.as_mut() else {
+                    return Ok(WebhookEffects::default());
+                };
+                if refund_ref.organization_id != org || refund_ref.credit_note_id.is_some() {
+                    return Ok(WebhookEffects::default());
+                }
+                let provider_status = object
+                    .and_then(|object| object.get("status"))
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        PaymentError::WebhookMalformed(
+                            "refund webhook carries no explicit provider status".into(),
+                        )
+                    })?;
+                let next = RefundStatus::parse(provider_status).ok_or_else(|| {
+                    PaymentError::WebhookMalformed(format!(
+                        "refund webhook carries unknown status {provider_status:?}"
+                    ))
+                })?;
+                if !refund_ref.status.can_transition_to(next) {
+                    return Ok(WebhookEffects::default());
+                }
+                if next != RefundStatus::Succeeded {
+                    refund_ref.status = next;
+                    return Ok(WebhookEffects {
+                        subscription: None,
+                        invoice: None,
+                        payment: None,
+                        refund: Some(refund_ref.clone()),
+                        credit_note: None,
+                        ..WebhookEffects::default()
+                    });
+                }
+                let Some(mut payment) = payment_tx(tx, org, &refund_ref.payment_id)? else {
+                    return Ok(WebhookEffects::default());
+                };
+                let Some(mut invoice) = invoice_tx(tx, org, &payment.invoice_id)? else {
+                    return Ok(WebhookEffects::default());
+                };
+                refund_ref.status = RefundStatus::Succeeded;
+                refund_ref.invoice_line_seq = bind_refund_invoice_line(&invoice);
+                let provider_refund = ProviderRefundObservation {
+                    provider: self.provider.name().to_string(),
+                    provider_refund_id: refund_ref.provider_refund_id.clone(),
+                    organization_id: org.to_string(),
+                    invoice_id: invoice.id.clone(),
+                    payment_id: payment.id.clone(),
+                    status: RefundStatus::Succeeded.as_str().to_string(),
+                    amount_minor: refund_ref.amount_minor,
+                    currency: refund_ref.currency.clone(),
+                    observed_ms: now,
+                    source: ProviderObservationSource::Webhook,
+                };
+                let mut note = settle_refund_ledger(
+                    &mut payment,
+                    &mut invoice,
+                    refund_ref,
+                    org,
+                    format!("cn_{}", uuid::Uuid::new_v4()),
+                    now,
+                )?;
+                let sequence = next_sequence_tx(tx, org, "credit_note")?;
+                note.number = format!("CN-{sequence:06}");
+                Ok(WebhookEffects {
+                    subscription: None,
+                    invoice: Some(invoice),
+                    payment: Some(payment),
+                    refund: Some(refund_ref.clone()),
+                    credit_note: Some(note),
+                    provider_refund: Some(provider_refund),
+                    ..WebhookEffects::default()
+                })
+            }
+            "invoice.paid" | "invoice.payment_succeeded" => {
+                self.webhook_invoice_paid_tx(tx, org, event, object, now)
+            }
+            "invoice.payment_failed" | "invoice.payment_action_required" => {
+                let provider_invoice_id = object_id();
+                let local_id = local_invoice_id();
                 let invoice = if let Some(local_id) = local_id {
-                    self.store.invoice(org, local_id)?
+                    invoice_tx(tx, org, local_id)?
                 } else if let Some(provider_invoice_id) = provider_invoice_id {
-                    self.store.invoice_by_provider_id(provider_invoice_id)?
+                    invoice_by_provider_id_tx(tx, provider_invoice_id)?
                 } else {
                     None
                 };
                 let Some(mut invoice) = invoice else {
                     return Ok(WebhookEffects::default());
                 };
-                if invoice.organization_id != org {
+                if invoice.organization_id != org
+                    || !invoice.status.can_transition_to(InvoiceStatus::PastDue)
+                {
                     return Ok(WebhookEffects::default());
                 }
                 invoice.status = InvoiceStatus::PastDue;
                 let subscription = invoice
                     .subscription_id
                     .as_deref()
-                    .and_then(|id| self.store.subscription_by_id(org, id).ok().flatten())
+                    .and_then(|id| subscription_by_id_tx(tx, org, id).ok().flatten())
+                    .filter(|subscription| {
+                        subscription
+                            .state
+                            .can_transition_to(SubscriptionState::PastDue)
+                    })
                     .map(|mut subscription| {
                         subscription.dunning_attempts =
                             subscription.dunning_attempts.saturating_add(1);
@@ -2015,76 +3506,87 @@ impl PaymentService {
                     subscription,
                     invoice: Some(invoice),
                     payment: None,
+                    refund: None,
+                    credit_note: None,
+                    ..WebhookEffects::default()
                 })
             }
             "customer.subscription.updated" => {
-                let Some(object) = object else {
+                let Some(provider_id) = object_id() else {
                     return Ok(WebhookEffects::default());
                 };
-                let Some(provider_id) = object.get("id").and_then(serde_json::Value::as_str) else {
-                    return Ok(WebhookEffects::default());
-                };
-                let Some(mut subscription) = self
-                    .store
-                    .subscription_organization(provider_id)?
-                    .and_then(|org| self.store.subscription(&org).ok().flatten())
+                let Some(mut subscription) = subscription_by_provider_id_tx(tx, provider_id)?
                 else {
                     return Ok(WebhookEffects::default());
                 };
-                if subscription.organization_id != org {
+                if subscription.organization_id != org
+                    || subscription.state == SubscriptionState::Canceled
+                {
                     return Ok(WebhookEffects::default());
                 }
-                if let Some(status) = object.get("status").and_then(serde_json::Value::as_str) {
+                if let Some(status) = object
+                    .and_then(|object| object.get("status"))
+                    .and_then(serde_json::Value::as_str)
+                {
                     if let Some(state) = SubscriptionState::parse(status) {
-                        subscription.state = state;
-                        if state == SubscriptionState::Canceled {
-                            subscription.canceled_ms = Some(now);
+                        if subscription.state.can_transition_to(state) {
+                            subscription.state = state;
+                            if state == SubscriptionState::Canceled {
+                                subscription.canceled_ms = Some(now);
+                            }
                         }
                     }
                 }
-                if let Some(quantity) = object.get("quantity").and_then(serde_json::Value::as_u64) {
+                if let Some(quantity) = object
+                    .and_then(|object| object.get("quantity"))
+                    .and_then(serde_json::Value::as_u64)
+                {
                     subscription.quantity = u32::try_from(quantity).map_err(|_| {
                         PaymentError::WebhookMalformed("subscription quantity overflow".into())
                     })?;
                 }
                 if let Some(cancel) = object
-                    .get("cancel_at_period_end")
+                    .and_then(|object| object.get("cancel_at_period_end"))
                     .and_then(serde_json::Value::as_bool)
                 {
                     subscription.cancel_at_period_end = cancel;
                 }
                 if let Some(end) = object
-                    .get("current_period_end")
+                    .and_then(|object| object.get("current_period_end"))
                     .and_then(serde_json::Value::as_i64)
                 {
-                    subscription.current_period_end_ms = if end.abs() < 10_000_000_000 {
+                    let end = if end.abs() < 10_000_000_000 {
                         end.saturating_mul(1000)
                     } else {
                         end
                     };
+                    subscription.current_period_end_ms =
+                        subscription.current_period_end_ms.max(end);
                 }
                 subscription.updated_ms = now;
                 Ok(WebhookEffects {
                     subscription: Some(subscription),
                     invoice: None,
                     payment: None,
+                    refund: None,
+                    credit_note: None,
+                    ..WebhookEffects::default()
                 })
             }
-            "customer.subscription.deleted" => {
-                let Some(object) = object else {
+            "customer.subscription.deleted" | "subscription.cancelled" => {
+                let Some(provider_id) = object_id() else {
                     return Ok(WebhookEffects::default());
                 };
-                let Some(provider_id) = object.get("id").and_then(serde_json::Value::as_str) else {
-                    return Ok(WebhookEffects::default());
-                };
-                let Some(mut subscription) = self
-                    .store
-                    .subscription_organization(provider_id)?
-                    .and_then(|org| self.store.subscription(&org).ok().flatten())
+                let Some(mut subscription) = subscription_by_provider_id_tx(tx, provider_id)?
                 else {
                     return Ok(WebhookEffects::default());
                 };
                 if subscription.organization_id != org {
+                    return Ok(WebhookEffects::default());
+                }
+                if subscription.state == SubscriptionState::Canceled
+                    && subscription.canceled_ms.is_some()
+                {
                     return Ok(WebhookEffects::default());
                 }
                 subscription.state = SubscriptionState::Canceled;
@@ -2095,11 +3597,164 @@ impl PaymentService {
                     subscription: Some(subscription),
                     invoice: None,
                     payment: None,
+                    refund: None,
+                    credit_note: None,
+                    ..WebhookEffects::default()
                 })
             }
             _ => Ok(WebhookEffects::default()),
         }
     }
+}
+
+fn provider_subscription_state(
+    status: &str,
+    trial_end_ms: Option<i64>,
+    now: i64,
+) -> Result<SubscriptionState, PaymentError> {
+    if status == "trialing" {
+        return Ok(SubscriptionState::Trialing);
+    }
+    match status {
+        "active" => Ok(if trial_end_ms.is_some_and(|trial| trial > now) {
+            SubscriptionState::Trialing
+        } else {
+            SubscriptionState::Active
+        }),
+        "past_due" | "unpaid" | "incomplete" | "paused" | "pending" => {
+            Ok(SubscriptionState::PastDue)
+        }
+        "canceled" | "cancelled" | "incomplete_expired" | "expired" => {
+            Ok(SubscriptionState::Canceled)
+        }
+        other => Err(PaymentError::Provider(format!(
+            "provider subscription returned an unsupported status {other:?}"
+        ))),
+    }
+}
+
+fn operation_resource_id(
+    prefix: &str,
+    organization_id: &str,
+    operation: &str,
+    key: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(organization_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(operation.as_bytes());
+    hasher.update([0]);
+    hasher.update(key.as_bytes());
+    let digest = hasher.finalize();
+    let hex: String = digest
+        .iter()
+        .take(16)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("{prefix}_{hex}")
+}
+
+fn decode_field<T: serde::de::DeserializeOwned>(
+    context: &serde_json::Value,
+    field: &str,
+) -> Result<T, PaymentError> {
+    serde_json::from_value(
+        context.get(field).cloned().ok_or_else(|| {
+            PaymentError::Store(format!("operation claim context has no {field}"))
+        })?,
+    )
+    .map_err(|e| PaymentError::Store(format!("operation claim context {field}: {e}")))
+}
+
+fn payment_status_from_provider(raw: &str) -> Result<PaymentStatus, PaymentError> {
+    let status = match raw {
+        "succeeded" | "captured" | "authorised" | "authorized" => PaymentStatus::Succeeded,
+        "processing" | "requires_capture" => PaymentStatus::Processing,
+        "pending" | "received" => PaymentStatus::Pending,
+        "requires_action" | "requires_confirmation" => PaymentStatus::RequiresAction,
+        "failed" | "canceled" | "cancelled" => PaymentStatus::Failed,
+        other => {
+            return Err(PaymentError::Provider(format!(
+                "provider charge returned an unsupported status {other:?}"
+            )))
+        }
+    };
+    Ok(status)
+}
+
+/// Apply the settled part of one refund to the payment and invoice and
+/// build the credit note skeleton. The caller allocates its sequence in the
+/// SAME transaction that inserts both rows.
+fn settle_refund_ledger(
+    payment: &mut Payment,
+    invoice: &mut Invoice,
+    refund: &mut Refund,
+    organization_id: &str,
+    credit_note_id: String,
+    now: i64,
+) -> Result<CreditNote, PaymentError> {
+    if refund.status != RefundStatus::Succeeded {
+        return Err(PaymentError::IllegalState(format!(
+            "refund {} is not settled",
+            refund.id
+        )));
+    }
+    if refund.credit_note_id.is_some() {
+        return Err(PaymentError::Conflict(format!(
+            "refund {} already has a credit note",
+            refund.id
+        )));
+    }
+    payment.refunded_minor = checked_add(payment.refunded_minor, refund.amount_minor)?;
+    if payment.refunded_minor > payment.amount_minor {
+        return Err(PaymentError::RefundExceedsPaid {
+            paid: payment.amount_minor,
+            refunded: payment.refunded_minor - refund.amount_minor,
+            requested: refund.amount_minor,
+        });
+    }
+    payment.status = if payment.refunded_minor >= payment.amount_minor {
+        PaymentStatus::Refunded
+    } else {
+        PaymentStatus::PartiallyRefunded
+    };
+    invoice.amount_refunded_minor =
+        checked_add(invoice.amount_refunded_minor, refund.amount_minor)?;
+    refund.credit_note_id = Some(credit_note_id.clone());
+    Ok(CreditNote {
+        id: credit_note_id,
+        organization_id: organization_id.to_string(),
+        number: String::new(),
+        invoice_id: invoice.id.clone(),
+        payment_id: payment.id.clone(),
+        amount_minor: refund.amount_minor,
+        currency: refund.currency.clone(),
+        reason: refund.reason.clone(),
+        invoice_line_seq: refund.invoice_line_seq,
+        created_ms: now,
+    })
+}
+
+/// Bind a refund/credit note to one authored charge line of the Faktor
+/// invoice. The sequence is the Faktor invoice-line index, never a provider
+/// line identity.
+fn bind_refund_invoice_line(invoice: &Invoice) -> Option<u32> {
+    invoice
+        .lines
+        .iter()
+        .enumerate()
+        .find(|(_, line)| {
+            line.amount_minor > 0
+                && matches!(
+                    line.kind,
+                    InvoiceLineKind::Plan
+                        | InvoiceLineKind::Seat
+                        | InvoiceLineKind::Proration
+                        | InvoiceLineKind::Usage
+                )
+        })
+        .map(|(seq, _)| seq as u32)
+        .or_else(|| (!invoice.lines.is_empty()).then_some(0))
 }
 
 fn bounded_text(name: &str, value: &str, max: usize) -> Result<(), PaymentError> {
@@ -2132,84 +3787,16 @@ fn disposition_string(disposition: WebhookDisposition) -> &'static str {
         WebhookDisposition::Duplicate => "duplicate",
         WebhookDisposition::StaleIgnored => "stale_ignored",
         WebhookDisposition::Ignored => "ignored",
+        WebhookDisposition::ReconciliationConflict => "reconciliation_conflict",
     }
 }
 
-/// Reject raw PAN input: a token field must never be a 12..=19 digit card
-/// number (with optional spaces/hyphens).
-pub fn validate_payment_token(token: &str) -> Result<(), PaymentError> {
-    if token.is_empty() || token.len() > 256 {
-        return Err(PaymentError::Malformed(
-            "payment token must be 1..=256 bytes".into(),
-        ));
-    }
-    let digits = token
-        .chars()
-        .filter(|c| c.is_ascii_digit())
-        .collect::<String>();
-    let pan_shaped = (12..=19).contains(&digits.len())
-        && token
-            .chars()
-            .all(|c| c.is_ascii_digit() || c == ' ' || c == '-');
-    if pan_shaped {
-        return Err(PaymentError::Malformed(
-            "raw card numbers are never accepted; use a provider token".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn invoices_csv(invoices: &[Invoice]) -> String {
-    let mut text = String::from(
-        "number,invoice_id,status,currency,line_kind,description,quantity,unit_amount_minor,\
-         amount_minor,subtotal_minor,discount_minor,credits_minor,tax_minor,total_minor,\
-         amount_paid_minor,amount_refunded_minor,balance_minor,issued_ms,due_ms,\
-         tax_jurisdiction,tax_inclusive\n",
-    );
-    for invoice in invoices {
-        for line in &invoice.lines {
-            let fields = vec![
-                invoice.number.clone(),
-                invoice.id.clone(),
-                invoice.status.as_str().to_string(),
-                invoice.currency.clone(),
-                line.kind.as_str().to_string(),
-                line.description.clone(),
-                line.quantity.to_string(),
-                line.unit_amount_minor.to_string(),
-                line.amount_minor.to_string(),
-                invoice.subtotal_minor.to_string(),
-                invoice.discount_minor.to_string(),
-                invoice.credits_minor.to_string(),
-                invoice.tax_minor.to_string(),
-                invoice.total_minor.to_string(),
-                invoice.amount_paid_minor.to_string(),
-                invoice.amount_refunded_minor.to_string(),
-                invoice.balance_minor().to_string(),
-                invoice.issued_ms.to_string(),
-                invoice.due_ms.to_string(),
-                invoice.tax_jurisdiction.clone().unwrap_or_default(),
-                invoice.tax_inclusive.to_string(),
-            ];
-            text.push_str(
-                &fields
-                    .iter()
-                    .map(|field| faktor_cloud::csv_field(field))
-                    .collect::<Vec<_>>()
-                    .join(","),
-            );
-            text.push('\n');
-        }
-    }
-    text
-}
-
-fn invoice_csv(invoice: &Invoice) -> String {
-    invoices_csv(std::slice::from_ref(invoice))
-}
-
-// Re-export the config helpers the CLI/server need without leaking the
-// service's private fields.
+/// Reject raw PAN/card-like input at every token boundary. A provider token
+/// is opaque text (letters/digits and a small punctuation set); any 12..=19
+/// digit run that is Luhn-valid is refused even when wrapped in a
+/// `tok_`/`pm_` prefix, and card-like separators/whitespace are refused
+/// outright. This validator is the ONE implementation used by the service,
+/// CLI and native routes.
 impl PaymentService {
     pub fn catalogue_plan(&self, plan_id: &str) -> Option<&PlanPrice> {
         self.config.catalogue.plan(plan_id)

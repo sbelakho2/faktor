@@ -62,6 +62,87 @@ fn read_pid(path: &std::path::Path) -> u32 {
     }
 }
 
+/// Locate the Rust `faktor-ci-tools` tcp probe when the workspace built it.
+/// Any member of this workspace can run the probe directly; the terminal
+/// crate's own test binary is the fallback so an isolated crate test never
+/// depends on a sibling binary that cargo did not build.
+#[cfg(target_os = "macos")]
+fn rust_tcp_probe() -> Option<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = std::env::var_os("FAKTOR_CI_TOOLS") {
+        candidates.push(std::path::PathBuf::from(path));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(target) = exe.parent().and_then(std::path::Path::parent) {
+            candidates.push(target.join("faktor-ci-tools"));
+        }
+    }
+    if let Some(target) = std::env::var_os("CARGO_TARGET_DIR") {
+        let target = std::path::PathBuf::from(target);
+        candidates.push(target.join("debug/faktor-ci-tools"));
+        candidates.push(target.join("release/faktor-ci-tools"));
+    }
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for profile in ["debug", "release"] {
+        candidates.push(
+            manifest
+                .join("../..")
+                .join("target")
+                .join(profile)
+                .join("faktor-ci-tools"),
+        );
+    }
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+#[cfg(target_os = "macos")]
+fn shell_quote(path: &std::path::Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+}
+
+/// A Rust TCP-connect probe executed INSIDE the confined child. The macOS
+/// step used to shell out to an interpreter one-liner; the repository has no
+/// Python tooling, so the probe is either the `faktor-ci-tools tcp-connect`
+/// helper or this same test binary re-executed with `--ignored --exact`.
+#[cfg(target_os = "macos")]
+fn rust_tcp_probe_command(port: u16) -> String {
+    if let Some(tool) = rust_tcp_probe() {
+        return format!(
+            "{} tcp-connect --host 127.0.0.1 --port {port} >probe.out 2>&1; echo net=$?; cat probe.out",
+            shell_quote(&tool)
+        );
+    }
+    let exe = std::env::current_exe().expect("the test binary has a path");
+    format!(
+        "FAKTOR_FINAL_PROBE_PORT={port} {} --exact final_surface_probes::final_probe_tcp_child \
+         --ignored --nocapture >probe.out 2>&1; echo net=$?; cat probe.out",
+        shell_quote(&exe)
+    )
+}
+
+/// Child-side Rust probe: no fixture, no interpreter. Invoked only by the
+/// macOS confinement test through `rust_tcp_probe_command`; absent the env
+/// marker it is a no-op so an ordinary ignored run never touches a port.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "[security] spawned by final_probe_macos_confinement_denies_network_home_and_allows_workspace as its Rust TCP probe"]
+fn final_probe_tcp_child() {
+    let Ok(port) = std::env::var("FAKTOR_FINAL_PROBE_PORT") else {
+        return;
+    };
+    let port: u16 = port.parse().expect("FAKTOR_FINAL_PROBE_PORT is a port");
+    match std::net::TcpStream::connect(("127.0.0.1", port)) {
+        Ok(_) => {
+            println!("tcp-connect-allowed");
+            std::process::exit(0);
+        }
+        Err(error) => {
+            println!("tcp-connect-denied: {error}");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// macOS: live Required confinement through the real supervisor. A local
 /// loopback listener is the network target, so the probe never depends on
 /// external connectivity.
@@ -111,10 +192,10 @@ fn final_probe_macos_confinement_denies_network_home_and_allows_workspace() {
         port
     );
 
+    let net_probe = rust_tcp_probe_command(port);
     let script = format!(
         "printf ok > allowed.txt; echo ws=$?\n\
-         /usr/bin/python3 -B -c \"import socket; socket.create_connection(('127.0.0.1',{port}),1)\" \
-           >/dev/null 2>&1; echo net=$?\n\
+         {net_probe}\n\
          printf x > '{home}' 2>/dev/null; echo home=$?\n\
          printf x > '{escape}' 2>/dev/null; echo parent=$?\n\
          printf x > '{tmp_escape}' 2>/dev/null; echo tmp=$?\n\
@@ -158,6 +239,10 @@ fn final_probe_macos_confinement_denies_network_home_and_allows_workspace() {
             assert!(
                 !report.contains("net=0"),
                 "loopback network must be denied: {report}"
+            );
+            assert!(
+                report.contains("tcp-connect-denied") || report.contains("tcp-connect:"),
+                "the Rust TCP probe must actually run inside the child: {report}"
             );
             assert!(
                 report.contains("home=1"),

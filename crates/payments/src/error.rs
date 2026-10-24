@@ -106,6 +106,58 @@ impl PaymentError {
     pub const fn retryable(&self) -> bool {
         matches!(self, PaymentError::Store(_) | PaymentError::Provider(_))
     }
+
+    /// True when a provider refusal PROVES no remote effect was created.
+    /// Anything else (transport, provider 5xx, store) is ambiguous and must
+    /// become an `unknown` operation claim.
+    pub const fn is_definitive_dispatch_failure(&self) -> bool {
+        matches!(
+            self,
+            PaymentError::ProviderUnconfigured(_)
+                | PaymentError::WebhookUnauthorized(_)
+                | PaymentError::WebhookStaleTimestamp
+                | PaymentError::WebhookMalformed(_)
+                | PaymentError::Malformed(_)
+                | PaymentError::NotFound(_)
+                | PaymentError::Config(_)
+                | PaymentError::PlanPriceUnconfigured(_)
+                | PaymentError::CurrencyMismatch(_)
+                | PaymentError::FxUnconfigured(_, _)
+                | PaymentError::TaxUnconfigured(_)
+                | PaymentError::NothingDue
+                | PaymentError::RefundExceedsPaid { .. }
+                | PaymentError::Declined(_)
+                | PaymentError::IllegalState(_)
+        )
+    }
+
+    /// Rebuild the typed refusal recorded on a failed operation claim.
+    pub fn from_recorded(code: &str, message: &str) -> Self {
+        match code {
+            "payment_provider_unconfigured" => {
+                PaymentError::ProviderUnconfigured(message.to_string())
+            }
+            "payment_provider_error" => PaymentError::Provider(message.to_string()),
+            "malformed" => PaymentError::Malformed(message.to_string()),
+            "not_found" => PaymentError::NotFound(message.to_string()),
+            "conflict" => PaymentError::Conflict(message.to_string()),
+            "payment_config" => PaymentError::Config(message.to_string()),
+            "payment_store_unavailable" => PaymentError::Store(message.to_string()),
+            "plan_price_unconfigured" => PaymentError::PlanPriceUnconfigured(message.to_string()),
+            "currency_mismatch" => PaymentError::CurrencyMismatch(message.to_string()),
+            "fx_rate_unconfigured" => PaymentError::FxUnconfigured(
+                "recorded".into(),
+                "provider reconciliation required".into(),
+            ),
+            "tax_unconfigured" => PaymentError::TaxUnconfigured(message.to_string()),
+            "nothing_due" => PaymentError::NothingDue,
+            "refund_exceeds_paid" => PaymentError::Conflict(message.to_string()),
+            "payment_declined" => PaymentError::Declined(message.to_string()),
+            "idempotency_conflict" => PaymentError::IdempotencyConflict(message.to_string()),
+            "illegal_state" => PaymentError::IllegalState(message.to_string()),
+            _ => PaymentError::Conflict(message.to_string()),
+        }
+    }
 }
 
 /// The wire shape of one refusal.

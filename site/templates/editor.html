@@ -1,0 +1,197 @@
+{% extends "base.html" %}
+{% block title %}Editor design — Faktor{% endblock %}
+{% block content %}
+
+<section class="page-hero shell" aria-labelledby="editor-title">
+  <div class="hero-copy">
+    <p class="kicker">Faktor / VS Code &amp; JetBrains</p>
+    <h1 class="page-title" id="editor-title">Work, inspect<br>and finish deliberately.</h1>
+    <p class="lead">A complete editor design: task capture, scoped permissions, candidate review, evidence, recovery and durable outcomes.</p>
+  </div>
+</section>
+
+<section class="section shell" aria-labelledby="prototype-title">
+  <p class="kicker" id="prototype-title">Interactive editor design</p>
+  <div class="split-head">
+    <p class="lead">Switch the host, theme and flow state, or use the controls inside the tool view.</p>
+  </div>
+  <p class="note-box">Local design prototype. No executable starts, repository changes, model requests, permissions or SCM actions occur here. Proposed controls and current-source differences are documented below.</p>
+
+  <div class="editor-demo">
+    <input type="radio" name="ed-host" id="ed-host-vscode" checked>
+    <input type="radio" name="ed-host" id="ed-host-jetbrains">
+    <input type="radio" name="ed-theme" id="ed-theme-dark" checked>
+    <input type="radio" name="ed-theme" id="ed-theme-light">
+    <input type="radio" name="ed-state" id="ed-state-evidence" checked>
+    <input type="radio" name="ed-state" id="ed-state-completion">
+
+    <div class="editor-controls">
+      <div class="control">
+        <span class="control-label">Editor</span>
+        <details class="control-select"><summary><span class="opt opt-vscode">VS Code</span><span class="opt opt-jetbrains">JetBrains</span><span class="chev" aria-hidden="true">˅</span></summary><div class="control-menu"><label for="ed-host-vscode">VS Code</label><label for="ed-host-jetbrains">JetBrains</label></div></details>
+      </div>
+      <div class="control">
+        <span class="control-label">Host theme</span>
+        <details class="control-select"><summary><span class="opt opt-dark">Dark</span><span class="opt opt-light">Light</span><span class="chev" aria-hidden="true">˅</span></summary><div class="control-menu"><label for="ed-theme-dark">Dark</label><label for="ed-theme-light">Light</label></div></details>
+      </div>
+      <div class="control">
+        <span class="control-label">Flow state</span>
+        <details class="control-select"><summary><span class="opt opt-evidence">Evidence pending</span><span class="opt opt-completion">Completion pending</span><span class="chev" aria-hidden="true">˅</span></summary><div class="control-menu"><label for="ed-state-evidence">Evidence pending</label><label for="ed-state-completion">Completion pending</label></div></details>
+      </div>
+    </div>
+
+    <div class="editor-stage">
+      <div class="editor-window">
+        <div class="editor-titlebar"><span class="ed-window-title">routing-service — Visual Studio Code</span><span>DESIGN PROTOTYPE / ILLUSTRATIVE TASK</span></div>
+        <div class="editor-body">
+          <div class="editor-tree">
+            <p class="tree-head">▤ PROJECT / ROUTING-SERVICE</p>
+            <p>⌕ <strong>▾ routing-service</strong></p>
+            <p>　▾ src</p>
+            <p>　　▾ auth</p>
+            <p>　　　<span class="active">session.rs</span></p>
+            <p>　　　session_test.rs</p>
+            <p>　　tests</p>
+            <p>　Cargo.toml</p>
+            <p>　README.md</p>
+            <p class="tree-foot">⑂</p>
+          </div>
+          <div class="editor-code">
+            <p class="editor-tab">session_test.rs</p>
+            <p class="editor-tab on">session.rs</p>
+            <p class="crumbs">routing-service › src › auth › session.rs</p>
+            <pre><code><span class="ln">1</span>use crate::auth::RefreshToken;
+<span class="ln">2</span>
+<span class="ln">3</span>pub fn rotate_session(token: RefreshToken) {
+<span class="ln">4</span>    // Candidate change / illustrative code
+<span class="ln">5</span>    validate_session(&amp;token);
+<span class="ln">6</span>    reject_replayed_token(&amp;token);
+<span class="ln">7</span>
+<span class="ln">8</span>    // Required concurrent-refresh result is missing
+<span class="ln">9</span>    let next = issue_rotated_token(&amp;token);
+<span class="ln">10</span>   preserve_active_session(&amp;token, &amp;next);
+<span class="ln">11</span>   record_rotation(&amp;next);
+<span class="ln">12</span>}</code></pre>
+            <p class="terminal-label">TERMINAL / ILLUSTRATIVE OUTPUT</p>
+            <pre class="terminal-output">Required test: replay rejection / passed
+Compatibility: active sessions / passed
+Concurrent refresh result / missing
+Completion remains pending.</pre>
+          </div>
+          <aside class="editor-side">
+            <div class="side-brand"><span>Faktor</span><span>Settings</span></div>
+            <div class="side-tabs"><span class="on">Work</span><span>Inspect</span><span>History</span></div>
+            <div class="side-subtabs"><span>Plan</span><span>Agents</span><span class="on">Evidence</span><span>Diff</span></div>
+            <div class="state-panel state-evidence">
+              <h3>Completion pending</h3>
+              <p>Two required criteria passed. One required result is missing.</p>
+              <div class="evidence-line"><span class="ok">✓</span><div><strong>Reject token replay</strong><small>Required test result / passed</small></div></div>
+              <div class="evidence-line"><span class="ok">✓</span><div><strong>Preserve active sessions</strong><small>Compatibility check / passed</small></div></div>
+              <div class="evidence-line"><span class="pend">◇</span><div><strong>Concurrent refresh yields one valid result</strong><small>Required result / missing</small></div></div>
+              <dl class="side-facts">
+                <div><dt>Candidate</dt><dd>candidate-08 / illustrative</dd></div>
+                <div><dt>Integration</dt><dd>Not started</dd></div>
+                <div><dt>Final basis</dt><dd>Not available</dd></div>
+              </dl>
+              <div class="side-actions"><span class="side-btn">Review changed files</span><span class="side-btn">Open criteria</span></div>
+              <p class="side-label">Evidence references</p>
+              <p class="side-ref">Replay test result</p>
+              <p class="side-ref">Session compatibility result</p>
+              <p class="side-ref">Concurrent-refresh result not recorded</p>
+            </div>
+            <div class="state-panel state-completion">
+              <h3>Completion remains pending.</h3>
+              <p>Two required criteria passed. One required result is missing.</p>
+            </div>
+          </aside>
+        </div>
+        <div class="editor-status"><span>routing-service / candidate workspace</span><span>Evidence pending</span></div>
+      </div>
+    </div>
+
+    <div class="editor-demo-actions">
+      <label class="design-link" for="ed-state-completion">Next design state →</label>
+      <a class="design-link" href="/editor/">Reset specimen</a>
+      <a class="design-link" href="{{ get_url(path='downloads/faktor-editor-assets.zip') }}">Complete editor asset kit ↓</a>
+      <a class="design-link" href="{{ get_url(path='downloads/faktor-editor-ui-ux.pdf') }}">Complete UI/UX PDF ↓</a>
+    </div>
+  </div>
+</section>
+
+<section class="section shell" aria-labelledby="host-title">
+  <p class="kicker">Host-specific design</p>
+  <h2 class="h2" id="host-title">Familiar in each editor.</h2>
+  <div class="table-panel">
+    <table class="data-table host-table">
+      <caption class="sr-only">Host-specific design decisions.</caption>
+      <thead><tr><th scope="col">Area</th><th scope="col">VS Code</th><th scope="col">JetBrains</th></tr></thead>
+      <tbody>
+        <tr><td>Placement</td><td>Movable view/container and webview. Current source has Chat and Inspect disclosure.</td><td>Right-anchored Faktor tool window with Work / Inspect / History.</td></tr>
+        <tr><td>Shared navigation</td><td>A proposed Work / Inspect / History shell, including a visible History addition.</td><td>Retains the existing top-level views and makes their content more coherent.</td></tr>
+        <tr><td>Finish choice</td><td>Hierarchical finish levels already exist.</td><td>Current independent checkboxes become a proposed common four-level selector.</td></tr>
+        <tr><td>Diff review</td><td>Proposed native side-by-side diff adapter.</td><td>Proposed native DiffManager adapter.</td></tr>
+        <tr><td>Typography and theme</td><td>Inherit VS Code font, editor settings, focus and semantic tokens.</td><td>Inherit JetBrains UI font, editor settings and native theme.</td></tr>
+        <tr><td>Native confirmation</td><td>Keep exact-path service-start confirmation and fail-closed checks.</td><td>Keep exact-path service-start confirmation and fail-closed checks.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="kicker next-label">Thirty-six specified screens</p>
+</section>
+
+<section class="section shell" aria-labelledby="flow-title">
+  <h2 class="h2" id="flow-title">The complete flow, beyond the hero.</h2>
+  <ol class="workflow-list flow-list">
+    <li><span class="num">01</span><div><h3>Capture and preserve the task.</h3><p>Project readiness, binary discovery, native start consent, typed task criteria, context attachments and captured finish choices.</p></div></li>
+    <li><span class="num">02</span><div><h3>Work with bounded authority.</h3><p>Named current work, stop conditions and target/reason/scope permission review. No blanket grant is implied.</p></div></li>
+    <li><span class="num">03</span><div><h3>Inspect the evaluated candidate.</h3><p>Plan, agents, all evidence references, review/verification, changed files and matching verified/landed identities.</p></div></li>
+    <li><span class="num">04</span><div><h3>Recover coherently.</h3><p>Ambiguous submission, reconnect, malformed durable frame, unavailable proof, missing cost and SCM blockers retain useful state.</p></div></li>
+    <li><span class="num">05</span><div><h3>Record the outcome.</h3><p>History separates conversation completion, engineering acceptance, integration, requested steps, final basis and recorded cost.</p></div></li>
+  </ol>
+</section>
+
+<section class="section shell" aria-labelledby="specimens-title">
+  <p class="kicker">Reproduction in both themes</p>
+  <h2 class="h2" id="specimens-title">Native layout specimens.</h2>
+  <div class="editor-preview-grid">
+    <figure class="editor-figure">
+      <img src="{{ get_url(path='images/editor-vscode-light.png') }}" width="1440" height="940" alt="VS Code light composer specimen for the Faktor editor design." loading="lazy">
+      <figcaption class="editor-caption">VS CODE / LIGHT / COMPOSER</figcaption>
+    </figure>
+    <figure class="editor-figure">
+      <img src="{{ get_url(path='images/editor-jetbrains-light.png') }}" width="1440" height="940" alt="JetBrains light composer specimen for the Faktor editor design." loading="lazy">
+      <figcaption class="editor-caption">JETBRAINS / LIGHT / COMPOSER</figcaption>
+    </figure>
+  </div>
+  <p class="specimen-note">The complete kit contains 56 native SVG and PNG screen assets: 14 core states × 2 hosts × 2 themes. The standalone specification maps 36 screens, 34 states and 16 end-to-end flows to the current source and proposed work.</p>
+  <p class="kicker next-label">Keyboard and recovery</p>
+</section>
+
+<section class="section shell" aria-labelledby="details-title">
+  <h2 class="h2" id="details-title">Small details that keep the work usable.</h2>
+  <div class="table-panel">
+    <table class="data-table detail-table">
+      <caption class="sr-only">Interaction contracts for keyboard, layout, refresh and recovery.</caption>
+      <thead><tr><th scope="col">Condition</th><th scope="col">Interaction contract</th></tr></thead>
+      <tbody>
+        <tr><td>Keyboard</td><td>Roving main tabs, visible focus, Ctrl/Cmd + Enter scoped to the composer, Escape for confirmation recovery.</td></tr>
+        <tr><td>Narrow pane</td><td>Wrap paths and key/value rows, stack composer actions, move only secondary controls to accessible overflow.</td></tr>
+        <tr><td>Async refresh</td><td>Retain item identity and coherent snapshot; do not steal focus or skip an unprocessed durable frame.</td></tr>
+        <tr><td>Submission</td><td>One admitted logical request; keep the captured draft, finish and context when the response is ambiguous.</td></tr>
+        <tr><td>Unavailable information</td><td>Show unavailable proof/cost explicitly. Unavailable cost is not zero.</td></tr>
+        <tr><td>Diagnostics</td><td>Mask credentials; copied support details are redacted.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="section shell" aria-labelledby="handoff-title">
+  <p class="kicker">Implementation handoff</p>
+  <h2 class="h2" id="handoff-title">Build the shared contract in native adapters.</h2>
+  <p class="lead">The source study distinguishes presentation refinements, UI work using existing backend support, new host integrations and backend extensions. The artifact is a complete design and handoff, not a claim that these extension changes are deployed.</p>
+  <div class="end-links">
+    <a class="link-arrow" href="{{ get_url(path='downloads/faktor-editor-ui-ux.pdf') }}">Download the complete specification</a>
+    <a class="link-arrow" href="/documentation/">Runtime and editor setup</a>
+  </div>
+</section>
+
+{% endblock %}

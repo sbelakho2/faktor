@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block title %}Task patterns — Faktor{% endblock %}
+{% block content %}
+
+<section class="page-hero shell" aria-labelledby="patterns-title">
+  <div class="hero-copy">
+    <p class="kicker">Task patterns / Reviewable engineering</p>
+    <h1 class="page-title" id="patterns-title">Useful work starts<br>with a bounded request.</h1>
+    <p class="lead">Choose observable conditions and the stop point before handing the task to an engineering agent.</p>
+  </div>
+</section>
+
+<section class="section shell" aria-labelledby="migration-title">
+  <p class="kicker">Migration</p>
+  <h2 class="h2" id="migration-title">Rotate refresh tokens without breaking sessions.</h2>
+  <div class="table-panel">
+    <table class="data-table pattern-table">
+      <caption class="sr-only">Illustrative migration brief.</caption>
+      <thead><tr><th scope="col">Contract field</th><th scope="col">Example</th></tr></thead>
+      <tbody>
+        <tr><td>Goal</td><td>Rotate refresh tokens.</td></tr>
+        <tr><td>Acceptance</td><td>Reject replay; preserve sessions; constrain concurrent refresh behavior.</td></tr>
+        <tr><td>Invariant</td><td>Active sessions continue under the stated compatibility conditions.</td></tr>
+        <tr><td>Candidate</td><td>Isolated workspace and snapshot identity.</td></tr>
+        <tr><td>Finish choice</td><td>Leave changes locally for review.</td></tr>
+      </tbody>
+    </table>
+    <p class="table-summary">Illustrative brief from the design study. The website does not run this migration or claim its results.</p>
+  </div>
+</section>
+
+<section class="section shell" aria-labelledby="repair-title">
+  <p class="kicker">Failure repair</p>
+  <h2 class="h2" id="repair-title">Start with the counterexample.</h2>
+  <ol class="workflow-list">
+    <li><span class="num">01</span><div><h3>Attach the failing basis.</h3><p>Keep the relevant test or observed failure alongside the task.</p></div></li>
+    <li><span class="num">02</span><div><h3>Constrain the repair.</h3><p>State preserved behavior, affected scope and the requested verification.</p></div></li>
+    <li><span class="num">03</span><div><h3>Review before landing.</h3><p>Inspect changed files, unrelated changes and the evidence for the candidate being integrated.</p></div></li>
+  </ol>
+</section>
+
+<section class="section shell" aria-labelledby="budget-title">
+  <p class="kicker">Budget-aware work</p>
+  <h2 class="h2" id="budget-title">Keep spend and rework observable.</h2>
+  <p class="lead">Recorded spend, attempted outcomes and model cohorts help evaluate an engineering workflow. They do not establish unmeasured token savings or guarantee that a cheaper model produces the same result.</p>
+  <p class="link-line"><a class="link-arrow" href="/outcomes/">Read the current outcome definitions →</a></p>
+</section>
+
+{% endblock %}

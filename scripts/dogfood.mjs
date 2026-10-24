@@ -481,6 +481,12 @@ const SCRIPT_ALLOWLIST = new Map(
   Object.entries({
     'scripts/certify-local.sh':
       'local certificate executor (fast/full profiles) driven explicitly by an operator; dogfood.sh is the CI-shaped local suite and does not run the whole certificate.',
+    'scripts/site-check.sh':
+      'website crate gate (fmt/check/test/clippy + Zola build + zero-JS); executed by the dedicated site workflow (.woodpecker/site.yaml) and locally, requires Zola and is not part of the offline Rust dogfood plan.',
+    'scripts/site-zero-js.sh':
+      'zero-JavaScript website gate invoked by scripts/site-check.sh and the dedicated site workflow; requires the built Zola output, not part of the offline Rust dogfood plan.',
+    'scripts/site-visual.sh':
+      'website screenshot/PDF parity gate invoked by the dedicated site visual lane; requires Zola, Playwright and ImageMagick and reviewed baselines, so it is not part of the offline Rust dogfood plan.',
     'scripts/install-matrix.mjs':
       'release install-matrix lane (clean-prefix extract + doctor + archive structure); requires built release artifacts and runs in the full certify-local profile.',
     'scripts/package-artifacts.sh':

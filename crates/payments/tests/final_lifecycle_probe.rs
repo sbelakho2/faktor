@@ -75,7 +75,9 @@ fn config() -> PaymentsConfig {
         },
         dunning: Default::default(),
         webhook_secret_env: WEBHOOK_ENV.into(),
+        vault_key_env: faktor_payments::catalog::default_vault_key_env(),
         stripe: Default::default(),
+        adyen: Default::default(),
     }
 }
 

@@ -9784,40 +9784,102 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
     }
 
     /// Paths whose committed text may never invoke an interpreter: repo
-    /// scripts, CI definitions and the CI image build surface.
+    /// scripts, workflow definitions, CI image build surfaces, the CI
+    /// selector/gate tooling and the host scripts those gates invoke.
     fn python_tooling_path(rel: &str) -> bool {
         rel.starts_with("scripts/")
             || rel.starts_with(".woodpecker/")
+            || rel.starts_with(".github/")
             || rel.starts_with("docker/")
+            // The selector/gate sources are tooling; its generated graph and
+            // registry JSON legitimately contain product package/test names
+            // (e.g. tree-sitter-python) and are data, not invocations.
+            || (rel.starts_with("tests/programme/") && !rel.ends_with(".json"))
+            || rel.starts_with("apps/vscode/scripts/")
+            || (rel.starts_with("apps/jetbrains/")
+                && (rel.ends_with(".sh") || rel.contains("/scripts/")))
             || rel == "deny.toml"
     }
 
-    /// A `python`/`python3` token on a tooling line (shebang, command,
-    /// comment example) is an invocation offender. Product code that
-    /// supports user Python projects is out of scope and lives in crates/.
+    /// A `python`/`python3`/`python3.12`/`python2` token. Boundaries reject
+    /// prose such as `cpython` while accepting version suffixes and absolute
+    /// interpreter paths (`/usr/bin/python3`). Product code that supports
+    /// user Python projects is out of scope and lives in crates/.
     fn python_invocation(line: &str) -> bool {
         let lower = line.to_ascii_lowercase();
-        if lower.contains("python3") {
-            return true;
-        }
-        let mut rest = lower.as_str();
-        while let Some(index) = rest.find("python") {
-            let after = &rest[index + "python".len()..];
-            let next = after.chars().next();
-            if next.is_none_or(|ch| ch.is_whitespace() || matches!(ch, '-' | '/' | '"' | '\'')) {
+        let mut start = 0;
+        while let Some(offset) = lower[start..].find("python") {
+            let index = start + offset;
+            let before = lower[..index].chars().next_back();
+            let before_ok = before.is_none_or(|ch| !(ch.is_ascii_alphanumeric() || ch == '_'));
+            let after = &lower[index + "python".len()..];
+            let after_ok = match after.chars().next() {
+                None => true,
+                Some(ch) if ch.is_ascii_digit() => true,
+                Some(ch) => {
+                    ch.is_whitespace()
+                        || matches!(
+                            ch,
+                            '-' | '/' | '"' | '\'' | ':' | ';' | ',' | ')' | ']' | '}'
+                        )
+                }
+            };
+            if before_ok && after_ok {
                 return true;
             }
-            rest = after;
+            start = index + "python".len();
         }
         false
+    }
+
+    /// Absolute interpreter paths are a distinct class: a workflow that
+    /// names `/usr/bin/python3` is just as forbidden as `python3`.
+    fn absolute_python_path(line: &str) -> bool {
+        let lower = line.to_ascii_lowercase();
+        [
+            "/usr/bin/python",
+            "/usr/local/bin/python",
+            "/opt/homebrew/bin/python",
+            "/bin/python",
+        ]
+        .iter()
+        .any(|prefix| lower.contains(prefix))
+    }
+
+    /// An interpreter shebang is refused in EVERY committed file, not only
+    /// the tooling directories: the file itself is runnable Python.
+    fn python_shebang(line: &str) -> bool {
+        line.trim_start().starts_with("#!") && python_invocation(line)
     }
 
     fn python_tooling_offenders(root: &Path, files: &[String]) -> Vec<String> {
         let mut offenders = Vec::new();
         for rel in files {
             if rel.ends_with(".py") {
-                offenders.push(format!("{rel}: Python source file"));
+                offenders.push(format!("{rel}: Python source file or fixture"));
                 continue;
+            }
+            // Interpreter shebangs are repository-wide, but only the first
+            // line is needed: never pull a whole binary/large committed file
+            // into memory just to classify it.
+            let first_line = {
+                use std::io::BufRead;
+                let Ok(file) = std::fs::File::open(root.join(rel)) else {
+                    continue;
+                };
+                let mut line = String::new();
+                let Ok(_) = std::io::BufReader::new(file).read_line(&mut line) else {
+                    continue;
+                };
+                line
+            };
+            let mut shebang_seen = false;
+            if python_shebang(&first_line) {
+                shebang_seen = true;
+                offenders.push(format!(
+                    "{rel}:1: Python interpreter shebang: {}",
+                    first_line.trim()
+                ));
             }
             if !python_tooling_path(rel) {
                 continue;
@@ -9826,7 +9888,16 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
                 continue;
             };
             for (number, line) in text.lines().enumerate() {
-                if python_invocation(line) {
+                if number == 0 && shebang_seen {
+                    continue;
+                }
+                if absolute_python_path(line) {
+                    offenders.push(format!(
+                        "{rel}:{}: absolute Python interpreter path in repository tooling: {}",
+                        number + 1,
+                        line.trim()
+                    ));
+                } else if python_invocation(line) {
                     offenders.push(format!(
                         "{rel}:{}: Python invocation in repository tooling: {}",
                         number + 1,
@@ -9854,36 +9925,50 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         let dir =
             std::env::temp_dir().join(format!("faktor-no-python-proof-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("scripts")).unwrap();
-        std::fs::write(dir.join("scripts/planted.py"), "print('x')\n").unwrap();
-        // The constraint is repository-wide, not tooling-directory-only: a
-        // committed `.py` fixture outside scripts/ is equally refused.
-        std::fs::create_dir_all(dir.join("crates/fixtures")).unwrap();
-        std::fs::write(
-            dir.join("crates/fixtures/planted_fixture.py"),
-            "assert True\n",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join("scripts/planted.sh"),
+        let write = |rel: &str, text: &str| {
+            let path = dir.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap_or(Path::new("."))).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        // Class 1: a committed `.py` source in repository tooling.
+        write("scripts/planted.py", "print('x')\n");
+        // Class 2: a committed `.py` fixture outside tooling paths.
+        write("crates/fixtures/planted_fixture.py", "assert True\n");
+        // Class 3: a relative interpreter invocation in a workflow/document.
+        write(
+            "scripts/planted.sh",
             "#!/bin/sh\npython3 scripts/planted.py\n",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join("scripts/planted-var.sh"),
-            "#!/bin/sh\nINTERPRETER=python\n",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join("scripts/clean.sh"),
-            "#!/bin/sh\ntarget/release/faktor-ci-tools iana-table --check\n",
-        )
-        .unwrap();
+        );
+        // Class 4: an absolute interpreter path, including the macOS
+        // `/usr/bin/python3` shape this scanner exists to refuse.
+        write(
+            ".woodpecker/planted.yaml",
+            "steps:\n  - run: /usr/bin/python3 scripts/planted.py\n",
+        );
+        // Class 5: a version-suffixed `python2` token the old scan missed.
+        write(
+            "scripts/planted-legacy.sh",
+            "#!/bin/sh\npython2 scripts/planted.py\n",
+        );
+        // Class 6: an interpreter shebang in a file OUTSIDE the tooling
+        // directories — the file is runnable Python wherever it lives.
+        write(
+            "apps/vscode/planted-helper",
+            "#!/usr/bin/env python3\nprint('x')\n",
+        );
+        // A clean file: `cpython` is prose, never a token boundary, and the
+        // sanctioned probe is Rust.
+        write(
+            "scripts/clean.sh",
+            "#!/usr/bin/env bash\n# cpython is a user-language note, not tooling.\ntarget/release/faktor-ci-tools tcp-connect --port 1\n",
+        );
         let files = [
             "scripts/planted.py",
             "crates/fixtures/planted_fixture.py",
             "scripts/planted.sh",
-            "scripts/planted-var.sh",
+            ".woodpecker/planted.yaml",
+            "scripts/planted-legacy.sh",
+            "apps/vscode/planted-helper",
             "scripts/clean.sh",
         ]
         .map(str::to_string)
@@ -9896,7 +9981,8 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         assert!(
             offenders
                 .iter()
-                .any(|item| item.contains("crates/fixtures/planted_fixture.py")),
+                .any(|item| item.contains("crates/fixtures/planted_fixture.py")
+                    && item.contains("source file or fixture")),
             "a planted .py fixture outside tooling paths must fire too: {offenders:#?}"
         );
         assert!(
@@ -9906,10 +9992,25 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
             "a planted python3 invocation must fire: {offenders:#?}"
         );
         assert!(
+            offenders.iter().any(|item| {
+                item.contains(".woodpecker/planted.yaml")
+                    && item.contains("absolute Python interpreter path")
+                    && item.contains("/usr/bin/python3")
+            }),
+            "a planted absolute /usr/bin/python3 invocation must fire as its own class: {offenders:#?}"
+        );
+        assert!(
             offenders
                 .iter()
-                .any(|item| item.contains("INTERPRETER=python")),
-            "a planted python alias must fire: {offenders:#?}"
+                .any(|item| item.contains("planted-legacy.sh") && item.contains("python2")),
+            "a planted version-suffixed python2 invocation must fire: {offenders:#?}"
+        );
+        assert!(
+            offenders.iter().any(|item| {
+                item.contains("apps/vscode/planted-helper")
+                    && item.contains("Python interpreter shebang")
+            }),
+            "a planted interpreter shebang outside tooling paths must fire: {offenders:#?}"
         );
         assert!(
             !offenders.iter().any(|item| item.contains("clean.sh")),
@@ -11216,5 +11317,113 @@ fn derives_the_exact_owner_key() {
                 .iter()
                 .all(|offender| !offender.contains("forbidden"))
         );
+    }
+
+    /// The invoice authority is Faktor's `payment_invoice` store. Provider
+    /// invoice/payment/refund objects are linked observations only, and every
+    /// route/CLI read goes through `PaymentService` (never a table or a
+    /// provider-object read).
+    fn invoice_authority_offenders(rel: &str, src: &str) -> Vec<String> {
+        let rel = normalize_rel(rel);
+        let mut offenders = Vec::new();
+        let store = "crates/payments/src/store.rs";
+        if rel != store && rel.starts_with("crates/payments/src/") {
+            for needle in [
+                "FROM payment_invoice",
+                "INTO payment_invoice",
+                "UPDATE payment_invoice",
+                "FROM payment_provider_invoice",
+                "FROM payment_provider_payment",
+                "FROM payment_provider_refund",
+            ] {
+                if src.contains(needle) {
+                    offenders.push(format!(
+                        "{rel}: invoice persistence escaped the store ({needle})"
+                    ));
+                }
+            }
+        }
+        if !rel.starts_with("crates/payments/src/") {
+            for needle in [
+                "payment_invoice",
+                "payment_provider_object",
+                "payment_provider_invoice",
+                "payment_provider_payment",
+                "payment_provider_refund",
+            ] {
+                if src.contains(needle) {
+                    offenders.push(format!("{rel}: competing invoice truth via {needle}"));
+                }
+            }
+        }
+        if rel == "crates/server/src/native/billing_payments.rs" {
+            if !src.contains(".invoice(") || !src.contains(".invoices(") {
+                offenders.push(format!(
+                    "{rel}: invoice routes must read PaymentService truth"
+                ));
+            }
+            if !src.contains(".reconcile(") {
+                offenders.push(format!(
+                    "{rel}: reconciliation route must call PaymentService"
+                ));
+            }
+        }
+        if rel == "crates/cli/src/billing_cli.rs" {
+            if !src.contains(".invoice(") || !src.contains(".invoices(") {
+                offenders.push(format!("{rel}: invoice CLI must read PaymentService truth"));
+            }
+            if !src.contains(".reconcile(") {
+                offenders.push(format!(
+                    "{rel}: reconciliation CLI must call PaymentService"
+                ));
+            }
+        }
+        offenders
+    }
+
+    #[test]
+    fn invoice_truth_has_one_store_and_no_competing_read_path() {
+        let mut offenders = Vec::new();
+        let mut scanned = 0usize;
+        for rel in walk_crate_sources() {
+            let Ok(src) = std::fs::read_to_string(repo_root().join(&rel)) else {
+                continue;
+            };
+            scanned += 1;
+            offenders.extend(invoice_authority_offenders(&rel, &src));
+        }
+        assert!(scanned >= 100, "invoice authority scan walked nothing");
+        assert!(
+            offenders.is_empty(),
+            "competing invoice read path(s): {offenders:#?}"
+        );
+    }
+
+    #[test]
+    fn invoice_authority_scan_fires_on_planted_competing_paths() {
+        let planted = synthetic_file(
+            "crates/server/src/native/billing_payments.rs",
+            r#"fn native_billing_invoices() { let _ = "SELECT payload FROM payment_invoice"; }"#,
+        );
+        let offenders = invoice_authority_offenders(&planted.rel, planted.src);
+        assert!(
+            offenders
+                .iter()
+                .any(|o| o.contains("competing invoice truth")),
+            "{offenders:?}"
+        );
+        assert!(
+            offenders
+                .iter()
+                .any(|o| o.contains("must read PaymentService")),
+            "{offenders:?}"
+        );
+        let escaped = synthetic_file(
+            "crates/payments/src/service.rs",
+            r#"fn read() { let _ = "SELECT payload FROM payment_invoice"; }"#,
+        );
+        assert!(invoice_authority_offenders(&escaped.rel, escaped.src)
+            .iter()
+            .any(|o| o.contains("escaped the store")));
     }
 }

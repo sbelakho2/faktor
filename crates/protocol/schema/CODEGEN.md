@@ -67,6 +67,25 @@ until a review-visible edit of that list — while `generated`, `no-body` and
 | `POST /native/agents/{child_id}/steer` | handwritten-grandfathered |  |
 | `GET,POST /native/approvals` | handwritten-grandfathered |  |
 | `POST /native/approvals/{id}/decide` | handwritten-grandfathered |  |
+| `GET /native/billing/overview` | handwritten-grandfathered |  |
+| `POST /native/billing/subscription` | handwritten-grandfathered |  |
+| `POST /native/billing/subscription/cancel` | handwritten-grandfathered |  |
+| `GET,POST /native/billing/invoices` | handwritten-grandfathered |  |
+| `GET /native/billing/invoices/{id}` | handwritten-grandfathered |  |
+| `POST /native/billing/invoices/{id}/pay` | handwritten-grandfathered |  |
+| `POST /native/billing/reconcile` | handwritten-grandfathered |  |
+| `GET /native/billing/payments` | handwritten-grandfathered |  |
+| `GET,POST /native/billing/payment-methods` | handwritten-grandfathered |  |
+| `DELETE /native/billing/payment-methods/{id}` | handwritten-grandfathered |  |
+| `POST /native/billing/payment-methods/{id}/rotate` | handwritten-grandfathered |  |
+| `GET /native/billing/tax` | handwritten-grandfathered |  |
+| `POST /native/billing/subscribe` | handwritten-grandfathered |  |
+| `POST /native/billing/seats` | handwritten-grandfathered |  |
+| `POST /native/billing/plan` | handwritten-grandfathered |  |
+| `POST /native/billing/refunds` | handwritten-grandfathered |  |
+| `GET /native/billing/plan-preview` | handwritten-grandfathered |  |
+| `GET /native/billing/seat-preview` | handwritten-grandfathered |  |
+| `POST /native/billing/webhook` | handwritten-grandfathered |  |
 | `POST /native/credits/grant` | handwritten-grandfathered |  |
 | `GET,POST /native/enterprise/artifacts` | handwritten-grandfathered |  |
 | `POST /native/enterprise/artifacts/{id}/eligible` | no-body |  |
@@ -86,6 +105,8 @@ until a review-visible edit of that list — while `generated`, `no-body` and
 | `GET /native/health` | handwritten-grandfathered |  |
 | `GET /native/identity` | handwritten-grandfathered |  |
 | `GET /native/index/coverage` | handwritten-grandfathered |  |
+| `GET /native/lsp/diagnostics` | handwritten-grandfathered |  |
+| `POST /native/lsp/code-actions` | handwritten-grandfathered |  |
 | `POST /native/invitations/accept` | handwritten-grandfathered |  |
 | `GET /native/jobs/{id}` | handwritten-grandfathered |  |
 | `POST /native/jobs/{id}/result` | handwritten-grandfathered |  |
@@ -114,6 +135,9 @@ until a review-visible edit of that list — while `generated`, `no-body` and
 | `GET /native/session/{id}/attachments/ref/{ref_id}/bytes` | streaming-special-case |  |
 | `GET,POST /native/session/{id}/board` | handwritten-grandfathered |  |
 | `GET /native/session/{id}/checkpoints` | handwritten-grandfathered |  |
+| `GET /native/session/{id}/checkpoints/coverage` | handwritten-grandfathered |  |
+| `GET /native/session/{id}/queue` | handwritten-grandfathered |  |
+| `DELETE,PATCH /native/session/{id}/queue/{op}` | handwritten-grandfathered |  |
 | `GET /native/session/{id}/events` | streaming-special-case |  |
 | `POST /native/session/{id}/prompt` | generated | `SessionPromptRequest`, `SessionPromptReceipt` |
 | `GET,POST /native/session/{id}/task-runs` | generated | `TaskRun`, `TaskRunStartRequest`, `TaskRunStarted` |
@@ -150,6 +174,7 @@ until a review-visible edit of that list — while `generated`, `no-body` and
 | `POST /native/updater/stage` | handwritten-grandfathered |  |
 | `GET /native/updater/status` | handwritten-grandfathered |  |
 | `GET /native/usage` | handwritten-grandfathered |  |
+| `GET /native/usage/export` | streaming-special-case |  |
 | `GET /native/value-entitlements` | generated | `ValueEntitlementsReport`, `ValueEntitlementDecision`, `ValueGovernanceCapabilities` |
 | `GET /native/workers` | handwritten-grandfathered |  |
 | `POST /native/workers/{id}/heartbeat` | handwritten-grandfathered |  |
@@ -205,6 +230,12 @@ until a review-visible edit of that list — while `generated`, `no-body` and
 | `POST /native/mcp/servers/{id}/connect` | no-body |  |
 | `GET /native/mcp/servers/{id}/resources` | no-body |  |
 | `POST /native/mcp/servers/{id}/oauth/revoke` | no-body |  |
+| `POST /native/mcp/servers/{id}/oauth/login` | handwritten-grandfathered |  |
+| `POST /native/mcp/servers/{id}/oauth/connect` | handwritten-grandfathered |  |
+| `POST /native/mcp/servers/{id}/oauth/complete` | handwritten-grandfathered |  |
+| `GET,POST /native/mcp/servers/{id}/oauth/status` | handwritten-grandfathered |  |
+| `GET /native/mcp/servers/{id}/oauth/callback/{flow_id}` | no-body |  |
+| `POST /native/mcp/servers/{id}/oauth/logout` | handwritten-grandfathered |  |
 | `GET,POST /native/memory` | handwritten-grandfathered |  |
 | `GET,PUT /native/memory/policy` | handwritten-grandfathered |  |
 | `GET,POST /native/memory/records` | handwritten-grandfathered |  |
@@ -215,6 +246,7 @@ until a review-visible edit of that list — while `generated`, `no-body` and
 | `DELETE /native/memory/{kind}/{key}` | handwritten-grandfathered |  |
 | `GET /native/model-parameters` | handwritten-grandfathered |  |
 | `GET /native/models` | handwritten-grandfathered |  |
+| `POST /native/models/compare` | handwritten-grandfathered |  |
 | `POST /native/model-parameters/compile` | handwritten-grandfathered |  |
 | `GET /native/permissions/audit` | handwritten-grandfathered |  |
 | `GET /native/permissions/policy` | handwritten-grandfathered |  |
@@ -243,6 +275,8 @@ until a review-visible edit of that list — while `generated`, `no-body` and
 | `GET,POST /native/session/{id}/review/comments` | generated | `ReviewComment` |
 | `DELETE,PATCH /native/session/{id}/review/comments/{comment}` | generated | `ReviewComment` |
 | `POST /native/session/{id}/changes/accept` | generated | `ChangeAcceptReceipt` |
+| `GET /native/session/{id}/changes` | handwritten-grandfathered |  |
+| `POST /native/session/{id}/changes/accept-hunks` | handwritten-grandfathered |  |
 | `DELETE /native/session/{id}` | generated | `SessionDeleteTombstone` |
 | `POST /native/session/{id}/export` | generated | `SessionExport` |
 | `GET,PUT /native/session/{id}/settings` | generated | `SessionSettings` |
@@ -257,6 +291,16 @@ until a review-visible edit of that list — while `generated`, `no-body` and
 | `POST /native/session/{id}/context/preview` | handwritten-grandfathered |  |
 | `GET /native/session/{id}/efficiency` | handwritten-grandfathered |  |
 | `POST /native/session/{id}/fork` | handwritten-grandfathered |  |
+| `GET /native/session/{id}/lineage` | handwritten-grandfathered |  |
+| `GET,POST /native/session/{id}/plan` | handwritten-grandfathered |  |
+| `POST /native/session/{id}/plan/{version}/approve` | handwritten-grandfathered |  |
+| `GET,POST /native/session/{id}/worktrees` | handwritten-grandfathered |  |
+| `POST /native/session/{id}/worktrees/repair` | handwritten-grandfathered |  |
+| `DELETE /native/session/{id}/worktrees/{worktree_id}` | handwritten-grandfathered |  |
+| `POST /native/session/{id}/worktrees/{worktree_id}/validate` | handwritten-grandfathered |  |
+| `POST /native/session/{id}/worktrees/{worktree_id}/transfer` | handwritten-grandfathered |  |
+| `POST /native/session/{id}/repo/lock` | handwritten-grandfathered |  |
+| `DELETE /native/session/{id}/repo/lock/{token}` | handwritten-grandfathered |  |
 | `GET /native/sessions/parallel` | handwritten-grandfathered |  |
 | `GET,POST /native/sessions/{id}/meta` | handwritten-grandfathered |  |
 | `GET /native/skills` | handwritten-grandfathered |  |

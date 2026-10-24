@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}Approach — Faktor{% endblock %}
+{% block content %}
+
+<section class="page-hero shell" aria-labelledby="approach-title">
+  <div class="hero-copy">
+    <p class="kicker">Approach / Engineering loop</p>
+    <h1 class="page-title" id="approach-title">Define the finish.<br>Then make the change.</h1>
+    <p class="lead">A goal, a candidate and a visible evidence basis. Each part does a different job.</p>
+  </div>
+  <div class="metric-grid approach-metrics">
+    <article class="metric-card">
+      <p class="kicker">01 / INTENT</p>
+      <h2 class="h3">Compile the task.</h2>
+      <p>Keep the goal, criteria, invariants, risks and proof obligations together before work starts.</p>
+    </article>
+    <article class="metric-card">
+      <p class="kicker">02 / PLAN</p>
+      <h2 class="h3">Order the work.</h2>
+      <p>A task graph records dependencies and makes the plan inspectable.</p>
+    </article>
+    <article class="metric-card">
+      <p class="kicker">03 / CANDIDATE</p>
+      <h2 class="h3">Separate the edit.</h2>
+      <p>Transactions, checkpoints and isolated candidates bound changes before integration.</p>
+    </article>
+  </div>
+  <p class="kicker next-label indent-label">The completion chain</p>
+</section>
+
+<section class="section shell approach-chain" aria-labelledby="chain-title">
+  <div class="indent-block">
+    <h2 class="h2" id="chain-title">A green result has a scope.</h2>
+    <p class="lead">Required-check acceptance, claim evidence, integration and requested finish actions stay distinct. A result for an earlier candidate cannot certify a different landed state.</p>
+    <ol class="chain-list">
+      <li><span class="num">1.</span><p><strong>Required acceptance.</strong> Every required result must be present and pass. Missing evidence stays Pending; a failure stays Fail.</p></li>
+      <li><span class="num">2.</span><p><strong>Claim evidence.</strong> Name the claim and the candidate snapshot. Unavailable means no verdict; refusal is a separate outcome.</p></li>
+      <li><span class="num">3.</span><p><strong>Integration.</strong> Keep verified and landed identities visible. Recheck a state that differs from the verified candidate.</p></li>
+      <li><span class="num">4.</span><p><strong>Finish actions.</strong> Local changes, commit, push and native pull request are user choices with durable outcomes.</p></li>
+    </ol>
+    <p class="body-note">The outcome ledger counts a verified change when it is accepted and integrated with a deterministic-checks final basis. A passing empty check set does not establish that condition.</p>
+    <div class="section-block">
+      <h2 class="h2">One workflow in the host.</h2>
+      <p class="lead">Work keeps conversation and the current task in front. Inspect exposes the plan, agents and evidence. History holds outcomes. IDE surfaces inherit their editor’s typography and theme.</p>
+    </div>
+    <div class="section-block">
+      <h2 class="h2">Start from the source.</h2>
+      <p class="lead">The source workspace includes the native Rust runtime, CLI, VS Code and JetBrains surfaces. Optional providers do not become product dependencies.</p>
+      <div class="btn-row"><a class="btn btn-ink" href="https://github.com/sbelakho2/faktor">Open the repository ↗</a><a class="btn btn-outline" href="/documentation/">Explore the example</a></div>
+    </div>
+  </div>
+</section>
+
+<section class="section shell approach-contract" aria-labelledby="contract-title">
+  <p class="kicker">Explore the contract</p>
+  <h2 class="h2" id="contract-title">A complete route through the work.</h2>
+  <nav class="link-rows" aria-label="Explore the contract">
+    <a href="/evidence/">Evidence and completion <span aria-hidden="true">↗</span></a>
+    <a href="/outcomes/">Outcome and cost definitions <span aria-hidden="true">↗</span></a>
+    <a href="/workflow/">Runtime and provider configuration <span aria-hidden="true">↗</span></a>
+    <a href="/editor/">VS Code and JetBrains design <span aria-hidden="true">↗</span></a>
+  </nav>
+</section>
+
+{% endblock %}

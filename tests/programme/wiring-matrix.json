@@ -214,6 +214,18 @@
       "state": "unwired",
       "reason": "billing/invoice administration endpoint; the Faktor-owned IDE panels do not yet expose invoice, seat or tax management, and the same PaymentService is driven by `faktor billing` and its lifecycle tests."
     },
+    "DELETE /native/billing/payment-methods/{id}": {
+      "state": "unwired",
+      "reason": "billing/invoice administration endpoint; the Faktor-owned IDE panels do not yet expose invoice, seat or tax management, and the same PaymentService is driven by `faktor billing` and its lifecycle tests."
+    },
+    "POST /native/billing/payment-methods/{id}/rotate": {
+      "state": "unwired",
+      "reason": "billing/invoice administration endpoint; the Faktor-owned IDE panels do not yet expose invoice, seat or tax management, and the same PaymentService is driven by `faktor billing` and its lifecycle tests."
+    },
+    "POST /native/billing/reconcile": {
+      "state": "unwired",
+      "reason": "billing/invoice administration endpoint; the Faktor-owned IDE panels do not yet expose invoice, seat or tax management, and the same PaymentService is driven by `faktor billing` and its lifecycle tests."
+    },
     "POST /native/billing/plan": {
       "state": "unwired",
       "reason": "billing/invoice administration endpoint; the Faktor-owned IDE panels do not yet expose invoice, seat or tax management, and the same PaymentService is driven by `faktor billing` and its lifecycle tests."

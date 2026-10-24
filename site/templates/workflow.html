@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}Runtime and providers — Faktor{% endblock %}
+{% block content %}
+
+<section class="page-hero shell" aria-labelledby="workflow-title">
+  <div class="hero-copy">
+    <p class="kicker">Runtime / Provider configuration</p>
+    <h1 class="page-title" id="workflow-title">The workflow stays yours.<br>The model is a choice.</h1>
+    <p class="lead">Connect the runtime deliberately, then keep model and optional service configuration separate from the engineering contract.</p>
+  </div>
+  <p class="kicker next-label indent-label">Before the first run</p>
+</section>
+
+<section class="section shell" aria-labelledby="readiness-title">
+  <h2 class="h2" id="readiness-title">Make readiness legible.</h2>
+  <ol class="workflow-list">
+    <li><span class="num">01</span><div><h3>Locate the binary.</h3><p>Show the configured path, discovery result and executable readiness. A bare checksum match means it matches the recorded checksum; it is different from a signed launcher’s signature verification.</p></div></li>
+    <li><span class="num">02</span><div><h3>Bind the project and daemon.</h3><p>Explain project scope, transport and autostart state. A disconnected daemon is a connectivity condition, not a failed verification verdict.</p></div></li>
+    <li><span class="num">03</span><div><h3>Configure the chosen model.</h3><p>Keep local or hosted provider details in settings. Secrets remain masked, and diagnostic copies redact credentials.</p></div></li>
+    <li><span class="num">04</span><div><h3>Inspect optional adapters.</h3><p>Optional intelligence and verification providers enrich neutral interfaces. The native baseline does not acquire a sibling-product dependency.</p></div></li>
+  </ol>
+  <p class="kicker next-label">Where the editor puts the detail</p>
+</section>
+
+<section class="section shell" aria-labelledby="detail-title">
+  <h2 class="h2" id="detail-title">Keep Work uncluttered.</h2>
+  <div class="two-col detail-columns">
+    <div>
+      <h3 class="column-title">Work</h3>
+      <p>Conversation, current run, scoped requests and composer. A short configuration status belongs beside the task; raw URLs, cursors and transport details belong in diagnostics.</p>
+    </div>
+    <div>
+      <h3 class="column-title">Settings and diagnostics</h3>
+      <p>Binary discovery, daemon lifecycle, provider readiness and redacted support details. Name the failed seam and the next safe recovery action.</p>
+    </div>
+  </div>
+  <p class="link-line"><a class="link-arrow" href="/editor/">Explore the configuration and diagnostics states →</a></p>
+</section>
+
+{% endblock %}

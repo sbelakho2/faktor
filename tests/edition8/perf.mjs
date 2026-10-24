@@ -12,6 +12,10 @@
 //   terminal-buffer    100k lines through a fixed ring buffer, cap + ratio
 //   patch-build        10 vs 200 staged controls, linear per-control cost
 //   refresh-coalescing 100 vs 10,000 frames -> the same bounded runs
+//   transcript-100k    100k-message durable transcript page under the cap
+//   screen-open-72     open every one of the 72 screens sequentially
+//   screen-diff-72     render a diff on every one of the 72 screens
+//   concurrent-16-sessions  16 live sessions advance together
 //
 // Bound: p95 <= 1.25x the committed per-platform baseline (floor 0.25 ms for
 // sub-millisecond noise); 3 runs, median. Missing baseline is never a pass.

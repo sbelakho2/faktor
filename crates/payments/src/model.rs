@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::authority::{InvoiceReconciliationState, ReconciliationSummary};
 use crate::catalog::{BillingInterval, PlanPrice, TaxRate};
 
 /// The lifecycle state of a paid subscription.
@@ -44,6 +45,19 @@ impl SubscriptionState {
             SubscriptionState::Trialing | SubscriptionState::Active | SubscriptionState::PastDue
         )
     }
+
+    /// Provider events arrive at-least-once and possibly late. A canceled
+    /// subscription is terminal and a live subscription never regresses to
+    /// the pre-payment trial state.
+    pub fn can_transition_to(self, next: Self) -> bool {
+        match self {
+            SubscriptionState::Canceled => matches!(next, SubscriptionState::Canceled),
+            SubscriptionState::Active | SubscriptionState::PastDue => {
+                !matches!(next, SubscriptionState::Trialing)
+            }
+            SubscriptionState::Trialing => true,
+        }
+    }
 }
 
 /// One durable paid subscription.
@@ -54,6 +68,16 @@ pub struct PaymentSubscription {
     pub organization_id: String,
     pub customer_id: String,
     pub provider_subscription_id: String,
+    /// Durable provider item identity used for every later update (Stripe
+    /// `subscription_item` id). Never recomputed from local plan data.
+    #[serde(default)]
+    pub provider_item_id: Option<String>,
+    /// Durable provider product identity used by inline `price_data`.
+    #[serde(default)]
+    pub provider_product_id: Option<String>,
+    /// Durable provider price identity returned with the subscription.
+    #[serde(default)]
+    pub provider_price_id: Option<String>,
     pub plan_id: String,
     pub interval: BillingInterval,
     pub quantity: u32,
@@ -97,22 +121,31 @@ pub struct PaymentCustomer {
     pub created_ms: i64,
 }
 
-/// A stored payment method. The token is a provider token (or a local opaque
-/// placeholder); the raw PAN is never accepted, never stored and never
-/// serialized to a route.
+/// A stored payment method. This type is deliberately token-free: the
+/// provider token exists only as vault ciphertext in
+/// [`StoredPaymentMethod`] and is never serialized to a route, export, log
+/// or UI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct PaymentMethod {
     pub id: String,
     pub organization_id: String,
     pub provider: String,
-    pub token: String,
     pub brand: String,
     pub last4: String,
     pub exp_month: u8,
     pub exp_year: u16,
     pub is_default: bool,
     pub created_ms: i64,
+}
+
+/// The at-rest payment-method row. `token_ciphertext` is AEAD-sealed vault
+/// material bound to `(organization_id, id)`; plaintext never enters the
+/// store and the row is never rendered on a wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredPaymentMethod {
+    #[serde(flatten)]
+    pub method: PaymentMethod,
+    pub token_ciphertext: String,
 }
 
 /// The safe wire projection of a payment method.
@@ -126,6 +159,12 @@ pub struct PaymentMethodView {
     pub exp_year: u16,
     pub is_default: bool,
     pub created_ms: i64,
+}
+
+impl From<&StoredPaymentMethod> for PaymentMethodView {
+    fn from(stored: &StoredPaymentMethod) -> Self {
+        Self::from(&stored.method)
+    }
 }
 
 impl From<&PaymentMethod> for PaymentMethodView {
@@ -182,6 +221,32 @@ impl InvoiceStatus {
     pub const fn is_open(self) -> bool {
         matches!(self, InvoiceStatus::Open | InvoiceStatus::PastDue)
     }
+
+    /// `paid`, `void` and `uncollectible` are terminal. A late provider
+    /// event can never reopen a settled invoice.
+    pub fn can_transition_to(self, next: Self) -> bool {
+        match self {
+            InvoiceStatus::Draft => true,
+            InvoiceStatus::Open => matches!(
+                next,
+                InvoiceStatus::Open
+                    | InvoiceStatus::PastDue
+                    | InvoiceStatus::Paid
+                    | InvoiceStatus::Void
+                    | InvoiceStatus::Uncollectible
+            ),
+            InvoiceStatus::PastDue => matches!(
+                next,
+                InvoiceStatus::PastDue
+                    | InvoiceStatus::Paid
+                    | InvoiceStatus::Void
+                    | InvoiceStatus::Uncollectible
+            ),
+            InvoiceStatus::Paid => matches!(next, InvoiceStatus::Paid),
+            InvoiceStatus::Void => matches!(next, InvoiceStatus::Void),
+            InvoiceStatus::Uncollectible => matches!(next, InvoiceStatus::Uncollectible),
+        }
+    }
 }
 
 /// The exact line-item kinds.
@@ -232,6 +297,16 @@ pub struct Invoice {
     pub number: String,
     pub subscription_id: Option<String>,
     pub provider_invoice_id: Option<String>,
+    /// The exact provider idempotency key used to create the linked provider
+    /// invoice. Reconciliation can look the operation up by this key when the
+    /// provider cannot fetch by invoice id.
+    #[serde(default)]
+    pub provider_idempotency_key: Option<String>,
+    /// The provider observation state for this invoice. `Unreconciled` on
+    /// every pre-observation row (and every new row until an observation is
+    /// recorded).
+    #[serde(default)]
+    pub reconciliation: InvoiceReconciliationState,
     pub currency: String,
     pub status: InvoiceStatus,
     pub lines: Vec<InvoiceLine>,
@@ -262,10 +337,15 @@ impl Invoice {
     }
 }
 
-/// Payment state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Payment state. Provider `processing`, `requires_action` and `pending`
+/// answers are durable transient states: they are never reported as
+/// succeeded and never settle an invoice or a subscription.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PaymentStatus {
+    Pending,
+    Processing,
+    RequiresAction,
     Succeeded,
     PartiallyRefunded,
     Refunded,
@@ -275,12 +355,115 @@ pub enum PaymentStatus {
 impl PaymentStatus {
     pub const fn as_str(self) -> &'static str {
         match self {
+            PaymentStatus::Pending => "pending",
+            PaymentStatus::Processing => "processing",
+            PaymentStatus::RequiresAction => "requires_action",
             PaymentStatus::Succeeded => "succeeded",
             PaymentStatus::PartiallyRefunded => "partially_refunded",
             PaymentStatus::Refunded => "refunded",
             PaymentStatus::Failed => "failed",
         }
     }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        Some(match raw {
+            "pending" => PaymentStatus::Pending,
+            "processing" => PaymentStatus::Processing,
+            "requires_action" => PaymentStatus::RequiresAction,
+            "succeeded" => PaymentStatus::Succeeded,
+            "partially_refunded" => PaymentStatus::PartiallyRefunded,
+            "refunded" => PaymentStatus::Refunded,
+            "failed" => PaymentStatus::Failed,
+            _ => return None,
+        })
+    }
+
+    /// True only when the provider has confirmed that money moved.
+    pub const fn is_settled(self) -> bool {
+        matches!(
+            self,
+            PaymentStatus::Succeeded | PaymentStatus::PartiallyRefunded | PaymentStatus::Refunded
+        )
+    }
+
+    /// True for a provider answer that has not settled yet.
+    pub const fn is_transient(self) -> bool {
+        matches!(
+            self,
+            PaymentStatus::Pending | PaymentStatus::Processing | PaymentStatus::RequiresAction
+        )
+    }
+
+    /// Monotonic payment-state order: a settled or failed payment never
+    /// regresses to a provider-transient state.
+    pub fn can_transition_to(self, next: Self) -> bool {
+        match self {
+            PaymentStatus::Pending => matches!(
+                next,
+                PaymentStatus::Processing
+                    | PaymentStatus::RequiresAction
+                    | PaymentStatus::Succeeded
+                    | PaymentStatus::Failed
+            ),
+            PaymentStatus::Processing | PaymentStatus::RequiresAction => matches!(
+                next,
+                PaymentStatus::Pending
+                    | PaymentStatus::Processing
+                    | PaymentStatus::RequiresAction
+                    | PaymentStatus::Succeeded
+                    | PaymentStatus::Failed
+            ),
+            PaymentStatus::Succeeded => {
+                matches!(
+                    next,
+                    PaymentStatus::PartiallyRefunded | PaymentStatus::Refunded
+                )
+            }
+            PaymentStatus::PartiallyRefunded => matches!(next, PaymentStatus::Refunded),
+            PaymentStatus::Refunded | PaymentStatus::Failed => false,
+        }
+    }
+}
+
+/// Refund truth. A provider `pending`/`processing` refund is durable but
+/// unsettled; a failed refund never touches the payment or invoice ledger.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RefundStatus {
+    #[default]
+    Pending,
+    Succeeded,
+    Failed,
+}
+
+impl RefundStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            RefundStatus::Pending => "pending",
+            RefundStatus::Succeeded => "succeeded",
+            RefundStatus::Failed => "failed",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        Some(match raw {
+            "pending" | "processing" | "requires_action" => RefundStatus::Pending,
+            "succeeded" => RefundStatus::Succeeded,
+            "failed" | "canceled" => RefundStatus::Failed,
+            _ => return None,
+        })
+    }
+
+    /// Pending refunds may only resolve to a terminal provider truth.
+    pub fn can_transition_to(self, next: Self) -> bool {
+        matches!(self, RefundStatus::Pending) && !matches!(next, RefundStatus::Pending)
+    }
+}
+
+fn legacy_refund_status() -> RefundStatus {
+    RefundStatus::Succeeded
 }
 
 /// One successful charge.
@@ -311,6 +494,16 @@ pub struct Refund {
     pub amount_minor: i64,
     pub currency: String,
     pub reason: String,
+    /// Rows written before the status field existed only existed after a
+    /// successful provider refund, so their legacy default is succeeded.
+    #[serde(default = "legacy_refund_status")]
+    pub status: RefundStatus,
+    /// Set exactly once, in the same transaction that settles the refund.
+    #[serde(default)]
+    pub credit_note_id: Option<String>,
+    /// The Faktor invoice line this refund/credit note is bound to.
+    #[serde(default)]
+    pub invoice_line_seq: Option<u32>,
     pub created_ms: i64,
 }
 
@@ -326,6 +519,9 @@ pub struct CreditNote {
     pub amount_minor: i64,
     pub currency: String,
     pub reason: String,
+    /// The Faktor invoice line this credit note is bound to.
+    #[serde(default)]
+    pub invoice_line_seq: Option<u32>,
     pub created_ms: i64,
 }
 
@@ -409,7 +605,9 @@ pub struct PayInvoiceOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RefundOutcome {
     pub refund: Refund,
-    pub credit_note: CreditNote,
+    /// Present only once the provider confirmed the refund (and therefore
+    /// the credit note was allocated and settled in the same transaction).
+    pub credit_note: Option<CreditNote>,
     pub payment: Payment,
     pub invoice: Invoice,
     pub replayed: bool,
@@ -503,6 +701,9 @@ pub struct PaymentsOverview {
     pub open_invoice_count: u64,
     pub outstanding_minor: i64,
     pub paid_minor: i64,
+    /// Counts of the Faktor invoices' provider-reconciliation states. Never
+    /// derived from provider totals.
+    pub reconciliation: ReconciliationSummary,
     pub payment_method_count: u64,
     pub tax: TaxSurface,
     pub payment: CapabilityStatus,
@@ -513,6 +714,158 @@ pub struct PaymentsOverview {
     pub now_ms: i64,
 }
 
+/// The kind of financial resource a provider operation mutates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FinancialResourceType {
+    Customer,
+    Subscription,
+    Invoice,
+    Payment,
+    Refund,
+    Checkout,
+}
+
+impl FinancialResourceType {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            FinancialResourceType::Customer => "customer",
+            FinancialResourceType::Subscription => "subscription",
+            FinancialResourceType::Invoice => "invoice",
+            FinancialResourceType::Payment => "payment",
+            FinancialResourceType::Refund => "refund",
+            FinancialResourceType::Checkout => "checkout",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        Some(match raw {
+            "customer" => FinancialResourceType::Customer,
+            "subscription" => FinancialResourceType::Subscription,
+            "invoice" => FinancialResourceType::Invoice,
+            "payment" => FinancialResourceType::Payment,
+            "refund" => FinancialResourceType::Refund,
+            "checkout" => FinancialResourceType::Checkout,
+            _ => return None,
+        })
+    }
+}
+
+/// The durable dispatch state of one external provider operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationClaimState {
+    /// Durably claimed, no provider call has been authorized yet.
+    Claimed,
+    /// The process crossed the provider boundary. A crash here is unknown.
+    Dispatched,
+    /// Dispatch happened but the outcome was not committed: reconcile with
+    /// the provider; never dispatch again with this idempotency key.
+    Unknown,
+    Succeeded,
+    Failed,
+}
+
+impl OperationClaimState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            OperationClaimState::Claimed => "claimed",
+            OperationClaimState::Dispatched => "dispatched",
+            OperationClaimState::Unknown => "unknown",
+            OperationClaimState::Succeeded => "succeeded",
+            OperationClaimState::Failed => "failed",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        Some(match raw {
+            "claimed" => OperationClaimState::Claimed,
+            "dispatched" => OperationClaimState::Dispatched,
+            "unknown" => OperationClaimState::Unknown,
+            "succeeded" => OperationClaimState::Succeeded,
+            "failed" => OperationClaimState::Failed,
+            _ => return None,
+        })
+    }
+
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            OperationClaimState::Succeeded | OperationClaimState::Failed
+        )
+    }
+
+    pub const fn is_in_flight(self) -> bool {
+        matches!(
+            self,
+            OperationClaimState::Claimed | OperationClaimState::Dispatched
+        )
+    }
+}
+
+/// One durable operation claim, keyed by
+/// `(organization_id, idempotency_key)` and bound to one resource tuple
+/// `(organization, resource_type, resource_id)` and request digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationClaim {
+    pub organization_id: String,
+    pub idempotency_key: String,
+    pub operation: String,
+    pub resource_type: FinancialResourceType,
+    pub resource_id: String,
+    pub request_digest: String,
+    /// The deterministic key sent to the provider for this operation; the
+    /// reconciliation path looks up exactly this object and never creates
+    /// a new one.
+    pub provider_idempotency_key: String,
+    pub state: OperationClaimState,
+    /// Sanitized, non-secret operation context used only to rebuild the
+    /// local transaction after provider reconciliation.
+    #[serde(default)]
+    pub context: String,
+    pub response: Option<String>,
+    pub failure_code: Option<String>,
+    pub failure_message: Option<String>,
+    pub created_ms: i64,
+    pub dispatched_ms: Option<i64>,
+    pub resolved_ms: Option<i64>,
+    pub updated_ms: i64,
+}
+
+impl OperationClaim {
+    pub fn is_replayable(&self) -> bool {
+        self.state.is_terminal() && self.response.is_some()
+    }
+}
+
+/// A request to acquire one operation claim, committed before any dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationClaimDraft {
+    pub organization_id: String,
+    pub idempotency_key: String,
+    pub operation: String,
+    pub resource_type: FinancialResourceType,
+    pub resource_id: String,
+    pub request_digest: String,
+    pub provider_idempotency_key: String,
+    pub context: String,
+    pub created_ms: i64,
+}
+
+/// The result of acquiring a claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimAcquisition {
+    /// This caller is the only one allowed to dispatch.
+    Acquired,
+    /// Another caller holds the claim and may be at the provider boundary.
+    InFlight(OperationClaim),
+    /// A crash left the provider outcome unknown; reconciliation is required.
+    Unresolved(OperationClaim),
+    /// The operation already reached a recorded terminal outcome.
+    Recorded(OperationClaim),
+}
+
 /// Webhook processing disposition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -521,6 +874,10 @@ pub enum WebhookDisposition {
     Duplicate,
     StaleIgnored,
     Ignored,
+    /// The provider reported an invoice amount/currency that disagrees with
+    /// the Faktor invoice. The observation is durable and the Faktor totals
+    /// are unchanged; operator reconciliation is required.
+    ReconciliationConflict,
 }
 
 /// The result of one verified webhook delivery.

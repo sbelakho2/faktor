@@ -574,6 +574,8 @@ pub struct BillingPaymentsCfg {
     pub dunning: Option<BillingDunningCfg>,
     #[serde(default)]
     pub stripe: Option<BillingStripeCfg>,
+    #[serde(default)]
+    pub adyen: Option<BillingAdyenCfg>,
 }
 
 /// One exact plan price in one currency (integer minor units).
@@ -639,6 +641,22 @@ pub struct BillingStripeCfg {
     pub user_agent: Option<String>,
 }
 
+/// The Adyen adapter's environment-variable references.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BillingAdyenCfg {
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    #[serde(default)]
+    pub webhook_hmac_key_env: Option<String>,
+    #[serde(default)]
+    pub merchant_account: Option<String>,
+    #[serde(default)]
+    pub user_agent: Option<String>,
+}
+
 /// The default payment database file name.
 pub const DEFAULT_PAYMENTS_DATABASE: &str = "payments.db";
 /// The default local webhook secret environment variable.
@@ -685,9 +703,10 @@ impl BillingPaymentsCfg {
         let provider = match self.provider.as_deref().unwrap_or("local") {
             "local" => faktor_payments::ProviderKind::Local,
             "stripe" => faktor_payments::ProviderKind::Stripe,
+            "adyen" => faktor_payments::ProviderKind::Adyen,
             other => {
                 return Err(format!(
-                    "billing payments: unknown provider {other:?} (local|stripe)"
+                    "billing payments: unknown provider {other:?} (local|stripe|adyen)"
                 ))
             }
         };
@@ -765,6 +784,24 @@ impl BillingPaymentsCfg {
                 stripe.user_agent = agent.clone();
             }
         }
+        let mut adyen = faktor_payments::AdyenConfig::default();
+        if let Some(cfg) = &self.adyen {
+            if let Some(base_url) = &cfg.base_url {
+                adyen.base_url = base_url.clone();
+            }
+            if let Some(env) = &cfg.api_key_env {
+                adyen.api_key_env = env.clone();
+            }
+            if let Some(env) = &cfg.webhook_hmac_key_env {
+                adyen.webhook_hmac_key_env = env.clone();
+            }
+            if let Some(account) = &cfg.merchant_account {
+                adyen.merchant_account = account.clone();
+            }
+            if let Some(agent) = &cfg.user_agent {
+                adyen.user_agent = agent.clone();
+            }
+        }
         let webhook_secret_env = self
             .webhook_secret_env
             .clone()
@@ -775,7 +812,9 @@ impl BillingPaymentsCfg {
             tax,
             dunning,
             webhook_secret_env,
+            vault_key_env: faktor_payments::catalog::default_vault_key_env(),
             stripe,
+            adyen,
         };
         config
             .validate()
@@ -950,6 +989,29 @@ mod tests {
         assert_eq!(runtime.stripe.api_key_env, "MY_STRIPE_KEY");
         assert_eq!(runtime.stripe.webhook_secret_env, "MY_HOOK");
         assert!(!format!("{runtime:?}").contains("sk_live"));
+    }
+
+    #[test]
+    fn payments_adyen_uses_env_names_and_exact_adapter_fields() {
+        let cfg = enabled(
+            r#"{"enabled":true,"organization":"o","plans":{"p":{"plan_id":"p","features":[],"limits":{}}},"payments":{"enabled":true,"provider":"adyen","adyen":{"base_url":"https://checkout-test.adyen.com/v72","api_key_env":"MY_ADYEN_KEY","webhook_hmac_key_env":"MY_ADYEN_HMAC","merchant_account":"MerchantX","user_agent":"faktor-test/1"}}}"#,
+        );
+        cfg.validate().unwrap();
+        let runtime = cfg.payments.unwrap().runtime_config(&cfg.plans).unwrap();
+        assert_eq!(runtime.provider, faktor_payments::ProviderKind::Adyen);
+        assert_eq!(
+            runtime.adyen.base_url,
+            "https://checkout-test.adyen.com/v72"
+        );
+        assert_eq!(runtime.adyen.api_key_env, "MY_ADYEN_KEY");
+        assert_eq!(runtime.adyen.webhook_hmac_key_env, "MY_ADYEN_HMAC");
+        assert_eq!(runtime.adyen.merchant_account, "MerchantX");
+        assert!(!format!("{runtime:?}").contains("AQE_"));
+
+        let rejected = enabled(
+            r#"{"enabled":true,"organization":"o","plans":{"p":{"plan_id":"p","features":[],"limits":{}}},"payments":{"enabled":true,"provider":"adyen","adyen":{"base_url":"ftp://x","api_key_env":"K","webhook_hmac_key_env":"H","merchant_account":"M"}}}"#,
+        );
+        assert!(rejected.validate().unwrap_err().contains("base_url"));
     }
 
     #[test]

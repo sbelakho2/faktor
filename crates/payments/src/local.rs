@@ -17,9 +17,11 @@ use crate::error::PaymentError;
 use crate::model::ProviderStatus;
 use crate::provider::{
     PaymentProvider, ProviderCancelRequest, ProviderChangePlanRequest, ProviderCharge,
-    ProviderChargeRequest, ProviderCustomer, ProviderCustomerRequest, ProviderInvoice,
-    ProviderInvoiceRequest, ProviderRefund, ProviderRefundRequest, ProviderSubscribeRequest,
-    ProviderSubscription, VerifiedWebhookEvent, WebhookHeaders,
+    ProviderChargeRequest, ProviderCheckout, ProviderCheckoutRequest, ProviderCustomer,
+    ProviderCustomerRequest, ProviderInvoice, ProviderInvoiceRequest, ProviderInvoiceSnapshot,
+    ProviderObjectKind, ProviderReconcileRequest, ProviderReconciled, ProviderRefund,
+    ProviderRefundRequest, ProviderSubscribeRequest, ProviderSubscription, VerifiedWebhookEvent,
+    WebhookHeaders,
 };
 use crate::secrets::SecretString;
 use crate::store::SqlitePaymentStore;
@@ -163,7 +165,7 @@ impl PaymentProvider for LocalPaymentProvider {
             &request.idempotency_key,
             "sub",
             |id| ProviderSubscription {
-                id,
+                id: id.clone(),
                 status: if request.trial_end_ms.is_some_and(|trial| trial > now) {
                     "trialing".into()
                 } else {
@@ -173,6 +175,9 @@ impl PaymentProvider for LocalPaymentProvider {
                 current_period_start_ms: start,
                 current_period_end_ms: end,
                 cancel_at_period_end: false,
+                item_id: Some(format!("{id}:item")),
+                product_id: Some(format!("{id}:product")),
+                price_id: Some(format!("{id}:price")),
             },
         )?;
         let encoded = serde_json::to_value(&subscription)
@@ -216,6 +221,9 @@ impl PaymentProvider for LocalPaymentProvider {
                     .now_ms()
                     .saturating_add(request.interval.period_ms()),
                 cancel_at_period_end: false,
+                item_id: Some(format!("{}:item", request.subscription_id)),
+                product_id: Some(format!("{}:product", request.subscription_id)),
+                price_id: Some(format!("{}:price", request.subscription_id)),
             }
         };
         subscription.quantity = request.quantity;
@@ -264,6 +272,9 @@ impl PaymentProvider for LocalPaymentProvider {
                 current_period_start_ms: self.clock.now_ms(),
                 current_period_end_ms: self.clock.now_ms(),
                 cancel_at_period_end: false,
+                item_id: Some(format!("{}:item", request.subscription_id)),
+                product_id: Some(format!("{}:product", request.subscription_id)),
+                price_id: Some(format!("{}:price", request.subscription_id)),
             });
         if request.at_period_end {
             subscription.cancel_at_period_end = true;
@@ -291,11 +302,30 @@ impl PaymentProvider for LocalPaymentProvider {
         Ok(subscription)
     }
 
+    async fn create_checkout(
+        &self,
+        request: ProviderCheckoutRequest,
+    ) -> Result<ProviderCheckout, PaymentError> {
+        self.object(
+            "checkout",
+            &request.organization_id,
+            &request.idempotency_key,
+            "cs",
+            |id| ProviderCheckout {
+                id,
+                status: "open".into(),
+                url: Some(format!("local://checkout/{}", request.organization_id)),
+                amount_minor: request.amount_minor,
+                currency: request.currency,
+            },
+        )
+    }
+
     async fn create_invoice(
         &self,
         request: ProviderInvoiceRequest,
     ) -> Result<ProviderInvoice, PaymentError> {
-        self.object(
+        let invoice = self.object(
             "invoice",
             &request.organization_id,
             &request.idempotency_key,
@@ -306,7 +336,48 @@ impl PaymentProvider for LocalPaymentProvider {
                 amount_minor: request.amount_minor,
                 currency: request.currency,
             },
-        )
+        )?;
+        let encoded = serde_json::to_value(&invoice)
+            .map_err(|e| PaymentError::Store(format!("local invoice encode: {e}")))?;
+        self.store.put_provider_object(
+            PROVIDER,
+            "invoice_by_id",
+            &request.organization_id,
+            &invoice.id,
+            &invoice.id,
+            &json!({"object": encoded}),
+        )?;
+        Ok(invoice)
+    }
+
+    async fn fetch_invoice(
+        &self,
+        provider_invoice_id: &str,
+    ) -> Result<ProviderInvoiceSnapshot, PaymentError> {
+        let payload = self
+            .store
+            .provider_object_by_object_id(PROVIDER, "invoice_by_id", provider_invoice_id)?
+            .or(self.store.provider_object_by_object_id(
+                PROVIDER,
+                "invoice",
+                provider_invoice_id,
+            )?);
+        let Some(payload) = payload else {
+            return Err(PaymentError::NotFound("provider invoice".into()));
+        };
+        let object = payload.get("object").cloned().unwrap_or(payload);
+        let invoice: ProviderInvoice = serde_json::from_value(object)
+            .map_err(|e| PaymentError::Store(format!("local provider invoice decoding: {e}")))?;
+        let paid = invoice.status == "paid";
+        Ok(ProviderInvoiceSnapshot {
+            id: invoice.id,
+            status: invoice.status,
+            amount_minor: invoice.amount_minor,
+            amount_paid_minor: if paid { invoice.amount_minor } else { 0 },
+            amount_refunded_minor: 0,
+            currency: invoice.currency,
+            paid_at_ms: paid.then(|| self.clock.now_ms()),
+        })
     }
 
     async fn charge(&self, request: ProviderChargeRequest) -> Result<ProviderCharge, PaymentError> {
@@ -362,6 +433,48 @@ impl PaymentProvider for LocalPaymentProvider {
             now_ms,
             DEFAULT_WEBHOOK_WINDOW_MS,
         )
+    }
+
+    async fn reconcile(
+        &self,
+        request: ProviderReconcileRequest,
+    ) -> Result<ProviderReconciled, PaymentError> {
+        let kind = match request.kind {
+            ProviderObjectKind::Customer => "customer",
+            ProviderObjectKind::Subscription => "subscription",
+            ProviderObjectKind::Change => "change",
+            ProviderObjectKind::Cancel => "cancel",
+            ProviderObjectKind::Invoice => "invoice",
+            ProviderObjectKind::Charge => "charge",
+            ProviderObjectKind::Refund => "refund",
+            ProviderObjectKind::Checkout => "checkout",
+        };
+        let Some((_id, payload)) = self.store.provider_object(
+            PROVIDER,
+            kind,
+            &request.organization_id,
+            &request.idempotency_key,
+        )?
+        else {
+            return Ok(ProviderReconciled::NotApplied);
+        };
+        let object = payload.get("object").cloned().unwrap_or(payload);
+        fn decode<T: serde::de::DeserializeOwned>(
+            value: serde_json::Value,
+        ) -> Result<T, PaymentError> {
+            serde_json::from_value(value)
+                .map_err(|e| PaymentError::Store(format!("local reconciliation decode: {e}")))
+        }
+        match request.kind {
+            ProviderObjectKind::Customer => Ok(ProviderReconciled::Customer(decode(object)?)),
+            ProviderObjectKind::Subscription
+            | ProviderObjectKind::Change
+            | ProviderObjectKind::Cancel => Ok(ProviderReconciled::Subscription(decode(object)?)),
+            ProviderObjectKind::Invoice => Ok(ProviderReconciled::Invoice(decode(object)?)),
+            ProviderObjectKind::Charge => Ok(ProviderReconciled::Charge(decode(object)?)),
+            ProviderObjectKind::Refund => Ok(ProviderReconciled::Refund(decode(object)?)),
+            ProviderObjectKind::Checkout => Ok(ProviderReconciled::Checkout(decode(object)?)),
+        }
     }
 }
 

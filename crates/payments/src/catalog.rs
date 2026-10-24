@@ -387,6 +387,7 @@ impl DunningConfig {
 pub enum ProviderKind {
     Local,
     Stripe,
+    Adyen,
 }
 
 impl ProviderKind {
@@ -394,6 +395,7 @@ impl ProviderKind {
         match self {
             ProviderKind::Local => "local",
             ProviderKind::Stripe => "stripe",
+            ProviderKind::Adyen => "adyen",
         }
     }
 
@@ -401,6 +403,7 @@ impl ProviderKind {
         Some(match raw {
             "local" => ProviderKind::Local,
             "stripe" => ProviderKind::Stripe,
+            "adyen" => ProviderKind::Adyen,
             _ => return None,
         })
     }
@@ -465,6 +468,73 @@ impl StripeConfig {
     }
 }
 
+/// The Adyen Checkout adapter configuration. Only environment-variable NAMES
+/// live here; the API key and webhook HMAC key are resolved through
+/// [`crate::secrets`] and never rendered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdyenConfig {
+    pub base_url: String,
+    pub api_key_env: String,
+    pub webhook_hmac_key_env: String,
+    pub merchant_account: String,
+    #[serde(default = "default_adyen_user_agent")]
+    pub user_agent: String,
+}
+
+fn default_adyen_user_agent() -> String {
+    "faktor-payments/0.1".to_string()
+}
+
+impl Default for AdyenConfig {
+    fn default() -> Self {
+        Self {
+            base_url: "https://checkout.adyen.com/v72".to_string(),
+            api_key_env: "FAKTOR_ADYEN_API_KEY".to_string(),
+            webhook_hmac_key_env: "FAKTOR_ADYEN_HMAC_KEY".to_string(),
+            merchant_account: "FAKTOR_ADYEN_MERCHANT_ACCOUNT".to_string(),
+            user_agent: default_adyen_user_agent(),
+        }
+    }
+}
+
+impl AdyenConfig {
+    pub fn validate(&self) -> Result<(), PaymentError> {
+        let base = self.base_url.trim_end_matches('/');
+        if !(base.starts_with("https://") || base.starts_with("http://")) {
+            return Err(PaymentError::Config(
+                "adyen base_url must be an absolute http(s) URL".into(),
+            ));
+        }
+        if base.contains(char::is_whitespace) || base.contains('@') {
+            return Err(PaymentError::Config(
+                "adyen base_url must not contain whitespace or userinfo".into(),
+            ));
+        }
+        for (name, env) in [
+            ("api_key_env", &self.api_key_env),
+            ("webhook_hmac_key_env", &self.webhook_hmac_key_env),
+        ] {
+            if env.is_empty() || env.len() > 128 {
+                return Err(PaymentError::Config(format!(
+                    "adyen {name} must name a bounded environment variable"
+                )));
+            }
+        }
+        if self.merchant_account.is_empty() || self.merchant_account.len() > 128 {
+            return Err(PaymentError::Config(
+                "adyen merchant_account must be 1..=128 bytes".into(),
+            ));
+        }
+        if self.user_agent.is_empty() || self.user_agent.len() > 256 {
+            return Err(PaymentError::Config(
+                "adyen user_agent must be 1..=256 bytes".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// The complete runtime payment configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -476,8 +546,19 @@ pub struct PaymentsConfig {
     #[serde(default)]
     pub dunning: DunningConfig,
     pub webhook_secret_env: String,
+    /// The environment variable naming the AEAD vault key used to seal
+    /// provider payment tokens at rest. When unset, an owner-only key file
+    /// beside the payment database is created/loaded.
+    #[serde(default = "default_vault_key_env")]
+    pub vault_key_env: String,
     #[serde(default)]
     pub stripe: StripeConfig,
+    #[serde(default)]
+    pub adyen: AdyenConfig,
+}
+
+pub fn default_vault_key_env() -> String {
+    "FAKTOR_PAYMENTS_VAULT_KEY".to_string()
 }
 
 impl PaymentsConfig {
@@ -490,8 +571,15 @@ impl PaymentsConfig {
                 "webhook_secret_env must name a bounded environment variable".into(),
             ));
         }
-        if self.provider == ProviderKind::Stripe {
-            self.stripe.validate()?;
+        if self.vault_key_env.is_empty() || self.vault_key_env.len() > 128 {
+            return Err(PaymentError::Config(
+                "vault_key_env must name a bounded environment variable".into(),
+            ));
+        }
+        match self.provider {
+            ProviderKind::Stripe => self.stripe.validate()?,
+            ProviderKind::Adyen => self.adyen.validate()?,
+            ProviderKind::Local => {}
         }
         Ok(())
     }
@@ -503,7 +591,9 @@ impl PaymentsConfig {
             tax: TaxConfig::default(),
             dunning: DunningConfig::default(),
             webhook_secret_env: "FAKTOR_BILLING_WEBHOOK_SECRET".to_string(),
+            vault_key_env: default_vault_key_env(),
             stripe: StripeConfig::default(),
+            adyen: AdyenConfig::default(),
         }
     }
 }

@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% block title %}Plans and billing — Faktor{% endblock %}
+{% block content %}
+
+<section class="page-hero shell">
+  <div class="hero-grid">
+    <div class="hero-copy">
+      <p class="kicker">Plans / Faktor billing</p>
+      <h1 class="page-title">A plan for the work<br class="wide-only"> you can inspect.</h1>
+      <p class="lead">Every plan includes the native runtime, the completion chain and durable evidence. Prices are shown in euro, excluding VAT. Checkout is hosted by Adyen; Faktor never receives a card number.</p>
+      <div class="button-row"><a class="btn btn-ink" href="/signup/">Create an account</a><a class="btn btn-outline" href="/account/">Sign in</a></div>
+    </div>
+  </div>
+</section>
+
+<section class="page-section shell">
+  <div class="section-head">
+    <div><p class="kicker">Current plans</p><h2 class="h2">Start small. Keep the basis.</h2></div>
+    <p class="lead">Plan changes are recorded with any proration on the next invoice. Cancellation takes effect at the chosen boundary: period end by default, or immediately when explicitly selected. The account area shows the exact recorded state.</p>
+  </div>
+  <div class="plan-grid">
+    <article class="plan-card">
+      <p class="plan-eyebrow">01 / Individual</p>
+      <h2>Solo</h2>
+      <p class="price">€19 <small>/ month</small></p>
+      <p class="plan-desc">One engineer, one shared evidence trail.</p>
+      <ul><li>One included seat</li><li>Native runtime and CLI</li><li>VS Code and JetBrains surfaces</li><li>Durable invoices and receipts</li></ul>
+      <div class="plan-interval"><span>Monthly €19</span><span>Annual €190</span></div>
+      <div class="section-cta"><a class="btn btn-outline btn-block" href="/signup/?plan=solo">Start with Solo</a></div>
+    </article>
+    <article class="plan-card featured">
+      <p class="plan-eyebrow">02 / Team</p>
+      <h2>Team</h2>
+      <p class="price">€49 <small>/ month</small></p>
+      <p class="plan-desc">Shared organization, roles and a visible evidence record.</p>
+      <ul><li>Organization roles and membership</li><li>Usage and invoice history</li></ul>
+      <div class="plan-interval"><span>Monthly €49</span><span>Annual €490</span></div>
+      <div class="section-cta"><a class="btn btn-ink btn-block" href="/signup/?plan=team">Start with Team</a></div>
+    </article>
+    <article class="plan-card">
+      <p class="plan-eyebrow">03 / Organization</p>
+      <h2>Enterprise</h2>
+      <p class="price">€199 <small>/ month</small></p>
+      <p class="plan-desc">A larger organization with the same inspectable finish.</p>
+      <ul><li>Platform administration</li><li>Usage and receipt exports</li></ul>
+      <div class="plan-interval"><span>Monthly €199</span><span>Annual €1,990</span></div>
+      <div class="section-cta"><a class="btn btn-outline btn-block" href="/signup/?plan=enterprise">Start with Enterprise</a></div>
+    </article>
+  </div>
+  <p class="plan-note">Exact amounts are stored in minor units. VAT is calculated with integer arithmetic at the configured jurisdiction rate. A plan change does not pretend to be a new payment; the next invoice records the new amount.</p>
+</section>
+
+<section class="page-section shell">
+  <div class="section-head"><div><p class="kicker">Billing rules</p><h2 class="h2">Provider truth upstream. Faktor billing truth.</h2></div><p class="lead">Adyen reports payment outcomes by signed webhook. Faktor records entitlements, invoices and receipts locally. A pending checkout never becomes a subscription because a browser returned successfully.</p></div>
+  <div class="three-col">
+    <article class="feature-block"><p class="kicker">Checkout</p><h3 class="h3">Hosted handoff</h3><p>Faktor creates a provider payment link server-side and redirects the browser. Payment details stay on the provider page.</p></article>
+    <article class="feature-block"><p class="kicker">Webhook</p><h3 class="h3">Signed and idempotent</h3><p>HMAC signature, timestamp window and event identity are checked before durable state changes.</p></article>
+    <article class="feature-block"><p class="kicker">Record</p><h3 class="h3">Exact and durable</h3><p>Invoices, receipts and payments use integer minor units. The account surface shows the recorded basis.</p></article>
+  </div>
+</section>
+
+{% endblock %}

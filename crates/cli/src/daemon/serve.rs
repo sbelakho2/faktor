@@ -1880,7 +1880,10 @@ fn wire_billing_plane(
             faktor_payments::SqlitePaymentStore::open(&path)
                 .map_err(|e| format!("payment store {}: {e}", path.display()))?,
         );
-        let transport = if runtime.provider == faktor_payments::ProviderKind::Stripe {
+        let transport = if matches!(
+            runtime.provider,
+            faktor_payments::ProviderKind::Stripe | faktor_payments::ProviderKind::Adyen
+        ) {
             Some(graph.transport.clone())
         } else {
             None

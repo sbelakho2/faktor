@@ -1794,7 +1794,7 @@ fn provision_cli_billing(dir: &std::path::Path) {
 
 #[test]
 fn local_billing_payment_cli_uses_the_same_durable_service() {
-    use billing_cli::BillingAction;
+    use billing_cli::{BillingAction, BillingMethodAction};
     use faktor_payments::{
         AddPaymentMethodRequest, IssueInvoiceRequest, PayInvoiceRequest, PaymentService,
         SqlitePaymentStore, StaticSecrets,
@@ -1857,6 +1857,68 @@ fn local_billing_payment_cli_uses_the_same_durable_service() {
         .unwrap()
         .to_string();
 
+    // Raw PAN is refused at the CLI boundary through the same validator the
+    // API and service use; no raw digits are echoed in the error.
+    for pan in ["4242424242424242", "pm_4242424242424242"] {
+        let error = billing_cli::render(
+            BillingAction::Method {
+                action: BillingMethodAction::Add {
+                    token: pan.into(),
+                    brand: "visa".into(),
+                    last4: "4242".into(),
+                    exp_month: 12,
+                    exp_year: 2030,
+                    set_default: true,
+                    idempotency_key: Some("cli-pan".into()),
+                },
+            },
+            dir.path(),
+            Some(path.clone()),
+        )
+        .unwrap_err();
+        assert!(error.contains("raw card numbers"), "{error}");
+        assert!(!error.contains(pan), "the raw PAN must not be echoed");
+    }
+    let stored = billing_cli::render(
+        BillingAction::Method {
+            action: BillingMethodAction::Add {
+                token: "pm_cli_valid_provider_token".into(),
+                brand: "visa".into(),
+                last4: "4242".into(),
+                exp_month: 12,
+                exp_year: 2030,
+                set_default: true,
+                idempotency_key: Some("cli-method".into()),
+            },
+        },
+        dir.path(),
+        Some(path.clone()),
+    )
+    .unwrap();
+    assert!(!stored.to_string().contains("pm_cli_valid_provider_token"));
+    let method_id = stored["paymentMethod"]["id"].as_str().unwrap().to_string();
+    let listed = billing_cli::render(
+        BillingAction::Method {
+            action: BillingMethodAction::List,
+        },
+        dir.path(),
+        Some(path.clone()),
+    )
+    .unwrap();
+    assert!(!listed.to_string().contains("pm_cli_valid_provider_token"));
+    assert!(!listed.to_string().contains("token_ciphertext"));
+    billing_cli::render(
+        BillingAction::Method {
+            action: BillingMethodAction::Remove {
+                id: method_id,
+                idempotency_key: Some("cli-remove".into()),
+            },
+        },
+        dir.path(),
+        Some(path.clone()),
+    )
+    .unwrap();
+
     // Issue and pay through the SAME service the CLI opens, then read it back
     // through the CLI subcommands.
     let config = load_entry_config(dir.path(), Some(path.clone())).unwrap().0;
@@ -1886,7 +1948,7 @@ fn local_billing_payment_cli_uses_the_same_durable_service() {
                 exp_month: 12,
                 exp_year: 2030,
                 set_default: true,
-                idempotency_key: "cli-method".into(),
+                idempotency_key: "cli-method-service".into(),
             },
         )
         .unwrap()
@@ -1957,6 +2019,27 @@ fn local_billing_payment_cli_uses_the_same_durable_service() {
     )
     .unwrap();
     assert_eq!(one["invoice"]["status"], "paid");
+    assert_eq!(one["invoice"]["reconciliation"], "matched");
+    assert_eq!(one["providerObservations"].as_array().unwrap().len(), 1);
+    let reconciled = billing_cli::render(
+        BillingAction::Reconcile { limit: Some(10) },
+        dir.path(),
+        Some(path.clone()),
+    )
+    .unwrap();
+    assert_eq!(reconciled["reconciliation"]["checked"], 1);
+    assert_eq!(reconciled["reconciliation"]["matched"], 1);
+    assert_eq!(reconciled["reconciliation"]["conflicts"], 0);
+    let invoice_after = billing_cli::render(
+        BillingAction::Invoice {
+            id: invoice.id.clone(),
+            format: "json".into(),
+        },
+        dir.path(),
+        Some(path.clone()),
+    )
+    .unwrap();
+    assert_eq!(invoice_after["invoice"]["total_minor"], invoice.total_minor);
     let payments = billing_cli::render(
         BillingAction::Payments { limit: Some(10) },
         dir.path(),

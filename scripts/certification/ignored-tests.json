@@ -83,6 +83,12 @@
   ],
   "manual": [
     {
+      "file": "crates/cloud/src/billing_rollup_tests.rs",
+      "fn": "billing_admission_is_constant_at_one_million_events",
+      "tag": "perf",
+      "reason": "manual performance/long probe: 1M-event caught-up rollup admission; run explicitly with `cargo test -- --ignored` when the billing hot path or scale shape changes; not a CI timing gate"
+    },
+    {
       "file": "crates/cli/src/acquire_certification.rs",
       "fn": "fault_acquire_restart_recovers_pending_jobs",
       "tag": "fault",
@@ -315,6 +321,11 @@
       "file": "crates/core/src/contract_compile.rs",
       "fn": "totals_add_up",
       "reason": "source-text fixture inside a test (`#[ignore = \"manual\"]` inside a raw string), not an ignored test"
+    },
+    {
+      "file": "crates/terminal/src/final_surface_probes.rs",
+      "fn": "final_probe_tcp_child",
+      "reason": "re-exec TCP probe child spawned by final_probe_macos_confinement_denies_network_home_and_allows_workspace; not an independently scheduled test"
     }
   ]
 }

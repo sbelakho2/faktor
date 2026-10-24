@@ -59,7 +59,14 @@ object Edition8DaemonDogfood {
                         SwingUtilities.invokeAndWait { row.probe.doClick() }
                         host.work.awaitIdle(15_000)
                         val status = view.statusForTest()
-                        val passed = !status.contains("not found", true) && !status.contains("404")
+                        // The probe body is arbitrary served JSON (a session
+                        // timestamp can contain "404"); only a typed failure
+                        // prefix proves the route is missing. Read/Staged/
+                        // Enabled/Disabled receipts all came from a real
+                        // route.
+                        val passed = status.isNotBlank() &&
+                            !status.startsWith("Unavailable") &&
+                            !status.startsWith("Failed")
                         if (!passed) failures.add("${workflow.id} $screen probe: $status")
                         workflowChecks++
                         results.add(

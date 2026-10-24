@@ -382,11 +382,39 @@ internal class Edition8Daemon(
         }) { after(it) }
     }
 
-    /** Resolve `{id}`/`{session}`/`{task}` placeholders from the bound scope. */
+    /** Resolve `{id}`/`{session}`/`{task}`/`:id`/`:session`/`:task` placeholders. */
     fun resolve(path: String): String? {
         var out = path
         val sid = sessionId()
         val tid = taskId()
+        // The Rev8 route catalog uses `:name` placeholders while capability
+        // routes use `{name}`. Resolve the unambiguous scope names first;
+        // an unresolved scope must refuse, never send a literal `:session`.
+        if (out.contains(":session")) {
+            if (sid == null) return null
+            out = out.replace(":session", sid)
+        }
+        if (out.contains(":task")) {
+            if (tid == null) return null
+            out = out.replace(":task", tid)
+        }
+        if (out.contains(":id")) {
+            when {
+                out.startsWith("/native/tasks/") || out.startsWith("/native/jobs/") -> {
+                    if (tid == null) return null
+                    out = out.replace(":id", tid)
+                }
+                out.startsWith("/native/session/") || out.startsWith("/native/sessions/") -> {
+                    if (sid == null) return null
+                    out = out.replace(":id", sid)
+                }
+                else -> return null
+            }
+        }
+        // Any remaining `:name` has no bound value in this scope (record,
+        // version, browser, mcp, ...); a literal is a malformed route, so
+        // the control stays a typed unavailable state.
+        if (Regex(":[A-Za-z_][A-Za-z0-9_]*").containsMatchIn(out)) return null
         // `{session}` is unambiguous and may appear on capability-scoped
         // queries (e.g. /native/instructions/bindings?session={session}),
         // not only under /native/session/. Resolve it first.

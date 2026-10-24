@@ -81,12 +81,31 @@ Every exception is an exact `HYGIENE_ALLOWLIST` entry with a written
 justification; the scan asserts each entry is non-stale (the committed file
 exists) and load-bearing (the rules would flag it without the exemption).
 
-The same crate also enforces the absolute no-Python tooling constraint:
-`repository_has_zero_python_sources_or_invocations` fails on any committed
-`.py` file anywhere in the repository and on any `python`/`python3` token in
-`scripts/`, `.woodpecker/`, `docker/` or `deny.toml`.
-`no_python_scan_fires_on_planted_sources_and_invocations` proves the scan is
-load-bearing for both a tooling `.py` source and a non-tooling `.py` fixture.
+The same crate also enforces the absolute no-Python constraint through three
+independent classes:
+
+1. **Sources and fixtures** — any committed `.py` file anywhere in the
+   repository is refused, whether it is a tooling script or a test fixture.
+2. **Tooling invocations** — any `python`, `python3`, version-suffixed
+   (`python2`, `python3.12`) or **absolute** interpreter path
+   (`/usr/bin/python3`, `/usr/local/bin/python`, Homebrew) in `scripts/`,
+   `.woodpecker/`, `.github/`, `docker/`, `tests/programme/` source and
+   workflow files, `apps/vscode/scripts/`, JetBrains shell/script tooling or
+   `deny.toml` is refused. Generated programme JSON (the selector graph and
+   registry) is data, not an invocation surface. The macOS certification probe that used
+   `/usr/bin/python3 -c "import socket..."` now runs the Rust
+   `faktor-ci-tools tcp-connect` helper (falling back to the test binary's
+   own Rust probe), so the lane has no interpreter dependency.
+3. **Interpreter shebangs** — any committed file whose first line is a
+   `#!` line naming Python is refused repository-wide, even outside the
+   tooling directories: the file itself is runnable Python.
+
+`repository_has_zero_python_sources_or_invocations` runs all three classes
+over `git ls-files`; `no_python_scan_fires_on_planted_sources_and_invocations`
+plants a fixture for **each** class (tooling `.py`, non-tooling `.py` fixture,
+relative `python3`, absolute `/usr/bin/python3` in a workflow, version-
+suffixed `python2`, and a non-tooling interpreter shebang) and asserts the
+sanctioned Rust tooling stays clean.
 Product-language test inputs that happen to contain Python are committed as
 `.py.fixture` (for example `crates/verify/tests/fixtures/rebind/`) and the
 consumer supplies the logical `*.py` path explicitly to the adapter; the file

@@ -1,0 +1,95 @@
+{
+  "name": "Faktor design tokens",
+  "edition": "4 / 12 October 2026",
+  "source": "Faktor_Website.pdf",
+  "color": {
+    "ink": "#08110C",
+    "forest": "#143D2B",
+    "paper": "#F3F5EF",
+    "sage": "#92AA99",
+    "ochre": "#D9BA75",
+    "ochreDeep": "#72541E",
+    "white": "#FFFFFF",
+    "success": "#2F7A55",
+    "warning": "#B9802B",
+    "danger": "#9D3B32"
+  },
+  "typography": {
+    "display": {
+      "family": "Barlow Semi Condensed",
+      "weight": 600,
+      "desktopPx": 108,
+      "lineHeight": 0.95
+    },
+    "pageTitle": {
+      "family": "Barlow Semi Condensed",
+      "weight": 600,
+      "desktopPx": 108,
+      "lineHeight": 0.95
+    },
+    "heading2": {
+      "family": "Barlow Semi Condensed",
+      "weight": 600,
+      "desktopPx": 58,
+      "lineHeight": 0.99
+    },
+    "heading3": {
+      "family": "Barlow",
+      "weight": 600,
+      "desktopPx": 34,
+      "lineHeight": 1.08
+    },
+    "lead": {
+      "family": "Barlow",
+      "weight": 400,
+      "desktopPx": 22,
+      "lineHeight": 1.55
+    },
+    "body": {
+      "family": "Barlow",
+      "weight": 400,
+      "desktopPx": 18,
+      "lineHeight": 1.56
+    },
+    "navigation": {
+      "family": "Barlow",
+      "weight": 400,
+      "desktopPx": 16
+    },
+    "metadata": {
+      "family": "IBM Plex Mono",
+      "weight": 400,
+      "desktopPx": 11,
+      "letterSpacing": "0.04em"
+    }
+  },
+  "layout": {
+    "designWidthPx": 1440,
+    "designHeightPx": 1080,
+    "shellMaxPx": 1440,
+    "gutterDesktopPx": 36,
+    "breakpointsPx": [
+      1180,
+      1023,
+      820,
+      640
+    ],
+    "rulePx": 1,
+    "pageHeroInsetPx": 96,
+    "sectionPaddingPx": 90,
+    "footerColumnsPx": [
+      525,
+      445,
+      400
+    ]
+  },
+  "logo": {
+    "clearSpace": "H/4",
+    "preferredSymbolPx": 24,
+    "masters": [
+      "faktor-logo-ink.svg",
+      "faktor-logo-ochre.svg",
+      "faktor-mark.svg"
+    ]
+  }
+}

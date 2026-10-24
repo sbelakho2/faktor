@@ -2923,11 +2923,15 @@ pub(crate) async fn native_session_export(
         Ok(session_id) => session_id,
         Err(e) => return wire_status(e),
     };
-    if let Ok(Some(_)) = state.deps.session.store().session_deletion(session_id) {
-        return conflict(
-            "session_deleted",
-            "the session content was deleted; only the closed tombstone remains",
-        );
+    match state.deps.session.store().session_deletion(session_id) {
+        Ok(Some(_)) => {
+            return conflict(
+                "session_deleted",
+                "the session content was deleted; only the closed tombstone remains",
+            )
+        }
+        Ok(None) => {}
+        Err(e) => return api_err(&store_err_to_core(e)),
     }
     let handle = match resolve_handle(&state, &id) {
         Ok(handle) => handle,
@@ -2969,7 +2973,10 @@ pub(crate) async fn native_session_export(
         transcript_bytes += size;
         transcript.push(entry);
     }
-    let checkpoints = handle.checkpoints_of().unwrap_or_default();
+    let checkpoints = match handle.checkpoints_of() {
+        Ok(checkpoints) => checkpoints,
+        Err(e) => return api_err(&e),
+    };
     let diffs: Vec<serde_json::Value> = checkpoints
         .iter()
         .take(200)
@@ -3027,17 +3034,23 @@ pub(crate) async fn native_session_export(
         _ => None,
     };
     let mut proof = Vec::new();
-    if let Ok(tasks) = store.list_tasks(handle.id()) {
+    {
+        let tasks = match store.list_tasks(handle.id()) {
+            Ok(tasks) => tasks,
+            Err(e) => return api_err(&store_err_to_core(e)),
+        };
         let tasks: Vec<_> = tasks.into_iter().take(50).collect();
         let ids: Vec<faktor_core::TaskId> = tasks.iter().map(|task| task.task_id).collect();
         // ONE batched read (first 20 records per task) instead of one query
         // per task; regrouped below in the original task order.
         let mut by_task: std::collections::HashMap<i64, Vec<(i64, String)>> =
             std::collections::HashMap::new();
-        if let Ok(records) = store.verification_record_head_by_tasks(handle.id(), &ids, 20) {
-            for (task_id, revision, status) in records {
-                by_task.entry(task_id).or_default().push((revision, status));
-            }
+        let records = match store.verification_record_head_by_tasks(handle.id(), &ids, 20) {
+            Ok(records) => records,
+            Err(e) => return api_err(&store_err_to_core(e)),
+        };
+        for (task_id, revision, status) in records {
+            by_task.entry(task_id).or_default().push((revision, status));
         }
         for task in tasks {
             for (revision, status) in by_task

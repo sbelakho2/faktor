@@ -9,6 +9,7 @@ mod lane_marker;
 mod license;
 mod manifest;
 mod mock_woodpecker;
+mod net;
 mod publish;
 mod sbom;
 mod util;
@@ -27,6 +28,7 @@ fn usage() {
            iana-table [--check]\n\
            mock-woodpecker --port N --state-dir DIR\n\
            free-port\n\
+           tcp-connect [--host HOST] --port PORT [--timeout-ms MS] | selftest\n\
            json MODE FILE [ARG...]\n\
            json-get FILE PATH [DEFAULT]\n\
            wo-body secret|secret-value|settings|cron ...\n\
@@ -62,6 +64,7 @@ fn main() {
         "iana-table" | "generate-iana-network-table" => iana::run(rest),
         "mock-woodpecker" => mock_woodpecker::run(rest),
         "free-port" => mock_woodpecker::free_port(),
+        "tcp-connect" => net::run(rest),
         "json" | "json-validate" => json_cmd::json(rest),
         "json-get" => json_cmd::json_get(rest),
         "wo-body" => json_cmd::wo_body(rest),

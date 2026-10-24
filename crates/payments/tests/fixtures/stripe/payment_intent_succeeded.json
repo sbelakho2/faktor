@@ -1,0 +1,7 @@
+{
+  "id": "pi_test_succeeded",
+  "object": "payment_intent",
+  "status": "succeeded",
+  "amount": 10000,
+  "currency": "usd"
+}

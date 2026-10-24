@@ -1,0 +1,24 @@
+# Faktor website — Zola configuration.
+# Build for a deployment with: zola build --base-url https://your.host
+base_url = "http://127.0.0.1:8080"
+title = "Faktor"
+description = "An engineering agent for changes you can inspect. Plan the task, work in an isolated candidate, and show the evidence."
+default_language = "en"
+compile_sass = false
+minify_html = false
+build_search_index = false
+generate_feeds = false
+hard_link_static = false
+taxonomies = []
+
+[markdown]
+render_emoji = false
+external_links_target_blank = false
+
+[extra]
+product = "Faktor"
+company = "Bel Consulting"
+edition = "Edition 4 / 12 October 2026"
+source_baseline = "16e8bd4cf2832affbb6a2e9e9281beee7527ac4d"
+prior_baseline = "c43f97451d68b2d8e4884e39c3b475d2737a8b27"
+live_note = "Static screens are server-rendered. Forms work without JavaScript."

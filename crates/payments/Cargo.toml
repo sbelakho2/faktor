@@ -19,6 +19,9 @@ sha2 = "0.10"
 zeroize.workspace = true
 uuid.workspace = true
 tokio.workspace = true
+ring = "0.17"
+base64 = "0.22"
+chrono.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

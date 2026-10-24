@@ -1,0 +1,7 @@
+{
+  "error": {
+    "type": "invalid_request_error",
+    "code": "resource_missing",
+    "message": "No such subscription item: si_wrong"
+  }
+}

@@ -1372,6 +1372,7 @@ export const PROTOCOL_ERROR_CODES: readonly string[] = [
   "malformed",
   "oversized",
   "rate_limited",
+  "goal_unavailable_after_redaction",
   "deadlock",
   "internal_error",
 ];
@@ -1389,6 +1390,7 @@ export const PROTOCOL_ERROR_HTTP_STATUS: { readonly [code: string]: number } = {
   "malformed": 400,
   "oversized": 413,
   "rate_limited": 429,
+  "goal_unavailable_after_redaction": 409,
   "deadlock": 409,
   "internal_error": 500,
 };
@@ -1406,6 +1408,7 @@ export const PROTOCOL_ERROR_RETRYABLE: { readonly [code: string]: boolean } = {
   "malformed": false,
   "oversized": false,
   "rate_limited": true,
+  "goal_unavailable_after_redaction": false,
   "deadlock": true,
   "internal_error": false,
 };

@@ -1,0 +1,6 @@
+{
+  "pspReference": "PSP_refund_1",
+  "status": "received",
+  "amount": {"currency": "USD", "value": 2500},
+  "reference": "faktor:org_1:refund:refund-1"
+}

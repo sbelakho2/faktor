@@ -593,10 +593,19 @@ fn native_core_routes(router: Router<AppState>) -> Router<AppState> {
             "/native/billing/invoices/{id}/pay",
             post(native_billing_pay_invoice),
         )
+        .route("/native/billing/reconcile", post(native_billing_reconcile))
         .route("/native/billing/payments", get(native_billing_payments))
         .route(
             "/native/billing/payment-methods",
             get(native_billing_payment_methods).post(native_billing_add_payment_method),
+        )
+        .route(
+            "/native/billing/payment-methods/{id}",
+            axum::routing::delete(native_billing_remove_payment_method),
+        )
+        .route(
+            "/native/billing/payment-methods/{id}/rotate",
+            post(native_billing_rotate_payment_method),
         )
         .route("/native/billing/tax", get(native_billing_tax))
         .route("/native/billing/subscribe", post(native_billing_subscribe))

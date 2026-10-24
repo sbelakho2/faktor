@@ -52,3 +52,8 @@ __pycache__/
 *.dll
 *.exe
 /mu_test
+
+# Faktor website build and generated visual-diff output
+site/public/
+site/visual/current/
+data/

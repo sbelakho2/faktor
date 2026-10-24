@@ -47,6 +47,16 @@ pub struct ProviderChangePlanRequest {
     pub organization_id: String,
     pub idempotency_key: String,
     pub subscription_id: String,
+    /// Durable provider subscription-item identity. An adapter that requires
+    /// it (Stripe) refuses typed instead of guessing/creating a second item.
+    pub provider_item_id: Option<String>,
+    /// Durable provider product identity for inline prices.
+    pub provider_product_id: Option<String>,
+    /// Durable provider price identity returned with the subscription.
+    pub provider_price_id: Option<String>,
+    /// True only when the plan or interval changed. A pure quantity update
+    /// reuses the stored item/price identity.
+    pub plan_changed: bool,
     pub plan_id: String,
     pub interval: BillingInterval,
     pub quantity: u32,
@@ -71,6 +81,44 @@ pub struct ProviderSubscription {
     pub current_period_start_ms: i64,
     pub current_period_end_ms: i64,
     pub cancel_at_period_end: bool,
+    /// Provider subscription-item identity, returned by the provider and
+    /// persisted so updates never recompute or guess it.
+    #[serde(default)]
+    pub item_id: Option<String>,
+    /// Provider product identity for inline prices.
+    #[serde(default)]
+    pub product_id: Option<String>,
+    /// Provider price identity.
+    #[serde(default)]
+    pub price_id: Option<String>,
+}
+
+/// One hosted-checkout creation. The adapter returns a provider checkout
+/// identity (and, where the provider offers one, a redirect URL).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderCheckoutRequest {
+    pub organization_id: String,
+    pub idempotency_key: String,
+    pub customer_id: String,
+    pub description: String,
+    pub amount_minor: i64,
+    pub currency: String,
+    pub success_url: String,
+    pub cancel_url: String,
+    /// When set, the provider checkout settles this local invoice. Adyen
+    /// encodes it as the merchant reference so the verified webhook can bind
+    /// the payment to Faktor's invoice record.
+    #[serde(default)]
+    pub local_invoice_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderCheckout {
+    pub id: String,
+    pub status: String,
+    pub url: Option<String>,
+    pub amount_minor: i64,
+    pub currency: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,6 +138,20 @@ pub struct ProviderInvoice {
     pub status: String,
     pub amount_minor: i64,
     pub currency: String,
+}
+
+/// The read-only provider projection used by reconciliation. It carries the
+/// provider's own status/amount/currency/paid/refund facts; the service never
+/// writes these into a Faktor invoice total.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderInvoiceSnapshot {
+    pub id: String,
+    pub status: String,
+    pub amount_minor: i64,
+    pub amount_paid_minor: i64,
+    pub amount_refunded_minor: i64,
+    pub currency: String,
+    pub paid_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,6 +192,46 @@ pub struct ProviderRefund {
     pub status: String,
     pub amount_minor: i64,
     pub currency: String,
+}
+
+/// One read-only provider reconciliation lookup. The request names the
+/// organization and the EXACT idempotency key the original dispatch used, so
+/// reconciliation can only observe an already-attempted operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderReconcileRequest {
+    pub organization_id: String,
+    pub kind: ProviderObjectKind,
+    pub idempotency_key: String,
+}
+
+/// The provider-side object classes that support reconciliation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderObjectKind {
+    Customer,
+    Subscription,
+    Change,
+    Cancel,
+    Invoice,
+    Charge,
+    Refund,
+    Checkout,
+}
+
+/// The result of a read-only reconciliation lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderReconciled {
+    Customer(ProviderCustomer),
+    Subscription(ProviderSubscription),
+    Invoice(ProviderInvoice),
+    Charge(ProviderCharge),
+    Refund(ProviderRefund),
+    Checkout(ProviderCheckout),
+    /// The provider has no object for this idempotency key: the attempted
+    /// operation definitely did not create anything.
+    NotApplied,
+    /// The adapter has no safe lookup for this operation (for example a
+    /// provider without idempotency-key search); the claim stays unknown.
+    Unresolved(String),
 }
 
 /// The headers of one inbound webhook delivery (lower-case names, bounded
@@ -224,10 +326,28 @@ pub trait PaymentProvider: Send + Sync {
         request: ProviderCancelRequest,
     ) -> Result<ProviderSubscription, PaymentError>;
 
+    async fn create_checkout(
+        &self,
+        request: ProviderCheckoutRequest,
+    ) -> Result<ProviderCheckout, PaymentError>;
+
     async fn create_invoice(
         &self,
         request: ProviderInvoiceRequest,
     ) -> Result<ProviderInvoice, PaymentError>;
+
+    /// Fetch one provider invoice by its provider id. Read-only: it must
+    /// never create, mutate or resend an operation. `NotFound` means the
+    /// provider has no such invoice.
+    async fn fetch_invoice(
+        &self,
+        _provider_invoice_id: &str,
+    ) -> Result<ProviderInvoiceSnapshot, PaymentError> {
+        Err(PaymentError::Provider(format!(
+            "{} cannot fetch an invoice by provider id",
+            self.name()
+        )))
+    }
 
     async fn charge(&self, request: ProviderChargeRequest) -> Result<ProviderCharge, PaymentError>;
 
@@ -241,6 +361,18 @@ pub trait PaymentProvider: Send + Sync {
         body: &[u8],
         now_ms: i64,
     ) -> Result<VerifiedWebhookEvent, PaymentError>;
+
+    /// Read-only reconciliation of a previously dispatched idempotency key.
+    /// This must never create, mutate or resend a provider operation.
+    async fn reconcile(
+        &self,
+        _request: ProviderReconcileRequest,
+    ) -> Result<ProviderReconciled, PaymentError> {
+        Ok(ProviderReconciled::Unresolved(format!(
+            "{} has no reconciliation lookup",
+            self.name()
+        )))
+    }
 }
 
 /// The typed provider used when configuration selects a provider whose
@@ -297,6 +429,13 @@ impl PaymentProvider for UnconfiguredPaymentProvider {
         &self,
         _request: ProviderCancelRequest,
     ) -> Result<ProviderSubscription, PaymentError> {
+        Err(PaymentError::ProviderUnconfigured(self.cause.clone()))
+    }
+
+    async fn create_checkout(
+        &self,
+        _request: ProviderCheckoutRequest,
+    ) -> Result<ProviderCheckout, PaymentError> {
         Err(PaymentError::ProviderUnconfigured(self.cause.clone()))
     }
 

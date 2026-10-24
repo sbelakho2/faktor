@@ -396,6 +396,7 @@ const ROUTE_CLASSES: &[(&str, &str)] = &[
     ("POST", "/native/billing/subscription"),
     ("GET", "/native/billing/invoices"),
     ("GET", "/native/billing/invoices/1"),
+    ("POST", "/native/billing/reconcile"),
     ("GET", "/native/billing/payments"),
     ("GET", "/native/billing/payment-methods"),
     ("GET", "/native/billing/tax"),
@@ -459,6 +460,7 @@ fn needs_control_principal(path: &str) -> bool {
             | "/native/billing/subscription"
             | "/native/billing/invoices"
             | "/native/billing/invoices/1"
+            | "/native/billing/reconcile"
             | "/native/billing/payments"
             | "/native/billing/payment-methods"
             | "/native/billing/tax"

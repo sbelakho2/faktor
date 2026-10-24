@@ -1,0 +1,8 @@
+{
+  "id": "in_test_1",
+  "object": "invoice",
+  "status": "open",
+  "amount_due": 10000,
+  "amount_paid": 0,
+  "currency": "usd"
+}

@@ -71,6 +71,7 @@ members = [
     "crates/cli",
     "crates/payments",
     "crates/ci-tools",
+    "crates/site",
     "crates/test-mocks",
     "crates/acp",
     "tests/integration",

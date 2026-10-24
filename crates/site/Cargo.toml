@@ -1,0 +1,37 @@
+[package]
+name = "faktor-site"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+axum = "0.8"
+tokio.workspace = true
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.7", features = ["fs", "limit", "set-header", "timeout", "trace"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+rusqlite.workspace = true
+rand.workspace = true
+uuid.workspace = true
+sha2 = "0.10"
+argon2 = "0.5"
+base64 = "0.22"
+chrono.workspace = true
+rand_core = { version = "0.6", features = ["getrandom"] }
+url = "2"
+faktor-cloud.workspace = true
+faktor-payments.workspace = true
+faktor-provider.workspace = true
+faktor-security.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+http-body-util = "0.1"
+
+[lints]
+workspace = true

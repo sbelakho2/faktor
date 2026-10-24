@@ -1,0 +1,6 @@
+{
+  "id": "PL_link_1",
+  "status": "expired",
+  "amount": {"currency": "USD", "value": 10000},
+  "reference": "faktor:org_1:plan:pro"
+}

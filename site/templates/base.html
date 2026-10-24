@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}{% if page is defined %}{{ page.title }} — {% elif section is defined %}{{ section.title }} — {% endif %}Faktor{% endblock %}</title>
+  <meta name="description" content="{% block description %}{{ config.description }}{% endblock %}">
+  <meta name="theme-color" content="#08110C">
+  <meta name="color-scheme" content="light">
+  <link rel="icon" href="{{ get_url(path='favicon.svg') }}" type="image/svg+xml">
+  <link rel="stylesheet" href="{{ get_url(path='css/site.css') }}?v=20261024h">
+  {% block head %}{% endblock %}
+</head>
+{% set cp = current_path | default(value="") %}
+<body class="{% block bodyclass %}{% endblock %}">
+  <a class="skip-link" href="#main">Skip to content</a>
+  {% block chrome %}
+  <div class="site-chrome">
+    <div class="chrome-inner">
+      <span class="chrome-brand">Bel Consulting</span>
+      <span class="chrome-note">Native engineering agent</span>
+    </div>
+  </div>
+  {% endblock %}
+  {% block header %}
+  <header class="site-header">
+    <div class="header-inner">
+      <a class="brand" href="/" aria-label="Faktor home">
+        {% include "partials/mark.html" %}
+        <span class="wordmark">faktor</span>
+      </a>
+      <nav class="primary-nav" aria-label="Primary">
+        <a href="/approach/"{% if cp is starting_with("/approach/") %} aria-current="page"{% endif %}>Approach</a>
+        <a href="/editor/"{% if cp is starting_with("/editor/") %} aria-current="page"{% endif %}>In your editor</a>
+        <a href="/documentation/"{% if cp is starting_with("/documentation/") %} aria-current="page"{% endif %}>Documentation</a>
+        <a href="/identity/"{% if cp is starting_with("/identity/") %} aria-current="page"{% endif %}>Identity</a>
+      </nav>
+      <details class="nav-disclosure">
+        <summary>Menu</summary>
+        <nav aria-label="Mobile">
+          <a href="/approach/">Approach</a>
+          <a href="/editor/">In your editor</a>
+          <a href="/documentation/">Documentation</a>
+          <a href="/identity/">Identity</a>
+        </nav>
+      </details>
+    </div>
+  </header>
+  {% endblock %}
+  <main id="main">
+    {% block content %}{% endblock %}
+  </main>
+  {% block footer %}{% include "partials/footer.html" %}{% endblock %}
+</body>
+</html>

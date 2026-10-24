@@ -1,8 +1,8 @@
 {
   "schema": "faktor-test-programme-registry/v1",
-  "generated_at": "2026-10-23T20:34:10.683Z",
-  "commit": "786fae201a839b6ea92678f239ac758013f22c8b",
-  "tree": "b91c1dafbacc0bf9e333c5c962e97efd2c35dce3",
+  "generated_at": "2026-10-24T03:18:29.354Z",
+  "commit": "909c0861aa1d55db85ac6c459d4b9ea91a1eab3b",
+  "tree": "22c535cc454bb5fd83a47fb089c93f984d782eb4",
   "layers": [
     "structural",
     "unit",
@@ -19,7 +19,7 @@
     "release"
   ],
   "counts": {
-    "rows": 978,
+    "rows": 981,
     "by_kind": {
       "acceptance-scenario": 40,
       "act-now": 8,
@@ -30,7 +30,7 @@
       "control": 200,
       "invariant": 159,
       "jetbrains-contribution": 1,
-      "native-route": 296,
+      "native-route": 299,
       "provider-adapter": 6,
       "screen": 72,
       "vscode-contribution": 39,
@@ -38,19 +38,19 @@
       "workflow": 16
     },
     "by_status": {
-      "deferred": 834,
+      "deferred": 837,
       "proven": 76,
       "stub": 68
     },
     "by_lane": {
       "nightly": 513,
-      "pull": 647,
-      "trusted": 977,
+      "pull": 650,
+      "trusted": 980,
       "weekly-live": 342
     },
     "by_layer": {
       "agent-evals": 1,
-      "contracts": 433,
+      "contracts": 436,
       "ide-screen-readers": 385,
       "state-model-crash": 257,
       "unit-property": 242
@@ -1874,7 +1874,7 @@
         "passed": true,
         "observed": {
           "command": "billing",
-          "help_bytes": 1375,
+          "help_bytes": 1584,
           "unknown_flag_exit": 2
         }
       }
@@ -17314,6 +17314,41 @@
       "evidence": null
     },
     {
+      "id": "native.delete.native.billing.payment-methods.id",
+      "kind": "native-route",
+      "path": "crates/server/src/api/lifecycle.rs",
+      "layers": [
+        "contracts"
+      ],
+      "lanes": [
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "native.route-contract.native.delete.native.billing.payment-methods.id"
+      ],
+      "evidence_kind": "exact-value",
+      "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
+      "status": "deferred",
+      "meta": {
+        "rev8": false,
+        "credential": false,
+        "method": "delete",
+        "surface_path": "native/billing/payment-methods/id"
+      },
+      "adversarial": [
+        "auth",
+        "strict-body",
+        "typed-error",
+        "bounds",
+        "traversal",
+        "duplicate",
+        "isolation",
+        "no-secret"
+      ],
+      "evidence": null
+    },
+    {
       "id": "native.delete.native.hooks.id",
       "kind": "native-route",
       "path": "crates/server/src/api/lifecycle.rs",
@@ -23371,6 +23406,41 @@
       "evidence": null
     },
     {
+      "id": "native.post.native.billing.payment-methods.id.rotate",
+      "kind": "native-route",
+      "path": "crates/server/src/api/lifecycle.rs",
+      "layers": [
+        "contracts"
+      ],
+      "lanes": [
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "native.route-contract.native.post.native.billing.payment-methods.id.rotate"
+      ],
+      "evidence_kind": "exact-value",
+      "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
+      "status": "deferred",
+      "meta": {
+        "rev8": false,
+        "credential": false,
+        "method": "post",
+        "surface_path": "native/billing/payment-methods/id/rotate"
+      },
+      "adversarial": [
+        "auth",
+        "strict-body",
+        "typed-error",
+        "bounds",
+        "traversal",
+        "duplicate",
+        "isolation",
+        "no-secret"
+      ],
+      "evidence": null
+    },
+    {
       "id": "native.post.native.billing.plan",
       "kind": "native-route",
       "path": "crates/server/src/api/lifecycle.rs",
@@ -23392,6 +23462,41 @@
         "credential": false,
         "method": "post",
         "surface_path": "native/billing/plan"
+      },
+      "adversarial": [
+        "auth",
+        "strict-body",
+        "typed-error",
+        "bounds",
+        "traversal",
+        "duplicate",
+        "isolation",
+        "no-secret"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "native.post.native.billing.reconcile",
+      "kind": "native-route",
+      "path": "crates/server/src/api/lifecycle.rs",
+      "layers": [
+        "contracts"
+      ],
+      "lanes": [
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "native.route-contract.native.post.native.billing.reconcile"
+      ],
+      "evidence_kind": "exact-value",
+      "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
+      "status": "deferred",
+      "meta": {
+        "rev8": false,
+        "credential": false,
+        "method": "post",
+        "surface_path": "native/billing/reconcile"
       },
       "adversarial": [
         "auth",
@@ -25735,7 +25840,7 @@
             "passed": true,
             "observed": {
               "status": 200,
-              "handle": "vault://provider_key/2f7fb2fbcccb121a51ecbc5438e95390"
+              "handle": "vault://provider_key/8ea34f52a294e8c97c1af8ae1e551fa5"
             }
           },
           {
