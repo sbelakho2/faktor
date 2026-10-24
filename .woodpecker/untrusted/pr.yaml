@@ -146,7 +146,10 @@ steps:
   # is written to selected-cargo.sh and executed by the linux lane below.
   # An unmapped path is a typed refusal escalated to the full workspace test.
   - name: programme-selection
-    image: node:24@sha256:64af3819f9275802414d7cdc38c27e9d82bd564dec4d4da87d008255d36c63b4 # node:24 @ 2026-09-23
+    # The selector executes the in-repo Rust authority. It must run on the
+    # same Debian release as the rust:1.98.0 image that builds it (trixie),
+    # otherwise the shared target/debug binary fails on a newer glibc.
+    image: node:24-trixie@sha256:016f604a11c4c725f0a4c62e29ff11adab153d297bf97046c9bf2ddb9f1011d3 # node:24-trixie @ 2026-10-24
     depends_on: [impact-graph]
     commands:
       - node scripts/programme/build-registry.mjs --check
