@@ -140,6 +140,38 @@ impl Harness {
     }
 }
 
+/// True when this host can create the network namespace the BrokerOnly
+/// sandbox needs. Docker's default capability set denies
+/// `unshare(CLONE_NEWNET)`, so the untrusted PR lane cannot exercise
+/// confinement; the trusted lane runs privileged and does. Probing the
+/// actual syscall (in a child) keeps the skip honest instead of assuming a
+/// platform implies the capability.
+fn browser_sandbox_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        if !cfg!(target_os = "linux") {
+            return true;
+        }
+        std::process::Command::new("unshare")
+            .args(["-n", "true"])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    })
+}
+
+macro_rules! require_browser_sandbox {
+    () => {
+        if !browser_sandbox_available() {
+            eprintln!(
+                "SKIP (typed, unprivileged host): this host cannot create the BrokerOnly \
+                 network namespace; the trusted privileged lane covers OS confinement"
+            );
+            return;
+        }
+    };
+}
+
 fn read_journal(path: &Path) -> Vec<Value> {
     let Ok(raw) = std::fs::read_to_string(path) else {
         return Vec::new();
@@ -172,6 +204,7 @@ fn wait_for_reap(
 
 #[tokio::test]
 async fn launched_env_has_no_planted_secrets_and_is_proxy_only() {
+    require_browser_sandbox!();
     const SECRETS: &[(&str, &str)] = &[
         ("OPENAI_API_KEY", "sk-planted-openai-secret"),
         ("ANTHROPIC_API_KEY", "sk-ant-planted"),
@@ -251,6 +284,7 @@ async fn launched_env_has_no_planted_secrets_and_is_proxy_only() {
 
 #[tokio::test]
 async fn proxy_only_cannot_be_overridden_by_extra_args() {
+    require_browser_sandbox!();
     let err = faktor_browser::launch::validate_extra_args(&["--no-proxy-server".to_string()])
         .expect_err("--no-proxy-server must be refused");
     assert_eq!(err.code(), "invalid_config");
@@ -298,6 +332,7 @@ async fn proxy_only_cannot_be_overridden_by_extra_args() {
 
 #[tokio::test]
 async fn navigation_and_network_records_flow_through_cdp() {
+    require_browser_sandbox!();
     let harness = Harness::new(
         json!({
             "page_url": "https://first.test/product",
@@ -334,6 +369,7 @@ async fn navigation_and_network_records_flow_through_cdp() {
 
 #[tokio::test]
 async fn console_observations_are_captured_bounded_and_ordered() {
+    require_browser_sandbox!();
     let mut console = Vec::new();
     for index in 0..80 {
         console.push(json!({
@@ -389,6 +425,7 @@ async fn console_observations_are_captured_bounded_and_ordered() {
 
 #[tokio::test]
 async fn interception_drops_blocked_resource_types_and_tracking_hosts() {
+    require_browser_sandbox!();
     let harness = Harness::new(
         json!({
             "pause_requests": true,
@@ -430,6 +467,7 @@ async fn interception_drops_blocked_resource_types_and_tracking_hosts() {
 
 #[tokio::test]
 async fn body_capture_is_bounded_and_oversize_is_refused() {
+    require_browser_sandbox!();
     let harness = Harness::new(
         json!({
             "body_bytes": 6000,
@@ -473,6 +511,7 @@ async fn body_capture_is_bounded_and_oversize_is_refused() {
 
 #[tokio::test]
 async fn attachment_navigation_is_default_denied_typed_without_deadline_hang() {
+    require_browser_sandbox!();
     let harness = Harness::new(
         json!({
             "suppress_lifecycle": true,
@@ -514,6 +553,7 @@ async fn attachment_navigation_is_default_denied_typed_without_deadline_hang() {
 
 #[tokio::test]
 async fn navigation_cancellation_stops_loading_and_releases_the_page() {
+    require_browser_sandbox!();
     let harness = Harness::new(json!({"suppress_lifecycle": true}), |_| {}).await;
     let page = harness.acquire("p1").await.expect("acquire");
     let cancel = CancellationToken::new();
@@ -550,6 +590,7 @@ async fn navigation_cancellation_stops_loading_and_releases_the_page() {
 
 #[tokio::test]
 async fn repeated_cancelled_captures_never_wedge_the_profile() {
+    require_browser_sandbox!();
     let harness = Harness::new(json!({"suppress_lifecycle": true}), |config| {
         config.max_pages_per_profile = 1;
     })
@@ -586,6 +627,7 @@ async fn repeated_cancelled_captures_never_wedge_the_profile() {
 
 #[tokio::test]
 async fn abandoned_in_flight_page_releases_its_slot_on_drop() {
+    require_browser_sandbox!();
     let harness = Harness::new(json!({"suppress_lifecycle": true}), |config| {
         config.max_pages_per_profile = 1;
     })
@@ -620,6 +662,7 @@ async fn abandoned_in_flight_page_releases_its_slot_on_drop() {
 
 #[tokio::test]
 async fn idle_shutdown_reaps_browsers_whose_pages_were_abandoned() {
+    require_browser_sandbox!();
     let clock = Arc::new(faktor_core::time::TestClock::new(1_000_000));
     let dir = tempfile::tempdir().unwrap();
     let scenario_path = dir.path().join("scenario.json");
@@ -666,6 +709,7 @@ async fn idle_shutdown_reaps_browsers_whose_pages_were_abandoned() {
 
 #[tokio::test]
 async fn concurrent_acquisitions_never_exceed_the_page_bound() {
+    require_browser_sandbox!();
     let harness = Harness::new(json!({}), |config| {
         config.max_pages_per_profile = 1;
         config.max_browsers = 1;
@@ -728,6 +772,7 @@ async fn concurrent_acquisitions_never_exceed_the_page_bound() {
 
 #[tokio::test]
 async fn incognito_never_reuses_a_persistent_page() {
+    require_browser_sandbox!();
     let harness = Harness::new(json!({}), |config| {
         config.max_browsers = 2;
     })
@@ -798,6 +843,7 @@ async fn incognito_never_reuses_a_persistent_page() {
 
 #[tokio::test]
 async fn idle_shutdown_kills_the_child_and_leaves_no_orphan() {
+    require_browser_sandbox!();
     let clock = Arc::new(faktor_core::time::TestClock::new(1_000_000));
     let dir = tempfile::tempdir().unwrap();
     let scenario_path = dir.path().join("scenario.json");
@@ -865,6 +911,7 @@ async fn idle_shutdown_kills_the_child_and_leaves_no_orphan() {
 
 #[tokio::test]
 async fn crash_detection_is_typed_and_leaves_no_zombie() {
+    require_browser_sandbox!();
     let harness = Harness::new(json!({"exit_on_method": "Page.navigate"}), |_| {}).await;
     let page = harness.acquire("p1").await.expect("acquire");
     let pid = harness.manager.health()[0].pid;
@@ -902,6 +949,7 @@ async fn crash_detection_is_typed_and_leaves_no_zombie() {
 
 #[tokio::test]
 async fn verification_detection_stops_the_profile_until_resumed() {
+    require_browser_sandbox!();
     let harness = Harness::new(json!({"verification": {"captcha": true}}), |_| {}).await;
     let page = harness.acquire("p1").await.expect("acquire");
     // Generous, explicit navigation budget: the assertion below is about the
@@ -940,6 +988,7 @@ async fn verification_detection_stops_the_profile_until_resumed() {
 
 #[tokio::test]
 async fn login_form_detection_is_authentication_required() {
+    require_browser_sandbox!();
     let harness = Harness::new(json!({"verification": {"login_form": true}}), |_| {}).await;
     let page = harness.acquire("p1").await.expect("acquire");
     page.navigate(
@@ -958,6 +1007,7 @@ async fn login_form_detection_is_authentication_required() {
 
 #[tokio::test]
 async fn downloads_are_disabled_by_default_and_cancelled() {
+    require_browser_sandbox!();
     let harness = Harness::new(
         json!({
             "download_will_begin": {
@@ -996,6 +1046,7 @@ async fn downloads_are_disabled_by_default_and_cancelled() {
 
 #[tokio::test]
 async fn screenshots_only_on_explicit_request() {
+    require_browser_sandbox!();
     let harness = Harness::new(json!({}), |_| {}).await;
     let page = harness.acquire("p1").await.expect("acquire");
     page.navigate(
@@ -1020,6 +1071,7 @@ async fn screenshots_only_on_explicit_request() {
 
 #[tokio::test]
 async fn persistent_profiles_are_owner_only_and_survive_shutdown() {
+    require_browser_sandbox!();
     let harness = Harness::new(json!({}), |_| {}).await;
     let page = harness.acquire("p1").await.expect("acquire");
     let _ = page.close().await;
@@ -1059,6 +1111,7 @@ async fn persistent_profiles_are_owner_only_and_survive_shutdown() {
 
 #[tokio::test]
 async fn daemon_teardown_kills_every_browser_tree() {
+    require_browser_sandbox!();
     let harness = Harness::new(json!({}), |_| {}).await;
     let page = harness.acquire("p1").await.expect("acquire");
     let pid = harness.manager.health()[0].pid;
@@ -1080,6 +1133,7 @@ async fn daemon_teardown_kills_every_browser_tree() {
 
 #[tokio::test]
 async fn incognito_profiles_are_temporary() {
+    require_browser_sandbox!();
     let harness = Harness::new(json!({}), |_| {}).await;
     let page = harness
         .manager
@@ -1124,6 +1178,7 @@ async fn incognito_profiles_are_temporary() {
 
 #[tokio::test]
 async fn page_and_browser_bounds_are_typed_refusals() {
+    require_browser_sandbox!();
     let harness = Harness::new(json!({}), |config| {
         config.max_pages_per_profile = 1;
         config.max_browsers = 1;
@@ -1143,6 +1198,7 @@ async fn page_and_browser_bounds_are_typed_refusals() {
 
 #[tokio::test]
 async fn identity_egress_is_stable_and_changes_only_on_retire() {
+    require_browser_sandbox!();
     let harness = Harness::new(json!({}), |_| {}).await;
     let page = harness.acquire("p1").await.expect("acquire");
     let pid = harness.manager.health()[0].pid;
@@ -1200,6 +1256,7 @@ async fn identity_egress_is_stable_and_changes_only_on_retire() {
 
 #[tokio::test]
 async fn disabled_browser_authority_refuses_without_side_effects() {
+    require_browser_sandbox!();
     let dir = tempfile::tempdir().unwrap();
     let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
     let supervisor = ProcessSupervisor::new(cas);
@@ -1302,6 +1359,7 @@ fn crate_has_no_site_knowledge_and_no_model_dependencies() {
 
 #[tokio::test]
 async fn upstream_route_selection_is_operational_config() {
+    require_browser_sandbox!();
     let harness = Harness::new(json!({}), |_| {}).await;
     harness
         .manager
@@ -1330,6 +1388,7 @@ async fn upstream_route_selection_is_operational_config() {
 
 #[tokio::test]
 async fn critical_event_overflow_fails_the_page_instead_of_continuing() {
+    require_browser_sandbox!();
     // A burst of paused requests far beyond the critical queue capacity:
     // the fake browser sends every event before it reads the broker's
     // continue/fail replies, so the queue overflows deterministically.
@@ -1385,6 +1444,7 @@ async fn critical_event_overflow_fails_the_page_instead_of_continuing() {
 
 #[tokio::test]
 async fn critical_overflow_fails_the_page_even_when_a_handler_is_stuck() {
+    require_browser_sandbox!();
     // Fault case: the event pump is parked in a per-event handler (the fake
     // browser never answers Fetch.continueRequest), so the pump cannot come
     // back to observe the queued lag itself. The overflow must still fail the
@@ -1453,6 +1513,7 @@ async fn wait_for_journal_count(
 
 #[tokio::test]
 async fn observation_gap_latches_and_history_refuses() {
+    require_browser_sandbox!();
     // Observation fan-out capacity 1: while the pump awaits the reply to the
     // first critical `Fetch.requestPaused` (the fake browser sends every
     // event before it reads commands), the network observation events
@@ -1507,6 +1568,7 @@ async fn observation_gap_latches_and_history_refuses() {
 
 #[tokio::test]
 async fn hostile_devtools_endpoint_is_rejected_and_the_child_is_killed() {
+    require_browser_sandbox!();
     let dir = tempfile::tempdir().unwrap();
     let script = dir.path().join("fake-chromium.sh");
     std::fs::write(
@@ -1635,6 +1697,7 @@ fn wait_for_broker_shutdown(port: u16, timeout: Duration) -> bool {
 
 #[tokio::test]
 async fn open_page_init_failures_close_the_created_target_at_every_step() {
+    require_browser_sandbox!();
     // (label, scenario, expected closeTarget count, target was handed to us)
     let cases: Vec<(&str, Value, usize, bool)> = vec![
         (
@@ -1734,6 +1797,7 @@ async fn open_page_init_failures_close_the_created_target_at_every_step() {
 
 #[tokio::test]
 async fn failed_launch_rolls_back_child_broker_and_temp_profile() {
+    require_browser_sandbox!();
     let cases: Vec<(&str, Value)> = vec![
         (
             "Browser.getVersion error",
@@ -1812,6 +1876,7 @@ async fn failed_launch_rolls_back_child_broker_and_temp_profile() {
 
 #[tokio::test]
 async fn failed_launch_keeps_a_persistent_profile_but_removes_no_orphan() {
+    require_browser_sandbox!();
     let harness = Harness::new(json!({"fail_methods": ["Browser.getVersion"]}), |_| {}).await;
     let result = harness
         .manager
@@ -1885,6 +1950,7 @@ async fn acquire_on(
 
 #[tokio::test]
 async fn idle_retirement_refuses_an_admission_that_raced_it() {
+    require_browser_sandbox!();
     let (clock, manager, _dir) = idle_harness().await;
     let page = acquire_on(&manager, "p1").await.expect("setup page");
     let _ = page.close().await;
@@ -1922,6 +1988,7 @@ async fn idle_retirement_refuses_an_admission_that_raced_it() {
 
 #[tokio::test]
 async fn idle_retirement_never_closes_a_browser_under_an_admitted_page() {
+    require_browser_sandbox!();
     let (clock, manager, _dir) = idle_harness().await;
     let page = acquire_on(&manager, "p1").await.expect("setup page");
     let _ = page.close().await;
@@ -1963,6 +2030,7 @@ async fn idle_retirement_never_closes_a_browser_under_an_admitted_page() {
 
 #[tokio::test]
 async fn page_admission_is_not_serialized_across_profiles() {
+    require_browser_sandbox!();
     let harness = Harness::new(json!({}), |config| {
         config.max_pages_per_profile = 1;
         config.max_browsers = 2;
@@ -2010,6 +2078,7 @@ async fn page_admission_is_not_serialized_across_profiles() {
 
 #[tokio::test]
 async fn incognito_and_persistent_instances_are_distinct_and_visible() {
+    require_browser_sandbox!();
     let harness = Harness::new(json!({}), |config| {
         config.max_browsers = 2;
         config.max_pages_per_profile = 1;
@@ -2113,6 +2182,7 @@ async fn wait_for<F: FnMut() -> bool>(mut ready: F, timeout: Duration) -> bool {
 
 #[tokio::test]
 async fn native_downloads_are_denied_centrally_and_progress_fails_closed() {
+    require_browser_sandbox!();
     let harness = Harness::new(
         json!({
             "browser_events": [
@@ -2212,6 +2282,7 @@ async fn native_downloads_are_denied_centrally_and_progress_fails_closed() {
 
 #[tokio::test]
 async fn response_stage_capture_streams_under_the_cap_and_publishes_atomically() {
+    require_browser_sandbox!();
     let harness = Harness::new(
         json!({
             "pause_response": true,
@@ -2276,6 +2347,7 @@ async fn response_stage_capture_streams_under_the_cap_and_publishes_atomically()
 
 #[tokio::test]
 async fn over_bound_capture_aborts_immediately_and_publishes_nothing() {
+    require_browser_sandbox!();
     let harness = Harness::new(
         json!({
             "pause_response": true,
@@ -2341,6 +2413,7 @@ async fn over_bound_capture_aborts_immediately_and_publishes_nothing() {
 
 #[tokio::test]
 async fn declared_or_malformed_length_denies_before_streaming() {
+    require_browser_sandbox!();
     for (label, length_fields) in [
         ("over-bound", json!({"content_length": 5000})),
         ("malformed", json!({"content_length_raw": "bananas"})),
@@ -2415,6 +2488,7 @@ async fn declared_or_malformed_length_denies_before_streaming() {
 #[cfg(unix)]
 #[tokio::test]
 async fn symlink_swapped_download_directory_cannot_publish_outside_the_profile() {
+    require_browser_sandbox!();
     let harness = Harness::new(
         json!({
             "pause_response": true,
