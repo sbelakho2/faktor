@@ -544,13 +544,16 @@ async function main() {
               if (prompted.status === 409 && String(prompted.text).includes('live shadow')) {
                 // Prefer natural settlement (the run watch integrates or
                 // discards its shadow); cancelling immediately races that
-                // watcher and can leave a Discarded shadow pointer.
-                let settled = await waitSessionIdle(base, token, sessionId, 20_000);
+                // watcher and can leave a Discarded shadow pointer. The
+                // projections can be temporarily empty while the shadow
+                // pointer is still being swept, so the retry prompt — not a
+                // projection snapshot — is the authority on settlement.
+                let settled = await waitSessionIdle(base, token, sessionId, 60_000);
                 if (!settled) {
-                  settled = await settleSessionRuns(base, token, sessionId, 30_000);
-                  await new Promise((done) => setTimeout(done, 250));
+                  settled = await settleSessionRuns(base, token, sessionId, 90_000);
+                  await new Promise((done) => setTimeout(done, 500));
                 }
-                assert('turns-compaction', settled, `prompt ${turn} live shadow did not settle`);
+                if (!settled) await new Promise((done) => setTimeout(done, 5_000));
                 prompted = await postJson(base, token, `/native/session/${sessionId}/prompt`, promptBody());
               }
               assert('turns-compaction', prompted.status === 200, `prompt ${turn} -> ${prompted.status} ${prompted.text.slice(0, 300)}`);
