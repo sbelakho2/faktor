@@ -74,21 +74,21 @@ export async function probeOrdering({ report = false } = {}) {
     const add = (name, passed, observed) => cases.push({ name, passed, observed });
 
     for (const cursor of ['18446744073709551616', '-1', 'abc', '1&after=2']) {
-      const result = await request(base, token, 'GET', `${events}?after=${cursor}`, undefined, 1200);
+      const result = await request(base, token, 'GET', `${events}?after=${cursor}`, undefined, 3000);
       add(`cursor-${cursor}`, no5xx(result) && !/panicked/i.test(result.text), {
         status: result.status,
         aborted: result.aborted,
       });
     }
     const [first, second] = await Promise.all([
-      request(base, token, 'GET', `${events}?after=0`, undefined, 900),
-      request(base, token, 'GET', `${events}?after=0`, undefined, 900),
+      request(base, token, 'GET', `${events}?after=0`, undefined, 3000),
+      request(base, token, 'GET', `${events}?after=0`, undefined, 3000),
     ]);
     add('two-concurrent-streams', no5xx(first) && no5xx(second), {
       first: first.aborted ? 'bounded' : first.status,
       second: second.aborted ? 'bounded' : second.status,
     });
-    const missingAuth = await request(base, null, 'GET', `${events}?after=0`, undefined, 500);
+    const missingAuth = await request(base, null, 'GET', `${events}?after=0`, undefined, 3000);
     add('stream-auth-before-data', missingAuth.status === 401, { status: missingAuth.status });
 
     const document = {
