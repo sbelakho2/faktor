@@ -48,6 +48,16 @@ pub enum ProviderCfg {
         /// to any other instance.
         #[serde(default)]
         quality: Option<ProviderQualityCfg>,
+        /// Cold-start response-header bound for this local runtime
+        /// (milliseconds). Absent = the documented
+        /// `OLLAMA_COLD_FIRST_BYTE_TIMEOUT_MS` (large local model load);
+        /// `0` is refused by the adapter's documented default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        first_byte_timeout_ms: Option<u64>,
+        /// Stream idle/read bound between frames (milliseconds). Absent =
+        /// `OLLAMA_STREAM_IDLE_TIMEOUT_MS`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        idle_timeout_ms: Option<u64>,
     },
     OpenAi {
         id: String,
@@ -711,8 +721,14 @@ impl ProviderCfg {
         transport: Arc<dyn HttpTransport>,
     ) -> Option<Arc<faktor_ollama::OllamaProvider>> {
         match self {
-            ProviderCfg::Ollama { base_url, .. } => {
-                let cfg = faktor_ollama::OllamaConfig::new(base_url.clone());
+            ProviderCfg::Ollama {
+                base_url,
+                first_byte_timeout_ms,
+                idle_timeout_ms,
+                ..
+            } => {
+                let cfg = faktor_ollama::OllamaConfig::new(base_url.clone())
+                    .with_timeouts(*first_byte_timeout_ms, *idle_timeout_ms);
                 Some(faktor_ollama::OllamaProvider::new(cfg, transport))
             }
             _ => None,
@@ -721,8 +737,14 @@ impl ProviderCfg {
 
     pub fn build(&self, transport: Arc<dyn HttpTransport>) -> Result<Arc<dyn Provider>, String> {
         let provider: Arc<dyn Provider> = match self {
-            ProviderCfg::Ollama { base_url, .. } => {
-                let cfg = faktor_ollama::OllamaConfig::new(base_url.clone());
+            ProviderCfg::Ollama {
+                base_url,
+                first_byte_timeout_ms,
+                idle_timeout_ms,
+                ..
+            } => {
+                let cfg = faktor_ollama::OllamaConfig::new(base_url.clone())
+                    .with_timeouts(*first_byte_timeout_ms, *idle_timeout_ms);
                 faktor_ollama::OllamaProvider::new(cfg, transport.clone())
             }
             ProviderCfg::OpenAi {

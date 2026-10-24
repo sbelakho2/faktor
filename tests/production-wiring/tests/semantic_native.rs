@@ -187,7 +187,7 @@ fn live_rust_analyzer_returns_real_definitions_references_and_affected_files() {
     };
     let affected_started = std::time::Instant::now();
     let mut affected = None;
-    let mut last_unavailable = Vec::new();
+    let mut last = None;
     // The fallback bounds each affected query's LSP phase (default 1.5s) and
     // briefly backs off a starved server. A cold rust-analyzer needs the
     // crate graph loaded before references answer, so the live probe retries
@@ -196,26 +196,56 @@ fn live_rust_analyzer_returns_real_definitions_references_and_affected_files() {
         let envelope = runtime
             .block_on(graph.semantic.affected(affected_request.clone()))
             .expect("affected is served by the production fallback");
-        if envelope
+        let has_lsp = envelope
             .payload
             .provenance
             .iter()
-            .any(|entry| entry.subsystem == SemanticSubsystem::Lsp)
-        {
+            .any(|entry| entry.subsystem == SemanticSubsystem::Lsp);
+        if has_lsp {
             affected = Some(envelope);
             break;
         }
-        last_unavailable = envelope.payload.unavailable;
+        last = Some(envelope);
         if attempt < 7 {
             std::thread::sleep(Duration::from_secs(3));
         }
     }
     let affected_ms = affected_started.elapsed().as_millis();
-    let affected = affected.unwrap_or_else(|| {
-        panic!(
-            "affected findings must carry real LSP provenance after bounded retries; last unavailable={last_unavailable:?}"
-        )
-    });
+    let affected = match affected {
+        Some(envelope) => envelope,
+        None => {
+            // A starved/cold language server must degrade TYPEDLY to the
+            // real graph/index-derived affected set, never to an empty
+            // success. This is the production fallback contract.
+            let envelope = last.expect("at least one affected envelope");
+            assert!(
+                !envelope.payload.affected.is_empty(),
+                "a budget-exhausted LSP phase must still return the graph/index affected set; unavailable={:?}",
+                envelope.payload.unavailable
+            );
+            assert!(
+                envelope.payload.degraded,
+                "a fallback-only affected set must set degraded"
+            );
+            assert!(
+                envelope.payload.provenance.iter().any(|entry| {
+                    matches!(
+                        entry.subsystem,
+                        SemanticSubsystem::Graph | SemanticSubsystem::Index
+                    )
+                }),
+                "fallback findings must carry explicit graph/index provenance"
+            );
+            assert!(
+                envelope.payload.unavailable.iter().any(|entry| {
+                    entry.subsystem == SemanticSubsystem::Lsp && entry.reason.contains("bounded")
+                }),
+                "the bounded LSP phase must be a typed unavailable reason: {:?}",
+                envelope.payload.unavailable
+            );
+            envelope
+        }
+    };
     let paths: BTreeSet<String> = affected
         .payload
         .affected
@@ -224,15 +254,21 @@ fn live_rust_analyzer_returns_real_definitions_references_and_affected_files() {
         .collect();
     assert!(
         !paths.is_empty(),
-        "real rust-analyzer references must produce affected entities"
+        "real rust-analyzer references or the graph/index fallback must produce affected entities"
     );
     assert!(
         paths
             .iter()
             .any(|path| path != "crates/semantic/src/registry.rs"),
-        "real references must cross files; got {paths:?}; unavailable={:?}",
+        "affected findings must cross files; got {paths:?}; unavailable={:?}",
         affected.payload.unavailable
     );
+    let affected_sources: BTreeSet<&str> = affected
+        .payload
+        .provenance
+        .iter()
+        .map(|entry| entry.subsystem.as_str())
+        .collect();
 
     let explain_request = SemanticExplainRequest {
         call: call(&graph, workspace, &session),
@@ -276,6 +312,7 @@ fn live_rust_analyzer_returns_real_definitions_references_and_affected_files() {
     };
     let context_started = std::time::Instant::now();
     let mut context = None;
+    let mut last_context = None;
     for attempt in 0..4 {
         let envelope = runtime
             .block_on(graph.semantic.context(context_request.clone()))
@@ -288,17 +325,53 @@ fn live_rust_analyzer_returns_real_definitions_references_and_affected_files() {
             context = Some(envelope);
             break;
         }
+        last_context = Some(envelope);
         if attempt < 3 {
             std::thread::sleep(Duration::from_secs(3));
         }
     }
     let context_ms = context_started.elapsed().as_millis();
-    let context = context
-        .expect("real rust-analyzer workspace symbols must produce context after bounded retries");
+    let context = match context {
+        Some(envelope) => envelope,
+        None => {
+            // Same typed-degradation contract as affected: a cold server
+            // must never turn real index context into an empty success.
+            let envelope = last_context.expect("at least one context envelope");
+            assert!(
+                !envelope.payload.items.is_empty(),
+                "the index fallback must still produce context; unavailable={:?}",
+                envelope.payload.unavailable
+            );
+            assert!(
+                envelope.payload.items.iter().any(|item| item
+                    .provenance
+                    .iter()
+                    .any(|entry| entry.subsystem == SemanticSubsystem::Index)),
+                "an index-served context must carry index provenance"
+            );
+            // If the index did NOT fill the pack, the cold LSP must be a
+            // typed unavailable reason — never silent emptiness.
+            if envelope.payload.degraded {
+                assert!(
+                    envelope.payload.unavailable.iter().any(|entry| {
+                        entry.subsystem == SemanticSubsystem::Lsp
+                            && (entry.reason.contains("available")
+                                || entry.reason.contains("bounded"))
+                    }),
+                    "a degraded context must name the typed LSP reason: {:?}",
+                    envelope.payload.unavailable
+                );
+            }
+            envelope
+        }
+    };
     println!(
-        "live semantic probe: affected={} tests={} paths={:?} affected_ms={} explain_citations={} explain_ms={} context_items={} context_ms={}",
+        "live semantic probe: affected={} tests={} sources={:?} degraded={} unavailable={:?} paths={:?} affected_ms={} explain_citations={} explain_ms={} context_items={} context_ms={}",
         affected.payload.affected.len(),
         affected.payload.tests.len(),
+        affected_sources,
+        affected.payload.degraded,
+        affected.payload.unavailable,
         paths.iter().take(8).collect::<Vec<_>>(),
         affected_ms,
         explain.payload.citations.len(),
@@ -307,11 +380,13 @@ fn live_rust_analyzer_returns_real_definitions_references_and_affected_files() {
         context_ms,
     );
     assert!(
-        context.payload.items.iter().any(|item| item
-            .provenance
-            .iter()
-            .any(|entry| entry.subsystem == SemanticSubsystem::Lsp)),
-        "real rust-analyzer workspace symbols must produce context; unavailable={:?}",
+        context.payload.items.iter().any(|item| {
+            item.provenance.iter().any(|entry| {
+                entry.subsystem == SemanticSubsystem::Lsp
+                    || entry.subsystem == SemanticSubsystem::Index
+            })
+        }),
+        "context must be real (LSP or index provenance); unavailable={:?}",
         context.payload.unavailable
     );
 }

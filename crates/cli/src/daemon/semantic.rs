@@ -273,9 +273,25 @@ impl IndexMetadata for DaemonIndexMetadata {
         changed: &[SemanticEntityRef],
         _max_depth: u32,
     ) -> Result<Vec<SemanticEntityRef>, SemanticError> {
-        let view = self.index.view(workspace).ok_or_else(|| {
-            unavailable("index", "no published index generation for this workspace")
-        })?;
+        // One bounded readiness retry: a workspace created after boot has no
+        // published generation until attach+build publish. The impact graph
+        // still answers even if this bound expires; the caller sees the typed
+        // index unavailable in that case.
+        let view = match self.index.view(workspace) {
+            Some(view) => view,
+            None => self
+                .index
+                .ensure_ready(workspace, Instant::now() + INDEX_AFFECTED_READY_BOUND)
+                .map_err(|error| {
+                    unavailable(
+                        "index",
+                        format!(
+                            "no published index generation after a {}ms readiness retry: {error}",
+                            INDEX_AFFECTED_READY_BOUND.as_millis()
+                        ),
+                    )
+                })?,
+        };
         let index = view.index();
         let guard = index
             .lock()
@@ -626,6 +642,14 @@ const LSP_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const LSP_READY_TIMEOUT: Duration = Duration::from_secs(45);
 const LSP_READY_POLL: Duration = Duration::from_millis(500);
 const MAX_LSP_FILE_BYTES: usize = 2 * 1024 * 1024;
+
+/// Documented bound for the ONE index-readiness retry on the affected path.
+/// The daemon normally has a published generation already; this covers the
+/// workspace-created-after-boot race (semantic query before the index worker
+/// published) without blocking a semantic answer indefinitely. If the build
+/// cannot publish inside the bound the fallback reports the typed unavailable
+/// and still answers from the repository impact graph.
+pub const INDEX_AFFECTED_READY_BOUND: Duration = Duration::from_secs(120);
 
 pub struct DaemonLspMetadata {
     manager: Arc<LspManager>,

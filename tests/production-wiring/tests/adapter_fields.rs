@@ -251,6 +251,7 @@ fn rows() -> Vec<Row> {
                         base_url: base.to_string(),
                         keep_alive: None,
                         model_overrides: HashMap::from([("qwen-audit".to_string(), caps)]),
+                        ..faktor_ollama::OllamaConfig::new(None)
                     },
                     transport(),
                 )
@@ -312,6 +313,7 @@ async fn ollama_refuses_documents_pre_wire() {
             base_url: base,
             keep_alive: None,
             model_overrides: HashMap::from([("qwen-audit".to_string(), caps)]),
+            ..faktor_ollama::OllamaConfig::new(None)
         },
         transport(),
     );

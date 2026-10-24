@@ -1540,6 +1540,8 @@ fn apply_saved_provider_connections(
                 allow_loopback: connection.allow_loopback,
                 pricing: None,
                 quality: None,
+                first_byte_timeout_ms: None,
+                idle_timeout_ms: None,
             },
             ProviderFamily::OpenAi => config::ProviderCfg::OpenAi {
                 id: connection.id.clone(),

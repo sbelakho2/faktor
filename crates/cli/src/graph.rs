@@ -1600,6 +1600,8 @@ mod tests {
             pricing: None,
             quality: None,
             allow_loopback: true,
+            first_byte_timeout_ms: None,
+            idle_timeout_ms: None,
         };
         let mut registry = ProviderRegistry::new();
         registry
@@ -1623,6 +1625,8 @@ mod tests {
             }),
             quality: None,
             allow_loopback: true,
+            first_byte_timeout_ms: None,
+            idle_timeout_ms: None,
         };
         let e = match hostile.build(open_transport()) {
             Ok(_) => panic!("ollama pricing refused"),
@@ -2930,6 +2934,8 @@ mod tests {
             pricing: None,
             quality: None,
             allow_loopback: true,
+            first_byte_timeout_ms: None,
+            idle_timeout_ms: None,
         };
         let mut registry = ProviderRegistry::new();
         registry
@@ -2967,6 +2973,8 @@ mod tests {
                 ..Default::default()
             }),
             allow_loopback: true,
+            first_byte_timeout_ms: None,
+            idle_timeout_ms: None,
         };
         let mut registry = ProviderRegistry::new();
         registry
