@@ -15,8 +15,24 @@ steps:
       - cargo fmt --check -p faktor-site
       - cargo check -p faktor-site
       - cargo clippy -p faktor-site --all-targets -- -D warnings
-      - curl -fsSLo /tmp/zola.tar.gz https://github.com/getzola/zola/releases/download/v0.22.1/zola-v0.22.1-x86_64-unknown-linux-gnu.tar.gz
-      - echo "0ca09aa40376aaa9ddfb512ff9ad963262ef95edb0d0f2d5ec6961b6f5cf22ef  /tmp/zola.tar.gz" | sha256sum -c -
+      - |
+        set -eu
+        case "$(uname -m)" in
+          x86_64)
+            zola_url="https://github.com/getzola/zola/releases/download/v0.22.1/zola-v0.22.1-x86_64-unknown-linux-gnu.tar.gz"
+            zola_sha="0ca09aa40376aaa9ddfb512ff9ad963262ef95edb0d0f2d5ec6961b6f5cf22ef"
+            ;;
+          aarch64|arm64)
+            zola_url="https://github.com/getzola/zola/releases/download/v0.22.1/zola-v0.22.1-aarch64-unknown-linux-gnu.tar.gz"
+            zola_sha="8af437ec6352f33ccd24d7a1cfcb54a3db95d3ce376dc69525b4ef3fb6b8c1d1"
+            ;;
+          *)
+            echo "site: unsupported architecture $(uname -m)" >&2
+            exit 1
+            ;;
+        esac
+        curl --proto '=https' --tlsv1.2 -fsSLo /tmp/zola.tar.gz "$zola_url"
+        printf '%s  %s\n' "$zola_sha" /tmp/zola.tar.gz | sha256sum -c -
       - tar -xzf /tmp/zola.tar.gz -C /usr/local/bin zola
       - zola --root site build
       - cargo test -p faktor-site
