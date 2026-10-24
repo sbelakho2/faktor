@@ -231,28 +231,56 @@ export function sealImpactGraph(document) {
  * heuristic.
  */
 export function loadImpactGraph(root = ROOT, { head = null, path = null } = {}) {
+  const pinned = path !== null || Boolean(process.env.FAKTOR_IMPACT_GRAPH);
   const candidates = graphCandidates(root, path);
+  let firstError = null;
   for (const candidate of candidates) {
     if (!existsSync(candidate)) continue;
     let text;
     try {
       text = read(candidate);
     } catch (error) {
-      return { document: null, error: `impact graph is unreadable: ${error.message ?? error}`, path: candidate, code: 'io' };
+      const failure = {
+        document: null,
+        error: `impact graph is unreadable: ${error.message ?? error}`,
+        path: candidate,
+        code: 'io',
+      };
+      if (pinned) return failure;
+      firstError ??= failure;
+      continue;
     }
     const verdict = validateGraphText(text, head, { root });
     if (!verdict.ok) {
-      return { document: null, error: verdict.error, code: verdict.code, path: candidate };
+      const failure = { document: null, error: verdict.error, code: verdict.code, path: candidate };
+      if (pinned) return failure;
+      firstError ??= failure;
+      continue;
     }
     let document;
     try {
       document = JSON.parse(text);
     } catch (error) {
-      return { document: null, error: `impact graph is unreadable: ${error.message ?? error}`, path: candidate, code: 'corrupt_json' };
+      const failure = {
+        document: null,
+        error: `impact graph is unreadable: ${error.message ?? error}`,
+        path: candidate,
+        code: 'corrupt_json',
+      };
+      if (pinned) return failure;
+      firstError ??= failure;
+      continue;
     }
     return { document, error: null, code: null, path: candidate };
   }
-  return { document: null, error: 'impact graph is missing (generator: scripts/programme/build-impact-graph.mjs)', code: 'missing', path: null };
+  return (
+    firstError ?? {
+      document: null,
+      error: 'impact graph is missing (generator: scripts/programme/build-impact-graph.mjs)',
+      code: 'missing',
+      path: null,
+    }
+  );
 }
 
 const GRAPH_FILE = 'tests/programme/impact-graph.json';
