@@ -12,6 +12,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "macos")]
 use faktor_core::cancellation::CancellationToken;
 
 use crate::{ProcessSupervisor, SpawnConfig};

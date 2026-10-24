@@ -109,15 +109,28 @@ fn fault_live_rust_analyzer_this_repository() {
             "crates/impact/src/lib.rs".into(),
         ],
         &LspOptions {
-            timeout: std::time::Duration::from_secs(20),
-            settle: std::time::Duration::from_secs(60),
+            timeout: std::time::Duration::from_secs(60),
+            settle: std::time::Duration::from_secs(30),
             max_requests: 2048,
-            max_duration: std::time::Duration::from_secs(240),
+            max_duration: std::time::Duration::from_secs(600),
             ..LspOptions::default()
         },
         &supervisor,
     )
     .unwrap();
+    eprintln!(
+        "live impact: references={} calls={} implementations={} files={} symbols={} probes={} readiness_ms={} quiescent={} degraded={} note={:?}",
+        stats.references,
+        stats.calls,
+        stats.implementations,
+        stats.files_opened,
+        stats.symbols,
+        stats.readiness_probes,
+        stats.readiness_wait_ms,
+        stats.quiescent,
+        stats.degraded,
+        stats.note
+    );
     assert!(
         stats.references + stats.calls > 0,
         "no LSP relationships (degraded={}): {stats:?}",

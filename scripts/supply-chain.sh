@@ -35,11 +35,15 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT" || exit 2
 CI_TOOLS="${FAKTOR_CI_TOOLS:-}"
 if [ -z "$CI_TOOLS" ]; then
-    if [ -n "${CARGO_TARGET_DIR:-}" ]; then
-        CI_TOOLS="$CARGO_TARGET_DIR/release/faktor-ci-tools"
-    else
-        CI_TOOLS="$ROOT/target/release/faktor-ci-tools"
-    fi
+    target_dir="${CARGO_TARGET_DIR:-$ROOT/target}"
+    for profile in release debug; do
+        candidate="$target_dir/$profile/faktor-ci-tools"
+        if [ -x "$candidate" ]; then
+            CI_TOOLS="$candidate"
+            break
+        fi
+    done
+    [ -n "$CI_TOOLS" ] || CI_TOOLS="$target_dir/release/faktor-ci-tools"
 fi
 
 OUT_DIR="${SUPPLY_CHAIN_OUT_DIR:-target/certification}"

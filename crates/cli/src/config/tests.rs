@@ -279,6 +279,8 @@ fn validate_rejects_duplicate_provider_ids() {
                 pricing: None,
                 allow_loopback: true,
                 quality: None,
+                first_byte_timeout_ms: None,
+                idle_timeout_ms: None,
             },
             ProviderCfg::Ollama {
                 id: "other".into(),
@@ -286,6 +288,8 @@ fn validate_rejects_duplicate_provider_ids() {
                 pricing: None,
                 allow_loopback: true,
                 quality: None,
+                first_byte_timeout_ms: None,
+                idle_timeout_ms: None,
             },
             ProviderCfg::OpenAi {
                 id: "dup".into(),
@@ -515,6 +519,8 @@ fn openai_api_setting_selects_family_with_documented_default() {
             pricing: None,
             allow_loopback: true,
             quality: None,
+            first_byte_timeout_ms: None,
+            idle_timeout_ms: None,
         }
         .openai_family(),
         None
@@ -862,6 +868,8 @@ fn hostile_pricing_override_values_are_typed_errors_everywhere() {
         }),
         allow_loopback: true,
         quality: None,
+        first_byte_timeout_ms: None,
+        idle_timeout_ms: None,
     };
     let e = ollama
         .validate_pricing()
@@ -1148,6 +1156,8 @@ fn billing_origin_matrix_is_strict_and_instance_scoped() {
             pricing: None,
             allow_loopback: true,
             quality: None,
+            first_byte_timeout_ms: None,
+            idle_timeout_ms: None,
         }
         .billing_origin(),
         BillingOrigin::Local

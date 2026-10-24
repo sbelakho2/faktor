@@ -1198,7 +1198,17 @@ impl SemanticProvider for GenericSemanticFallback {
             }
 
             if let Some(index) = &self.index {
-                match index.impacted_entities(workspace, &changed, max_depth) {
+                // Index readiness is asynchronous (attach/build/publish).
+                // One bounded retry turns the common cold-start race into
+                // real index-derived affected entities instead of an empty
+                // answer; the adapter itself may also drive a readiness
+                // retry. If it still cannot answer, the typed unavailable
+                // below is explicit degradation, never silent emptiness.
+                let mut outcome = index.impacted_entities(workspace, &changed, max_depth);
+                if matches!(outcome, Err(SemanticError::Unavailable { .. })) {
+                    outcome = index.impacted_entities(workspace, &changed, max_depth);
+                }
+                match outcome {
                     Ok(refs) => {
                         for entity in refs {
                             let subject = entity.entity_id.as_str().to_string();
@@ -2097,6 +2107,47 @@ mod tests {
         }
     }
 
+    /// Deterministic cold-index seam: the first `fail_times` calls report
+    /// the same typed Unavailable the production adapter returns before a
+    /// generation is published, then it answers with real entities.
+    struct FlakyIndex {
+        fail_times: usize,
+        calls: std::sync::atomic::AtomicUsize,
+        entities: Vec<SemanticEntityRef>,
+    }
+
+    impl FlakyIndex {
+        fn new(fail_times: usize, entities: Vec<SemanticEntityRef>) -> Self {
+            Self {
+                fail_times,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                entities,
+            }
+        }
+    }
+
+    impl IndexMetadata for FlakyIndex {
+        fn identity(&self) -> String {
+            "index:flaky".to_string()
+        }
+
+        fn impacted_entities(
+            &self,
+            _workspace: WorkspaceId,
+            _changed: &[SemanticEntityRef],
+            _max_depth: u32,
+        ) -> Result<Vec<SemanticEntityRef>, SemanticError> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call < self.fail_times {
+                return Err(SemanticError::Unavailable {
+                    subsystem: "index".to_string(),
+                    reason: "no published index generation for this workspace".to_string(),
+                });
+            }
+            Ok(self.entities.clone())
+        }
+    }
+
     struct MapHashes(BTreeMap<String, FileHash>);
 
     impl SourceHashView for MapHashes {
@@ -2854,6 +2905,134 @@ mod tests {
             .affected
             .iter()
             .any(|entity| entity.entity_id.as_str() == "caller"));
+    }
+
+    #[test]
+    fn budget_exhausted_lsp_keeps_graph_and_retried_index_entities_with_typed_flags() {
+        let slow = Arc::new(SlowLsp::default());
+        let index = Arc::new(FlakyIndex::new(
+            1,
+            vec![entity("src/indexed.rs", "indexed")],
+        ));
+        let fallback = GenericSemanticFallback::default()
+            .with_impact(Arc::new(FakeImpact))
+            .with_index(index.clone())
+            .with_lsp(slow.clone())
+            .with_affected_lsp_budget(Duration::from_millis(20))
+            .with_affected_lsp_entity_cap(8);
+        let workspace = WorkspaceId::new(1);
+        let envelope = block_on_timed(fallback.affected(AffectedRequest {
+            call: call(),
+            workspace,
+            snapshot_id: snapshot(workspace, "rev-1"),
+            changed: vec![
+                entity("src/a.rs", "a"),
+                entity("src/b.rs", "b"),
+                entity("src/c.rs", "c"),
+            ],
+            max_depth: 2,
+        }))
+        .unwrap();
+        assert_eq!(
+            index.calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the cold index is retried exactly once"
+        );
+        let names: Vec<&str> = envelope
+            .payload
+            .affected
+            .iter()
+            .map(|entity| entity.entity_id.as_str())
+            .collect();
+        assert!(
+            names.contains(&"caller"),
+            "graph findings survive: {names:?}"
+        );
+        assert!(
+            names.contains(&"indexed"),
+            "the retried index fallback contributes real entities: {names:?}"
+        );
+        assert!(envelope
+            .payload
+            .tests
+            .iter()
+            .any(|entity| entity.entity_id.as_str() == "checks"));
+        assert!(envelope.payload.degraded, "budget exhaustion is explicit");
+        assert!(envelope.payload.provenance.iter().any(|entry| {
+            entry.subsystem == SemanticSubsystem::Graph
+                && entry.fidelity == SemanticFidelity::Structural
+        }));
+        assert!(envelope.payload.provenance.iter().any(|entry| {
+            entry.subsystem == SemanticSubsystem::Index
+                && entry.source == "index:flaky"
+                && entry.fidelity == SemanticFidelity::Heuristic
+        }));
+        let lsp = envelope
+            .payload
+            .unavailable
+            .iter()
+            .find(|entry| entry.subsystem == SemanticSubsystem::Lsp)
+            .expect("bounded LSP phase is typed unavailable");
+        assert!(lsp.reason.contains("bounded"), "reason: {}", lsp.reason);
+        assert!(
+            !envelope
+                .payload
+                .unavailable
+                .iter()
+                .any(|entry| entry.subsystem == SemanticSubsystem::Index),
+            "the successful readiness retry must clear the index degradation"
+        );
+    }
+
+    #[test]
+    fn budget_exhausted_lsp_with_unready_index_is_non_empty_and_fully_typed() {
+        let slow = Arc::new(SlowLsp::default());
+        let index = Arc::new(FlakyIndex::new(usize::MAX, Vec::new()));
+        let fallback = GenericSemanticFallback::default()
+            .with_impact(Arc::new(FakeImpact))
+            .with_index(index.clone())
+            .with_lsp(slow)
+            .with_affected_lsp_budget(Duration::from_millis(20))
+            .with_affected_lsp_entity_cap(8);
+        let workspace = WorkspaceId::new(1);
+        let envelope = block_on_timed(fallback.affected(AffectedRequest {
+            call: call(),
+            workspace,
+            snapshot_id: snapshot(workspace, "rev-1"),
+            changed: vec![entity("src/a.rs", "a")],
+            max_depth: 2,
+        }))
+        .unwrap();
+        assert_eq!(
+            index.calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one retry, then the typed fallback"
+        );
+        assert!(
+            envelope
+                .payload
+                .affected
+                .iter()
+                .any(|entity| entity.entity_id.as_str() == "caller"),
+            "the graph-derived set is never discarded because the index is cold"
+        );
+        assert!(envelope.payload.degraded);
+        assert!(envelope
+            .payload
+            .unavailable
+            .iter()
+            .any(|entry| entry.subsystem == SemanticSubsystem::Lsp));
+        let index_reason = envelope
+            .payload
+            .unavailable
+            .iter()
+            .find(|entry| entry.subsystem == SemanticSubsystem::Index)
+            .map(|entry| entry.reason.clone())
+            .expect("an index that stayed cold is typed unavailable");
+        assert!(
+            index_reason.contains("no published index generation"),
+            "reason: {index_reason}"
+        );
     }
 
     #[test]

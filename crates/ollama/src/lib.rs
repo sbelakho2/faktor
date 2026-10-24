@@ -34,7 +34,10 @@ use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+mod cold_start;
 mod frame;
+use cold_start::stream_deadlines;
+pub use cold_start::{OLLAMA_COLD_FIRST_BYTE_TIMEOUT_MS, OLLAMA_STREAM_IDLE_TIMEOUT_MS};
 use frame::parse_ollama_frame;
 /// Map a transport-level refusal onto the ollama host-facing error type.
 /// A genuine transport failure stays a retryable `Network` error (exactly
@@ -50,20 +53,6 @@ fn egress_to_host_error(e: faktor_provider::egress::EgressError) -> Error {
         },
     };
     Error::new(kind, e.to_string())
-}
-/// Stream hang controls: first-byte / idle bounds from the transport
-/// defaults (audit round 9). The OVERALL bound now rides the operation
-/// deadline the runtime stamped into `RequestMeta::deadline_ms` (audit
-/// round 15): `0` keeps streams unbounded overall (defaults only), any
-/// positive value caps the stream's whole lifetime at
-/// `min(deadline_ms, PROVIDER_CEILING_MS)` — a stuck daemon can never
-/// outlive the operation that started the request.
-fn stream_deadlines(request: &GenericAgentRequest) -> StreamDeadlines {
-    let mut deadlines = StreamDeadlines::default();
-    if request.meta.deadline_ms > 0 {
-        deadlines.overall_ms = request.meta.deadline_ms.min(PROVIDER_CEILING_MS);
-    }
-    deadlines
 }
 use faktor_provider::{
     ContentKind, EmbeddingRequest, EmbeddingResponse, GenericAgentRequest, Provider, ProviderChunk,
@@ -283,6 +272,12 @@ pub struct OllamaConfig {
     pub keep_alive: Option<String>,
     /// Capability overrides per model (probed values win unless overridden).
     pub model_overrides: HashMap<String, ModelCapabilities>,
+    /// First-byte/header bound for `/api/chat` streams. `None` uses
+    /// [`OLLAMA_COLD_FIRST_BYTE_TIMEOUT_MS`] (local cold model load).
+    pub first_byte_timeout_ms: Option<u64>,
+    /// Idle/read bound between stream frames. `None` uses
+    /// [`OLLAMA_STREAM_IDLE_TIMEOUT_MS`].
+    pub idle_timeout_ms: Option<u64>,
 }
 impl OllamaConfig {
     pub fn new(base_url: Option<String>) -> Self {
@@ -290,6 +285,8 @@ impl OllamaConfig {
             base_url: base_url.unwrap_or_else(|| DEFAULT_BASE.to_string()),
             keep_alive: Some("30m".into()),
             model_overrides: HashMap::new(),
+            first_byte_timeout_ms: None,
+            idle_timeout_ms: None,
         }
     }
 }
@@ -818,8 +815,9 @@ impl Provider for OllamaProvider {
             req.deadline_ms().min(PROVIDER_CEILING_MS)
         } else {
             // A non-streaming POST has no idle/first-byte guard of its own:
-            // the transport's first-byte default is the fallback bound.
-            StreamDeadlines::default().first_byte_ms
+            // the configured cold-start first-byte bound is the fallback (a
+            // local model may be loaded lazily by this very call).
+            self.config.stream_timeouts().0
         };
         run_embedding_future(async move {
             let call = async {
@@ -893,7 +891,7 @@ impl Provider for OllamaProvider {
         // increments monotonically so tool ids (ollama:<seq>:<idx>) never
         // collide across responses of the same provider instance.
         let response_seq = self.response_seq.fetch_add(1, Ordering::Relaxed);
-        let deadlines = stream_deadlines(&req);
+        let deadlines = stream_deadlines(&req, &self.config);
         let cancel = req.meta.cancellation.clone();
         Box::pin(ollama_chat_stream(
             transport,
@@ -1605,7 +1603,7 @@ mod tests {
     use faktor_security::destination::DestinationPolicy;
     use futures::StreamExt;
 
-    fn req(model: &str) -> GenericAgentRequest {
+    pub(crate) fn req(model: &str) -> GenericAgentRequest {
         GenericAgentRequest {
             model: model.into(),
             system: "sys".into(),
@@ -1634,7 +1632,7 @@ mod tests {
 
     /// Drain a provider stream, panicking on any error (tests that assert
     /// error paths collect the chunks inline instead).
-    async fn stream_chunks(
+    pub(crate) async fn stream_chunks(
         provider: &dyn Provider,
         request: GenericAgentRequest,
     ) -> Vec<ProviderChunk> {

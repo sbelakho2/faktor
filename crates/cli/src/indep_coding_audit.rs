@@ -25,7 +25,7 @@ impl faktor_agent::PermissionRequester for AuditAllow {
 #[ignore = "[live] live Ollama coding-task audit"]
 async fn indep_coding_task_audit() {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("faktor_agent=debug,faktor_openai=debug")
+        .with_env_filter("info,faktor_agent=debug,faktor_openai=debug")
         .with_test_writer()
         .try_init();
     let port: u16 = std::env::var("AUDIT_PROXY_PORT")
@@ -53,17 +53,16 @@ async fn indep_coding_task_audit() {
     let data = tempfile::tempdir().unwrap();
     let cfg = config::Config {
         model: model.clone(),
-        routing_mode: Some(faktor_core::model::RoutingMode::Pinned {
-            provider: "local".into(),
-            model: model.clone(),
-        }),
-        providers: vec![config::ProviderCfg::OpenAi {
+        // Economy: the only registered local runtime advertises the real
+        // installed model (live discovery); the synthetic `default` alias
+        // resolves to it in the adapter. Pinning is deliberately avoided
+        // here because the boot preflight validates pins before live
+        // Ollama discovery has run.
+        routing_mode: None,
+        providers: vec![config::ProviderCfg::Ollama {
             id: "local".into(),
-            base_url: format!("http://127.0.0.1:{port}/v1"),
-            api_key_env: None,
-            api: Some(config::OpenAiApi::Chat),
+            base_url: Some(format!("http://127.0.0.1:{port}")),
             allow_loopback: true,
-            models: vec![model.clone()],
             pricing: None,
             quality: Some(config::ProviderQualityCfg {
                 coding_reliability: Some(80),
@@ -71,6 +70,10 @@ async fn indep_coding_task_audit() {
                 tool_reliability: Some(80),
                 reasoning_reliability: Some(80),
             }),
+            // Local cold-start bound: a 27B model is loaded lazily on the
+            // first request; the generic 60 s header default is premature.
+            first_byte_timeout_ms: Some(300_000),
+            idle_timeout_ms: Some(120_000),
         }],
         instructions: "You are Faktor, a careful senior engineer. Read each file at most once. \
 After identifying the bug, apply the fix with edit_file immediately, then run the tests."
@@ -85,6 +88,17 @@ After identifying the bug, apply the fix with edit_file immediately, then run th
     };
     let graph = build_daemon_with_permission(data.path(), Some(cfg), Arc::new(AuditAllow))
         .expect("daemon graph");
+    // Warm the model OUTSIDE the measured window. A cold Ollama loads the
+    // model on the first request; doing that inside the task makes a correct
+    // turn look like a provider timeout.
+    let warm = faktor_ollama::OllamaProvider::new(
+        faktor_ollama::OllamaConfig::new(Some(format!("http://127.0.0.1:{port}")))
+            .with_timeouts(Some(300_000), Some(120_000)),
+        Arc::new(faktor_provider::egress::PolicyCheckedHttpTransport::permissive()),
+    );
+    let warm_started = std::time::Instant::now();
+    warm.warm_up(&model).await.expect("Ollama warm-up");
+    let warmup_ms = warm_started.elapsed().as_millis() as u64;
     let ws = graph
         .session
         .create_workspace(tmp.path().to_str().unwrap())
@@ -139,6 +153,7 @@ After identifying the bug, apply the fix with edit_file immediately, then run th
         "{}",
         serde_json::json!({
             "model": model,
+            "warmup_ms": warmup_ms,
             "elapsed_ms": elapsed.as_millis() as u64,
             "final_state": format!("{:?}", outcome.final_state),
             "stop_reason": format!("{:?}", outcome.stop_reason),
