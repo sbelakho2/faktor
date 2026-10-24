@@ -150,16 +150,6 @@ fn operation_is_active(session: SessionId, operation_id: &str) -> bool {
         .contains_key(&(session.raw(), operation_id.to_string()))
 }
 
-fn process_start_ms() -> i64 {
-    static START: OnceLock<i64> = OnceLock::new();
-    *START.get_or_init(|| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
-            .unwrap_or(0)
-    })
-}
-
 /// A non-terminal operation whose executor vanished with a previous daemon
 /// can never advance again. Reading it must not paint a live "compacting"
 /// spinner forever (Rev8 S10: truthful states, no fabricated progress):
@@ -169,16 +159,17 @@ fn process_start_ms() -> i64 {
 /// - every earlier phase has not touched the checkpoint/event, so the
 ///   operation is `cancelled` and the prior basis remains authoritative.
 ///
-/// Runs only for rows last updated BEFORE this process started and with no
-/// registered executor, so a just-admitted operation is never rewritten.
+/// The live-executor registry is the ONLY liveness authority: a start
+/// registers before the durable row exists, so any non-terminal row with no
+/// registered executor is genuine residue. A wall-clock guard on
+/// `updated_ms` made this racy (the store stamps created/updated from a
+/// monotonic sequence, so a same-millisecond read could mistake residue for
+/// a just-admitted operation and leave the spinner forever).
 fn reconcile_stale_operation(
     handle: &faktor_session::SessionHandle,
     op: CompactionOperation,
 ) -> CompactionOperation {
-    if op.is_terminal()
-        || operation_is_active(handle.id(), &op.operation_id)
-        || op.updated_ms >= process_start_ms()
-    {
+    if op.is_terminal() || operation_is_active(handle.id(), &op.operation_id) {
         return op;
     }
     let (state, error_code, message, result) = match op.state {
