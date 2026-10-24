@@ -969,6 +969,36 @@ async function main() {
         console.error(
           `[scale] memory-5000: live=${live} expected=${expectedLive.length} created=${createdIds.size} deleted=${deletedIds.size} missing=${missing.length} ${missing.slice(0, 5).join(',')}`,
         );
+        for (const id of missing.slice(0, 3)) {
+          console.error(`[scale] memory-5000: missing index=${idsList.indexOf(id)} deleted=${deletedIds.has(id)}`);
+        }
+        const tombstoned = new Map();
+        let cursor = null;
+        for (;;) {
+          const query = new URLSearchParams({ session: sessionId, limit: '200', scope: 'session', includeDeleted: 'true' });
+          if (cursor !== null) {
+            query.set('afterMs', String(cursor.afterMs));
+            query.set('afterKind', String(cursor.afterKind));
+            query.set('afterKey', String(cursor.afterKey));
+          }
+          const page = await getJson(base, token, `/native/memory/records?${query}`);
+          for (const record of page.json.records) tombstoned.set(record.id, record);
+          if (!page.json.hasMore) break;
+          cursor = page.json.nextCursor;
+          if (cursor === null) break;
+        }
+        for (const id of missing.slice(0, 3)) {
+          const record = tombstoned.get(id);
+          console.error(
+            `[scale] memory-5000: missing ${id} in-include-deleted=${record ? JSON.stringify({ deleted: record.deleted, version: record.version }) : 'absent'}`,
+          );
+          const probeRow = await fetch(`${base}/native/memory/records/${encodeURIComponent(id)}`, {
+            method: 'PUT',
+            headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+            body: JSON.stringify({ session: sessionId, expectedVersion: 1, value: { type: 'number', value: -1 } }),
+          });
+          console.error(`[scale] memory-5000: probe-exists ${id} -> ${probeRow.status} ${(await probeRow.text()).slice(0, 200)}`);
+        }
       }
       assert('memory-5000', live === expectedLive.length, `live memory ${live} != expected ${expectedLive.length}`);
 

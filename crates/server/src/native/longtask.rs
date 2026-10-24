@@ -1144,6 +1144,7 @@ pub(crate) async fn native_memory_records_list(
     };
     let mut records = Vec::new();
     let mut has_more = false;
+    let mut page_cursor = None;
     for (index, scope) in scopes.iter().enumerate() {
         let page = match store.list(
             scope,
@@ -1159,9 +1160,9 @@ pub(crate) async fn native_memory_records_list(
             Err(e) => return memory_error(e),
         };
         has_more |= page.has_more;
+        page_cursor = page.cursor;
         records.extend(page.records);
         if records.len() >= limit {
-            has_more = true;
             break;
         }
     }
@@ -1172,18 +1173,21 @@ pub(crate) async fn native_memory_records_list(
             .then_with(|| b.id.cmp(&a.id))
     });
     records.truncate(limit);
+    // The resumable cursor is the STORE row cursor, not the decoded payload
+    // timestamp: `fact_timestamp()` may advance past the create-time
+    // `updated_ms` (monotonic millisecond collision), and rebuilding the
+    // cursor from the payload skipped one row whenever the two diverged.
     // A merged two-scope page has no single resumable cursor; the IDE pages
     // a concrete scope for stable cursor semantics.
     let next_cursor = if requested == "all" {
         serde_json::Value::Null
     } else {
-        records
-            .last()
-            .map(|f| {
+        page_cursor
+            .map(|(ms, kind, key)| {
                 serde_json::json!({
-                    "afterMs": f.updated_ms,
-                    "afterKind": f.row_kind(),
-                    "afterKey": f.id,
+                    "afterMs": ms,
+                    "afterKind": kind,
+                    "afterKey": key,
                 })
             })
             .unwrap_or(serde_json::Value::Null)
