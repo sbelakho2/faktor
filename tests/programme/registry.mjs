@@ -377,11 +377,8 @@ export function driftProblems(committed, discovered = null, { stats = null, root
   return problems;
 }
 
-export function writeRegistry(registry) {
-  mkdirSync(dirname(REGISTRY_PATH), { recursive: true });
-  writeFileSync(REGISTRY_PATH, `${JSON.stringify(registry, null, 2)}\n`);
-  mkdirSync(dirname(STATUS_PATH), { recursive: true });
-  const status = {
+function statusDocument(registry) {
+  return {
     schema: STATUS_SCHEMA,
     generated_at: registry.generated_at,
     commit: registry.commit,
@@ -395,7 +392,19 @@ export function writeRegistry(registry) {
       test_ids: row.test_ids,
     })),
   };
-  writeFileSync(STATUS_PATH, `${JSON.stringify(status, null, 2)}\n`);
+}
+
+/** Persist only the derived status evidence under target (never tracked). */
+export function writeStatusEvidence(registry) {
+  mkdirSync(dirname(STATUS_PATH), { recursive: true });
+  writeFileSync(STATUS_PATH, `${JSON.stringify(statusDocument(registry), null, 2)}\n`);
+  return STATUS_PATH;
+}
+
+export function writeRegistry(registry) {
+  mkdirSync(dirname(REGISTRY_PATH), { recursive: true });
+  writeFileSync(REGISTRY_PATH, `${JSON.stringify(registry, null, 2)}\n`);
+  writeStatusEvidence(registry);
   return { registry: REGISTRY_PATH, status: STATUS_PATH, digest: sha(JSON.stringify(registry.rows)) };
 }
 
@@ -558,7 +567,11 @@ export async function main() {
     if (dynamic) {
       const fresh = await buildRegistry({ dynamic: true, discovered });
       problems.push(...validateRegistry(fresh, { discovered, release: mode === 'release' }));
-      writeRegistry(fresh);
+      // `--check` is a gate: refresh the derived status evidence under
+      // target, but never rewrite the tracked registry. A check must leave
+      // the tree byte-identical (generated_at and probed observations are
+      // wall-clock/random and would otherwise dirty a clean evidence SHA).
+      writeStatusEvidence(fresh);
       for (const [kind, count] of Object.entries(fresh.counts.by_status)) {
         console.log(`registry: status ${kind}: ${count}`);
       }
