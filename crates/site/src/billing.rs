@@ -319,6 +319,7 @@ pub fn checkout_request(
             invoice.id
         ),
         cancel_url: format!("{base_url}/account/billing/"),
+        webhook_url: Some(format!("{base_url}/webhooks/payments")),
         local_invoice_id: Some(invoice.id.clone()),
     })
 }

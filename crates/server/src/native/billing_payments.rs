@@ -5,8 +5,10 @@
 //! resolution BEFORE it touches `state.deps.payments`. A foreign organization
 //! is the byte-identical 404 a missing object answers. Mutations are owner-
 //! only, idempotency-keyed and strict DTOs. The webhook ingress is the one
-//! intentionally unauthenticated route: the provider's HMAC signature is its
-//! credential and is verified before any durable state is touched.
+//! intentionally unauthenticated route: the configured adapter is the
+//! credential boundary (signed body or Mollie id-only fetch + id/org binding),
+//! and it resolves authoritative provider truth before durable state is
+//! touched.
 //!
 //! With no `[billing.payments]` section every route answers 409
 //! `payments_disabled`; the daemon is otherwise unchanged.
@@ -1035,8 +1037,9 @@ pub(crate) async fn native_billing_remove_payment_method(
 }
 
 /// `POST /native/billing/webhook` — the provider ingress. There is no daemon
-/// password: the HMAC signature is the credential. The body is verified
-/// before the event id/order/store is consulted.
+/// password: the configured adapter authenticates the delivery (a signed
+/// body, or Mollie's id-only payload fetched and id/org-bound through checked
+/// egress) before the event id/order/store is consulted.
 pub(crate) async fn native_billing_webhook(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1050,7 +1053,10 @@ pub(crate) async fn native_billing_webhook(
         .filter_map(|(name, value)| value.to_str().ok().map(|value| (name.as_str(), value)))
         .collect();
     let webhook_headers = WebhookHeaders::from_pairs(pairs);
-    match service.handle_webhook(&webhook_headers, &body, service.now_ms()) {
+    match service
+        .handle_webhook(&webhook_headers, &body, service.now_ms())
+        .await
+    {
         Ok(outcome) => Json(serde_json::json!({
             "ok": true,
             "status": match outcome.disposition {

@@ -57,19 +57,39 @@ impl TestApp {
         provider: faktor_payments::ProviderKind,
         transport: Option<Arc<dyn faktor_provider::egress::HttpTransport>>,
     ) -> Self {
+        Self::build_inner(provider, transport, None)
+    }
+
+    pub fn build_with_mollie(
+        transport: Arc<dyn faktor_provider::egress::HttpTransport>,
+        base_url: String,
+    ) -> Self {
+        Self::build_inner(
+            faktor_payments::ProviderKind::Mollie,
+            Some(transport),
+            Some(base_url),
+        )
+    }
+
+    fn build_inner(
+        provider: faktor_payments::ProviderKind,
+        transport: Option<Arc<dyn faktor_provider::egress::HttpTransport>>,
+        mollie_base_url: Option<String>,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config();
         config.data_dir = dir.path().to_path_buf();
         config.payment_db = dir.path().join("payments.db");
         config.billing_provider = provider;
         config.payments = build_payments_config(provider).unwrap();
-        config.payments.adyen.merchant_account = "TestMerchant".into();
+        if let Some(base_url) = mollie_base_url {
+            config.payments.mollie.base_url = base_url;
+        }
         let clock = Arc::new(ManualClock::new(TEST_NOW_MS));
         let store = Arc::new(SqlitePaymentStore::open(&config.payment_db).unwrap());
         let secrets = Arc::new(StaticSecrets::new([
             ("FAKTOR_SITE_WEBHOOK_SECRET".into(), TEST_SECRET.into()),
-            ("FAKTOR_ADYEN_API_KEY".into(), "test_adyen_key".into()),
-            ("FAKTOR_ADYEN_HMAC_KEY".into(), TEST_SECRET.into()),
+            ("FAKTOR_MOLLIE_API_KEY".into(), "test_mollie_key".into()),
             ("FAKTOR_SITE_PAYMENT_VAULT_KEY".into(), "11".repeat(32)),
         ]));
         let service_clock: Arc<dyn Clock> = clock.clone();
@@ -78,9 +98,9 @@ impl TestApp {
                 PaymentService::open_local(store, config.payments.clone(), service_clock, secrets)
                     .unwrap()
             }
-            faktor_payments::ProviderKind::Adyen => {
-                let transport = transport.expect("Adyen tests inject a mock transport");
-                PaymentService::open_adyen(
+            faktor_payments::ProviderKind::Mollie => {
+                let transport = transport.expect("Mollie tests inject a mock transport");
+                PaymentService::open_mollie(
                     store,
                     config.payments.clone(),
                     service_clock,

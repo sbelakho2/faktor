@@ -145,9 +145,9 @@ fn build_payment_service(config: &Config, clock: Arc<dyn Clock>) -> SiteResult<P
         ProviderKind::Local => {
             PaymentService::open_local(store, config.payments.clone(), clock, secrets)?
         }
-        ProviderKind::Adyen => {
-            let transport = adyen_transport(&config.payments)?;
-            PaymentService::open_adyen(
+        ProviderKind::Mollie => {
+            let transport = mollie_transport(&config.payments)?;
+            PaymentService::open_mollie(
                 store,
                 config.payments.clone(),
                 clock,
@@ -157,34 +157,35 @@ fn build_payment_service(config: &Config, clock: Arc<dyn Clock>) -> SiteResult<P
         }
         ProviderKind::Stripe => {
             return Err(SiteError::internal_message(
-                "the website supports local and Adyen billing providers",
+                "the website supports local and Mollie billing providers",
             ))
         }
     };
     Ok(service)
 }
 
-fn adyen_transport(
+fn mollie_transport(
     config: &PaymentsConfig,
 ) -> SiteResult<Arc<dyn faktor_provider::egress::HttpTransport>> {
-    let url = url::Url::parse(&config.adyen.base_url)
-        .map_err(|_| SiteError::internal_message("Adyen base URL is invalid"))?;
+    let url = url::Url::parse(&config.mollie.base_url)
+        .map_err(|_| SiteError::internal_message("Mollie base URL is invalid"))?;
     let host = url
         .host_str()
-        .ok_or_else(|| SiteError::internal_message("Adyen base URL has no host"))?;
+        .ok_or_else(|| SiteError::internal_message("Mollie base URL has no host"))?;
     let rule = match url.scheme() {
         "https" => format!("https://{host}"),
         "http" => format!("http://{host}"),
         _ => {
             return Err(SiteError::internal_message(
-                "Adyen base URL must use http or https",
+                "Mollie base URL must use http or https",
             ))
         }
     };
     let policy = DestinationPolicy::parse_lines([rule])
-        .map_err(|error| SiteError::internal_message(format!("Adyen egress policy: {error}")))?;
-    let transport = PolicyCheckedHttpTransport::try_with_policy(policy)
-        .map_err(|error| SiteError::internal_message(format!("Adyen egress transport: {error}")))?;
+        .map_err(|error| SiteError::internal_message(format!("Mollie egress policy: {error}")))?;
+    let transport = PolicyCheckedHttpTransport::try_with_policy(policy).map_err(|error| {
+        SiteError::internal_message(format!("Mollie egress transport: {error}"))
+    })?;
     Ok(Arc::new(transport))
 }
 

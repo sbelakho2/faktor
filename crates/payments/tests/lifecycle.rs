@@ -86,7 +86,7 @@ fn config() -> PaymentsConfig {
         webhook_secret_env: SECRET_ENV.into(),
         vault_key_env: faktor_payments::catalog::default_vault_key_env(),
         stripe: StripeConfig::default(),
-        adyen: Default::default(),
+        mollie: Default::default(),
     }
 }
 
@@ -482,13 +482,16 @@ async fn webhook_forgery_replay_and_out_of_order_are_typed() {
     let forged = format!("t={now_secs},v1={}", "0".repeat(64));
     let forged_headers = WebhookHeaders::from_pairs([("Stripe-Signature", forged.as_str())]);
     assert!(matches!(
-        service.handle_webhook(&forged_headers, &body, START),
+        service.handle_webhook(&forged_headers, &body, START).await,
         Err(PaymentError::WebhookUnauthorized(_))
     ));
 
     let header = faktor_payments::sign_local_webhook(WEBHOOK_SECRET, now_secs, &body);
     let headers = WebhookHeaders::from_pairs([("Stripe-Signature", header.as_str())]);
-    let applied = service.handle_webhook(&headers, &body, START).unwrap();
+    let applied = service
+        .handle_webhook(&headers, &body, START)
+        .await
+        .unwrap();
     assert_eq!(
         applied.disposition,
         faktor_payments::WebhookDisposition::Applied
@@ -498,7 +501,10 @@ async fn webhook_forgery_replay_and_out_of_order_are_typed() {
     assert_eq!(paid.amount_paid_minor, expected_total);
 
     // Replay of the exact same event id is idempotent.
-    let duplicate = service.handle_webhook(&headers, &body, START).unwrap();
+    let duplicate = service
+        .handle_webhook(&headers, &body, START)
+        .await
+        .unwrap();
     assert_eq!(
         duplicate.disposition,
         faktor_payments::WebhookDisposition::Duplicate
@@ -528,6 +534,7 @@ async fn webhook_forgery_replay_and_out_of_order_are_typed() {
     let stale_headers = WebhookHeaders::from_pairs([("Stripe-Signature", stale_header.as_str())]);
     let stale = service
         .handle_webhook(&stale_headers, &stale_body, START)
+        .await
         .unwrap();
     assert_eq!(
         stale.disposition,
@@ -560,6 +567,7 @@ async fn webhook_forgery_replay_and_out_of_order_are_typed() {
     let newer_headers = WebhookHeaders::from_pairs([("Stripe-Signature", newer_header.as_str())]);
     let newer = service
         .handle_webhook(&newer_headers, &newer_body, START + 10_000)
+        .await
         .unwrap();
     assert_eq!(
         newer.disposition,
@@ -864,7 +872,7 @@ async fn webhook_timestamp_window_is_enforced() {
     );
     let headers = WebhookHeaders::from_pairs([("Stripe-Signature", stale.as_str())]);
     assert_eq!(
-        service.handle_webhook(&headers, &body, START),
+        service.handle_webhook(&headers, &body, START).await,
         Err(PaymentError::WebhookStaleTimestamp)
     );
 }

@@ -72,7 +72,7 @@ fn config() -> PaymentsConfig {
         webhook_secret_env: NEW_WEBHOOK.into(),
         vault_key_env: "FAKTOR_CLAIMS_VAULT_KEY".into(),
         stripe: Default::default(),
-        adyen: Default::default(),
+        mollie: Default::default(),
     }
 }
 
@@ -452,6 +452,7 @@ async fn hosted_checkout_side_effect_is_claimed_and_replayed() {
         currency: invoice.currency.clone(),
         success_url: "https://example.test/success".into(),
         cancel_url: "https://example.test/cancel".into(),
+        webhook_url: Some("https://example.test/webhooks/payments".into()),
         local_invoice_id: Some(invoice.id.clone()),
     };
     let first = fixture
@@ -582,6 +583,7 @@ async fn webhooks_are_atomic_ordered_and_monotonic() {
     let first = fixture
         .service
         .handle_webhook(&headers(&success_body, now_secs), &success_body, NOW)
+        .await
         .unwrap();
     assert_eq!(first.disposition, WebhookDisposition::Applied);
     let settled = fixture.service.payments(&organization, 10).unwrap();
@@ -593,6 +595,7 @@ async fn webhooks_are_atomic_ordered_and_monotonic() {
     let duplicate = fixture
         .service
         .handle_webhook(&headers(&success_body, now_secs), &success_body, NOW)
+        .await
         .unwrap();
     assert_eq!(duplicate.disposition, WebhookDisposition::Duplicate);
     assert_eq!(
@@ -619,6 +622,7 @@ async fn webhooks_are_atomic_ordered_and_monotonic() {
     let regression = fixture
         .service
         .handle_webhook(&headers(&regression_body, now_secs), &regression_body, NOW)
+        .await
         .unwrap();
     assert_eq!(regression.disposition, WebhookDisposition::Ignored);
     let still_paid = fixture.service.invoice(&organization, &invoice.id).unwrap();
@@ -638,6 +642,7 @@ async fn webhooks_are_atomic_ordered_and_monotonic() {
     let stale = fixture
         .service
         .handle_webhook(&headers(&stale_body, now_secs), &stale_body, NOW)
+        .await
         .unwrap();
     assert_eq!(stale.disposition, WebhookDisposition::StaleIgnored);
     assert_eq!(
@@ -672,6 +677,7 @@ async fn webhooks_are_atomic_ordered_and_monotonic() {
             &trial_regression,
             NOW,
         )
+        .await
         .unwrap();
     assert_eq!(
         fixture
@@ -728,10 +734,10 @@ async fn pending_and_failed_refunds_stay_unsettled_until_confirmed() {
             "metadata": {"organization_id": organization.as_str()},
         }),
     );
-    let refused =
-        fixture
-            .service
-            .handle_webhook(&headers(&missing_status, now_secs), &missing_status, NOW);
+    let refused = fixture
+        .service
+        .handle_webhook(&headers(&missing_status, now_secs), &missing_status, NOW)
+        .await;
     assert!(matches!(refused, Err(PaymentError::WebhookMalformed(_))));
     let still_pending = fixture
         .store
@@ -757,6 +763,7 @@ async fn pending_and_failed_refunds_stay_unsettled_until_confirmed() {
     let applied = fixture
         .service
         .handle_webhook(&headers(&success_body, now_secs), &success_body, NOW)
+        .await
         .unwrap();
     assert_eq!(applied.disposition, WebhookDisposition::Applied);
     let refunds = fixture
@@ -807,6 +814,7 @@ async fn pending_and_failed_refunds_stay_unsettled_until_confirmed() {
     let duplicate = fixture
         .service
         .handle_webhook(&headers(&success_body, now_secs), &success_body, NOW)
+        .await
         .unwrap();
     assert_eq!(duplicate.disposition, WebhookDisposition::Duplicate);
 
@@ -843,6 +851,7 @@ async fn pending_and_failed_refunds_stay_unsettled_until_confirmed() {
     let late = fixture
         .service
         .handle_webhook(&headers(&late_body, now_secs), &late_body, NOW)
+        .await
         .unwrap();
     assert_eq!(late.disposition, WebhookDisposition::Ignored);
     let after = fixture
@@ -894,24 +903,25 @@ async fn concurrent_duplicate_webhook_allocates_exactly_one_credit_note() {
             "metadata": {"organization_id": organization.as_str()},
         }),
     );
-    let barrier = Arc::new(std::sync::Barrier::new(8));
-    let mut threads = Vec::new();
+    let barrier = Arc::new(tokio::sync::Barrier::new(8));
+    let mut tasks = Vec::new();
     for _ in 0..8 {
         let service = fixture.service.clone();
         let body = body.clone();
         let barrier = barrier.clone();
-        threads.push(std::thread::spawn(move || {
-            barrier.wait();
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
             service
                 .handle_webhook(&headers(&body, now_secs), &body, NOW)
+                .await
                 .unwrap()
                 .disposition
         }));
     }
     let mut applied = 0;
     let mut duplicates = 0;
-    for thread in threads {
-        match thread.join().unwrap() {
+    for task in tasks {
+        match task.await.unwrap() {
             WebhookDisposition::Applied => applied += 1,
             WebhookDisposition::Duplicate => duplicates += 1,
             other => panic!("unexpected disposition {other:?}"),

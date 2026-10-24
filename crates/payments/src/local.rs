@@ -104,13 +104,14 @@ impl LocalPaymentProvider {
         let object = build(id);
         let encoded = serde_json::to_value(&object)
             .map_err(|e| PaymentError::Store(format!("local provider encoding: {e}")))?;
-        self.store.put_provider_object(
+        self.store.put_provider_object_observed(
             PROVIDER,
             kind,
             organization_id,
             idempotency_key,
             &object_id(&encoded),
             &json!({"object": encoded}),
+            self.clock.now_ms(),
         )?;
         Ok(object)
     }
@@ -182,13 +183,14 @@ impl PaymentProvider for LocalPaymentProvider {
         )?;
         let encoded = serde_json::to_value(&subscription)
             .map_err(|e| PaymentError::Store(format!("local subscription encode: {e}")))?;
-        self.store.put_provider_object(
+        self.store.put_provider_object_observed(
             PROVIDER,
             "subscription_by_id",
             &request.organization_id,
             &subscription.id,
             &subscription.id,
             &json!({"object": encoded}),
+            self.clock.now_ms(),
         )?;
         Ok(subscription)
     }
@@ -230,21 +232,23 @@ impl PaymentProvider for LocalPaymentProvider {
         subscription.status = "active".into();
         let encoded = serde_json::to_value(&subscription)
             .map_err(|e| PaymentError::Store(format!("local subscription encode: {e}")))?;
-        self.store.put_provider_object(
+        self.store.put_provider_object_observed(
             PROVIDER,
             "change",
             &request.organization_id,
             &request.idempotency_key,
             &subscription.id,
             &json!({"object": encoded.clone()}),
+            self.clock.now_ms(),
         )?;
-        self.store.put_provider_object(
+        self.store.put_provider_object_observed(
             PROVIDER,
             "subscription_by_id",
             &request.organization_id,
             &subscription.id,
             &subscription.id,
             &json!({"object": encoded}),
+            self.clock.now_ms(),
         )?;
         Ok(subscription)
     }
@@ -283,21 +287,23 @@ impl PaymentProvider for LocalPaymentProvider {
         }
         let encoded = serde_json::to_value(&subscription)
             .map_err(|e| PaymentError::Store(format!("local subscription encode: {e}")))?;
-        self.store.put_provider_object(
+        self.store.put_provider_object_observed(
             PROVIDER,
             "cancel",
             &request.organization_id,
             &request.idempotency_key,
             &subscription.id,
             &json!({"object": encoded.clone()}),
+            self.clock.now_ms(),
         )?;
-        self.store.put_provider_object(
+        self.store.put_provider_object_observed(
             PROVIDER,
             "subscription_by_id",
             &request.organization_id,
             &subscription.id,
             &subscription.id,
             &json!({"object": encoded}),
+            self.clock.now_ms(),
         )?;
         Ok(subscription)
     }
@@ -339,13 +345,14 @@ impl PaymentProvider for LocalPaymentProvider {
         )?;
         let encoded = serde_json::to_value(&invoice)
             .map_err(|e| PaymentError::Store(format!("local invoice encode: {e}")))?;
-        self.store.put_provider_object(
+        self.store.put_provider_object_observed(
             PROVIDER,
             "invoice_by_id",
             &request.organization_id,
             &invoice.id,
             &invoice.id,
             &json!({"object": encoded}),
+            self.clock.now_ms(),
         )?;
         Ok(invoice)
     }

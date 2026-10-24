@@ -77,7 +77,7 @@ fn config() -> PaymentsConfig {
         webhook_secret_env: WEBHOOK_ENV.into(),
         vault_key_env: faktor_payments::catalog::default_vault_key_env(),
         stripe: Default::default(),
-        adyen: Default::default(),
+        mollie: Default::default(),
     }
 }
 
@@ -327,10 +327,10 @@ async fn webhook_forgery_staleness_and_replay_are_refused() {
     let good = header(WEBHOOK_SECRET, ts, &body);
 
     // Valid signature: accepted exactly once; the no-op type is ignored.
-    let first = service.handle_webhook(&good, &body, now).unwrap();
+    let first = service.handle_webhook(&good, &body, now).await.unwrap();
     assert_eq!(first.disposition, WebhookDisposition::Ignored);
     // Byte-identical replay: recognized as a duplicate, no second effect.
-    let replay = service.handle_webhook(&good, &body, now).unwrap();
+    let replay = service.handle_webhook(&good, &body, now).await.unwrap();
     assert_eq!(replay.disposition, WebhookDisposition::Duplicate);
     assert_eq!(replay.event_id, first.event_id);
 
@@ -338,27 +338,31 @@ async fn webhook_forgery_staleness_and_replay_are_refused() {
     let mut forged_body = body.clone();
     forged_body.push(b' ');
     assert!(matches!(
-        service.handle_webhook(&good, &forged_body, now),
+        service.handle_webhook(&good, &forged_body, now).await,
         Err(PaymentError::WebhookUnauthorized(_))
     ));
     // Wrong secret.
     assert!(matches!(
-        service.handle_webhook(&header("whsec_wrong", ts, &body), &body, now),
+        service
+            .handle_webhook(&header("whsec_wrong", ts, &body), &body, now)
+            .await,
         Err(PaymentError::WebhookUnauthorized(_))
     ));
     // Missing signature header.
     assert!(matches!(
-        service.handle_webhook(
-            &WebhookHeaders::from_pairs([("content-type", "application/json")]),
-            &body,
-            now
-        ),
+        service
+            .handle_webhook(
+                &WebhookHeaders::from_pairs([("content-type", "application/json")]),
+                &body,
+                now
+            )
+            .await,
         Err(PaymentError::WebhookUnauthorized(_))
     ));
     // Signature valid but outside the freshness window.
     let stale = header(WEBHOOK_SECRET, ts - 3_600, &body);
     assert_eq!(
-        service.handle_webhook(&stale, &body, now),
+        service.handle_webhook(&stale, &body, now).await,
         Err(PaymentError::WebhookStaleTimestamp)
     );
     // The subscription is untouched by every refused delivery.

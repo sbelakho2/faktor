@@ -1,0 +1,12 @@
+{
+  "resource": "payment-link",
+  "id": "pl_link_1",
+  "mode": "test",
+  "description": "Faktor invoice inv_1",
+  "amount": {"currency": "USD", "value": "100.00"},
+  "archived": false,
+  "reusable": true,
+  "paidAt": null,
+  "metadata": {"organization_id": "org_1", "faktor_provider": "mollie", "faktor_kind": "payment_link"},
+  "_links": {"paymentLink": {"href": "https://payment-links.mollie.test/payment/link_1", "type": "text/html"}}
+}

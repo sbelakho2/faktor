@@ -1,8 +1,9 @@
 //! The durable payment/invoice store. One SQLite database (its own
-//! `payment.db`, `PRAGMA user_version = 3`) owns customers, subscriptions,
+//! `payment.db`, `PRAGMA user_version = 5`) owns customers, subscriptions,
 //! invoices, payments, refunds, credit notes, payment methods, local-provider
-//! objects, linked provider observations, operation claims, webhook
-//! idempotency/watermarks and request-bound idempotency.
+//! objects, linked provider observations, operation claims, financial
+//! mutation leases, webhook idempotency/watermarks and request-bound
+//! idempotency.
 //!
 //! Every mutation that matters to money runs in ONE immediate transaction:
 //! the effect rows, the operation claim outcome and the idempotency record
@@ -28,15 +29,20 @@ use crate::model::{
     OperationClaimDraft, OperationClaimState, Payment, PaymentCustomer, PaymentSubscription,
     PendingProration, Refund, StoredPaymentMethod,
 };
+use crate::provider::{WebhookBinding, WebhookBindingLookup};
 use crate::webhook::DEFAULT_WEBHOOK_WINDOW_MS;
 
 /// The legacy schema version.
 pub const PAYMENT_SCHEMA_V1: i64 = 1;
 /// The operation-claim/refund-truth schema version.
 pub const PAYMENT_SCHEMA_V2: i64 = 2;
-/// The current schema version (adds linked provider observations and the
-/// invoice reconciliation column while preserving every earlier row).
-pub const PAYMENT_SCHEMA_VERSION: i64 = 3;
+/// The linked-provider-observation schema version.
+pub const PAYMENT_SCHEMA_V3: i64 = 3;
+/// The financial-mutation-lease schema version.
+pub const PAYMENT_SCHEMA_V4: i64 = 4;
+/// The current schema version (adds provider-object versions/observations
+/// while preserving every earlier row).
+pub const PAYMENT_SCHEMA_VERSION: i64 = 5;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS payment_customer (
@@ -195,6 +201,8 @@ CREATE TABLE IF NOT EXISTS payment_provider_object (
     object_id TEXT NOT NULL,
     payload TEXT NOT NULL,
     created_ms INTEGER NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
+    observed_ms INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (provider, kind, organization_id, idempotency_key)
 );
 CREATE INDEX IF NOT EXISTS idx_payment_provider_object_id
@@ -281,6 +289,31 @@ CREATE TABLE IF NOT EXISTS payment_provider_refund (
 );
 CREATE INDEX IF NOT EXISTS idx_payment_provider_refund_invoice
     ON payment_provider_refund(organization_id, invoice_id, observed_ms DESC);
+
+CREATE TABLE IF NOT EXISTS financial_mutation_lease (
+    id TEXT PRIMARY KEY,
+    organization_id TEXT NOT NULL,
+    conflict_domain TEXT NOT NULL,
+    logical_resource_id TEXT NOT NULL,
+    operation_claim_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('held','terminal','released')),
+    acquired_ms INTEGER NOT NULL,
+    released_ms INTEGER,
+    reserved_amount_micro INTEGER,
+    currency TEXT,
+    request_digest TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    CHECK (state <> 'held' OR released_ms IS NULL),
+    CHECK (reserved_amount_micro IS NULL OR reserved_amount_micro > 0)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_financial_mutation_lease_active
+    ON financial_mutation_lease(organization_id, conflict_domain, logical_resource_id)
+    WHERE state = 'held';
+CREATE INDEX IF NOT EXISTS idx_financial_mutation_lease_claim
+    ON financial_mutation_lease(organization_id, operation_claim_id);
+CREATE INDEX IF NOT EXISTS idx_financial_mutation_lease_key
+    ON financial_mutation_lease(organization_id, idempotency_key);
 ";
 
 /// Version-1 databases gain the refund truth columns and the claim table.
@@ -386,6 +419,45 @@ CREATE INDEX IF NOT EXISTS idx_payment_provider_refund_invoice
     ON payment_provider_refund(organization_id, invoice_id, observed_ms DESC);
 ";
 
+/// Version-3 databases gain the durable financial mutation lease. Existing
+/// non-terminal operation claims are backfilled as held leases so an
+/// in-flight payment can never lose its resource fence across the upgrade.
+const MIGRATE_V4: &str = "
+CREATE TABLE IF NOT EXISTS financial_mutation_lease (
+    id TEXT PRIMARY KEY,
+    organization_id TEXT NOT NULL,
+    conflict_domain TEXT NOT NULL,
+    logical_resource_id TEXT NOT NULL,
+    operation_claim_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('held','terminal','released')),
+    acquired_ms INTEGER NOT NULL,
+    released_ms INTEGER,
+    reserved_amount_micro INTEGER,
+    currency TEXT,
+    request_digest TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    CHECK (state <> 'held' OR released_ms IS NULL),
+    CHECK (reserved_amount_micro IS NULL OR reserved_amount_micro > 0)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_financial_mutation_lease_active
+    ON financial_mutation_lease(organization_id, conflict_domain, logical_resource_id)
+    WHERE state = 'held';
+CREATE INDEX IF NOT EXISTS idx_financial_mutation_lease_claim
+    ON financial_mutation_lease(organization_id, operation_claim_id);
+CREATE INDEX IF NOT EXISTS idx_financial_mutation_lease_key
+    ON financial_mutation_lease(organization_id, idempotency_key);
+";
+
+/// Version-4 databases gain provider-object version/observation columns.
+/// Existing objects become version 1 observed at their original creation
+/// time, so an old object can never outrank a later update.
+const MIGRATE_V5: &str = "
+ALTER TABLE payment_provider_object ADD COLUMN version INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE payment_provider_object ADD COLUMN observed_ms INTEGER NOT NULL DEFAULT 0;
+UPDATE payment_provider_object SET observed_ms = created_ms WHERE observed_ms = 0;
+";
+
 /// One idempotency record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdempotencyRecord {
@@ -464,6 +536,17 @@ pub struct ClaimRecovery {
     pub released: usize,
 }
 
+/// The outcome of one provider-object observation write. `applied` is false
+/// when a stale observation (older than the durable row) was refused; the
+/// row's current version is reported either way so callers can prove the
+/// monotonic ordering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ProviderObjectWrite {
+    pub applied: bool,
+    pub version: i64,
+    pub observed_ms: i64,
+}
+
 /// The durable store.
 pub struct SqlitePaymentStore {
     conn: Mutex<Connection>,
@@ -508,12 +591,21 @@ impl SqlitePaymentStore {
                     if version < PAYMENT_SCHEMA_V2 {
                         conn.execute_batch(MIGRATE_V2).map_err(store_err)?;
                     }
-                    if version < PAYMENT_SCHEMA_VERSION {
+                    if version < PAYMENT_SCHEMA_V3 {
                         conn.execute_batch(MIGRATE_V3).map_err(store_err)?;
                     }
+                    if version < PAYMENT_SCHEMA_V4 {
+                        conn.execute_batch(MIGRATE_V4).map_err(store_err)?;
+                    }
+                    if version < PAYMENT_SCHEMA_VERSION {
+                        conn.execute_batch(MIGRATE_V5).map_err(store_err)?;
+                    }
                 }
-                if version < PAYMENT_SCHEMA_VERSION {
+                if version < PAYMENT_SCHEMA_V3 {
                     backfill_provider_observations(&conn)?;
+                }
+                if version < PAYMENT_SCHEMA_V4 {
+                    crate::lease::backfill_financial_leases(&conn)?;
                 }
                 Ok(())
             })();
@@ -539,13 +631,13 @@ impl SqlitePaymentStore {
         self.path.as_deref()
     }
 
-    fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>, PaymentError> {
+    pub(crate) fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>, PaymentError> {
         self.conn
             .lock()
             .map_err(|_| PaymentError::Store("payment store lock is poisoned".into()))
     }
 
-    fn tx<T>(
+    pub(crate) fn tx<T>(
         &self,
         f: impl FnOnce(&Transaction<'_>) -> Result<T, PaymentError>,
     ) -> Result<T, PaymentError> {
@@ -761,6 +853,61 @@ impl SqlitePaymentStore {
     ) -> Result<Option<Refund>, PaymentError> {
         let conn = self.lock()?;
         refund_by_provider_id_conn(&conn, organization_id, provider_refund_id)
+    }
+
+    /// Whether an organization has a durable customer binding in this
+    /// payment database. Read-only; used to reject fetched Mollie resources
+    /// that name an organization this deployment does not serve.
+    fn organization_is_known(&self, organization_id: &str) -> Result<bool, PaymentError> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM payment_customer WHERE organization_id = ?1)",
+            params![organization_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(store_err)
+    }
+
+    /// Resolve the provider-parent ids needed to fetch a webhook resource
+    /// that Mollie scopes under a payment/customer. Read-only.
+    fn webhook_binding(
+        &self,
+        provider_object_id: &str,
+    ) -> Result<Option<WebhookBinding>, PaymentError> {
+        let conn = self.lock()?;
+        let refund = conn
+            .query_row(
+                "SELECT r.organization_id, p.provider_payment_id \
+                 FROM payment_refund r JOIN payment_payment p ON p.id = r.payment_id \
+                 WHERE r.provider_refund_id = ?1 LIMIT 1",
+                params![provider_object_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(store_err)?;
+        if let Some((organization_id, provider_payment_id)) = refund {
+            return Ok(Some(WebhookBinding::Refund {
+                organization_id,
+                provider_payment_id,
+            }));
+        }
+        let subscription: Option<(String, String)> = conn
+            .query_row(
+                "SELECT s.organization_id, c.provider_customer_id \
+                 FROM payment_subscription s \
+                 JOIN payment_customer c ON c.organization_id = s.organization_id \
+                 WHERE s.provider_subscription_id = ?1 LIMIT 1",
+                params![provider_object_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(store_err)?;
+        Ok(subscription.map(|(organization_id, provider_customer_id)| {
+            WebhookBinding::Subscription {
+                organization_id,
+                provider_customer_id,
+            }
+        }))
     }
 
     pub fn refunds_for_payment(
@@ -1517,25 +1664,94 @@ impl SqlitePaymentStore {
         object_id: &str,
         payload: &serde_json::Value,
     ) -> Result<(), PaymentError> {
+        self.put_provider_object_observed(
+            provider,
+            kind,
+            organization_id,
+            idempotency_key,
+            object_id,
+            payload,
+            now_ms(),
+        )
+        .map(|_| ())
+    }
+
+    /// Observe one provider object at `observed_ms`. The row is an upsert:
+    /// a newer observation replaces the stored payload and bumps `version`,
+    /// while an older observation is refused so a replayed webhook or a
+    /// delayed local write can never regress newer provider truth.
+    #[allow(clippy::too_many_arguments)]
+    pub fn put_provider_object_observed(
+        &self,
+        provider: &str,
+        kind: &str,
+        organization_id: &str,
+        idempotency_key: &str,
+        object_id: &str,
+        payload: &serde_json::Value,
+        observed_ms: i64,
+    ) -> Result<ProviderObjectWrite, PaymentError> {
         let encoded = serde_json::to_string(payload)
             .map_err(|e| PaymentError::Store(format!("provider object encoding: {e}")))?;
         let conn = self.lock()?;
-        conn.execute(
-            "INSERT OR IGNORE INTO payment_provider_object \
-             (provider, kind, organization_id, idempotency_key, object_id, payload, created_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                provider,
-                kind,
-                organization_id,
-                idempotency_key,
-                object_id,
-                encoded,
-                now_ms()
-            ],
+        let applied = conn
+            .execute(
+                "INSERT INTO payment_provider_object \
+                 (provider, kind, organization_id, idempotency_key, object_id, payload, \
+                  created_ms, version, observed_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8) \
+                 ON CONFLICT(provider, kind, organization_id, idempotency_key) DO UPDATE SET \
+                 object_id = excluded.object_id, \
+                 payload = excluded.payload, \
+                 observed_ms = excluded.observed_ms, \
+                 version = payment_provider_object.version + 1 \
+                 WHERE excluded.observed_ms >= payment_provider_object.observed_ms",
+                params![
+                    provider,
+                    kind,
+                    organization_id,
+                    idempotency_key,
+                    object_id,
+                    encoded,
+                    now_ms(),
+                    observed_ms
+                ],
+            )
+            .map_err(store_err)?;
+        let (version, stored_ms) = conn
+            .query_row(
+                "SELECT version, observed_ms FROM payment_provider_object \
+                 WHERE provider = ?1 AND kind = ?2 AND organization_id = ?3 \
+                 AND idempotency_key = ?4",
+                params![provider, kind, organization_id, idempotency_key],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .map_err(store_err)?;
+        Ok(ProviderObjectWrite {
+            applied: applied > 0,
+            version,
+            observed_ms: stored_ms,
+        })
+    }
+
+    /// The current version/observation stamp of one provider object.
+    pub fn provider_object_version(
+        &self,
+        provider: &str,
+        kind: &str,
+        organization_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<(i64, i64)>, PaymentError> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT version, observed_ms FROM payment_provider_object \
+             WHERE provider = ?1 AND kind = ?2 AND organization_id = ?3 \
+             AND idempotency_key = ?4",
+            params![provider, kind, organization_id, idempotency_key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .map_err(store_err)?;
-        Ok(())
+        .optional()
+        .map_err(store_err)
     }
 
     // ------------------------------------------------------------ webhook
@@ -1682,6 +1898,16 @@ impl SqlitePaymentStore {
     /// Record a stale/ignored event without applying effects.
     pub fn record_webhook_only(&self, record: &WebhookRecord) -> Result<(), PaymentError> {
         self.record_webhook(record, &WebhookEffects::default(), false)
+    }
+}
+
+impl WebhookBindingLookup for SqlitePaymentStore {
+    fn binding(&self, provider_object_id: &str) -> Result<Option<WebhookBinding>, PaymentError> {
+        self.webhook_binding(provider_object_id)
+    }
+
+    fn is_known_organization(&self, organization_id: &str) -> Result<bool, PaymentError> {
+        self.organization_is_known(organization_id)
     }
 }
 
@@ -1866,17 +2092,33 @@ fn update_invoice_conn(conn: &Connection, invoice: &Invoice) -> Result<(), Payme
 
 /// Upsert the latest linked provider-invoice observation. The primary key is
 /// `(provider, provider_invoice_id)`; the row is an observation, never an
-/// invoice and never a total authority.
+/// invoice and never a total authority. An observation older than the stored
+/// one is refused, so replaying an old webhook/fetch cannot regress newer
+/// provider truth.
 pub(crate) fn upsert_provider_invoice_conn(
     conn: &Connection,
     observation: &ProviderInvoiceObservation,
 ) -> Result<(), PaymentError> {
     conn.execute(
-        "INSERT OR REPLACE INTO payment_provider_invoice \
+        "INSERT INTO payment_provider_invoice \
          (provider, provider_invoice_id, organization_id, invoice_id, status, amount_minor, \
           amount_paid_minor, amount_refunded_minor, currency, paid_at_ms, observed_ms, source, \
           reconciliation, payload) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
+         ON CONFLICT(provider, provider_invoice_id) DO UPDATE SET \
+         organization_id = excluded.organization_id, \
+         invoice_id = excluded.invoice_id, \
+         status = excluded.status, \
+         amount_minor = excluded.amount_minor, \
+         amount_paid_minor = excluded.amount_paid_minor, \
+         amount_refunded_minor = excluded.amount_refunded_minor, \
+         currency = excluded.currency, \
+         paid_at_ms = excluded.paid_at_ms, \
+         observed_ms = excluded.observed_ms, \
+         source = excluded.source, \
+         reconciliation = excluded.reconciliation, \
+         payload = excluded.payload \
+         WHERE excluded.observed_ms >= payment_provider_invoice.observed_ms",
         params![
             observation.provider,
             observation.provider_invoice_id,
@@ -1903,10 +2145,23 @@ pub(crate) fn upsert_provider_payment_conn(
     observation: &ProviderPaymentObservation,
 ) -> Result<(), PaymentError> {
     conn.execute(
-        "INSERT OR REPLACE INTO payment_provider_payment \
+        "INSERT INTO payment_provider_payment \
          (provider, provider_payment_id, organization_id, invoice_id, payment_id, status, \
           amount_minor, refunded_minor, currency, paid_at_ms, observed_ms, source, payload) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+         ON CONFLICT(provider, provider_payment_id) DO UPDATE SET \
+         organization_id = excluded.organization_id, \
+         invoice_id = excluded.invoice_id, \
+         payment_id = excluded.payment_id, \
+         status = excluded.status, \
+         amount_minor = excluded.amount_minor, \
+         refunded_minor = excluded.refunded_minor, \
+         currency = excluded.currency, \
+         paid_at_ms = excluded.paid_at_ms, \
+         observed_ms = excluded.observed_ms, \
+         source = excluded.source, \
+         payload = excluded.payload \
+         WHERE excluded.observed_ms >= payment_provider_payment.observed_ms",
         params![
             observation.provider,
             observation.provider_payment_id,
@@ -1932,10 +2187,21 @@ pub(crate) fn upsert_provider_refund_conn(
     observation: &ProviderRefundObservation,
 ) -> Result<(), PaymentError> {
     conn.execute(
-        "INSERT OR REPLACE INTO payment_provider_refund \
+        "INSERT INTO payment_provider_refund \
          (provider, provider_refund_id, organization_id, invoice_id, payment_id, status, \
           amount_minor, currency, observed_ms, source, payload) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+         ON CONFLICT(provider, provider_refund_id) DO UPDATE SET \
+         organization_id = excluded.organization_id, \
+         invoice_id = excluded.invoice_id, \
+         payment_id = excluded.payment_id, \
+         status = excluded.status, \
+         amount_minor = excluded.amount_minor, \
+         currency = excluded.currency, \
+         observed_ms = excluded.observed_ms, \
+         source = excluded.source, \
+         payload = excluded.payload \
+         WHERE excluded.observed_ms >= payment_provider_refund.observed_ms",
         params![
             observation.provider,
             observation.provider_refund_id,

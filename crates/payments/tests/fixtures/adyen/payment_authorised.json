@@ -1,6 +1,0 @@
-{
-  "resultCode": "Authorised",
-  "pspReference": "PSP_payment_1",
-  "merchantReference": "faktor:org_1:invoice:inv_1",
-  "amount": {"currency": "USD", "value": 10000}
-}

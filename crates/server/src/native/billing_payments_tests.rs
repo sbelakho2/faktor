@@ -83,7 +83,7 @@ fn payments_config() -> PaymentsConfig {
         webhook_secret_env: "FAKTOR_ROUTE_WEBHOOK_SECRET".into(),
         vault_key_env: faktor_payments::catalog::default_vault_key_env(),
         stripe: Default::default(),
-        adyen: Default::default(),
+        mollie: Default::default(),
     }
 }
 

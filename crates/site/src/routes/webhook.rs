@@ -9,12 +9,15 @@ use faktor_payments::{PaymentError, WebhookDisposition, WebhookHeaders};
 use crate::web;
 use crate::AppState;
 
-pub async fn adyen(
+/// The provider-neutral payment webhook ingress. Local (signed) and Mollie
+/// (id-only, resolved by an authoritative API fetch) events both arrive here;
+/// the configured adapter owns verification.
+pub async fn payments(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(error) = state.limit(&state.ip_key(&headers, "webhook:adyen"), 240, 60 * 1000) {
+    if let Err(error) = state.limit(&state.ip_key(&headers, "webhook:payments"), 240, 60 * 1000) {
         return web::text_response(
             error.status(),
             "text/plain; charset=utf-8",
@@ -29,6 +32,7 @@ pub async fn adyen(
     match state
         .payments
         .handle_webhook(&webhook_headers, &body, state.now_ms())
+        .await
     {
         Ok(outcome) => {
             let status = match outcome.disposition {
@@ -58,9 +62,13 @@ pub async fn adyen(
                 PaymentError::WebhookUnauthorized(_) | PaymentError::WebhookStaleTimestamp => {
                     StatusCode::UNAUTHORIZED
                 }
-                PaymentError::WebhookMalformed(_) => StatusCode::BAD_REQUEST,
+                PaymentError::WebhookMalformed(_) | PaymentError::Declined(_) => {
+                    StatusCode::BAD_REQUEST
+                }
+                PaymentError::NotFound(_) => StatusCode::NOT_FOUND,
                 PaymentError::ProviderUnconfigured(_) => StatusCode::SERVICE_UNAVAILABLE,
-                PaymentError::Declined(_) => StatusCode::BAD_REQUEST,
+                PaymentError::Provider(_) | PaymentError::Config(_) => StatusCode::BAD_GATEWAY,
+                PaymentError::Store(_) => StatusCode::SERVICE_UNAVAILABLE,
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
             };
             tracing::warn!(status = status.as_u16(), error = %error, "payment webhook refused");

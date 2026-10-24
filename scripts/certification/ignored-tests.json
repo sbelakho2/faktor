@@ -143,7 +143,7 @@
       "reason": "manual performance/long probe: run explicitly with `cargo test -- --ignored` when the hot path or scale shape changes; not a CI timing gate"
     },
     {
-      "file": "crates/cli/src/indep_coding_audit.rs",
+      "file": "crates/cli/src/indep_coding_audit_tests.rs",
       "fn": "indep_coding_task_audit",
       "tag": "live",
       "reason": "manual live-environment test: needs the real tool/service and this repository; run explicitly with `cargo test -- --ignored`"

@@ -32,6 +32,7 @@ faktor-security.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 http-body-util = "0.1"
+faktor-provider = { workspace = true, features = ["test-utils"] }
 
 [lints]
 workspace = true

@@ -52,7 +52,7 @@ being advertised in the top chrome or footer.
 - `/account/` (overview/profile), `/account/organization/`, `/account/billing/`,
   `/account/invoices/`, `/account/invoices/{id}/`, receipt, CSV/JSON export,
   `/account/usage/`, `/account/security/`, `/admin/`
-- `/webhooks/adyen`, `/healthz`
+- `/webhooks/payments`, `/healthz`
 
 ## Build and run
 
@@ -88,22 +88,22 @@ then gets `Secure`) or set `FAKTOR_SITE_COOKIE_SECURE=1` explicitly.
 | `FAKTOR_SITE_COOKIE_SECURE` | derived from base URL | Force `Secure` cookies |
 | `FAKTOR_SITE_TRUST_PROXY` | `0` | Trust `X-Forwarded-For`/`X-Real-IP` |
 | `FAKTOR_SITE_ADMIN_EMAIL` | unset | Email bootstrapped as platform admin |
-| `FAKTOR_SITE_BILLING_PROVIDER` | `local` | `local` or `adyen` |
+| `FAKTOR_SITE_BILLING_PROVIDER` | `local` | `local` or `mollie` |
 | `FAKTOR_SITE_WEBHOOK_SECRET` | generated for local | Local webhook HMAC secret |
 | `FAKTOR_SITE_PAYMENT_VAULT_KEY` | generated key file | Payment-token sealing key |
-| `FAKTOR_ADYEN_BASE_URL` | `https://checkout-test.adyen.com/v71` | Adyen API base |
-| `FAKTOR_ADYEN_MERCHANT_ACCOUNT` | required for Adyen | Adyen merchant account |
-| `FAKTOR_ADYEN_API_KEY` | required for Adyen | Adyen API key (server-side only) |
-| `FAKTOR_ADYEN_HMAC_KEY` | required for Adyen | Adyen webhook HMAC key |
+| `FAKTOR_MOLLIE_BASE_URL` | `https://api.mollie.com/v2` | Mollie API base (point at a mock for tests; test mode uses a `test_` key on the same base) |
+| `FAKTOR_MOLLIE_API_KEY` | required for Mollie | Mollie API key (server-side only, never rendered or logged) |
 
 Email verification and password-reset messages use a local, mode-0600 outbox
 under `<data-dir>/outbox` by default. The `Mailer` trait is the production
 transport seam: an SMTP implementation plugs in behind `Mailer` without
 changing auth, templates or tests, while the local outbox remains the default
 for development and CI. No SMTP credentials are invented or stored by this
-repository. Adyen (and Stripe in `faktor-payments`) remain provider-configured
+repository. Mollie (and Stripe in `faktor-payments`) remain provider-configured
 through their existing configuration surfaces; the website hard-codes neither
-credentials nor provider behavior.
+credentials nor provider behavior. The Mollie API key is resolved by the
+environment-variable NAME `FAKTOR_MOLLIE_API_KEY` and never appears in a
+route, log, export or template.
 
 ## Accounts and security
 
@@ -134,13 +134,17 @@ subscription, invoice and payment-method records live in the existing
 Flow:
 
 1. `POST /account/billing/checkout` creates the subscription and an open invoice
-   in the payment service, then asks the provider for a hosted checkout with
-   `local_invoice_id` bound into the provider reference.
-2. The browser is redirected to the provider URL. A return to
+   in the payment service, then asks Mollie for a hosted payment with
+   `metadata.local_invoice_id` / `metadata.organization_id` bound at creation.
+2. The browser is redirected to Mollie's `_links.checkout.href`. A return to
    `/account/billing/checkout/return/` never settles the invoice.
-3. The provider posts to `/webhooks/adyen`. The adapter verifies the HMAC,
-   timestamp window and event id before the service applies payment state.
-   Duplicate events return `[duplicate]`; invalid/stale signatures return 401.
+3. Mollie posts only `id=tr_...` to `/webhooks/payments`. The adapter does not
+   trust the payload or its status: it fetches the payment from Mollie through
+   the checked egress transport, requires the fetched id to equal the posted id
+   and the Faktor metadata binding to match, then applies the authoritative
+   state in one durable transaction (idempotent event id + organization
+   watermark). Replays return `[duplicate]`; forged ids are 404 and foreign or
+   unmarked resources are 401.
 4. Local mode renders `/account/billing/local/{id}/` and delivers a signed local
    provider event on the pay form, so the same verified-webhook path is exercised
    without an external account.
@@ -166,8 +170,8 @@ plus a side-by-side montage for all 13 designed page groups (RMSE <= 0.55;
 pages must have its designed copy present, the PDF chrome must not add auth
 links, and the prior routes must be full pages with the dated banner. The
 account/billing pages are tested by the Rust route suite (signup/login/
-verification, local and Adyen checkout, webhook HMAC/timestamp/idempotency,
-tenant isolation, roles, admin, exact money), not by the PDF gate because they
+verification, local and Mollie checkout, id-only webhook fetch/forgery/
+replay/ordering, tenant isolation, roles, admin, exact money), not by the PDF gate because they
 have no PDF page.
 
 ## Deployment
@@ -178,5 +182,7 @@ listen on `0.0.0.0:8080`; set `FAKTOR_SITE_BASE_URL` to the HTTPS origin and mou
 `/data` on durable storage. `.woodpecker/site.yaml` adds the website gates to CI
 without touching certification lanes.
 
-Residual: production SMTP delivery (behind `Mailer`), a real Adyen merchant
-account, and multi-instance rate-limit coordination.
+Residual: production SMTP delivery (behind `Mailer`), live Mollie test-mode/
+production credentials (the adapter is exercised against checked local mocks;
+the opt-in live probe requires `FAKTOR_MOLLIE_LIVE_OPT_IN=1` plus
+`FAKTOR_MOLLIE_API_KEY`), and multi-instance rate-limit coordination.

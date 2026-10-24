@@ -1867,8 +1867,9 @@ fn wire_billing_plane(
     // The additive `[billing.payments]` subsection: disabled by default (no
     // payment.db is created and every payment route answers 409). When
     // enabled, the durable invoice/subscription store opens here; the local
-    // provider is fully offline, while the Stripe adapter receives the
-    // daemon's ONE checked egress transport. Provider credentials are
+    // provider is fully offline, while the Stripe and Mollie adapters receive
+    // the daemon's ONE checked egress transport. Mollie's webhook truth is an
+    // id-only API fetch through that transport. Provider credentials are
     // resolved from environment-variable NAMES and are never logged.
     if let Some(payments_cfg) = config_billing.payments.as_ref().filter(|cfg| cfg.enabled) {
         let path = config_billing
@@ -1884,7 +1885,7 @@ fn wire_billing_plane(
         );
         let transport = if matches!(
             runtime.provider,
-            faktor_payments::ProviderKind::Stripe | faktor_payments::ProviderKind::Adyen
+            faktor_payments::ProviderKind::Stripe | faktor_payments::ProviderKind::Mollie
         ) {
             Some(graph.transport.clone())
         } else {

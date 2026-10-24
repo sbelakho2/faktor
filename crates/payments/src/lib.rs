@@ -9,9 +9,11 @@
 //! - [`stripe::StripePaymentProvider`]: a Stripe-compatible adapter over the
 //!   daemon's checked egress transport, with env-var-named credentials and
 //!   durable provider subscription/item/product/price identity;
-//! - [`adyen::AdyenPaymentProvider`]: the Adyen Checkout adapter (payment
-//!   links, sessions, payments, refunds, stored tokens, in-body HMAC
-//!   webhooks) over the same checked egress transport;
+//! - [`mollie::MolliePaymentProvider`]: the Mollie Payments adapter
+//!   (payments, payment links, refunds, customers, subscriptions, mandates,
+//!   stored-mandate charges) over the same checked egress transport. Mollie
+//!   webhooks carry only an id; the adapter fetches the resource before any
+//!   state is applied and verifies the Faktor metadata binding;
 //! - [`catalog`]: exact integer plan prices (monthly/annual, per plan
 //!   currency), explicit FX, per-jurisdiction inclusive/exclusive tax and the
 //!   dunning policy;
@@ -24,36 +26,42 @@
 //!
 //! Security invariants: no raw PAN is accepted or stored, provider tokens are
 //! AEAD-sealed by [`vault`] before persistence and are never serialized to a
-//! route/export/UI, no secret value is logged, webhook signature/timestamp
-//! verification runs before any state is touched, and every query is
-//! organization-scoped.
+//! route/export/UI, no secret value is logged, webhook authentication
+//! (signature/timestamp where the provider signs, an authoritative id-bound
+//! API fetch where it does not) runs before any state is touched, and every
+//! query is organization-scoped.
 
-pub mod adyen;
 pub mod authority;
 pub mod catalog;
 pub mod error;
+pub mod lease;
 pub mod local;
 pub mod model;
+pub mod mollie;
 pub mod money;
 pub mod provider;
 pub mod secrets;
 pub mod service;
 pub mod store;
 pub mod stripe;
+mod subscription_ops;
 pub mod vault;
 pub mod webhook;
 
-pub use adyen::sign_adyen_webhook_hmac;
 pub use authority::{
     InvoiceReconciliationState, ProviderInvoiceObservation, ProviderObservationSource,
     ProviderPaymentObservation, ProviderRefundObservation, ReconciliationItem,
     ReconciliationReport, ReconciliationSummary, MAX_RECONCILIATION_INVOICES,
 };
 pub use catalog::{
-    AdyenConfig, BillingInterval, CurrencySpec, DunningConfig, FxRate, PaymentsConfig, PlanPrice,
+    BillingInterval, CurrencySpec, DunningConfig, FxRate, MollieConfig, PaymentsConfig, PlanPrice,
     PriceCatalogue, ProviderKind, StripeConfig, TaxConfig, TaxRate,
 };
 pub use error::{PaymentError, PaymentErrorBody};
+pub use lease::{
+    ConflictDomain, FinancialMutationLease, LeaseAcquisition, LeaseAmount, LeaseClaim,
+    LeaseRecovery, LeaseState, TerminalOutcome, UnknownReconciliation,
+};
 pub use local::{sign_local_webhook, LocalPaymentProvider};
 pub use model::{
     AddPaymentMethodRequest, CancelRequest, CapabilityStatus, ChangePlanRequest,
@@ -71,12 +79,14 @@ pub use money::{
     convert, exclusive_tax, format_minor, inclusive_tax, prorate, valid_currency, MAX_MONEY_MINOR,
 };
 pub use provider::{
-    PaymentProvider, ProviderCancelRequest, ProviderChangePlanRequest, ProviderCharge,
-    ProviderChargeRequest, ProviderCheckout, ProviderCheckoutRequest, ProviderCustomer,
-    ProviderCustomerRequest, ProviderInvoice, ProviderInvoiceRequest, ProviderInvoiceSnapshot,
-    ProviderObjectKind, ProviderReconcileRequest, ProviderReconciled, ProviderRefund,
-    ProviderRefundRequest, ProviderSubscribeRequest, ProviderSubscription,
-    UnconfiguredPaymentProvider, VerifiedWebhookEvent, WebhookHeaders,
+    EmptyWebhookBindings, PaymentProvider, ProviderCancelRequest, ProviderChangePlanRequest,
+    ProviderCharge, ProviderChargeRequest, ProviderCheckout, ProviderCheckoutRequest,
+    ProviderCustomer, ProviderCustomerRequest, ProviderCustomerUpdate, ProviderInvoice,
+    ProviderInvoiceRequest, ProviderInvoiceSnapshot, ProviderMandate, ProviderMandateRequest,
+    ProviderObjectKind, ProviderPaymentLink, ProviderPaymentLinkRequest, ProviderPaymentSnapshot,
+    ProviderReconcileRequest, ProviderReconciled, ProviderRefund, ProviderRefundRequest,
+    ProviderSubscribeRequest, ProviderSubscription, UnconfiguredPaymentProvider,
+    VerifiedWebhookEvent, WebhookBinding, WebhookBindingLookup, WebhookHeaders,
 };
 pub use secrets::{EnvSecrets, SecretSource, SecretString, StaticSecrets};
 pub use service::{
@@ -84,8 +94,8 @@ pub use service::{
     MAX_SEATS, MAX_TEXT_BYTES, MAX_TRIAL_DAYS, MAX_USAGE_LINES,
 };
 pub use store::{
-    ClaimRecovery, IdempotencyRecord, IdempotencyWrite, InvoiceStats, SqlitePaymentStore,
-    WebhookDecision, WebhookEffects, WebhookPlan, WebhookRecord,
+    ClaimRecovery, IdempotencyRecord, IdempotencyWrite, InvoiceStats, ProviderObjectWrite,
+    SqlitePaymentStore, WebhookDecision, WebhookEffects, WebhookPlan, WebhookRecord,
 };
 pub use vault::{PaymentTokenVault, MAX_TOKEN_BYTES, VAULT_KEY_LEN};
 pub use webhook::{
@@ -113,6 +123,8 @@ pub fn build_service(
         ProviderKind::Stripe => {
             PaymentService::open_stripe(store, config, clock, secrets, transport)
         }
-        ProviderKind::Adyen => PaymentService::open_adyen(store, config, clock, secrets, transport),
+        ProviderKind::Mollie => {
+            PaymentService::open_mollie(store, config, clock, secrets, transport)
+        }
     }
 }

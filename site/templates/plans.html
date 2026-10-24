@@ -7,7 +7,7 @@
     <div class="hero-copy">
       <p class="kicker">Plans / Faktor billing</p>
       <h1 class="page-title">A plan for the work<br class="wide-only"> you can inspect.</h1>
-      <p class="lead">Every plan includes the native runtime, the completion chain and durable evidence. Prices are shown in euro, excluding VAT. Checkout is hosted by Adyen; Faktor never receives a card number.</p>
+      <p class="lead">Every plan includes the native runtime, the completion chain and durable evidence. Prices are shown in euro, excluding VAT. Checkout is hosted by Mollie; Faktor never receives a card number.</p>
       <div class="button-row"><a class="btn btn-ink" href="/signup/">Create an account</a><a class="btn btn-outline" href="/account/">Sign in</a></div>
     </div>
   </div>
@@ -51,7 +51,7 @@
 </section>
 
 <section class="page-section shell">
-  <div class="section-head"><div><p class="kicker">Billing rules</p><h2 class="h2">Provider truth upstream. Faktor billing truth.</h2></div><p class="lead">Adyen reports payment outcomes by signed webhook. Faktor records entitlements, invoices and receipts locally. A pending checkout never becomes a subscription because a browser returned successfully.</p></div>
+  <div class="section-head"><div><p class="kicker">Billing rules</p><h2 class="h2">Provider truth upstream. Faktor billing truth.</h2></div><p class="lead">Mollie reports a payment outcome by webhook id; Faktor fetches the authoritative payment from Mollie before recording anything. Faktor records entitlements, invoices and receipts locally. A pending checkout never becomes a subscription because a browser returned successfully.</p></div>
   <div class="three-col">
     <article class="feature-block"><p class="kicker">Checkout</p><h3 class="h3">Hosted handoff</h3><p>Faktor creates a provider payment link server-side and redirects the browser. Payment details stay on the provider page.</p></article>
     <article class="feature-block"><p class="kicker">Webhook</p><h3 class="h3">Signed and idempotent</h3><p>HMAC signature, timestamp window and event identity are checked before durable state changes.</p></article>

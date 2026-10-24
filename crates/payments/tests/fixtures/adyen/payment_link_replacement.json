@@ -1,7 +1,0 @@
-{
-  "id": "PL_link_2",
-  "status": "active",
-  "url": "https://checkout-test.adyen.com/pay/PL_link_2",
-  "amount": {"currency": "USD", "value": 20000},
-  "reference": "faktor:org_1:plan:team"
-}

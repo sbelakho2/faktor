@@ -30,6 +30,16 @@ pub struct ProviderCustomer {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderCustomerUpdate {
+    pub organization_id: String,
+    pub customer_id: String,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderSubscribeRequest {
     pub organization_id: String,
     pub idempotency_key: String,
@@ -47,6 +57,10 @@ pub struct ProviderChangePlanRequest {
     pub organization_id: String,
     pub idempotency_key: String,
     pub subscription_id: String,
+    /// Durable provider customer identity; providers whose subscription
+    /// endpoints are customer-scoped (Mollie) address the subscription
+    /// through it rather than guessing.
+    pub customer_id: String,
     /// Durable provider subscription-item identity. An adapter that requires
     /// it (Stripe) refuses typed instead of guessing/creating a second item.
     pub provider_item_id: Option<String>,
@@ -70,6 +84,9 @@ pub struct ProviderCancelRequest {
     pub organization_id: String,
     pub idempotency_key: String,
     pub subscription_id: String,
+    /// Durable provider customer identity (see
+    /// [`ProviderChangePlanRequest::customer_id`]).
+    pub customer_id: String,
     pub at_period_end: bool,
 }
 
@@ -105,9 +122,14 @@ pub struct ProviderCheckoutRequest {
     pub currency: String,
     pub success_url: String,
     pub cancel_url: String,
-    /// When set, the provider checkout settles this local invoice. Adyen
-    /// encodes it as the merchant reference so the verified webhook can bind
-    /// the payment to Faktor's invoice record.
+    /// Public webhook ingress for providers that report outcomes
+    /// asynchronously. Mollie requires it for authoritative status fetches;
+    /// adapters that do not need one ignore it.
+    #[serde(default)]
+    pub webhook_url: Option<String>,
+    /// When set, the provider checkout settles this local invoice. Adapters
+    /// encode it in provider metadata so the verified webhook can bind the
+    /// payment to Faktor's invoice record.
     #[serde(default)]
     pub local_invoice_id: Option<String>,
 }
@@ -192,6 +214,111 @@ pub struct ProviderRefund {
     pub status: String,
     pub amount_minor: i64,
     pub currency: String,
+}
+
+/// One read-only provider payment projection. `metadata` is provider data;
+/// callers bind it to a local organization only after the adapter verifies
+/// the marker it wrote at creation time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderPaymentSnapshot {
+    pub id: String,
+    pub status: String,
+    pub amount_minor: i64,
+    pub currency: String,
+    #[serde(default)]
+    pub customer_id: Option<String>,
+    #[serde(default)]
+    pub mandate_id: Option<String>,
+    #[serde(default)]
+    pub metadata: Value,
+}
+
+/// One shareable payment link. Links are useful for operator-issued payment
+/// handoffs; one-off invoice checkout still creates a payment directly so
+/// refunds address the payment id from the first verified webhook.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderPaymentLinkRequest {
+    pub organization_id: String,
+    pub idempotency_key: String,
+    pub description: String,
+    pub amount_minor: i64,
+    pub currency: String,
+    pub redirect_url: String,
+    #[serde(default)]
+    pub webhook_url: Option<String>,
+    pub reusable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderPaymentLink {
+    pub id: String,
+    pub status: String,
+    pub url: Option<String>,
+    pub amount_minor: i64,
+    pub currency: String,
+}
+
+/// One customer mandate creation. Mollie creates direct-debit mandates
+/// through the customer's mandate endpoint; no bank credential is ever
+/// stored or rendered by this crate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderMandateRequest {
+    pub organization_id: String,
+    pub idempotency_key: String,
+    pub customer_id: String,
+    pub method: String,
+    #[serde(default)]
+    pub consumer_name: Option<String>,
+    #[serde(default)]
+    pub consumer_account: Option<String>,
+    #[serde(default)]
+    pub signature_date: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderMandate {
+    pub id: String,
+    pub customer_id: String,
+    pub status: String,
+    pub method: String,
+}
+
+/// A durable local binding used to address providers whose webhook object
+/// cannot be fetched without its parent (Mollie refunds/subscriptions).
+/// Lookups are read-only and never create provider state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebhookBinding {
+    Refund {
+        organization_id: String,
+        provider_payment_id: String,
+    },
+    Subscription {
+        organization_id: String,
+        provider_customer_id: String,
+    },
+}
+
+pub trait WebhookBindingLookup: Send + Sync {
+    fn binding(&self, provider_object_id: &str) -> Result<Option<WebhookBinding>, PaymentError>;
+
+    /// Whether this deployment has durable local state for the organization
+    /// named by a fetched provider resource. The service store answers from
+    /// its customer rows; adapters that have no local context default to
+    /// `true` and still require the creation-time metadata markers.
+    fn is_known_organization(&self, _organization_id: &str) -> Result<bool, PaymentError> {
+        Ok(true)
+    }
+}
+
+/// A lookup with no local bindings. Adapter tests that only exercise
+/// payment id-only webhooks use it; production passes the payment store.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EmptyWebhookBindings;
+
+impl WebhookBindingLookup for EmptyWebhookBindings {
+    fn binding(&self, _provider_object_id: &str) -> Result<Option<WebhookBinding>, PaymentError> {
+        Ok(None)
+    }
 }
 
 /// One read-only provider reconciliation lookup. The request names the
@@ -311,6 +438,27 @@ pub trait PaymentProvider: Send + Sync {
         request: ProviderCustomerRequest,
     ) -> Result<ProviderCustomer, PaymentError>;
 
+    async fn update_customer(
+        &self,
+        _request: ProviderCustomerUpdate,
+    ) -> Result<ProviderCustomer, PaymentError> {
+        Err(PaymentError::Provider(format!(
+            "{} cannot update a customer",
+            self.name()
+        )))
+    }
+
+    async fn delete_customer(
+        &self,
+        _organization_id: &str,
+        _customer_id: &str,
+    ) -> Result<(), PaymentError> {
+        Err(PaymentError::Provider(format!(
+            "{} cannot delete a customer",
+            self.name()
+        )))
+    }
+
     async fn subscribe(
         &self,
         request: ProviderSubscribeRequest,
@@ -349,6 +497,86 @@ pub trait PaymentProvider: Send + Sync {
         )))
     }
 
+    /// Fetch one payment by its provider id. Read-only; never creates.
+    async fn fetch_payment(
+        &self,
+        _provider_payment_id: &str,
+    ) -> Result<ProviderPaymentSnapshot, PaymentError> {
+        Err(PaymentError::Provider(format!(
+            "{} cannot fetch a payment by provider id",
+            self.name()
+        )))
+    }
+
+    /// Fetch one refund by its provider payment id and refund id. Read-only.
+    async fn fetch_refund(
+        &self,
+        _provider_payment_id: &str,
+        _provider_refund_id: &str,
+    ) -> Result<ProviderRefund, PaymentError> {
+        Err(PaymentError::Provider(format!(
+            "{} cannot fetch a refund by provider ids",
+            self.name()
+        )))
+    }
+
+    /// Create a customer mandate (direct debit). Providers without a
+    /// mandate resource refuse typed.
+    async fn create_mandate(
+        &self,
+        _request: ProviderMandateRequest,
+    ) -> Result<ProviderMandate, PaymentError> {
+        Err(PaymentError::Provider(format!(
+            "{} has no mandate lifecycle",
+            self.name()
+        )))
+    }
+
+    async fn get_mandate(
+        &self,
+        _organization_id: &str,
+        _customer_id: &str,
+        _mandate_id: &str,
+    ) -> Result<ProviderMandate, PaymentError> {
+        Err(PaymentError::Provider(format!(
+            "{} has no mandate lifecycle",
+            self.name()
+        )))
+    }
+
+    async fn revoke_mandate(
+        &self,
+        _organization_id: &str,
+        _customer_id: &str,
+        _mandate_id: &str,
+    ) -> Result<ProviderMandate, PaymentError> {
+        Err(PaymentError::Provider(format!(
+            "{} has no mandate lifecycle",
+            self.name()
+        )))
+    }
+
+    /// Create a shareable provider payment link.
+    async fn create_payment_link(
+        &self,
+        _request: ProviderPaymentLinkRequest,
+    ) -> Result<ProviderPaymentLink, PaymentError> {
+        Err(PaymentError::Provider(format!(
+            "{} has no payment-link resource",
+            self.name()
+        )))
+    }
+
+    async fn fetch_payment_link(
+        &self,
+        _provider_payment_link_id: &str,
+    ) -> Result<ProviderPaymentLink, PaymentError> {
+        Err(PaymentError::Provider(format!(
+            "{} has no payment-link resource",
+            self.name()
+        )))
+    }
+
     async fn charge(&self, request: ProviderChargeRequest) -> Result<ProviderCharge, PaymentError>;
 
     async fn refund(&self, request: ProviderRefundRequest) -> Result<ProviderRefund, PaymentError>;
@@ -361,6 +589,24 @@ pub trait PaymentProvider: Send + Sync {
         body: &[u8],
         now_ms: i64,
     ) -> Result<VerifiedWebhookEvent, PaymentError>;
+
+    /// Resolve one webhook delivery to authoritative provider truth.
+    ///
+    /// Providers that sign the event body fall back to
+    /// [`Self::verify_webhook`]. Providers whose webhook carries only an
+    /// object id (Mollie) override this to fetch the resource through the
+    /// checked egress transport, verify the id/organization binding and only
+    /// then return the event. Local bindings supply parent ids for scoped
+    /// resources (refund/subscription) that cannot be fetched by id alone.
+    async fn resolve_webhook(
+        &self,
+        headers: &WebhookHeaders,
+        body: &[u8],
+        now_ms: i64,
+        _bindings: &dyn WebhookBindingLookup,
+    ) -> Result<VerifiedWebhookEvent, PaymentError> {
+        self.verify_webhook(headers, body, now_ms)
+    }
 
     /// Read-only reconciliation of a previously dispatched idempotency key.
     /// This must never create, mutate or resend a provider operation.

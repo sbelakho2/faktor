@@ -172,6 +172,7 @@ async fn matching_webhook_updates_faktor_invoice_and_observation_atomically() {
     let outcome = fixture
         .service
         .handle_webhook(&signed(&body), &body, START)
+        .await
         .unwrap();
     assert_eq!(outcome.disposition, WebhookDisposition::Applied);
 
@@ -223,6 +224,7 @@ async fn provider_amount_mismatch_is_a_typed_conflict_and_never_rewrites_totals(
     let outcome = fixture
         .service
         .handle_webhook(&signed(&body), &body, START)
+        .await
         .unwrap();
     assert_eq!(
         outcome.disposition,
@@ -281,6 +283,7 @@ async fn provider_currency_mismatch_is_a_conflict_and_keeps_faktor_currency() {
     let outcome = fixture
         .service
         .handle_webhook(&signed(&body), &body, START)
+        .await
         .unwrap();
     assert_eq!(
         outcome.disposition,
@@ -311,10 +314,12 @@ async fn duplicate_and_replayed_paid_events_never_double_credit() {
     fixture
         .service
         .handle_webhook(&signed(&body), &body, START)
+        .await
         .unwrap();
     let duplicate = fixture
         .service
         .handle_webhook(&signed(&body), &body, START)
+        .await
         .unwrap();
     assert_eq!(duplicate.disposition, WebhookDisposition::Duplicate);
 
@@ -329,6 +334,7 @@ async fn duplicate_and_replayed_paid_events_never_double_credit() {
     fixture
         .service
         .handle_webhook(&signed(&replay), &replay, START + 5_000)
+        .await
         .unwrap();
     let invoice = fixture
         .service

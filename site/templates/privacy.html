@@ -8,7 +8,7 @@
   <h2>Data we do not store</h2><p>We do not store raw card numbers, card verification codes or full provider payment payloads. Payment-method records contain only the provider token, brand, last four digits and expiry that the provider supplies.</p>
   <h2>Cookies</h2><p>The account surface uses an HttpOnly, Secure, SameSite=Lax session cookie and an anonymous CSRF cookie before sign-in. The marketing site uses no analytics or tracking scripts. No JavaScript runs.</p>
   <h2>Retention</h2><p>Session records are revoked on sign-out and expire after the configured session lifetime. Email tokens expire and are single-use. Billing records are retained for the accounting period required by the operating entity.</p>
-  <h2>Processors</h2><p>Adyen processes payments and returns signed outcomes. Email delivery is performed by the configured mail transport. Both receive only the fields needed for the operation.</p>
+  <h2>Processors</h2><p>Mollie processes payments and notifies Faktor with a payment id; Faktor fetches the referenced payment from Mollie before applying any state. Email delivery is performed by the configured mail transport. Both receive only the fields needed for the operation.</p>
   <h2>Your choices</h2><p>You can request account export or deletion through the operating entity. A deletion request cannot erase records that must be retained for tax or fraud-prevention obligations; the response names the retained basis.</p>
 </div></section>
 {% endblock %}

@@ -1,0 +1,1 @@
+{"status": 422, "title": "Unprocessable Entity", "detail": "The payment could not be processed", "field": "amount", "_links": {"documentation": {"href": "https://docs.mollie.com/errors", "type": "text/html"}}}

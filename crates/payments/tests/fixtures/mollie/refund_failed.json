@@ -1,0 +1,11 @@
+{
+  "resource": "refund",
+  "id": "re_refund_1",
+  "mode": "test",
+  "createdAt": "2026-10-24T10:02:00+00:00",
+  "amount": {"currency": "USD", "value": "25.00"},
+  "description": "goodwill",
+  "status": "failed",
+  "paymentId": "tr_payment_1",
+  "metadata": {"organization_id": "org_1", "faktor_provider": "mollie", "faktor_kind": "refund"}
+}

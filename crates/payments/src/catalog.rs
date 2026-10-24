@@ -387,7 +387,7 @@ impl DunningConfig {
 pub enum ProviderKind {
     Local,
     Stripe,
-    Adyen,
+    Mollie,
 }
 
 impl ProviderKind {
@@ -395,7 +395,7 @@ impl ProviderKind {
         match self {
             ProviderKind::Local => "local",
             ProviderKind::Stripe => "stripe",
-            ProviderKind::Adyen => "adyen",
+            ProviderKind::Mollie => "mollie",
         }
     }
 
@@ -403,7 +403,7 @@ impl ProviderKind {
         Some(match raw {
             "local" => ProviderKind::Local,
             "stripe" => ProviderKind::Stripe,
-            "adyen" => ProviderKind::Adyen,
+            "mollie" => ProviderKind::Mollie,
             _ => return None,
         })
     }
@@ -468,67 +468,68 @@ impl StripeConfig {
     }
 }
 
-/// The Adyen Checkout adapter configuration. Only environment-variable NAMES
-/// live here; the API key and webhook HMAC key are resolved through
-/// [`crate::secrets`] and never rendered.
+/// The Mollie adapter configuration. Only environment-variable NAMES live
+/// here; the API key is resolved through [`crate::secrets`] and never
+/// rendered. `webhook_url` is the public HTTPS ingress Mollie posts id-only
+/// notifications to; it is not a credential.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct AdyenConfig {
+pub struct MollieConfig {
     pub base_url: String,
     pub api_key_env: String,
-    pub webhook_hmac_key_env: String,
-    pub merchant_account: String,
-    #[serde(default = "default_adyen_user_agent")]
+    #[serde(default)]
+    pub webhook_url: Option<String>,
+    #[serde(default = "default_mollie_user_agent")]
     pub user_agent: String,
 }
 
-fn default_adyen_user_agent() -> String {
+fn default_mollie_user_agent() -> String {
     "faktor-payments/0.1".to_string()
 }
 
-impl Default for AdyenConfig {
+impl Default for MollieConfig {
     fn default() -> Self {
         Self {
-            base_url: "https://checkout.adyen.com/v72".to_string(),
-            api_key_env: "FAKTOR_ADYEN_API_KEY".to_string(),
-            webhook_hmac_key_env: "FAKTOR_ADYEN_HMAC_KEY".to_string(),
-            merchant_account: "FAKTOR_ADYEN_MERCHANT_ACCOUNT".to_string(),
-            user_agent: default_adyen_user_agent(),
+            base_url: "https://api.mollie.com/v2".to_string(),
+            api_key_env: "FAKTOR_MOLLIE_API_KEY".to_string(),
+            webhook_url: None,
+            user_agent: default_mollie_user_agent(),
         }
     }
 }
 
-impl AdyenConfig {
+impl MollieConfig {
     pub fn validate(&self) -> Result<(), PaymentError> {
         let base = self.base_url.trim_end_matches('/');
         if !(base.starts_with("https://") || base.starts_with("http://")) {
             return Err(PaymentError::Config(
-                "adyen base_url must be an absolute http(s) URL".into(),
+                "mollie base_url must be an absolute http(s) URL".into(),
             ));
         }
         if base.contains(char::is_whitespace) || base.contains('@') {
             return Err(PaymentError::Config(
-                "adyen base_url must not contain whitespace or userinfo".into(),
+                "mollie base_url must not contain whitespace or userinfo".into(),
             ));
         }
-        for (name, env) in [
-            ("api_key_env", &self.api_key_env),
-            ("webhook_hmac_key_env", &self.webhook_hmac_key_env),
-        ] {
-            if env.is_empty() || env.len() > 128 {
-                return Err(PaymentError::Config(format!(
-                    "adyen {name} must name a bounded environment variable"
-                )));
-            }
-        }
-        if self.merchant_account.is_empty() || self.merchant_account.len() > 128 {
+        if self.api_key_env.is_empty() || self.api_key_env.len() > 128 {
             return Err(PaymentError::Config(
-                "adyen merchant_account must be 1..=128 bytes".into(),
+                "mollie api_key_env must name a bounded environment variable".into(),
             ));
+        }
+        if let Some(webhook) = &self.webhook_url {
+            if webhook.len() > 2048
+                || !(webhook.starts_with("https://") || webhook.starts_with("http://"))
+                || webhook.contains(char::is_whitespace)
+                || webhook.contains('@')
+            {
+                return Err(PaymentError::Config(
+                    "mollie webhook_url must be a bounded absolute http(s) URL".into(),
+                ));
+            }
         }
         if self.user_agent.is_empty() || self.user_agent.len() > 256 {
             return Err(PaymentError::Config(
-                "adyen user_agent must be 1..=256 bytes".into(),
+                "mollie user_agent must be 1..=256 bytes".into(),
             ));
         }
         Ok(())
@@ -554,7 +555,7 @@ pub struct PaymentsConfig {
     #[serde(default)]
     pub stripe: StripeConfig,
     #[serde(default)]
-    pub adyen: AdyenConfig,
+    pub mollie: MollieConfig,
 }
 
 pub fn default_vault_key_env() -> String {
@@ -578,7 +579,7 @@ impl PaymentsConfig {
         }
         match self.provider {
             ProviderKind::Stripe => self.stripe.validate()?,
-            ProviderKind::Adyen => self.adyen.validate()?,
+            ProviderKind::Mollie => self.mollie.validate()?,
             ProviderKind::Local => {}
         }
         Ok(())
@@ -593,7 +594,7 @@ impl PaymentsConfig {
             webhook_secret_env: "FAKTOR_BILLING_WEBHOOK_SECRET".to_string(),
             vault_key_env: default_vault_key_env(),
             stripe: StripeConfig::default(),
-            adyen: AdyenConfig::default(),
+            mollie: MollieConfig::default(),
         }
     }
 }

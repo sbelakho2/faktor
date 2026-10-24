@@ -134,7 +134,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .merge(
             Router::new()
-                .route("/webhooks/adyen", post(webhook::adyen))
+                .route("/webhooks/payments", post(webhook::payments))
                 .layer(DefaultBodyLimit::max(256 * 1024)),
         )
         .with_state(state.clone());

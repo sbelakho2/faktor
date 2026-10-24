@@ -560,14 +560,14 @@ pub async fn local_checkout_pay(
     if !billing::invoice_is_open(&invoice) {
         return Err(SiteError::Conflict("The invoice is not open for payment."));
     }
-    deliver_local_payment(&state, &checkout, &invoice)?;
+    deliver_local_payment(&state, &checkout, &invoice).await?;
     Ok(see_other(
         &format!("/account/billing/checkout/return/?invoice={}", invoice.id),
         &[],
     ))
 }
 
-fn deliver_local_payment(
+async fn deliver_local_payment(
     state: &AppState,
     checkout: &CheckoutRecord,
     invoice: &Invoice,
@@ -602,7 +602,7 @@ fn deliver_local_payment(
     let body = serde_json::to_vec(&body).map_err(SiteError::internal)?;
     let signature = faktor_payments::sign_local_webhook(secret.expose(), now / 1000, &body);
     let headers = WebhookHeaders::from_pairs([("x-faktor-signature", signature.as_str())]);
-    let outcome = state.payments.handle_webhook(&headers, &body, now)?;
+    let outcome = state.payments.handle_webhook(&headers, &body, now).await?;
     match outcome.disposition {
         WebhookDisposition::Applied | WebhookDisposition::Duplicate => {
             if let Ok(conn) = state.db.conn() {

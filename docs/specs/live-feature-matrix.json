@@ -24304,13 +24304,13 @@
       "hosts": [
         "daemon"
       ],
-      "live_testability": "blocked: no payment-provider adapter, endpoint, or API key is configured",
+      "live_testability": "blocked: Mollie adapter is wired; no live Mollie test-mode credential is configured",
       "real_data": [
-        "real payment-provider key/endpoint",
-        "webhook secret"
+        "real Mollie test-mode API key/endpoint",
+        "public webhook URL"
       ],
-      "probe": "Configure the provider; reconcile a subscription/invoice; send a signed webhook",
-      "observe": "provider events attributed; local ledger remains authoritative; absent provider is a named blocker, not a fake paid state",
+      "probe": "Configure Mollie; create/reconcile a subscription/invoice; deliver an id-only webhook",
+      "observe": "provider events attributed after the authoritative fetch; local ledger remains authoritative; absent provider is a named blocker, not a fake paid state",
       "controls": [],
       "routes": [],
       "cli": [],
@@ -24328,12 +24328,12 @@
       "external": {
         "kind": "payment-provider",
         "checked": [
-          "STRIPE_SECRET_KEY",
-          "STRIPE_WEBHOOK_SECRET",
+          "FAKTOR_MOLLIE_API_KEY",
+          "FAKTOR_MOLLIE_BASE_URL",
           "billing provider config"
         ],
         "present": false,
-        "reason": "blocked: no external payment-provider adapter/key configured"
+        "reason": "blocked: Mollie adapter is wired; no live test-mode credential is configured"
       },
       "related_screens": [],
       "entry_points": {
@@ -29474,13 +29474,13 @@
       "name": "External payment/billing provider",
       "kind": "payment-provider",
       "checked": [
-        "STRIPE_SECRET_KEY",
-        "STRIPE_WEBHOOK_SECRET",
+        "FAKTOR_MOLLIE_API_KEY",
+        "FAKTOR_MOLLIE_BASE_URL",
         "billing provider config"
       ],
       "present": false,
-      "reason": "blocked: no external payment-provider adapter/key configured",
-      "live_testability": "blocked: no payment-provider adapter, endpoint, or API key is configured"
+      "reason": "blocked: Mollie adapter is wired; no live test-mode credential is configured",
+      "live_testability": "blocked: Mollie adapter is wired; no live Mollie test-mode credential is configured"
     },
     {
       "feature": "F031",
@@ -29609,8 +29609,8 @@
       "GITHUB_TOKEN",
       "AWS_ACCESS_KEY_ID",
       "AWS_SECRET_ACCESS_KEY",
-      "STRIPE_SECRET_KEY",
-      "STRIPE_WEBHOOK_SECRET",
+      "FAKTOR_MOLLIE_API_KEY",
+      "FAKTOR_MOLLIE_BASE_URL",
       "FAKTOR_HOOKS"
     ],
     "present_env_names": [],

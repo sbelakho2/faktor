@@ -575,7 +575,7 @@ pub struct BillingPaymentsCfg {
     #[serde(default)]
     pub stripe: Option<BillingStripeCfg>,
     #[serde(default)]
-    pub adyen: Option<BillingAdyenCfg>,
+    pub mollie: Option<BillingMollieCfg>,
 }
 
 /// One exact plan price in one currency (integer minor units).
@@ -641,18 +641,17 @@ pub struct BillingStripeCfg {
     pub user_agent: Option<String>,
 }
 
-/// The Adyen adapter's environment-variable references.
+/// The Mollie adapter's environment-variable references and public webhook
+/// ingress. Credentials are named, never embedded.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct BillingAdyenCfg {
+pub struct BillingMollieCfg {
     #[serde(default)]
     pub base_url: Option<String>,
     #[serde(default)]
     pub api_key_env: Option<String>,
     #[serde(default)]
-    pub webhook_hmac_key_env: Option<String>,
-    #[serde(default)]
-    pub merchant_account: Option<String>,
+    pub webhook_url: Option<String>,
     #[serde(default)]
     pub user_agent: Option<String>,
 }
@@ -703,10 +702,10 @@ impl BillingPaymentsCfg {
         let provider = match self.provider.as_deref().unwrap_or("local") {
             "local" => faktor_payments::ProviderKind::Local,
             "stripe" => faktor_payments::ProviderKind::Stripe,
-            "adyen" => faktor_payments::ProviderKind::Adyen,
+            "mollie" => faktor_payments::ProviderKind::Mollie,
             other => {
                 return Err(format!(
-                    "billing payments: unknown provider {other:?} (local|stripe|adyen)"
+                    "billing payments: unknown provider {other:?} (local|stripe|mollie)"
                 ))
             }
         };
@@ -784,22 +783,19 @@ impl BillingPaymentsCfg {
                 stripe.user_agent = agent.clone();
             }
         }
-        let mut adyen = faktor_payments::AdyenConfig::default();
-        if let Some(cfg) = &self.adyen {
+        let mut mollie = faktor_payments::MollieConfig::default();
+        if let Some(cfg) = &self.mollie {
             if let Some(base_url) = &cfg.base_url {
-                adyen.base_url = base_url.clone();
+                mollie.base_url = base_url.clone();
             }
             if let Some(env) = &cfg.api_key_env {
-                adyen.api_key_env = env.clone();
+                mollie.api_key_env = env.clone();
             }
-            if let Some(env) = &cfg.webhook_hmac_key_env {
-                adyen.webhook_hmac_key_env = env.clone();
-            }
-            if let Some(account) = &cfg.merchant_account {
-                adyen.merchant_account = account.clone();
+            if let Some(webhook) = &cfg.webhook_url {
+                mollie.webhook_url = Some(webhook.clone());
             }
             if let Some(agent) = &cfg.user_agent {
-                adyen.user_agent = agent.clone();
+                mollie.user_agent = agent.clone();
             }
         }
         let webhook_secret_env = self
@@ -814,7 +810,7 @@ impl BillingPaymentsCfg {
             webhook_secret_env,
             vault_key_env: faktor_payments::catalog::default_vault_key_env(),
             stripe,
-            adyen,
+            mollie,
         };
         config
             .validate()
@@ -992,24 +988,23 @@ mod tests {
     }
 
     #[test]
-    fn payments_adyen_uses_env_names_and_exact_adapter_fields() {
+    fn payments_mollie_uses_env_names_and_exact_adapter_fields() {
         let cfg = enabled(
-            r#"{"enabled":true,"organization":"o","plans":{"p":{"plan_id":"p","features":[],"limits":{}}},"payments":{"enabled":true,"provider":"adyen","adyen":{"base_url":"https://checkout-test.adyen.com/v72","api_key_env":"MY_ADYEN_KEY","webhook_hmac_key_env":"MY_ADYEN_HMAC","merchant_account":"MerchantX","user_agent":"faktor-test/1"}}}"#,
+            r#"{"enabled":true,"organization":"o","plans":{"p":{"plan_id":"p","features":[],"limits":{}}},"payments":{"enabled":true,"provider":"mollie","mollie":{"base_url":"https://api.mollie.test/v2","api_key_env":"MY_MOLLIE_KEY","webhook_url":"https://example.invalid/webhooks/payments","user_agent":"faktor-test/1"}}}"#,
         );
         cfg.validate().unwrap();
         let runtime = cfg.payments.unwrap().runtime_config(&cfg.plans).unwrap();
-        assert_eq!(runtime.provider, faktor_payments::ProviderKind::Adyen);
+        assert_eq!(runtime.provider, faktor_payments::ProviderKind::Mollie);
+        assert_eq!(runtime.mollie.base_url, "https://api.mollie.test/v2");
+        assert_eq!(runtime.mollie.api_key_env, "MY_MOLLIE_KEY");
         assert_eq!(
-            runtime.adyen.base_url,
-            "https://checkout-test.adyen.com/v72"
+            runtime.mollie.webhook_url.as_deref(),
+            Some("https://example.invalid/webhooks/payments")
         );
-        assert_eq!(runtime.adyen.api_key_env, "MY_ADYEN_KEY");
-        assert_eq!(runtime.adyen.webhook_hmac_key_env, "MY_ADYEN_HMAC");
-        assert_eq!(runtime.adyen.merchant_account, "MerchantX");
         assert!(!format!("{runtime:?}").contains("AQE_"));
 
         let rejected = enabled(
-            r#"{"enabled":true,"organization":"o","plans":{"p":{"plan_id":"p","features":[],"limits":{}}},"payments":{"enabled":true,"provider":"adyen","adyen":{"base_url":"ftp://x","api_key_env":"K","webhook_hmac_key_env":"H","merchant_account":"M"}}}"#,
+            r#"{"enabled":true,"organization":"o","plans":{"p":{"plan_id":"p","features":[],"limits":{}}},"payments":{"enabled":true,"provider":"mollie","mollie":{"base_url":"ftp://x","api_key_env":"K","webhook_url":"https://example.invalid/hook"}}}"#,
         );
         assert!(rejected.validate().unwrap_err().contains("base_url"));
     }

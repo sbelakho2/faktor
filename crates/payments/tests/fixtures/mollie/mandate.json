@@ -1,0 +1,10 @@
+{
+  "resource": "mandate",
+  "id": "mdt_mandate_1",
+  "mode": "test",
+  "status": "valid",
+  "method": "directdebit",
+  "customerId": "cst_customer_1",
+  "consumerName": "Org One",
+  "consumerAccount": "NL55INGB0000000000"
+}

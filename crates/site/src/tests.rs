@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use axum::http::StatusCode;
 use faktor_payments::InvoiceStatus;
-use faktor_provider::egress::MockHttpTransport;
+use faktor_provider::egress::PolicyCheckedHttpTransport;
+use faktor_provider::testing::{MockAction, MockServer};
 
 use crate::test_support::{field_value, Client, TestApp, TEST_NOW_MS, TEST_SECRET};
 
@@ -590,7 +591,7 @@ async fn webhook_signature_timestamp_idempotency_and_bounds() {
     let invalid = format!("t={},v1={}", TEST_NOW_MS / 1000, "0".repeat(64));
     let response = client
         .post_raw_with(
-            "/webhooks/adyen",
+            "/webhooks/payments",
             &body,
             "application/json",
             &[("x-faktor-signature", invalid.as_str())],
@@ -606,7 +607,7 @@ async fn webhook_signature_timestamp_idempotency_and_bounds() {
     let stale_header = signature_header(TEST_NOW_MS / 1000 - 3_600, &body);
     let stale = client
         .post_raw_with(
-            "/webhooks/adyen",
+            "/webhooks/payments",
             &body,
             "application/json",
             &[("x-faktor-signature", stale_header.as_str())],
@@ -617,7 +618,7 @@ async fn webhook_signature_timestamp_idempotency_and_bounds() {
     let header = signature_header(TEST_NOW_MS / 1000, &body);
     let valid = client
         .post_raw_with(
-            "/webhooks/adyen",
+            "/webhooks/payments",
             &body,
             "application/json",
             &[("x-faktor-signature", header.as_str())],
@@ -631,7 +632,7 @@ async fn webhook_signature_timestamp_idempotency_and_bounds() {
 
     let replay = client
         .post_raw_with(
-            "/webhooks/adyen",
+            "/webhooks/payments",
             &body,
             "application/json",
             &[("x-faktor-signature", header.as_str())],
@@ -644,7 +645,7 @@ async fn webhook_signature_timestamp_idempotency_and_bounds() {
     let malformed_header = signature_header(TEST_NOW_MS / 1000, malformed);
     let malformed_response = client
         .post_raw_with(
-            "/webhooks/adyen",
+            "/webhooks/payments",
             malformed,
             "application/json",
             &[("x-faktor-signature", malformed_header.as_str())],
@@ -654,12 +655,12 @@ async fn webhook_signature_timestamp_idempotency_and_bounds() {
 
     let oversized = "x".repeat(300 * 1024);
     let oversized_response = client
-        .post_raw("/webhooks/adyen", &oversized, "application/json")
+        .post_raw("/webhooks/payments", &oversized, "application/json")
         .await;
     assert_eq!(oversized_response.status, StatusCode::PAYLOAD_TOO_LARGE);
 }
 
-async fn start_adyen_checkout(client: &mut Client) -> String {
+async fn start_mollie_checkout(client: &mut Client) -> String {
     let form = billing_form(client).await;
     let response = client
         .post(
@@ -682,100 +683,119 @@ async fn start_adyen_checkout(client: &mut Client) -> String {
         .to_string()
 }
 
-fn adyen_body(
-    org: &str,
-    invoice: &faktor_payments::Invoice,
-    psp: &str,
-    event_date: &str,
-    signature: &str,
-) -> String {
-    serde_json::json!({
-        "live": "false",
-        "notificationItems": [{"NotificationRequestItem": {
-            "pspReference": psp,
-            "originalReference": "",
-            "merchantAccountCode": "TestMerchant",
-            "merchantReference": format!("faktor:{org}:invoice:{}", invoice.id),
-            "amount": {"value": invoice.total_minor, "currency": invoice.currency},
-            "eventCode": "AUTHORISATION",
-            "success": "true",
-            "eventDate": event_date,
-            "additionalData": {"hmacSignature": signature}
-        }}]
-    })
-    .to_string()
-}
-
 #[tokio::test]
-async fn adyen_handoff_and_hmac_webhook_settle_the_invoice() {
-    let transport = Arc::new(MockHttpTransport::new(
-        200,
-        r#"{"id":"cs_test","status":"active","url":"https://checkoutshopper-test.adyen.com/checkout"}"#,
-    ));
-    let app = TestApp::build_with_provider(
-        faktor_payments::ProviderKind::Adyen,
-        Some(transport.clone()),
+async fn mollie_handoff_and_id_only_webhook_fetch_settle_the_invoice() {
+    let mock = MockServer::new();
+    mock.route(
+        "POST",
+        "/v2/customers",
+        MockAction::Respond {
+            status: 201,
+            body: include_str!("../../payments/tests/fixtures/mollie/customer.json").into(),
+        },
     );
-    let mut client = signup_verified(&app, "adyen@example.com").await;
-    let location = start_adyen_checkout(&mut client).await;
-    assert_eq!(location, "https://checkoutshopper-test.adyen.com/checkout");
-    let requests = transport.requests();
-    assert!(requests
-        .iter()
-        .any(|(_, url)| url.contains("/paymentLinks")));
-    assert!(requests.iter().any(|(_, url)| url.contains("/sessions")));
+    mock.route(
+        "POST",
+        "/v2/customers/cst_customer_1/subscriptions",
+        MockAction::Respond {
+            status: 201,
+            body: include_str!("../../payments/tests/fixtures/mollie/subscription_active.json")
+                .into(),
+        },
+    );
+    mock.route(
+        "POST",
+        "/v2/payments",
+        MockAction::Respond {
+            status: 201,
+            body: include_str!("../../payments/tests/fixtures/mollie/payment_open.json").into(),
+        },
+    );
+    let base = mock.base_url().await;
+    let transport = Arc::new(PolicyCheckedHttpTransport::permissive());
+    let app = TestApp::build_with_mollie(transport, format!("{base}/v2"));
+    let mut client = signup_verified(&app, "mollie@example.com").await;
+    let location = start_mollie_checkout(&mut client).await;
+    assert_eq!(location, "https://checkout.mollie.test/tr_payment_1");
 
-    let org = app.org_for_email("adyen@example.com");
+    let org = app.org_for_email("mollie@example.com");
     let invoice = invoice_for(&app, &org);
-    let event_date = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(TEST_NOW_MS)
-        .unwrap()
-        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let sig = faktor_payments::sign_adyen_webhook_hmac(
-        TEST_SECRET,
-        "psp_test_1",
-        "",
-        "TestMerchant",
-        &format!("faktor:{org}:invoice:{}", invoice.id),
-        invoice.total_minor,
-        &invoice.currency,
-        "AUTHORISATION",
-        "true",
+    let amount_value = format!(
+        "{}.{:02}",
+        invoice.total_minor / 100,
+        invoice.total_minor % 100
     );
-    let body = adyen_body(&org, &invoice, "psp_test_1", &event_date, &sig);
+    let paid = include_str!("../../payments/tests/fixtures/mollie/payment_paid.json")
+        .replace("\"org_1\"", &format!("\"{org}\""))
+        .replace("\"inv_1\"", &format!("\"{}\"", invoice.id))
+        .replace("\"USD\"", &format!("\"{}\"", invoice.currency))
+        .replace("\"100.00\"", &format!("\"{amount_value}\""));
+    mock.route(
+        "GET",
+        "/v2/payments/tr_payment_1",
+        MockAction::Respond {
+            status: 200,
+            body: paid,
+        },
+    );
+    mock.route(
+        "GET",
+        "/v2/payments/tr_forged",
+        MockAction::Respond {
+            status: 404,
+            body: include_str!("../../payments/tests/fixtures/mollie/error_not_found.json").into(),
+        },
+    );
+    mock.route(
+        "GET",
+        "/v2/payments/tr_foreign",
+        MockAction::Respond {
+            status: 200,
+            body: include_str!("../../payments/tests/fixtures/mollie/payment_foreign.json").into(),
+        },
+    );
+
+    // The posted `status=failed` is untrusted; the fetched resource is paid.
+    let body = "id=tr_payment_1&status=failed";
     let response = client
-        .post_raw("/webhooks/adyen", &body, "application/json")
+        .post_raw(
+            "/webhooks/payments",
+            body,
+            "application/x-www-form-urlencoded",
+        )
         .await;
     assert_eq!(response.status, StatusCode::OK, "{}", response.body);
-    let paid = invoice_for(&app, &org);
-    assert_eq!(paid.status, InvoiceStatus::Paid);
-    assert_eq!(paid.amount_paid_minor, paid.total_minor);
+    assert_eq!(response.body, "[accepted]");
+    let paid_invoice = invoice_for(&app, &org);
+    assert_eq!(paid_invoice.status, InvoiceStatus::Paid);
+    assert_eq!(paid_invoice.amount_paid_minor, paid_invoice.total_minor);
 
-    let bad_body = adyen_body(&org, &invoice, "psp_test_2", &event_date, "AAAA");
-    let bad = client
-        .post_raw("/webhooks/adyen", &bad_body, "application/json")
+    let replay = client
+        .post_raw(
+            "/webhooks/payments",
+            body,
+            "application/x-www-form-urlencoded",
+        )
         .await;
-    assert_eq!(bad.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(replay.status, StatusCode::OK, "{}", replay.body);
+    assert_eq!(replay.body, "[duplicate]");
 
-    let stale_date =
-        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(TEST_NOW_MS - 25 * 60 * 60 * 1000)
-            .unwrap()
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let stale_sig = faktor_payments::sign_adyen_webhook_hmac(
-        TEST_SECRET,
-        "psp_test_3",
-        "",
-        "TestMerchant",
-        &format!("faktor:{org}:invoice:{}", invoice.id),
-        invoice.total_minor,
-        &invoice.currency,
-        "AUTHORISATION",
-        "true",
-    );
-    let stale_body = adyen_body(&org, &invoice, "psp_test_3", &stale_date, &stale_sig);
-    let stale = client
-        .post_raw("/webhooks/adyen", &stale_body, "application/json")
+    let forged = client
+        .post_raw(
+            "/webhooks/payments",
+            "id=tr_forged",
+            "application/x-www-form-urlencoded",
+        )
         .await;
-    assert_eq!(stale.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(forged.status, StatusCode::NOT_FOUND, "{}", forged.body);
+    let foreign = client
+        .post_raw(
+            "/webhooks/payments",
+            "id=tr_foreign",
+            "application/x-www-form-urlencoded",
+        )
+        .await;
+    assert_eq!(foreign.status, StatusCode::UNAUTHORIZED, "{}", foreign.body);
 }
 
 #[tokio::test]

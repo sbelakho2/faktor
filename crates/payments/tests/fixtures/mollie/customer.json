@@ -1,0 +1,7 @@
+{
+  "resource": "customer",
+  "id": "cst_customer_1",
+  "name": "Org One",
+  "email": "billing@example.invalid",
+  "metadata": {"organization_id": "org_1", "faktor_provider": "mollie", "faktor_kind": "customer"}
+}

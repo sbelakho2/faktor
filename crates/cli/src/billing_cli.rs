@@ -133,7 +133,7 @@ pub(crate) enum BillingAction {
 pub(crate) enum BillingMethodAction {
     /// Store one provider token (vault-sealed at rest).
     Add {
-        /// Opaque provider token (`pm_...`, `tok_...`, Adyen stored id).
+        /// Opaque provider token (`pm_...`, `tok_...`, Mollie mandate id).
         #[arg(long)]
         token: String,
         #[arg(long, default_value = "card")]
@@ -273,7 +273,7 @@ fn payments_service(
     );
     let transport = if matches!(
         runtime.provider,
-        faktor_payments::ProviderKind::Stripe | faktor_payments::ProviderKind::Adyen
+        faktor_payments::ProviderKind::Stripe | faktor_payments::ProviderKind::Mollie
     ) {
         let policy = config
             .sandbox_policy()

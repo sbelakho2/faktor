@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use faktor_cloud::{ManualClock, OrganizationId};
 use faktor_payments::{
-    validate_payment_token, AddPaymentMethodRequest, AdyenConfig, CurrencySpec, DunningConfig,
+    validate_payment_token, AddPaymentMethodRequest, CurrencySpec, DunningConfig, MollieConfig,
     PaymentService, PaymentTokenVault, PaymentsConfig, PlanPrice, PriceCatalogue, ProviderKind,
     SqlitePaymentStore, StaticSecrets, StripeConfig, TaxConfig,
 };
@@ -40,7 +40,7 @@ fn payments_config() -> PaymentsConfig {
         webhook_secret_env: "FAKTOR_TEST_WEBHOOK_SECRET".into(),
         vault_key_env: faktor_payments::catalog::default_vault_key_env(),
         stripe: StripeConfig::default(),
-        adyen: AdyenConfig::default(),
+        mollie: MollieConfig::default(),
     }
 }
 
@@ -88,7 +88,7 @@ fn strict_token_shape_rejects_pan_at_any_offset_and_oversize() {
         );
     }
     assert!(validate_payment_token("pm_1PxYzAbCdEfGhIjKlMn").is_ok());
-    assert!(validate_payment_token("adyen_stored_7fc0d3a2").is_ok());
+    assert!(validate_payment_token("mollie_mandate_7fc0d3a2").is_ok());
     assert!(validate_payment_token("tok_with/slash_and:colon.ok").is_ok());
     let too_long = "a".repeat(faktor_payments::MAX_TOKEN_BYTES + 1);
     assert!(validate_payment_token(&too_long).is_err());

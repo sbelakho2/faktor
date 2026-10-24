@@ -1,0 +1,11 @@
+{
+  "resource": "subscription",
+  "id": "sub_subscription_1",
+  "mode": "test",
+  "createdAt": "2026-10-24T10:00:00+00:00",
+  "status": "canceled",
+  "amount": {"currency": "USD", "value": "100.00"},
+  "interval": "1 month",
+  "customerId": "cst_customer_1",
+  "metadata": {"organization_id": "org_1", "faktor_provider": "mollie", "faktor_kind": "subscription"}
+}

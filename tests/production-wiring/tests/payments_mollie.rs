@@ -1,4 +1,4 @@
-//! Production wiring for the Adyen/Stripe provider selection: the exact
+//! Production wiring for the Mollie/Stripe provider selection: the exact
 //! `build_service` seam the daemon calls must install a configured adapter
 //! with checked egress, or the typed unconfigured provider when the named
 //! credential is absent. Secrets are supplied by name and never rendered.
@@ -8,15 +8,14 @@ use std::sync::Arc;
 
 use faktor_cloud::{ManualClock, OrganizationId};
 use faktor_payments::{
-    build_service, AdyenConfig, BillingInterval, CurrencySpec, DunningConfig, PaymentError,
+    build_service, BillingInterval, CurrencySpec, DunningConfig, MollieConfig, PaymentError,
     PaymentService, PaymentsConfig, PlanPrice, PriceCatalogue, ProviderKind, SqlitePaymentStore,
     StaticSecrets, StripeConfig, SubscribeRequest, TaxConfig,
 };
 use faktor_provider::egress::{HttpTransport, PolicyCheckedHttpTransport};
 
 const NOW_MS: i64 = 1_700_000_000_000;
-const API_ENV: &str = "FAKTOR_TEST_ADYEN_API_KEY";
-const HMAC_ENV: &str = "FAKTOR_TEST_ADYEN_HMAC_KEY";
+const API_ENV: &str = "FAKTOR_TEST_MOLLIE_API_KEY";
 
 fn config(provider: ProviderKind) -> PaymentsConfig {
     PaymentsConfig {
@@ -41,11 +40,10 @@ fn config(provider: ProviderKind) -> PaymentsConfig {
         webhook_secret_env: "FAKTOR_TEST_WEBHOOK_SECRET".into(),
         vault_key_env: faktor_payments::catalog::default_vault_key_env(),
         stripe: StripeConfig::default(),
-        adyen: AdyenConfig {
-            base_url: "https://checkout-test.adyen.com/v72".into(),
+        mollie: MollieConfig {
+            base_url: "https://api.mollie.test/v2".into(),
             api_key_env: API_ENV.into(),
-            webhook_hmac_key_env: HMAC_ENV.into(),
-            merchant_account: "FaktorWiringMerchant".into(),
+            webhook_url: Some("https://example.invalid/webhooks/payments".into()),
             user_agent: "faktor-wiring-test/0.1".into(),
         },
     }
@@ -68,26 +66,26 @@ fn build(
 }
 
 #[tokio::test]
-async fn adyen_is_wired_and_missing_named_credentials_are_typed() {
+async fn mollie_is_wired_and_missing_named_credentials_are_typed() {
     let secrets = || {
-        StaticSecrets::new([
-            (API_ENV.to_string(), "AQE_wiring_api_key".to_string()),
-            (HMAC_ENV.to_string(), "ab".repeat(32)),
-        ])
+        StaticSecrets::new([(
+            API_ENV.to_string(),
+            "test_wiring_mollie_api_key".to_string(),
+        )])
     };
     let service = build(
         secrets(),
         Some(Arc::new(PolicyCheckedHttpTransport::permissive())),
-        ProviderKind::Adyen,
+        ProviderKind::Mollie,
     );
-    assert_eq!(service.provider_kind(), ProviderKind::Adyen);
+    assert_eq!(service.provider_kind(), ProviderKind::Mollie);
     assert_eq!(service.provider_status().state, "available");
-    assert!(!format!("{:?}", service.provider_status()).contains("AQE_wiring_api_key"));
+    assert!(!format!("{:?}", service.provider_status()).contains("test_wiring_mollie_api_key"));
 
     let unconfigured = build(
         StaticSecrets::default(),
         Some(Arc::new(PolicyCheckedHttpTransport::permissive())),
-        ProviderKind::Adyen,
+        ProviderKind::Mollie,
     );
     assert_eq!(unconfigured.provider_status().state, "unconfigured");
     let org = OrganizationId::try_new("org_wiring").unwrap();
@@ -109,7 +107,7 @@ async fn adyen_is_wired_and_missing_named_credentials_are_typed() {
     assert!(matches!(error, PaymentError::ProviderUnconfigured(_)));
 
     // The configured adapter without a transport is also honestly typed.
-    let no_transport = build(secrets(), None, ProviderKind::Adyen);
+    let no_transport = build(secrets(), None, ProviderKind::Mollie);
     assert_eq!(no_transport.provider_status().state, "unconfigured");
     assert_eq!(
         build(StaticSecrets::default(), None, ProviderKind::Stripe).provider_kind(),

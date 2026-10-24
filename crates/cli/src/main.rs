@@ -3567,4 +3567,4 @@ mod main_value_tests;
 mod main_cli_tests;
 
 #[cfg(test)]
-mod indep_coding_audit;
+mod indep_coding_audit_tests;

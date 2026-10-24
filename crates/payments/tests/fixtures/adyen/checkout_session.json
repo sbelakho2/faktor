@@ -1,8 +1,0 @@
-{
-  "id": "CS_checkout_1",
-  "sessionData": "session-data-opaque",
-  "url": "https://checkout-test.adyen.com/checkout/CS_checkout_1",
-  "amount": {"currency": "USD", "value": 10000},
-  "reference": "faktor:org_1:checkout:checkout-1",
-  "status": "active"
-}

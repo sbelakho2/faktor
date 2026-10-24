@@ -1,0 +1,11 @@
+{
+  "resource": "payment",
+  "id": "tr_expired",
+  "mode": "test",
+  "createdAt": "2026-10-24T10:00:00+00:00",
+  "expiredAt": "2026-10-24T11:00:00+00:00",
+  "amount": {"currency": "USD", "value": "100.00"},
+  "description": "Faktor Pro plan",
+  "status": "expired",
+  "metadata": {"organization_id": "org_1", "faktor_provider": "mollie", "faktor_kind": "payment", "local_invoice_id": "inv_1"}
+}

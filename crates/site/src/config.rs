@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use faktor_payments::{
-    AdyenConfig, BillingInterval, CurrencySpec, PaymentsConfig, PlanPrice, PriceCatalogue,
+    BillingInterval, CurrencySpec, MollieConfig, PaymentsConfig, PlanPrice, PriceCatalogue,
     ProviderKind, SecretString, StaticSecrets, TaxConfig, TaxRate,
 };
 use thiserror::Error;
@@ -51,10 +51,10 @@ impl Config {
             .as_str()
         {
             "local" => ProviderKind::Local,
-            "adyen" => ProviderKind::Adyen,
+            "mollie" => ProviderKind::Mollie,
             other => {
                 return Err(ConfigError::Invalid(format!(
-                    "unknown billing provider {other:?}; expected local or adyen"
+                    "unknown billing provider {other:?}; expected local or mollie"
                 )))
             }
         };
@@ -112,11 +112,11 @@ impl Config {
                 "session lifetime bounds are invalid".into(),
             ));
         }
-        if self.billing_provider == ProviderKind::Adyen
-            && self.payments.adyen.merchant_account == "unconfigured"
+        if self.billing_provider == ProviderKind::Mollie
+            && std::env::var(&self.payments.mollie.api_key_env).is_err()
         {
             tracing::warn!(
-                "Adyen is selected but FAKTOR_ADYEN_MERCHANT_ACCOUNT is empty; paid operations will refuse typed"
+                "Mollie is selected but its API-key environment variable is unset; paid operations will refuse typed"
             );
         }
         if self.billing_provider == ProviderKind::Local {
@@ -126,7 +126,7 @@ impl Config {
             if !local_origin {
                 tracing::warn!(
                     base_url = %self.base_url,
-                    "the local billing provider is enabled for a non-loopback origin; use FAKTOR_SITE_BILLING_PROVIDER=adyen in production"
+                    "the local billing provider is enabled for a non-loopback origin; use FAKTOR_SITE_BILLING_PROVIDER=mollie in production"
                 );
             }
         }
@@ -141,11 +141,8 @@ impl Config {
                 secret.expose().to_string(),
             ));
         }
-        if let Ok(value) = std::env::var(&self.payments.adyen.api_key_env) {
-            values.push((self.payments.adyen.api_key_env.clone(), value));
-        }
-        if let Ok(value) = std::env::var(&self.payments.adyen.webhook_hmac_key_env) {
-            values.push((self.payments.adyen.webhook_hmac_key_env.clone(), value));
+        if let Ok(value) = std::env::var(&self.payments.mollie.api_key_env) {
+            values.push((self.payments.mollie.api_key_env.clone(), value));
         }
         if let Ok(value) = std::env::var(&self.payments.vault_key_env) {
             values.push((self.payments.vault_key_env.clone(), value));
@@ -217,12 +214,10 @@ pub fn build_payments_config(provider: ProviderKind) -> Result<PaymentsConfig, C
             inclusive: false,
         },
     );
-    let merchant_account = std::env::var("FAKTOR_ADYEN_MERCHANT_ACCOUNT")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "unconfigured".to_string());
-    let adyen_base = std::env::var("FAKTOR_ADYEN_BASE_URL")
-        .unwrap_or_else(|_| "https://checkout-test.adyen.com/v71".to_string());
+    let public_base =
+        std::env::var("FAKTOR_SITE_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into());
+    let mollie_base = std::env::var("FAKTOR_MOLLIE_BASE_URL")
+        .unwrap_or_else(|_| "https://api.mollie.com/v2".to_string());
     let config = PaymentsConfig {
         provider,
         catalogue: PriceCatalogue {
@@ -238,11 +233,13 @@ pub fn build_payments_config(provider: ProviderKind) -> Result<PaymentsConfig, C
         webhook_secret_env: "FAKTOR_SITE_WEBHOOK_SECRET".to_string(),
         vault_key_env: "FAKTOR_SITE_PAYMENT_VAULT_KEY".to_string(),
         stripe: Default::default(),
-        adyen: AdyenConfig {
-            base_url: adyen_base,
-            api_key_env: "FAKTOR_ADYEN_API_KEY".to_string(),
-            webhook_hmac_key_env: "FAKTOR_ADYEN_HMAC_KEY".to_string(),
-            merchant_account,
+        mollie: MollieConfig {
+            base_url: mollie_base,
+            api_key_env: "FAKTOR_MOLLIE_API_KEY".to_string(),
+            webhook_url: Some(format!(
+                "{}/webhooks/payments",
+                public_base.trim_end_matches('/')
+            )),
             user_agent: "faktor-site/0.1".to_string(),
         },
     };

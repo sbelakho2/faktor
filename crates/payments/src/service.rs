@@ -20,6 +20,7 @@ use crate::catalog::{
     BillingInterval, DunningConfig, PaymentsConfig, PlanPrice, ProviderKind, TaxConfig, TaxRate,
 };
 use crate::error::{PaymentError, PaymentErrorBody};
+use crate::lease::ConflictDomain;
 use crate::model::{
     AddPaymentMethodRequest, CancelRequest, CapabilityStatus, ChangePlanRequest,
     ChangeSeatsRequest, ClaimAcquisition, CreditNote, FinancialResourceType, Invoice, InvoiceLine,
@@ -44,13 +45,14 @@ use crate::store::{
     next_sequence_tx, payment_by_provider_id_tx, payment_tx, put_customer_tx,
     put_payment_method_tx, put_subscription_tx, refund_by_id_tx, refund_by_provider_id_conn,
     subscription_by_id_tx, subscription_by_provider_id_tx, update_invoice_tx,
-    upsert_provider_invoice_conn, upsert_provider_payment_conn, upsert_provider_refund_conn,
-    watermark_tx, IdempotencyWrite, InvoiceStats, SqlitePaymentStore, WebhookDecision,
-    WebhookEffects, WebhookPlan, WebhookRecord,
+    upsert_provider_invoice_conn, watermark_tx, IdempotencyWrite, InvoiceStats, SqlitePaymentStore,
+    WebhookDecision, WebhookEffects, WebhookPlan, WebhookRecord,
 };
+use crate::subscription_ops;
 use crate::vault::PaymentTokenVault;
 
 mod export;
+mod invoice_ops;
 mod tokens;
 mod webhooks;
 
@@ -104,9 +106,14 @@ impl PaymentService {
 
     /// Startup recovery: claims that crossed the provider boundary in a
     /// previous process become `unknown`; claims that never dispatched are
-    /// released (no provider effect can exist).
+    /// released (no provider effect can exist). Financial mutation fences
+    /// whose claim is terminal or gone are released; every other held fence
+    /// stays occupied for reconciliation.
     fn recover_dispatch_claims(&self) -> Result<(), PaymentError> {
         self.store.recover_claims(self.now_ms())?;
+        subscription_ops::recover_leases_after_claim_recovery(self.store.as_ref())?;
+        self.recover_invoice_and_refund_leases()?;
+        self.store.recover_leases()?;
         Ok(())
     }
 
@@ -192,39 +199,33 @@ impl PaymentService {
         Self::new(store, provider, config, clock, vault)
     }
 
-    /// Construct the Adyen Checkout adapter. A missing API key is not a
-    /// construction failure: the honest unconfigured provider is installed
-    /// so reads work and every paid operation refuses typed.
-    pub fn open_adyen(
+    /// Construct the Mollie adapter. A missing API key is not a construction
+    /// failure: the honest unconfigured provider is installed so reads work
+    /// and every paid operation refuses typed.
+    pub fn open_mollie(
         store: Arc<SqlitePaymentStore>,
         config: PaymentsConfig,
         clock: Arc<dyn Clock>,
         secrets: Arc<dyn SecretSource>,
         transport: Option<Arc<dyn faktor_provider::egress::HttpTransport>>,
     ) -> Result<Self, PaymentError> {
-        let api_key = secrets.get(&config.adyen.api_key_env);
-        let webhook_key = secrets.get(&config.adyen.webhook_hmac_key_env);
+        let api_key = secrets.get(&config.mollie.api_key_env);
         let vault = Self::open_vault(&store, &config, secrets.as_ref())?;
         let provider: Arc<dyn PaymentProvider> = match (api_key, transport) {
-            (Some(api_key), Some(transport)) if !api_key.is_empty() => {
-                Arc::new(crate::adyen::AdyenPaymentProvider::new(
-                    &config.adyen,
-                    api_key,
-                    webhook_key,
-                    transport,
-                )?)
-            }
+            (Some(api_key), Some(transport)) if !api_key.is_empty() => Arc::new(
+                crate::mollie::MolliePaymentProvider::new(&config.mollie, api_key, transport)?,
+            ),
             (Some(api_key), None) if !api_key.is_empty() => {
                 Arc::new(crate::provider::UnconfiguredPaymentProvider::new(
-                    "adyen",
+                    "mollie",
                     "no checked egress transport is wired",
                 ))
             }
             _ => Arc::new(crate::provider::UnconfiguredPaymentProvider::new(
-                "adyen",
+                "mollie",
                 format!(
                     "the environment variable {} does not resolve to an API key",
-                    config.adyen.api_key_env
+                    config.mollie.api_key_env
                 ),
             )),
         };
@@ -378,6 +379,7 @@ impl PaymentService {
         let price = plan.price(request.interval);
         let org = organization.as_str();
         let hash = request_hash(&request)?;
+        subscription_ops::release_resolved(self.store.as_ref(), org)?;
         if let Some(response) = self.replay("subscribe", org, &request.idempotency_key, &hash)? {
             let subscription = self.subscription_from_replay(org, &response)?;
             return Ok(SubscriptionOutcome {
@@ -419,6 +421,47 @@ impl PaymentService {
                 return Err(Self::claim_unresolved_error(&claim))
             }
         }
+        let lease = match subscription_ops::acquire(
+            self.store.as_ref(),
+            org,
+            &ConflictDomain::Subscription {
+                organization_id: org.to_string(),
+            },
+            org,
+            &request.idempotency_key,
+            &hash,
+        ) {
+            Ok(lease) => lease,
+            Err(error) => {
+                subscription_ops::abandon_claim(
+                    self.store.as_ref(),
+                    org,
+                    &request.idempotency_key,
+                )?;
+                return Err(error);
+            }
+        };
+        if let Some(existing) = self.store.subscription(org)? {
+            if existing.is_live() {
+                let error = PaymentError::Conflict(
+                    "the organization already has a live payment subscription".into(),
+                );
+                self.store.fail_claim(
+                    org,
+                    &request.idempotency_key,
+                    error.code(),
+                    &error.to_string(),
+                    now,
+                )?;
+                subscription_ops::settle(
+                    self.store.as_ref(),
+                    org,
+                    &lease,
+                    &request.idempotency_key,
+                )?;
+                return Err(error);
+            }
+        }
         self.store
             .mark_claim_dispatched(org, &request.idempotency_key, now)?;
         let existing_customer = self.store.customer(org)?;
@@ -438,6 +481,12 @@ impl PaymentService {
                     Ok(remote) => remote,
                     Err(error) => {
                         self.fail_dispatch(org, &request.idempotency_key, &error)?;
+                        subscription_ops::settle(
+                            self.store.as_ref(),
+                            org,
+                            &lease,
+                            &request.idempotency_key,
+                        )?;
                         return Err(error);
                     }
                 };
@@ -474,6 +523,12 @@ impl PaymentService {
             Ok(remote) => remote,
             Err(error) => {
                 self.fail_dispatch(org, &request.idempotency_key, &error)?;
+                subscription_ops::settle(
+                    self.store.as_ref(),
+                    org,
+                    &lease,
+                    &request.idempotency_key,
+                )?;
                 return Err(error);
             }
         };
@@ -542,11 +597,25 @@ impl PaymentService {
             }
             put_subscription_tx(tx, &cloned_subscription)
         }) {
-            Ok(()) => Ok(SubscriptionOutcome {
-                subscription,
-                replayed: false,
-            }),
+            Ok(()) => {
+                subscription_ops::settle(
+                    self.store.as_ref(),
+                    org,
+                    &lease,
+                    &request.idempotency_key,
+                )?;
+                Ok(SubscriptionOutcome {
+                    subscription,
+                    replayed: false,
+                })
+            }
             Err(PaymentError::IdempotencyConflict(_)) | Err(PaymentError::Conflict(_)) => {
+                subscription_ops::settle(
+                    self.store.as_ref(),
+                    org,
+                    &lease,
+                    &request.idempotency_key,
+                )?;
                 if let Some(response) =
                     self.replay("subscribe", org, &request.idempotency_key, &hash)?
                 {
@@ -591,6 +660,7 @@ impl PaymentService {
         self.validate_idempotency(&request.idempotency_key)?;
         let org = organization.as_str();
         let hash = request_hash(&request)?;
+        subscription_ops::release_resolved(self.store.as_ref(), org)?;
         if let Some(response) = self.replay("change_plan", org, &request.idempotency_key, &hash)? {
             return self.plan_change_from_replay(org, &response, true);
         }
@@ -600,6 +670,11 @@ impl PaymentService {
                 subscription.state.as_str().into(),
             ));
         }
+        let provider_customer_id = self
+            .store
+            .customer(org)?
+            .map(|customer| customer.provider_customer_id)
+            .ok_or_else(|| PaymentError::IllegalState("provider customer is missing".into()))?;
         let interval = request.interval.unwrap_or(subscription.interval);
         let proration =
             self.compute_plan_proration(&subscription, &request.plan_id, interval, self.now_ms())?;
@@ -626,6 +701,49 @@ impl PaymentService {
                 return Err(Self::claim_unresolved_error(&claim))
             }
         }
+        let lease = match subscription_ops::acquire(
+            self.store.as_ref(),
+            org,
+            &ConflictDomain::SubscriptionMutation {
+                subscription_id: subscription.id.clone(),
+            },
+            &subscription.id,
+            &request.idempotency_key,
+            &hash,
+        ) {
+            Ok(lease) => lease,
+            Err(error) => {
+                subscription_ops::abandon_claim(
+                    self.store.as_ref(),
+                    org,
+                    &request.idempotency_key,
+                )?;
+                return Err(error);
+            }
+        };
+        let current = match self.require_subscription(org, &request.subscription_id) {
+            Ok(current) if current == subscription => current,
+            Ok(_) | Err(_) => {
+                let error = PaymentError::Conflict(
+                    "the subscription changed while the plan change was being fenced".into(),
+                );
+                self.store.fail_claim(
+                    org,
+                    &request.idempotency_key,
+                    error.code(),
+                    &error.to_string(),
+                    self.now_ms(),
+                )?;
+                subscription_ops::settle(
+                    self.store.as_ref(),
+                    org,
+                    &lease,
+                    &request.idempotency_key,
+                )?;
+                return Err(error);
+            }
+        };
+        let subscription = current;
         self.store
             .mark_claim_dispatched(org, &request.idempotency_key, self.now_ms())?;
         let remote = match self
@@ -634,6 +752,7 @@ impl PaymentService {
                 organization_id: org.to_string(),
                 idempotency_key: provider_key,
                 subscription_id: subscription.provider_subscription_id.clone(),
+                customer_id: provider_customer_id.clone(),
                 provider_item_id: subscription.provider_item_id.clone(),
                 provider_product_id: subscription.provider_product_id.clone(),
                 provider_price_id: subscription.provider_price_id.clone(),
@@ -650,6 +769,12 @@ impl PaymentService {
             Ok(remote) => remote,
             Err(error) => {
                 self.fail_dispatch(org, &request.idempotency_key, &error)?;
+                subscription_ops::settle(
+                    self.store.as_ref(),
+                    org,
+                    &lease,
+                    &request.idempotency_key,
+                )?;
                 return Err(error);
             }
         };
@@ -684,12 +809,26 @@ impl PaymentService {
             }
             Ok(())
         }) {
-            Ok(()) => Ok(PlanChangeOutcome {
-                subscription: updated,
-                proration,
-                replayed: false,
-            }),
+            Ok(()) => {
+                subscription_ops::settle(
+                    self.store.as_ref(),
+                    org,
+                    &lease,
+                    &request.idempotency_key,
+                )?;
+                Ok(PlanChangeOutcome {
+                    subscription: updated,
+                    proration,
+                    replayed: false,
+                })
+            }
             Err(PaymentError::IdempotencyConflict(_)) | Err(PaymentError::Conflict(_)) => {
+                subscription_ops::settle(
+                    self.store.as_ref(),
+                    org,
+                    &lease,
+                    &request.idempotency_key,
+                )?;
                 let response = self
                     .replay("change_plan", org, &request.idempotency_key, &hash)?
                     .ok_or_else(|| {
@@ -713,6 +852,7 @@ impl PaymentService {
         self.validate_idempotency(&request.idempotency_key)?;
         let org = organization.as_str();
         let hash = request_hash(&request)?;
+        subscription_ops::release_resolved(self.store.as_ref(), org)?;
         if let Some(response) = self.replay("cancel", org, &request.idempotency_key, &hash)? {
             return Ok(SubscriptionOutcome {
                 subscription: self.subscription_from_replay(org, &response)?,
@@ -723,6 +863,11 @@ impl PaymentService {
         if subscription.state == SubscriptionState::Canceled {
             return Err(PaymentError::IllegalState("canceled".into()));
         }
+        let provider_customer_id = self
+            .store
+            .customer(org)?
+            .map(|customer| customer.provider_customer_id)
+            .ok_or_else(|| PaymentError::IllegalState("provider customer is missing".into()))?;
         let provider_key = format!("{}:cancel", request.idempotency_key);
         match self.acquire_claim(
             org,
@@ -747,6 +892,48 @@ impl PaymentService {
                 return Err(Self::claim_unresolved_error(&claim))
             }
         }
+        let lease = match subscription_ops::acquire(
+            self.store.as_ref(),
+            org,
+            &ConflictDomain::SubscriptionMutation {
+                subscription_id: subscription.id.clone(),
+            },
+            &subscription.id,
+            &request.idempotency_key,
+            &hash,
+        ) {
+            Ok(lease) => lease,
+            Err(error) => {
+                subscription_ops::abandon_claim(
+                    self.store.as_ref(),
+                    org,
+                    &request.idempotency_key,
+                )?;
+                return Err(error);
+            }
+        };
+        let subscription = match self.require_subscription(org, &request.subscription_id) {
+            Ok(current) if current == subscription => current,
+            Ok(_) | Err(_) => {
+                let error = PaymentError::Conflict(
+                    "the subscription changed while the cancel was being fenced".into(),
+                );
+                self.store.fail_claim(
+                    org,
+                    &request.idempotency_key,
+                    error.code(),
+                    &error.to_string(),
+                    self.now_ms(),
+                )?;
+                subscription_ops::settle(
+                    self.store.as_ref(),
+                    org,
+                    &lease,
+                    &request.idempotency_key,
+                )?;
+                return Err(error);
+            }
+        };
         self.store
             .mark_claim_dispatched(org, &request.idempotency_key, self.now_ms())?;
         if let Err(error) = self
@@ -755,11 +942,13 @@ impl PaymentService {
                 organization_id: org.to_string(),
                 idempotency_key: provider_key,
                 subscription_id: subscription.provider_subscription_id.clone(),
+                customer_id: provider_customer_id,
                 at_period_end: request.at_period_end,
             })
             .await
         {
             self.fail_dispatch(org, &request.idempotency_key, &error)?;
+            subscription_ops::settle(self.store.as_ref(), org, &lease, &request.idempotency_key)?;
             return Err(error);
         }
         let now = self.now_ms();
@@ -785,11 +974,25 @@ impl PaymentService {
             .store
             .record_atomic(&write, |tx| put_subscription_tx(tx, &cloned))
         {
-            Ok(()) => Ok(SubscriptionOutcome {
-                subscription: updated,
-                replayed: false,
-            }),
+            Ok(()) => {
+                subscription_ops::settle(
+                    self.store.as_ref(),
+                    org,
+                    &lease,
+                    &request.idempotency_key,
+                )?;
+                Ok(SubscriptionOutcome {
+                    subscription: updated,
+                    replayed: false,
+                })
+            }
             Err(PaymentError::IdempotencyConflict(_)) | Err(PaymentError::Conflict(_)) => {
+                subscription_ops::settle(
+                    self.store.as_ref(),
+                    org,
+                    &lease,
+                    &request.idempotency_key,
+                )?;
                 let response = self
                     .replay("cancel", org, &request.idempotency_key, &hash)?
                     .ok_or_else(|| {
@@ -831,6 +1034,7 @@ impl PaymentService {
         }
         let org = organization.as_str();
         let hash = request_hash(&request)?;
+        subscription_ops::release_resolved(self.store.as_ref(), org)?;
         if let Some(response) = self.replay("change_seats", org, &request.idempotency_key, &hash)? {
             return self.seat_change_from_replay(org, &response, true);
         }
@@ -840,6 +1044,11 @@ impl PaymentService {
                 subscription.state.as_str().into(),
             ));
         }
+        let provider_customer_id = self
+            .store
+            .customer(org)?
+            .map(|customer| customer.provider_customer_id)
+            .ok_or_else(|| PaymentError::IllegalState("provider customer is missing".into()))?;
         let proration =
             self.compute_seat_proration(&subscription, request.quantity, self.now_ms())?;
         let provider_key = format!("{}:seats", request.idempotency_key);
@@ -863,6 +1072,48 @@ impl PaymentService {
                 return Err(Self::claim_unresolved_error(&claim))
             }
         }
+        let lease = match subscription_ops::acquire(
+            self.store.as_ref(),
+            org,
+            &ConflictDomain::SubscriptionMutation {
+                subscription_id: subscription.id.clone(),
+            },
+            &subscription.id,
+            &request.idempotency_key,
+            &hash,
+        ) {
+            Ok(lease) => lease,
+            Err(error) => {
+                subscription_ops::abandon_claim(
+                    self.store.as_ref(),
+                    org,
+                    &request.idempotency_key,
+                )?;
+                return Err(error);
+            }
+        };
+        let subscription = match self.require_subscription(org, &request.subscription_id) {
+            Ok(current) if current == subscription => current,
+            Ok(_) | Err(_) => {
+                let error = PaymentError::Conflict(
+                    "the subscription changed while the seat change was being fenced".into(),
+                );
+                self.store.fail_claim(
+                    org,
+                    &request.idempotency_key,
+                    error.code(),
+                    &error.to_string(),
+                    self.now_ms(),
+                )?;
+                subscription_ops::settle(
+                    self.store.as_ref(),
+                    org,
+                    &lease,
+                    &request.idempotency_key,
+                )?;
+                return Err(error);
+            }
+        };
         self.store
             .mark_claim_dispatched(org, &request.idempotency_key, self.now_ms())?;
         let remote = match self
@@ -871,6 +1122,7 @@ impl PaymentService {
                 organization_id: org.to_string(),
                 idempotency_key: provider_key,
                 subscription_id: subscription.provider_subscription_id.clone(),
+                customer_id: provider_customer_id,
                 provider_item_id: subscription.provider_item_id.clone(),
                 provider_product_id: subscription.provider_product_id.clone(),
                 provider_price_id: subscription.provider_price_id.clone(),
@@ -891,6 +1143,12 @@ impl PaymentService {
             Ok(remote) => remote,
             Err(error) => {
                 self.fail_dispatch(org, &request.idempotency_key, &error)?;
+                subscription_ops::settle(
+                    self.store.as_ref(),
+                    org,
+                    &lease,
+                    &request.idempotency_key,
+                )?;
                 return Err(error);
             }
         };
@@ -923,12 +1181,26 @@ impl PaymentService {
             }
             Ok(())
         }) {
-            Ok(()) => Ok(SeatChangeOutcome {
-                subscription: updated,
-                proration,
-                replayed: false,
-            }),
+            Ok(()) => {
+                subscription_ops::settle(
+                    self.store.as_ref(),
+                    org,
+                    &lease,
+                    &request.idempotency_key,
+                )?;
+                Ok(SeatChangeOutcome {
+                    subscription: updated,
+                    proration,
+                    replayed: false,
+                })
+            }
             Err(PaymentError::IdempotencyConflict(_)) | Err(PaymentError::Conflict(_)) => {
+                subscription_ops::settle(
+                    self.store.as_ref(),
+                    org,
+                    &lease,
+                    &request.idempotency_key,
+                )?;
                 let response = self
                     .replay("change_seats", org, &request.idempotency_key, &hash)?
                     .ok_or_else(|| {
@@ -972,6 +1244,7 @@ impl PaymentService {
         }
         let org = organization.as_str();
         let hash = request_hash(&request)?;
+        subscription_ops::release_resolved(self.store.as_ref(), org)?;
         if let Some(response) =
             self.replay("issue_invoice", org, &request.idempotency_key, &hash)?
         {
@@ -1116,9 +1389,24 @@ impl PaymentService {
             .ok_or_else(|| PaymentError::NotFound("payment customer".into()))?;
         let now = self.now_ms();
         let due_days = request.due_in_days.unwrap_or(7).clamp(1, MAX_DUE_DAYS);
-        let invoice_id =
-            operation_resource_id("inv", org, "issue_invoice", &request.idempotency_key);
+        let period = subscription_ops::period_key(&subscription);
         let pending_ids: Vec<String> = pending.iter().map(|line| line.id.clone()).collect();
+        let mut content = request.clone();
+        content.idempotency_key.clear();
+        let content_digest = request_hash(&serde_json::json!({
+            "request": content,
+            "period": period,
+            "plan_id": subscription.plan_id,
+            "interval": subscription.interval,
+            "quantity": subscription.quantity,
+            "pending_prorations": pending_ids,
+        }))?;
+        let invoice_id = operation_resource_id(
+            "inv",
+            org,
+            "period_issue",
+            &format!("{}:{period}:{content_digest}", subscription.id),
+        );
         let invoice = Invoice {
             id: invoice_id.clone(),
             organization_id: org.to_string(),
@@ -1178,6 +1466,71 @@ impl PaymentService {
                 return Err(Self::claim_unresolved_error(&claim))
             }
         }
+        let lease = match subscription_ops::acquire(
+            self.store.as_ref(),
+            org,
+            &ConflictDomain::InvoiceIssue {
+                subscription_id: subscription.id.clone(),
+                period: period.clone(),
+            },
+            &format!("{}:{period}", subscription.id),
+            &request.idempotency_key,
+            &hash,
+        ) {
+            Ok(lease) => lease,
+            Err(error) => {
+                subscription_ops::abandon_claim(
+                    self.store.as_ref(),
+                    org,
+                    &request.idempotency_key,
+                )?;
+                return Err(error);
+            }
+        };
+        let subscription = match self.require_subscription(org, &request.subscription_id) {
+            Ok(current)
+                if current == subscription && subscription_ops::period_key(&current) == period =>
+            {
+                current
+            }
+            Ok(_) | Err(_) => {
+                let error = PaymentError::Conflict(
+                    "the subscription or its billing period changed while the invoice was being \
+                     fenced"
+                        .into(),
+                );
+                self.store.fail_claim(
+                    org,
+                    &request.idempotency_key,
+                    error.code(),
+                    &error.to_string(),
+                    now,
+                )?;
+                subscription_ops::settle(
+                    self.store.as_ref(),
+                    org,
+                    &lease,
+                    &request.idempotency_key,
+                )?;
+                return Err(error);
+            }
+        };
+        if let Some(existing) = self.store.invoice(org, &invoice_id)? {
+            let write = self.write(
+                org,
+                &request.idempotency_key,
+                "issue_invoice",
+                hash.clone(),
+                &serde_json::json!({"invoice_id": existing.id}),
+                now,
+            )?;
+            self.store.record_atomic(&write, |_| Ok(()))?;
+            subscription_ops::settle(self.store.as_ref(), org, &lease, &request.idempotency_key)?;
+            return Ok(InvoiceOutcome {
+                invoice: existing,
+                replayed: true,
+            });
+        }
         self.store
             .mark_claim_dispatched(org, &request.idempotency_key, now)?;
         let provider_invoice = match self
@@ -1196,6 +1549,12 @@ impl PaymentService {
             Ok(invoice) => invoice,
             Err(error) => {
                 self.fail_dispatch(org, &request.idempotency_key, &error)?;
+                subscription_ops::settle(
+                    self.store.as_ref(),
+                    org,
+                    &lease,
+                    &request.idempotency_key,
+                )?;
                 return Err(error);
             }
         };
@@ -1241,11 +1600,25 @@ impl PaymentService {
             Ok(invoice.clone())
         });
         match effect_value {
-            Ok(recorded) => Ok(InvoiceOutcome {
-                invoice: recorded,
-                replayed: false,
-            }),
+            Ok(recorded) => {
+                subscription_ops::settle(
+                    self.store.as_ref(),
+                    org,
+                    &lease,
+                    &request.idempotency_key,
+                )?;
+                Ok(InvoiceOutcome {
+                    invoice: recorded,
+                    replayed: false,
+                })
+            }
             Err(PaymentError::IdempotencyConflict(_)) | Err(PaymentError::Conflict(_)) => {
+                subscription_ops::settle(
+                    self.store.as_ref(),
+                    org,
+                    &lease,
+                    &request.idempotency_key,
+                )?;
                 let response = self
                     .replay("issue_invoice", org, &request.idempotency_key, &hash)?
                     .ok_or_else(|| {
@@ -1306,194 +1679,7 @@ impl PaymentService {
         organization: &OrganizationId,
         request: PayInvoiceRequest,
     ) -> Result<PayInvoiceOutcome, PaymentError> {
-        self.validate_idempotency(&request.idempotency_key)?;
-        let org = organization.as_str();
-        let hash = request_hash(&request)?;
-        if let Some(response) = self.replay("pay_invoice", org, &request.idempotency_key, &hash)? {
-            return self.pay_from_replay(org, &response, true);
-        }
-        let mut invoice = self.invoice(organization, &request.invoice_id)?;
-        if !invoice.status.is_open() {
-            return Err(PaymentError::IllegalState(invoice.status.as_str().into()));
-        }
-        let balance = invoice.balance_minor();
-        if balance <= 0 {
-            return Err(PaymentError::NothingDue);
-        }
-        let method = self
-            .store
-            .payment_method(org, &request.payment_method_id)?
-            .ok_or_else(|| PaymentError::NotFound("payment method".into()))?;
-        if method.method.organization_id != org {
-            return Err(PaymentError::NotFound("payment method".into()));
-        }
-        if method.method.provider != self.provider.name() {
-            return Err(PaymentError::Malformed(
-                "the payment method belongs to a different payment provider".into(),
-            ));
-        }
-        let token = self.payment_method_token(org, &method.method.id)?;
-        let payment_id = operation_resource_id("pay", org, "pay_invoice", &request.idempotency_key);
-        let provider_key = format!("{}:charge", request.idempotency_key);
-        let claim_context = serde_json::json!({
-            "request": &request,
-            "payment_id": &payment_id,
-            "amount_minor": balance,
-            "payment_method_id": &request.payment_method_id,
-            "currency": &invoice.currency,
-        });
-        match self.acquire_claim(
-            org,
-            &request.idempotency_key,
-            "pay_invoice",
-            FinancialResourceType::Payment,
-            &payment_id,
-            &hash,
-            &provider_key,
-            &claim_context,
-        )? {
-            ClaimAcquisition::Acquired => {}
-            ClaimAcquisition::Recorded(claim) => {
-                let (response, _) = self.claim_replay(&claim, true)?;
-                return self.pay_from_replay(org, &response, true);
-            }
-            ClaimAcquisition::InFlight(claim) => return Err(Self::claim_in_flight_error(&claim)),
-            ClaimAcquisition::Unresolved(claim) => {
-                return Err(Self::claim_unresolved_error(&claim))
-            }
-        }
-        self.store
-            .mark_claim_dispatched(org, &request.idempotency_key, self.now_ms())?;
-        let charge = match self
-            .provider
-            .charge(crate::provider::ProviderChargeRequest {
-                organization_id: org.to_string(),
-                idempotency_key: provider_key,
-                customer_id: self
-                    .store
-                    .customer(org)?
-                    .ok_or_else(|| PaymentError::NotFound("payment customer".into()))?
-                    .provider_customer_id,
-                payment_method_token: token,
-                amount_minor: balance,
-                currency: invoice.currency.clone(),
-                invoice_ref: Some(invoice.id.clone()),
-            })
-            .await
-        {
-            Ok(charge) => charge,
-            Err(PaymentError::Declined(reason)) => {
-                self.store.fail_claim(
-                    org,
-                    &request.idempotency_key,
-                    "payment_declined",
-                    &reason,
-                    self.now_ms(),
-                )?;
-                let _ = self.record_payment_failure(organization, &invoice.id);
-                return Err(PaymentError::Declined(reason));
-            }
-            Err(error) => {
-                self.fail_dispatch(org, &request.idempotency_key, &error)?;
-                return Err(error);
-            }
-        };
-        let now = self.now_ms();
-        let status = match payment_status_from_provider(&charge.status) {
-            Ok(status) => status,
-            Err(error) => {
-                self.store
-                    .mark_claim_unknown(org, &request.idempotency_key, now)?;
-                return Err(error);
-            }
-        };
-        let payment = Payment {
-            id: payment_id,
-            organization_id: org.to_string(),
-            invoice_id: invoice.id.clone(),
-            provider: self.provider.name().to_string(),
-            provider_payment_id: charge.id.clone(),
-            payment_method_id: Some(request.payment_method_id.clone()),
-            amount_minor: balance,
-            refunded_minor: 0,
-            currency: invoice.currency.clone(),
-            status,
-            created_ms: now,
-        };
-        let mut subscription = self
-            .store
-            .subscription(org)?
-            .filter(|sub| invoice.subscription_id.as_deref() == Some(sub.id.as_str()));
-        if status == PaymentStatus::Succeeded {
-            invoice.amount_paid_minor = checked_add(invoice.amount_paid_minor, balance)?;
-            invoice.status = InvoiceStatus::Paid;
-            invoice.paid_ms = Some(now);
-            if let Some(sub) = subscription.as_mut() {
-                sub.state = SubscriptionState::Active;
-                sub.dunning_attempts = 0;
-                sub.grace_end_ms = None;
-                sub.updated_ms = now;
-            }
-        }
-        let updated_invoice = invoice.clone();
-        let provider_payment = ProviderPaymentObservation {
-            provider: self.provider.name().to_string(),
-            provider_payment_id: payment.provider_payment_id.clone(),
-            organization_id: org.to_string(),
-            invoice_id: updated_invoice.id.clone(),
-            payment_id: Some(payment.id.clone()),
-            status: charge.status.clone(),
-            amount_minor: charge.amount_minor,
-            refunded_minor: 0,
-            currency: charge.currency.clone(),
-            paid_at_ms: status.is_settled().then_some(now),
-            observed_ms: now,
-            source: ProviderObservationSource::Payment,
-        };
-        let write = self.write(
-            org,
-            &request.idempotency_key,
-            "pay_invoice",
-            hash.clone(),
-            &serde_json::json!({
-                "payment_id": payment.id,
-                "invoice_id": updated_invoice.id,
-            }),
-            now,
-        )?;
-        let cloned_payment = payment.clone();
-        let cloned_invoice = updated_invoice.clone();
-        let cloned_subscription = subscription.clone();
-        let cloned_provider_payment = provider_payment.clone();
-        match self.store.record_atomic(&write, |tx| {
-            insert_payment_tx(tx, &cloned_payment)?;
-            update_invoice_tx(tx, &cloned_invoice)?;
-            upsert_provider_payment_conn(tx, &cloned_provider_payment)?;
-            if let Some(subscription) = &cloned_subscription {
-                put_subscription_tx(tx, subscription)?;
-            }
-            Ok(())
-        }) {
-            Ok(()) => Ok(PayInvoiceOutcome {
-                payment,
-                invoice: updated_invoice,
-                subscription,
-                replayed: false,
-            }),
-            Err(PaymentError::IdempotencyConflict(_)) | Err(PaymentError::Conflict(_)) => {
-                let response = self
-                    .replay("pay_invoice", org, &request.idempotency_key, &hash)?
-                    .ok_or_else(|| {
-                        PaymentError::Conflict("payment was recorded concurrently".into())
-                    })?;
-                self.pay_from_replay(org, &response, true)
-            }
-            Err(e) => {
-                self.store
-                    .mark_claim_unknown(org, &request.idempotency_key, self.now_ms())?;
-                Err(e)
-            }
-        }
+        self.pay_invoice_fenced(organization, request).await
     }
 
     pub fn record_payment_failure(
@@ -1551,193 +1737,7 @@ impl PaymentService {
         organization: &OrganizationId,
         request: RefundRequest,
     ) -> Result<RefundOutcome, PaymentError> {
-        self.validate_idempotency(&request.idempotency_key)?;
-        if request.amount_minor <= 0 {
-            return Err(PaymentError::Malformed(
-                "refund amount must be positive".into(),
-            ));
-        }
-        bounded_text("refund reason", &request.reason, MAX_TEXT_BYTES)?;
-        let org = organization.as_str();
-        let hash = request_hash(&request)?;
-        if let Some(response) = self.replay("refund", org, &request.idempotency_key, &hash)? {
-            return self.refund_from_replay(org, &response, true);
-        }
-        let payment = self
-            .store
-            .payment(org, &request.payment_id)?
-            .ok_or_else(|| PaymentError::NotFound("payment".into()))?;
-        let refunded = self
-            .store
-            .committed_refunds_for_payment(org, &payment.id)?
-            .max(payment.refunded_minor);
-        let available = payment.amount_minor - refunded;
-        if request.amount_minor > available {
-            return Err(PaymentError::RefundExceedsPaid {
-                paid: payment.amount_minor,
-                refunded,
-                requested: request.amount_minor,
-            });
-        }
-        let refund_id = operation_resource_id("re", org, "refund", &request.idempotency_key);
-        let provider_key = format!("{}:refund", request.idempotency_key);
-        match self.acquire_claim(
-            org,
-            &request.idempotency_key,
-            "refund",
-            FinancialResourceType::Refund,
-            &refund_id,
-            &hash,
-            &provider_key,
-            &serde_json::json!({"request": &request, "refund_id": &refund_id}),
-        )? {
-            ClaimAcquisition::Acquired => {}
-            ClaimAcquisition::Recorded(claim) => {
-                let (response, _) = self.claim_replay(&claim, true)?;
-                return self.refund_from_replay(org, &response, true);
-            }
-            ClaimAcquisition::InFlight(claim) => return Err(Self::claim_in_flight_error(&claim)),
-            ClaimAcquisition::Unresolved(claim) => {
-                return Err(Self::claim_unresolved_error(&claim))
-            }
-        }
-        self.store
-            .mark_claim_dispatched(org, &request.idempotency_key, self.now_ms())?;
-        let remote = match self
-            .provider
-            .refund(crate::provider::ProviderRefundRequest {
-                organization_id: org.to_string(),
-                idempotency_key: provider_key,
-                provider_payment_id: payment.provider_payment_id.clone(),
-                amount_minor: request.amount_minor,
-                currency: payment.currency.clone(),
-                reason: request.reason.clone(),
-            })
-            .await
-        {
-            Ok(remote) => remote,
-            Err(error) => {
-                self.fail_dispatch(org, &request.idempotency_key, &error)?;
-                return Err(error);
-            }
-        };
-        let now = self.now_ms();
-        if remote.amount_minor != request.amount_minor {
-            self.store
-                .mark_claim_unknown(org, &request.idempotency_key, now)?;
-            return Err(PaymentError::Provider(format!(
-                "provider refund amount {} does not match the requested {}",
-                remote.amount_minor, request.amount_minor
-            )));
-        }
-        let status = match RefundStatus::parse(&remote.status) {
-            Some(status) => status,
-            None => {
-                self.store
-                    .mark_claim_unknown(org, &request.idempotency_key, now)?;
-                return Err(PaymentError::Provider(format!(
-                    "provider refund returned an unsupported status {:?}",
-                    remote.status
-                )));
-            }
-        };
-        let refund = Refund {
-            id: refund_id.clone(),
-            organization_id: org.to_string(),
-            payment_id: payment.id.clone(),
-            provider_refund_id: remote.id.clone(),
-            amount_minor: request.amount_minor,
-            currency: payment.currency.clone(),
-            reason: request.reason.clone(),
-            status,
-            credit_note_id: None,
-            invoice_line_seq: None,
-            created_ms: now,
-        };
-        let provider_refund = ProviderRefundObservation {
-            provider: self.provider.name().to_string(),
-            provider_refund_id: remote.id,
-            organization_id: org.to_string(),
-            invoice_id: payment.invoice_id.clone(),
-            payment_id: payment.id.clone(),
-            status: status.as_str().to_string(),
-            amount_minor: request.amount_minor,
-            currency: payment.currency.clone(),
-            observed_ms: now,
-            source: ProviderObservationSource::Refund,
-        };
-        let credit_note_id = if status == RefundStatus::Succeeded {
-            Some(format!("cn_{}", uuid::Uuid::new_v4()))
-        } else {
-            None
-        };
-        let write = self.write(
-            org,
-            &request.idempotency_key,
-            "refund",
-            hash.clone(),
-            &serde_json::json!({
-                "refund_id": refund.id,
-                "credit_note_id": credit_note_id,
-            }),
-            now,
-        )?;
-        let cloned_provider_refund = provider_refund.clone();
-        let result = self.store.record_atomic(&write, |tx| {
-            let mut current_payment = payment_tx(tx, org, &refund.payment_id)?
-                .ok_or_else(|| PaymentError::NotFound("payment".into()))?;
-            let mut current_invoice = invoice_tx(tx, org, &current_payment.invoice_id)?
-                .ok_or_else(|| PaymentError::NotFound("invoice".into()))?;
-            let mut current_refund = refund.clone();
-            current_refund.invoice_line_seq = bind_refund_invoice_line(&current_invoice);
-            let mut note = None;
-            if current_refund.status == RefundStatus::Succeeded {
-                let note_id = credit_note_id.clone().ok_or_else(|| {
-                    PaymentError::Store("settled refund has no credit-note id".into())
-                })?;
-                let mut settled = settle_refund_ledger(
-                    &mut current_payment,
-                    &mut current_invoice,
-                    &mut current_refund,
-                    org,
-                    note_id,
-                    now,
-                )?;
-                let sequence = next_sequence_tx(tx, org, "credit_note")?;
-                settled.number = format!("CN-{sequence:06}");
-                insert_credit_note_tx(tx, &settled)?;
-                note = Some(settled);
-            }
-            insert_refund_tx(tx, &current_refund)?;
-            upsert_provider_refund_conn(tx, &cloned_provider_refund)?;
-            if current_refund.status == RefundStatus::Succeeded {
-                insert_payment_tx(tx, &current_payment)?;
-                update_invoice_tx(tx, &current_invoice)?;
-            }
-            Ok((note, current_payment, current_invoice, current_refund))
-        });
-        match result {
-            Ok((credit_note, payment, invoice, refund)) => Ok(RefundOutcome {
-                refund,
-                credit_note,
-                payment,
-                invoice,
-                replayed: false,
-            }),
-            Err(PaymentError::IdempotencyConflict(_)) | Err(PaymentError::Conflict(_)) => {
-                let response = self
-                    .replay("refund", org, &request.idempotency_key, &hash)?
-                    .ok_or_else(|| {
-                        PaymentError::Conflict("refund was recorded concurrently".into())
-                    })?;
-                self.refund_from_replay(org, &response, true)
-            }
-            Err(e) => {
-                self.store
-                    .mark_claim_unknown(org, &request.idempotency_key, self.now_ms())?;
-                Err(e)
-            }
-        }
+        self.refund_fenced(organization, request).await
     }
 
     // ------------------------------------------------------------ lifecycle
@@ -1922,16 +1922,42 @@ impl PaymentService {
 
     // -------------------------------------------------------------- webhook
 
-    pub fn handle_webhook(
+    pub async fn handle_webhook(
         &self,
         headers: &WebhookHeaders,
         body: &[u8],
         now_ms: i64,
     ) -> Result<WebhookOutcome, PaymentError> {
-        let event = self.provider.verify_webhook(headers, body, now_ms)?;
+        let event = self
+            .provider
+            .resolve_webhook(headers, body, now_ms, self.store.as_ref())
+            .await?;
         let provider = self.provider.name();
         let organization = self.webhook_organization(&event)?;
         let org = organization.as_str();
+        if let Some(provider_subscription_id) = event
+            .payload
+            .pointer("/data/object/id")
+            .and_then(serde_json::Value::as_str)
+        {
+            let subscription_event = matches!(
+                event.event_type.as_str(),
+                "customer.subscription.updated"
+                    | "customer.subscription.deleted"
+                    | "subscription.cancelled"
+            );
+            if subscription_event
+                && subscription_ops::webhook_blocked_by_fence(
+                    self.store.as_ref(),
+                    org,
+                    provider_subscription_id,
+                )?
+            {
+                return Err(PaymentError::Conflict(
+                    "a subscription mutation is in flight; retry the webhook".into(),
+                ));
+            }
+        }
         let digest = sha256_hex(body);
         let record = |disposition: &str| WebhookRecord {
             provider: provider.to_string(),
@@ -1951,7 +1977,7 @@ impl PaymentService {
                         record: record("stale_ignored"),
                         effects: WebhookEffects::default(),
                         advance_watermark: false,
-                        value: WebhookDisposition::StaleIgnored,
+                        value: (WebhookDisposition::StaleIgnored, WebhookEffects::default()),
                     });
                 }
             }
@@ -1977,15 +2003,18 @@ impl PaymentService {
             };
             Ok(WebhookPlan {
                 record: record(disposition_string(disposition)),
-                effects,
+                effects: effects.clone(),
                 advance_watermark: true,
-                value: disposition,
+                value: (disposition, effects),
             })
         })?;
-        let disposition = match decision {
-            WebhookDecision::Duplicate(_) => WebhookDisposition::Duplicate,
-            WebhookDecision::Applied(disposition) => disposition,
+        let (disposition, effects) = match decision {
+            WebhookDecision::Duplicate(_) => {
+                (WebhookDisposition::Duplicate, WebhookEffects::default())
+            }
+            WebhookDecision::Applied((disposition, effects)) => (disposition, effects),
         };
+        self.release_leases_after_webhook(org, &effects);
         Ok(WebhookOutcome {
             disposition,
             event_id: event.id,
@@ -2520,6 +2549,12 @@ impl PaymentService {
                         "provider reconciliation found no effect for the dispatched key",
                         self.now_ms(),
                     )?;
+                    self.release_lease_after_claim_reconciliation(org, &claim, false);
+                    subscription_ops::release_for_claim(
+                        self.store.as_ref(),
+                        org,
+                        &claim.idempotency_key,
+                    )?;
                 }
                 ProviderReconciled::Unresolved(_) => {}
                 other => {
@@ -2527,6 +2562,16 @@ impl PaymentService {
                         .apply_reconciled_claim(&claim, other, self.now_ms())
                         .await?
                     {
+                        self.release_lease_after_claim_reconciliation(
+                            org,
+                            &updated,
+                            self.claim_business_outcome_is_terminal(org, &updated),
+                        );
+                        subscription_ops::release_for_claim(
+                            self.store.as_ref(),
+                            org,
+                            &updated.idempotency_key,
+                        )?;
                         resolved.push(updated);
                     }
                 }
@@ -3220,7 +3265,7 @@ impl PaymentService {
                 } else {
                     let recorded = amount.unwrap_or_else(|| invoice_ref.balance_minor());
                     payment = Some(Payment {
-                        id: format!("pay_{}", uuid::Uuid::new_v4()),
+                        id: self.webhook_payment_id_tx(tx, org, &invoice_ref.id)?,
                         organization_id: org.to_string(),
                         invoice_id: invoice_ref.id.clone(),
                         provider: self.provider.name().to_string(),
