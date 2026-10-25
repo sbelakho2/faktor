@@ -1096,6 +1096,14 @@ const ALLOWLIST = [
     owner: 'site auth',
   },
   {
+    file: 'crates/site/src/security.rs',
+    line_contains: 'let value = value.to_str().ok()?;',
+    count: 1,
+    reason:
+      'forwarded-chain header decoding: the header is untrusted optional wire data, not a durable authority. A non-UTF-8 value makes the whole forwarding chain absent (fallback to the socket peer or "local"), and a trusted proxy chain that parses only partially is rejected rather than accepted; no store/session/lease read is collapsed.',
+    owner: 'site proxy-trust client address derivation',
+  },
+  {
     file: 'crates/store/src/queue_store.rs',
     line_contains: 'row.get::<_, i64>(0).unwrap_or(-1)',
     count: 1,
