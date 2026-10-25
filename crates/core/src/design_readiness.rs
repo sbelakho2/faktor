@@ -283,13 +283,14 @@ pub fn audit_compiled_design(source: &impl DesignReadinessSource) -> DesignReadi
         if obligation.requirement != Requirement::Required || is_claim_bound(obligation) {
             continue;
         }
-        let statement = format!(
-            "required proof obligation {} is not claim-bound: {}",
-            obligation.id, obligation.claim
-        );
+        // Bound each hostile component BEFORE formatting: a huge claim/id
+        // must not allocate a huge intermediate string just to be truncated.
+        let obligation_id = bounded_text(&obligation.id, MAX_DESIGN_FINDING_ID_BYTES);
+        let claim = bounded_text(&obligation.claim, MAX_DESIGN_FINDING_BYTES);
+        let statement =
+            format!("required proof obligation {obligation_id} is not claim-bound: {claim}");
         let basis = format!(
-            "obligation {} requests {} evidence but its binding class is {}; no specific evidence can discharge it",
-            obligation.id,
+            "obligation {obligation_id} requests {} evidence but its binding class is {}; no specific evidence can discharge it",
             obligation.evidence.as_str(),
             obligation.evidence_binding.class()
         );

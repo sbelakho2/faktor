@@ -578,6 +578,11 @@ const SUITE_COMMANDS = Object.freeze({
     'node scripts/programme/check-core-dumps.mjs --selftest',
     'node scripts/programme/check-settlement.mjs --selftest',
   ],
+  invariants: [
+    'node scripts/check-invariants.mjs',
+    'node scripts/mutation-run.mjs --check-specs',
+    'cargo test -p faktor-tests-static-authority',
+  ],
   edition8: ['node tests/edition8/registry.mjs'],
   vscode: [
     'npm --prefix apps/vscode run build',
@@ -1253,6 +1258,11 @@ export function selftest() {
   check(
     'the invariant registry maps to the invariants suite (never an unmapped authority)',
     invariantRegistry.suites.includes('invariants') && invariantRegistry.refused === false,
+  );
+  check(
+    'the invariants suite runs the invariant gate and the interpreter-free static authority',
+    invariantRegistry.commands.includes('node scripts/check-invariants.mjs') &&
+      invariantRegistry.commands.includes('cargo test -p faktor-tests-static-authority'),
   );
   const mutationSurfaces = select(['tests/mutation-surfaces.json']);
   check(
