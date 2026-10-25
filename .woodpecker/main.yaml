@@ -1,0 +1,67 @@
+# Faktor main-branch CI — CHANGE-SCOPED ONLY (single-maintainer policy).
+#
+# Direct pushes to main are expected. This lane never runs the whole test suite
+# for a partial change: it compiles the workspace (cheap relative to tests) and
+# runs fmt/clippy/tests only for the crates whose files changed, plus app/site
+# checks only when those trees changed. Pull-request gating is not required and
+# branch protection must remain off for this single-person repository.
+when:
+  - event: push
+    branch: main
+
+labels:
+  platform: linux/amd64
+
+steps:
+  - name: changed-scope
+    image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24
+    environment:
+      RUST_BACKTRACE: "1"
+    commands:
+      - rustup component add rustfmt clippy
+      - |
+        set -eu
+        base="${CI_COMMIT_BEFORE_SHA:-}"
+        case "$base" in ""|0000000000000000000000000000000000000000) base="HEAD~1" ;; esac
+        git fetch --no-tags --depth=2 origin "$base" 2>/dev/null || true
+        changed="$(git diff --name-only "$base" HEAD 2>/dev/null || git diff --name-only HEAD~1 HEAD)"
+        echo "changed files:"; echo "$changed"
+        crates="$(printf '%s\n' "$changed" | sed -n 's#^crates/\([^/]*\)/.*#faktor-\1#p' | sort -u)"
+        echo "changed crates: ${crates:-<none>}"
+        if [ -n "$crates" ]; then
+          # Compile the whole workspace once (type-checks cross-crate effects)
+          cargo check --workspace --all-targets
+          for p in $crates; do
+            cargo fmt --check -p "$p"
+            cargo clippy -p "$p" --all-targets -- -D warnings
+            cargo test -p "$p"
+          done
+        fi
+      - |
+        set -eu
+        base="${CI_COMMIT_BEFORE_SHA:-HEAD~1}"
+        changed="$(git diff --name-only "$base" HEAD 2>/dev/null || git diff --name-only HEAD~1 HEAD)"
+        if printf '%s\n' "$changed" | grep -qE '^(tests/programme|scripts/programme|scripts/mutations|tests/static-authority)'; then
+          node scripts/programme/check-registry.mjs --check
+          node scripts/programme/select-tests.mjs selftest
+          node scripts/programme/check-core-dumps.mjs --check
+        fi
+        if printf '%s\n' "$changed" | grep -qE '^(docs/|AGENTS\.md|README\.md)'; then
+          ./scripts/check-docs-sync.sh
+        fi
+      - |
+        set -eu
+        base="${CI_COMMIT_BEFORE_SHA:-HEAD~1}"
+        changed="$(git diff --name-only "$base" HEAD 2>/dev/null || git diff --name-only HEAD~1 HEAD)"
+        if printf '%s\n' "$changed" | grep -q '^crates/site/'; then
+          cargo fmt --check -p faktor-site
+          cargo check -p faktor-site
+          cargo clippy -p faktor-site --all-targets -- -D warnings
+          cargo test -p faktor-site
+        fi
+        if printf '%s\n' "$changed" | grep -q '^apps/vscode/'; then
+          (cd apps/vscode && npm ci && npm run build && node scripts/selftest.mjs)
+        fi
+        if printf '%s\n' "$changed" | grep -q '^apps/jetbrains/'; then
+          bash apps/jetbrains/compile-and-smoke.sh
+        fi
