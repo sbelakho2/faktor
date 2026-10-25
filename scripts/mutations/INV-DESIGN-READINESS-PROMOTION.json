@@ -1,0 +1,12 @@
+{
+  "id": "INV-DESIGN-READINESS-PROMOTION",
+  "file": "crates/core/src/design_readiness.rs",
+  "find": "            _ => RiskSeverity::Medium,",
+  "replace": "            _ => finding.severity,",
+  "gate": "cargo test -p faktor-core --lib mutation_witness_promotion_rule_would_escalate_without_the_clamp",
+  "expect": "FAILED",
+  "note": "Using the unclamped finding severity lets readiness newly promote a calm contract to High/Unknown.",
+  "capabilities": [],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+}

@@ -30,6 +30,7 @@ pub mod command;
 pub mod completion;
 pub mod contract;
 pub mod contract_compile;
+pub mod design_readiness;
 pub mod entitlement;
 pub mod error;
 pub mod event;
@@ -92,6 +93,11 @@ pub use contract_compile::{
     RepositorySnapshot, StatementKind, StatementOrigin, StatementProvenance,
     SystemIntelligenceProvider, MAX_FINDINGS, MAX_FINDING_BASIS_BYTES, MAX_FINDING_DIAGNOSTICS,
     MAX_FINDING_DIAGNOSTIC_BYTES, MAX_FINDING_REVISION_BYTES, MAX_FINDING_TEXT_BYTES,
+};
+pub use design_readiness::{
+    apply_design_readiness, audit_compiled_design, design_focus_is_economic, design_focus_terms,
+    DesignReadinessAudit, DesignReadinessFinding, DesignReadinessKind, MAX_DESIGN_FOCUS_TERMS,
+    MAX_DESIGN_FOCUS_TERM_BYTES, MAX_DESIGN_READINESS_FINDINGS, MIN_DESIGN_FOCUS_SAVINGS_BYTES,
 };
 pub use entitlement::{
     EnforcementHook, ValueEntitlement, ValueEntitlementGate, ValueGate, ValueGateRefusal,

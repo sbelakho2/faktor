@@ -2798,3 +2798,33 @@ mutation_command = "node scripts/mutation-run.mjs INV-COMPACTION-EXECUTOR-RAII"
 mutation_debt = ""
 release_critical = true
 platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-DESIGN-READINESS-PROMOTION"
+statement = "Applying fresh-context design-readiness findings never newly promotes a calm contract to the High/Unknown risk tier: a new risk row is Medium unless the pre-audit contract already carried an elevated risk."
+owner = "crates/core design readiness + crates/agent contract compiler"
+authority = "crates/core/src/design_readiness.rs apply_design_readiness severity clamp; crates/agent/src/runtime/contract_compiler.rs compile_baseline_contract readiness application"
+script_check = ""
+unit_test = "promotion_rule_clamps_new_findings_on_a_calm_contract"
+production_wiring = "mutation_witness_promotion_rule_would_escalate_without_the_clamp"
+fault = ""
+mutation_witness = "mutation_witness_promotion_rule_would_escalate_without_the_clamp"
+mutation_command = "node scripts/mutation-run.mjs INV-DESIGN-READINESS-PROMOTION"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-DESIGN-FOCUS-ECONOMIC"
+statement = "The in-memory design focus projection may replace duplicated retrieval-key material only when it is at least 12.5% smaller than the baseline AND saves at least 2 KiB; otherwise the baseline work item stays byte-identical."
+owner = "crates/core design readiness + crates/agent retrieval"
+authority = "crates/core/src/design_readiness.rs design_focus_is_economic; crates/agent/src/runtime/retrieval.rs task_facts_for"
+script_check = ""
+unit_test = "economic_gate_boundaries_at_one_eighth_and_two_kib"
+production_wiring = "mutation_witness_economic_gate_rejects_each_boundary_crossing"
+fault = ""
+mutation_witness = "mutation_witness_economic_gate_rejects_each_boundary_crossing"
+mutation_command = "node scripts/mutation-run.mjs INV-DESIGN-FOCUS-ECONOMIC"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]

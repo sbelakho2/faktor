@@ -517,7 +517,7 @@ impl AgentRuntime {
         // questions are built from; it is pure and bounded.
         let native = compile_contract(&request);
         let provider = self.system_intelligence_provider();
-        let compiled = match &provider {
+        let mut compiled = match &provider {
             Some(provider) => {
                 // The organization-contract enrichment BOUNDARY: consulting
                 // the org's system-intelligence provider (and applying its
@@ -601,6 +601,25 @@ impl AgentRuntime {
                 ),
                 None => {}
             }
+        }
+        // Fresh-context design readiness without another agent/model call:
+        // inspect only the compiled contract + bounded compiler facts. Findings
+        // are risk hypotheses, never proof, and no capsule/transcript/artifact
+        // is created. The audit cannot newly promote a calm task to Faktor's
+        // expensive High/Unknown risk route; it preserves an escalation only
+        // when the authoritative pre-audit contract already justified one.
+        // Tangerine has already enriched through the existing neutral call;
+        // Kiwi remains downstream independent verification.
+        let readiness = faktor_core::audit_compiled_design(&compiled);
+        let readiness_applied = faktor_core::apply_design_readiness(&mut compiled, &readiness);
+        if readiness_applied > 0 {
+            tracing::info!(
+                session = %session,
+                task_id = task.task_id.raw(),
+                findings = readiness_applied,
+                focus_terms = readiness.focus_terms.len(),
+                "fresh-context design readiness added bounded risk hypotheses"
+            );
         }
         if compiled.contract.is_empty() {
             return;

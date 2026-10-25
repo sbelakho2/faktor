@@ -84,6 +84,59 @@ Every stage names a role, not a vendor: intelligence is consumed through
 `SystemIntelligenceProvider` and verification through
 `VerificationProvider`.
 
+## Fresh-context design readiness (zero-call Elephant/Goldfish)
+
+Faktor adopts the useful independence property of the Elephant/Goldfish
+pattern **without adding another model invocation to the normal path**. After
+native contract compilation and the existing optional
+`SystemIntelligenceProvider` enrichment, a deterministic fresh-context pass
+reviews only the compiled `EngineeringContract` and its bounded compiler
+facts. It never sees the implementation conversation or hidden architect
+reasoning.
+
+The pass may only add bounded **risk hypotheses** for structural gaps such as
+high/unknown risk without claim-bound proof, unbound required proof, or a
+concurrency/migration/compatibility concern without corresponding proof
+coverage. It **must not** create or discharge proof obligations, certify
+completion, call tools, call a model, call Tangerine again, or write a design
+capsule/reviewer transcript/artifact. The pass also must not newly promote a
+calm contract to the High/Unknown risk tier: a newly discovered gap is Medium
+unless the pre-audit contract already carried an elevated risk. Therefore the
+readiness layer cannot by itself raise Faktor's routing quality floor.
+
+The durable `EngineeringContract` remains the single design authority. A tiny
+in-memory focus projection may be derived from its proof bindings, risks and
+invariants and used only to **replace** the active work item's duplicated
+retrieval-key material when a zero-call byte gate proves a meaningful dividend:
+at least 12.5% smaller and at least 2 KiB removed. It is never appended to the
+baseline search material, is not rendered as a new prompt section and is not
+persisted. Small/local tasks and tasks that fail the dividend gate keep the
+baseline path byte-for-byte, while long tasks can sharpen evidence selection
+without another context artifact.
+
+Role separation is strict:
+
+```text
+Native intelligence + optional Tangerine enrichment
+                         ↓
+             EngineeringContract
+                         ↓
+        native fresh-context readiness audit
+             (risk only; zero calls)
+                         ↓
+                  implementation
+                         ↓
+       native verification + optional Kiwi
+                         ↓
+               completion proof/gate
+```
+
+Tangerine therefore gives the contract richer eyes through the existing
+neutral intelligence seam; the readiness audit challenges that contract
+without sharing implementation context; Kiwi independently adjudicates
+formal claims after implementation. No stage creates a competing system
+model or a second source of truth.
+
 ## Required task representation
 
 Every significant task must contain:

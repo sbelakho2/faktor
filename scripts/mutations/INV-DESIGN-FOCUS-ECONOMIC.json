@@ -1,0 +1,12 @@
+{
+  "id": "INV-DESIGN-FOCUS-ECONOMIC",
+  "file": "crates/core/src/design_readiness.rs",
+  "find": "    (saved as u128) * 8 >= baseline_bytes as u128",
+  "replace": "    (saved as u128) >= baseline_bytes as u128",
+  "gate": "cargo test -p faktor-core --lib mutation_witness_economic_gate_rejects_each_boundary_crossing",
+  "expect": "FAILED",
+  "note": "Dropping the one-eighth conjunct makes the focus projection replace the baseline without the required 12.5% dividend.",
+  "capabilities": [],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+}

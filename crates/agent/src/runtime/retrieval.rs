@@ -1059,12 +1059,36 @@ impl AgentRuntime {
                 failures.push(test.clone());
             }
         }
-        let active_work_item = ledger.open_steps.first().map(|step| WorkItem {
-            id: "step:0".to_string(),
-            title: step.clone(),
-            state: "open".to_string(),
-            paths: ledger.changed_files.clone(),
-            criteria: Vec::new(),
+        // Zero-artifact Elephant memory: derive a tiny focus projection from
+        // the authoritative durable contract in memory. It may REPLACE only
+        // this work item's duplicated retrieval-key material, never add to it,
+        // and only behind the tokenizer-free economic gate (>=12.5% AND >=2 KiB
+        // smaller). Precise owned/recent path needs below remain unchanged.
+        // No prompt section, memory fact, CAS object or second design document.
+        let design_focus = task
+            .map(|task| faktor_core::design_focus_terms(&task.contract))
+            .unwrap_or_default();
+        let active_work_item = ledger.open_steps.first().map(|step| {
+            let baseline_bytes = ledger.changed_files.iter().fold(step.len(), |total, path| {
+                total.saturating_add(path.len()).saturating_add(1)
+            });
+            if faktor_core::design_focus_is_economic(baseline_bytes, &design_focus) {
+                WorkItem {
+                    id: "step:0".to_string(),
+                    title: String::new(),
+                    state: "open".to_string(),
+                    paths: Vec::new(),
+                    criteria: design_focus,
+                }
+            } else {
+                WorkItem {
+                    id: "step:0".to_string(),
+                    title: step.clone(),
+                    state: "open".to_string(),
+                    paths: ledger.changed_files.clone(),
+                    criteria: Vec::new(),
+                }
+            }
         });
         Ok(TaskFacts {
             session_id: handle.id(),
