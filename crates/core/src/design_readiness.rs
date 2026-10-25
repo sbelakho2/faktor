@@ -17,7 +17,7 @@
 //! discharges a proof obligation, never certifies completion and never raises
 //! the contract's verification depth on its own: a newly added row is Medium
 //! unless the pre-audit contract already carried an elevated risk, in which
-//! case an equally elevated finding may be preserved. A calm contract can
+//! case an elevated finding may preserve its tier. A calm contract can
 //! therefore never be newly promoted to High/Unknown by this layer.
 //!
 //! The focus projection is derived from proof bindings, risk descriptions and
@@ -389,11 +389,16 @@ pub fn apply_design_readiness(
             continue;
         }
         // The promotion clamp: a calm pre-audit contract can only receive
-        // Medium rows. An already-elevated contract may preserve an equally
-        // elevated finding; nothing here can raise a calm contract.
-        let severity = match (pre_audit_elevated, finding.severity) {
-            (true, RiskSeverity::High) => RiskSeverity::High,
-            (true, RiskSeverity::Unknown) => RiskSeverity::Unknown,
+        // Medium rows. An already-elevated contract preserves an elevated
+        // finding's tier; nothing here can raise a calm contract.
+        let proposed = if pre_audit_elevated {
+            finding.severity
+        } else {
+            RiskSeverity::Medium
+        };
+        let severity = match proposed {
+            RiskSeverity::High => RiskSeverity::High,
+            RiskSeverity::Unknown => RiskSeverity::Unknown,
             _ => RiskSeverity::Medium,
         };
         contract.risks.push(RiskHypothesis {
@@ -568,18 +573,22 @@ fn for_each_binding_target(binding: &EvidenceBinding, mut visit: impl FnMut(&str
 }
 
 fn first_concern(contract: &EngineeringContract, kind: DesignReadinessKind) -> Option<String> {
+    let tokens = kind.concern_tokens();
+    if tokens.is_empty() {
+        return None;
+    }
     for risk in contract.risks.iter().take(MAX_DESIGN_SOURCES) {
-        if concern_kind(&risk.description) == Some(kind) {
+        if text_mentions_any(&risk.description, tokens) {
             return Some(bounded_text(&risk.description, MAX_DESIGN_FINDING_BYTES));
         }
     }
     for invariant in contract.invariants.iter().take(MAX_DESIGN_SOURCES) {
-        if concern_kind(&invariant.statement) == Some(kind) {
+        if text_mentions_any(&invariant.statement, tokens) {
             return Some(bounded_text(&invariant.statement, MAX_DESIGN_FINDING_BYTES));
         }
     }
     for constraint in contract.constraints.iter().take(MAX_DESIGN_SOURCES) {
-        if concern_kind(&constraint.statement) == Some(kind) {
+        if text_mentions_any(&constraint.statement, tokens) {
             return Some(bounded_text(
                 &constraint.statement,
                 MAX_DESIGN_FINDING_BYTES,
@@ -589,27 +598,15 @@ fn first_concern(contract: &EngineeringContract, kind: DesignReadinessKind) -> O
     None
 }
 
-fn concern_kind(text: &str) -> Option<DesignReadinessKind> {
-    let mut found = None;
+fn text_mentions_any(text: &str, tokens: &[&str]) -> bool {
+    let mut hit = false;
     scan_tokens(text, |token| {
-        let kind = if token_names_any(token, CONCURRENCY_TOKENS) {
-            Some(DesignReadinessKind::ConcurrencyWithoutProof)
-        } else if token_names_any(token, MIGRATION_TOKENS) {
-            Some(DesignReadinessKind::MigrationWithoutProof)
-        } else if token_names_any(token, COMPATIBILITY_TOKENS) {
-            Some(DesignReadinessKind::CompatibilityWithoutProof)
-        } else {
-            None
-        };
-        match kind {
-            Some(kind) => {
-                found = Some(kind);
-                false
-            }
-            None => true,
+        if token_names_any(token, tokens) {
+            hit = true;
         }
+        !hit
     });
-    found
+    hit
 }
 
 fn has_concern_coverage(contract: &EngineeringContract, kind: DesignReadinessKind) -> bool {
@@ -625,26 +622,14 @@ fn has_concern_coverage(contract: &EngineeringContract, kind: DesignReadinessKin
 }
 
 fn proof_mentions(obligation: &ProofObligation, tokens: &[&str]) -> bool {
-    let mut hit = false;
-    scan_tokens(&obligation.claim, |token| {
-        if token_names_any(token, tokens) {
-            hit = true;
-        }
-        !hit
-    });
-    if hit {
+    if text_mentions_any(&obligation.claim, tokens) {
         return true;
     }
+    let mut hit = false;
     for_each_binding_target(&obligation.evidence_binding, |target| {
-        if hit {
-            return;
+        if !hit {
+            hit = text_mentions_any(target, tokens);
         }
-        scan_tokens(target, |token| {
-            if token_names_any(token, tokens) {
-                hit = true;
-            }
-            !hit
-        });
     });
     hit
 }
@@ -945,6 +930,45 @@ mod tests {
     }
 
     #[test]
+    fn elevated_pre_audit_contract_preserves_either_elevated_finding_tier() {
+        let high_contract = EngineeringContract {
+            risks: vec![risk("existing high risk", RiskSeverity::High)],
+            ..EngineeringContract::default()
+        };
+        let mut high_contract = high_contract;
+        let unknown_finding = audit_of(vec![manual_finding(
+            DesignReadinessKind::ElevatedRiskWithoutProof,
+            "unknown finding on a high contract",
+            RiskSeverity::Unknown,
+        )]);
+        assert_eq!(
+            apply_design_readiness(&mut high_contract, &unknown_finding),
+            1
+        );
+        assert_eq!(high_contract.risks[1].severity, RiskSeverity::Unknown);
+
+        let mut unknown_contract = EngineeringContract {
+            risks: vec![risk("existing unknown risk", RiskSeverity::Unknown)],
+            ..EngineeringContract::default()
+        };
+        let high_finding = audit_of(vec![manual_finding(
+            DesignReadinessKind::ElevatedRiskWithoutProof,
+            "high finding on an unknown contract",
+            RiskSeverity::High,
+        )]);
+        assert_eq!(
+            apply_design_readiness(&mut unknown_contract, &high_finding),
+            1
+        );
+        assert_eq!(unknown_contract.risks[1].severity, RiskSeverity::High);
+
+        let mut calm = EngineeringContract::default();
+        assert_eq!(apply_design_readiness(&mut calm, &high_finding), 1);
+        assert_eq!(calm.risks[0].severity, RiskSeverity::Medium);
+        assert!(!calm.has_elevated_risk());
+    }
+
+    #[test]
     fn mutation_witness_promotion_rule_would_escalate_without_the_clamp() {
         // Counterfactual witness: the raw finding severity is High, but the
         // calm-contract apply path must emit Medium. Deleting the clamp in
@@ -1077,6 +1101,43 @@ mod tests {
             assert!(
                 !audit.findings.iter().any(|finding| finding.kind == kind),
                 "{kind:?} must be covered by a matching claim-bound proof"
+            );
+        }
+    }
+
+    #[test]
+    fn one_entry_can_ground_every_concern_class_it_names() {
+        let mut contract = EngineeringContract::default();
+        contract.risks.push(risk(
+            "a concurrent replay during migration of the public API",
+            RiskSeverity::Medium,
+        ));
+        let audit = audit_compiled_design(&contract);
+        for kind in [
+            DesignReadinessKind::ConcurrencyWithoutProof,
+            DesignReadinessKind::MigrationWithoutProof,
+            DesignReadinessKind::CompatibilityWithoutProof,
+        ] {
+            assert!(
+                audit.findings.iter().any(|finding| finding.kind == kind),
+                "{kind:?} must be grounded by a shared entry"
+            );
+        }
+
+        contract.proof_obligations.push(obligation(
+            "concurrent replay is rejected",
+            Requirement::Required,
+            EvidenceBinding::TestSelector("race_replay::migration::api".into()),
+        ));
+        let covered = audit_compiled_design(&contract);
+        for kind in [
+            DesignReadinessKind::ConcurrencyWithoutProof,
+            DesignReadinessKind::MigrationWithoutProof,
+            DesignReadinessKind::CompatibilityWithoutProof,
+        ] {
+            assert!(
+                !covered.findings.iter().any(|finding| finding.kind == kind),
+                "{kind:?} must be covered by the shared claim-bound proof"
             );
         }
     }
