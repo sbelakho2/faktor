@@ -430,6 +430,16 @@ pub struct ChildRuntime {
     #[serde(default)]
     pub last_progress_ms: Option<i64>,
     pub created_ms: i64,
+    /// Durable per-child lifecycle generation: incremented on EVERY
+    /// lifecycle/blocker transition and persisted with the transition. The
+    /// child-handoff delivery watermark binds to this revision — never to
+    /// `updated_ms`, which is presentation/audit metadata only and can
+    /// collide for two distinct terminal transitions in one millisecond.
+    /// Rows written before this field existed decode as generation 0 (the
+    /// conservative legacy generation).
+    #[serde(default)]
+    pub revision: u64,
+    /// Wall-clock presentation/audit timestamp. NEVER a delivery watermark.
     pub updated_ms: i64,
     /// The durable base-snapshot id the child started from (audits 70/98):
     /// recorded at spawn for isolated worktree children; `None` for
@@ -547,17 +557,34 @@ impl ChildRuntime {
         Ok(())
     }
 
+    /// Advance this child's durable lifecycle generation. Monotonic and
+    /// saturating: every transition gets a strictly newer revision than the
+    /// state it replaced, so a handoff watermark can never confuse two
+    /// distinct terminal transitions that share an `updated_ms`.
+    pub fn bump_revision(&mut self) {
+        self.revision = self.revision.saturating_add(1);
+    }
+
     /// Mark this row Blocked with the given (validated) blocker. The state
     /// and the blocker fields move together — a Blocked row without a
     /// populated blocker is unrepresentable through this path.
     pub fn set_blocker(&mut self, blocker: &ChildBlocker) -> Result<(), ExecError> {
         blocker.validate()?;
+        let changed = self.state != ChildState::Blocked
+            || self.blocker_kind.as_deref() != Some(blocker.kind.as_str())
+            || self.blocker_reason.as_deref() != Some(blocker.reason.as_str())
+            || self.blocker_dependency != blocker.dependency
+            || self.blocker_resolution != blocker.resolution
+            || self.last_progress_ms != blocker.last_progress_ms;
         self.state = ChildState::Blocked;
         self.blocker_kind = Some(blocker.kind.as_str().to_string());
         self.blocker_reason = Some(blocker.reason.clone());
         self.blocker_dependency = blocker.dependency.clone();
         self.blocker_resolution = blocker.resolution.clone();
         self.last_progress_ms = blocker.last_progress_ms;
+        if changed {
+            self.bump_revision();
+        }
         Ok(())
     }
 
@@ -570,6 +597,9 @@ impl ChildRuntime {
         self.blocker_dependency = None;
         self.blocker_resolution = None;
         self.last_progress_ms = None;
+        if previous.is_some() {
+            self.bump_revision();
+        }
         previous
     }
 }
@@ -2334,7 +2364,10 @@ impl OrchestratorRuntime {
         }
         for mut row in rows {
             let (reconciled, blocker) = self.reconcile_child_state(&row)?;
-            row.state = reconciled;
+            if row.state != reconciled {
+                row.state = reconciled;
+                row.bump_revision();
+            }
             // Dependency truth: a non-terminal child whose item still has
             // unfinished dependencies is BLOCKED naming the dependency —
             // never silently re-driven as if it were runnable.
@@ -2563,6 +2596,7 @@ impl OrchestratorRuntime {
                 } else {
                     if row.state != outcome_state {
                         row.state = outcome_state;
+                        row.bump_revision();
                         row.updated_ms = self.manager.now_ms();
                     }
                     // Any non-Blocked transition clears the durable blocker
@@ -2905,6 +2939,7 @@ impl OrchestratorRuntime {
                     let mut row = child.clone();
                     if row.state != ChildState::Running && !row.is_terminal() {
                         row.state = ChildState::Running;
+                        row.bump_revision();
                         // The transition back to Running CLEARS the durable
                         // blocker truth (audited in the typed ledger).
                         if let Some(previous) = row.clear_blocker() {
@@ -3202,6 +3237,7 @@ impl OrchestratorRuntime {
             blocker_resolution: None,
             last_progress_ms: None,
             created_ms: now,
+            revision: 1,
             updated_ms: now,
             base_snapshot_id: None,
             run_base_snapshot: None,

@@ -1904,6 +1904,7 @@ name = "faktor-site"
 version = "0.1.0"
 dependencies = [
  "argon2",
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "chrono",
@@ -1912,6 +1913,7 @@ dependencies = [
  "faktor-provider",
  "faktor-security",
  "http-body-util",
+ "ipnet",
  "rand",
  "rand_core 0.6.4",
  "rusqlite",

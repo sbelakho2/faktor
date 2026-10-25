@@ -768,6 +768,7 @@ mod preflight_integration {
             blocker_resolution: None,
             last_progress_ms: None,
             created_ms: 1,
+            revision: 1,
             updated_ms: 1,
             base_snapshot_id: Some("base-child-0".into()),
             run_base_snapshot: None,

@@ -1127,6 +1127,7 @@ pub fn discard_candidate_worktree(
         if let Some(mut row) = rows.into_iter().find(|r| r.child_id == candidate.child_id) {
             if !row.state.is_terminal() {
                 row.state = ChildState::Cancelled;
+                row.bump_revision();
                 row.updated_ms = manager.now_ms();
                 let value = serde_json::to_string(&row).map_err(|e| {
                     TournamentError::Cleanup(format!("registry row serialization: {e}"))

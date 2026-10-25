@@ -69,14 +69,14 @@ async fn fault_probe_crash_before_parent_handoff_reattach_heals_exactly_once() {
         "child-handoff-delivered/run-handoff-crash/{}",
         rows[0].child_id
     );
-    let watermark = rows[0].updated_ms.to_string();
+    let watermark = format!("rev:{}", rows[0].revision);
     assert_eq!(
         parent
             .memory_fact_get("internal_context", &watermark_key)
             .unwrap()
             .as_deref(),
         Some(watermark.as_str()),
-        "the delivery watermark binds the handoff to the exact terminal state"
+        "the delivery watermark binds the handoff to the exact terminal generation"
     );
 
     // The parent's next logical turn consumes the healed handoff exactly
@@ -526,4 +526,317 @@ async fn heal_does_not_duplicate_a_legacy_unqualified_handoff() {
         .memory_fact_get("internal_context", &format!("child-handoff/{child_id}"))
         .unwrap()
         .is_some());
+}
+
+// ---------------------------------------------------- revision watermark
+/// Persist a crafted registry row plus its typed child-runtime projection
+/// (the handoff outcome authority). Test-only helper for the crash matrix.
+fn overwrite_child_row(env: &Env, run: &str, row: &ChildRuntime) {
+    let parent = env.manager.get_session(env.parent).unwrap().unwrap();
+    parent
+        .upsert_memory_fact(
+            REGISTRY_ROW_KIND,
+            &format!("{run}/{}", row.child_id),
+            &serde_json::to_string(row).unwrap(),
+        )
+        .unwrap();
+    let session = env
+        .manager
+        .get_session(SessionId::try_from(row.session_id).unwrap())
+        .unwrap()
+        .expect("crafted child session");
+    session
+        .orchestrator_child_runtime_put(&faktor_session::child::ChildRuntimeBlockerRow {
+            child_id: row.child_id.clone(),
+            state: child_state_tag(row.state).to_string(),
+            blocker: row.blocker(),
+            updated_ms: row.updated_ms,
+        })
+        .unwrap();
+}
+
+fn registry_child(env: &Env, run: &str, child_id: &str) -> ChildRuntime {
+    OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, run)
+        .unwrap()
+        .into_iter()
+        .find(|row| row.child_id == child_id)
+        .expect("child registry row")
+}
+
+/// DEFECT: `updated_ms` is not a delivery watermark. A Failed child is
+/// delivered, retried, and reaches Done in the SAME millisecond; a crash
+/// before the done handoff leaves the old timestamp watermark equal to the
+/// new `updated_ms`. Re-attach must use the newer REVISION, deliver done
+/// exactly once, and a duplicate heal (or a consumed ack) is a no-op.
+#[tokio::test]
+async fn same_millisecond_retry_done_reattach_delivers_done_once() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(open_env(dir.path(), empty_script(), 0));
+    let run = "run-same-ms-retry";
+    let child_id = "child-0";
+    craft_child_row(&env, run, child_id, "analysis", ChildState::Failed, None);
+    let mut row = registry_child(&env, run, child_id);
+    row.revision = 2;
+    row.updated_ms = 1_000;
+    overwrite_child_row(&env, run, &row);
+    env.orchestrator
+        .deliver_child_handoff(env.parent, run, &row);
+
+    let parent = env.manager.get_session(env.parent).unwrap().unwrap();
+    let key = format!("child-handoff/{run}/{child_id}");
+    let watermark_key = format!("child-handoff-delivered/{run}/{child_id}");
+    let failed = parent
+        .memory_fact_get("internal_context", &key)
+        .unwrap()
+        .expect("the failed generation was delivered");
+    assert!(failed.contains("outcome: failed"), "{failed}");
+    assert_eq!(
+        parent
+            .memory_fact_get("internal_context", &watermark_key)
+            .unwrap()
+            .as_deref(),
+        Some("rev:2")
+    );
+
+    // Retry -> Running -> Done, every transition in the SAME millisecond.
+    row.state = ChildState::Running;
+    row.bump_revision();
+    row.updated_ms = 1_000;
+    overwrite_child_row(&env, run, &row);
+    row.state = ChildState::Done;
+    row.bump_revision();
+    row.updated_ms = 1_000;
+    overwrite_child_row(&env, run, &row);
+    assert_eq!(
+        parent
+            .memory_fact_get("internal_context", &key)
+            .unwrap()
+            .as_deref(),
+        Some(failed.as_str()),
+        "crash fired BEFORE the done handoff: the failed section is still pending"
+    );
+    assert_eq!(
+        parent
+            .memory_fact_get("internal_context", &watermark_key)
+            .unwrap()
+            .as_deref(),
+        Some("rev:2"),
+        "the stale watermark names generation 2, not the done generation 4"
+    );
+
+    let mut children = HashMap::new();
+    children.insert(child_id.to_string(), row.clone());
+    env.orchestrator
+        .heal_pending_child_handoffs(env.parent, run, &children);
+    let done = parent
+        .memory_fact_get("internal_context", &key)
+        .unwrap()
+        .expect("the newer terminal generation is delivered");
+    assert!(done.contains("outcome: done"), "{done}");
+    assert!(!done.contains("outcome: failed"), "{done}");
+    assert_eq!(
+        parent
+            .memory_fact_get("internal_context", &watermark_key)
+            .unwrap()
+            .as_deref(),
+        Some("rev:4")
+    );
+
+    // Duplicate heal for the SAME generation must not rewrite the section.
+    env.orchestrator
+        .heal_pending_child_handoffs(env.parent, run, &children);
+    assert_eq!(
+        parent
+            .memory_fact_get("internal_context", &key)
+            .unwrap()
+            .as_deref(),
+        Some(done.as_str())
+    );
+
+    // The parent consumes the healed handoff exactly once; a later heal can
+    // never resurrect the consumed ack.
+    env.agent
+        .run_turn(env.parent, "continue the parent task", &[])
+        .await
+        .expect("parent continuation drives");
+    assert_eq!(
+        parent
+            .memory_fact_get("internal_context", &key)
+            .unwrap()
+            .as_deref(),
+        Some("")
+    );
+    env.orchestrator
+        .heal_pending_child_handoffs(env.parent, run, &children);
+    assert_eq!(
+        parent
+            .memory_fact_get("internal_context", &key)
+            .unwrap()
+            .as_deref(),
+        Some(""),
+        "a duplicate heal must never resurrect a consumed handoff"
+    );
+}
+
+/// MIGRATION: a registry row written before `revision` existed decodes as
+/// generation 0. With no prior delivery it is delivered ONCE and the
+/// `rev:0` watermark is recorded; repeated healing is a no-op.
+#[tokio::test]
+async fn legacy_row_without_revision_delivers_once_then_records_generation_zero() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(open_env(dir.path(), empty_script(), 0));
+    let run = "run-legacy-revision";
+    let child_id = "child-0";
+    craft_child_row(&env, run, child_id, "analysis", ChildState::Done, None);
+    let row = registry_child(&env, run, child_id);
+    overwrite_child_row(&env, run, &row);
+
+    let parent = env.manager.get_session(env.parent).unwrap().unwrap();
+    let mut value = serde_json::to_value(&row).unwrap();
+    value.as_object_mut().unwrap().remove("revision");
+    let legacy = serde_json::to_string(&value).unwrap();
+    assert!(!legacy.contains("\"revision\""), "{legacy}");
+    parent
+        .upsert_memory_fact(REGISTRY_ROW_KIND, &format!("{run}/{child_id}"), &legacy)
+        .unwrap();
+
+    let loaded = registry_child(&env, run, child_id);
+    assert_eq!(loaded.revision, 0, "legacy rows decode as generation 0");
+    let mut children = HashMap::new();
+    children.insert(child_id.to_string(), loaded);
+    let key = format!("child-handoff/{run}/{child_id}");
+    let watermark_key = format!("child-handoff-delivered/{run}/{child_id}");
+    env.orchestrator
+        .heal_pending_child_handoffs(env.parent, run, &children);
+    let section = parent
+        .memory_fact_get("internal_context", &key)
+        .unwrap()
+        .expect("the legacy generation is delivered once");
+    assert!(section.contains("outcome: done"), "{section}");
+    assert_eq!(
+        parent
+            .memory_fact_get("internal_context", &watermark_key)
+            .unwrap()
+            .as_deref(),
+        Some("rev:0"),
+        "the delivery records the legacy generation"
+    );
+
+    env.orchestrator
+        .heal_pending_child_handoffs(env.parent, run, &children);
+    assert_eq!(
+        parent
+            .memory_fact_get("internal_context", &key)
+            .unwrap()
+            .as_deref(),
+        Some(section.as_str())
+    );
+    env.agent
+        .run_turn(env.parent, "continue", &[])
+        .await
+        .expect("parent continuation drives");
+    env.orchestrator
+        .heal_pending_child_handoffs(env.parent, run, &children);
+    assert_eq!(
+        parent
+            .memory_fact_get("internal_context", &key)
+            .unwrap()
+            .as_deref(),
+        Some(""),
+        "the legacy once-delivery is never re-armed"
+    );
+}
+
+/// CONCURRENCY: two re-attach healers race the same undelivered generation.
+/// The section + revision watermark CAS has exactly one winner; the parent
+/// still consumes exactly one handoff and a later heal is a no-op.
+#[tokio::test]
+async fn concurrent_reattach_delivers_one_generation_exactly_once() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(open_env(dir.path(), empty_script(), 0));
+    let run = "run-concurrent-heal";
+    let child_id = "child-0";
+    craft_child_row(&env, run, child_id, "analysis", ChildState::Done, None);
+    let mut row = registry_child(&env, run, child_id);
+    row.revision = 5;
+    row.updated_ms = 9;
+    overwrite_child_row(&env, run, &row);
+    let mut children = HashMap::new();
+    children.insert(child_id.to_string(), row);
+
+    std::thread::scope(|scope| {
+        for _ in 0..2 {
+            let env = env.clone();
+            let orchestrator = env.orchestrator.clone();
+            let children = children.clone();
+            scope.spawn(move || {
+                orchestrator.heal_pending_child_handoffs(env.parent, run, &children)
+            });
+        }
+    });
+
+    let parent = env.manager.get_session(env.parent).unwrap().unwrap();
+    let key = format!("child-handoff/{run}/{child_id}");
+    let watermark_key = format!("child-handoff-delivered/{run}/{child_id}");
+    let section = parent
+        .memory_fact_get("internal_context", &key)
+        .unwrap()
+        .expect("the raced generation is delivered");
+    assert!(section.contains("outcome: done"), "{section}");
+    assert_eq!(
+        parent
+            .memory_fact_get("internal_context", &watermark_key)
+            .unwrap()
+            .as_deref(),
+        Some("rev:5")
+    );
+    env.agent
+        .run_turn(env.parent, "continue", &[])
+        .await
+        .expect("parent continuation drives");
+    assert_eq!(
+        parent
+            .memory_fact_get("internal_context", &key)
+            .unwrap()
+            .as_deref(),
+        Some(""),
+        "exactly one handoff is consumed"
+    );
+    env.orchestrator
+        .heal_pending_child_handoffs(env.parent, run, &children);
+    assert_eq!(
+        parent
+            .memory_fact_get("internal_context", &key)
+            .unwrap()
+            .as_deref(),
+        Some("")
+    );
+}
+
+/// CASE MC-HANDOFF-REVISION (mutation witness): the delivery watermark MUST
+/// be the child's revision. Substituting `updated_ms` (a zero timestamp is
+/// the same defect) must be detectable by this witness.
+fn revision_watermark_guard_present(source: &str) -> bool {
+    source.contains("let watermark = handoff_watermark(child.revision);")
+        && source.contains("delivered.covers(child.revision)")
+}
+
+#[test]
+fn revision_watermark_guard_is_pinned_and_rejects_a_timestamp_substitute() {
+    const SOURCE: &str = include_str!("runtime_handoff.rs");
+    assert!(
+        revision_watermark_guard_present(SOURCE),
+        "the handoff delivery watermark lost its revision binding"
+    );
+    let timestamp = SOURCE.replace(
+        "handoff_watermark(child.revision)",
+        "handoff_watermark(child.updated_ms as u64)",
+    );
+    assert!(
+        !revision_watermark_guard_present(&timestamp),
+        "the witness must detect a wall-clock watermark regression"
+    );
 }

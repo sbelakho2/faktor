@@ -1,0 +1,16 @@
+{
+  "id": "INV-BILLING-PAYMENT-FAILED-DUNNING-FENCE",
+  "surface": "payments.billing",
+  "file": "crates/payments/src/service/webhook_effects.rs",
+  "find": "        if invoice.organization_id != org\n            || !invoice.status.can_transition_to(InvoiceStatus::PastDue)\n        {\n            return Ok(WebhookEffects {\n                subscription: None,\n                invoice: None,\n                payment: Some(payment),\n                refund: None,\n                credit_note: None,\n                ..WebhookEffects::default()\n            });\n        }\n        if let Some(subscription_id) = invoice.subscription_id.as_deref() {\n            if Self::subscription_mutation_fence_active(tx, org, subscription_id)? {",
+  "replace": "        if invoice.organization_id != org\n            || !invoice.status.can_transition_to(InvoiceStatus::PastDue)\n        {\n            return Ok(WebhookEffects {\n                subscription: None,\n                invoice: None,\n                payment: Some(payment),\n                refund: None,\n                credit_note: None,\n                ..WebhookEffects::default()\n            });\n        }\n        if let Some(subscription_id) = invoice.subscription_id.as_deref() {\n            if false {",
+  "gate": "cargo test -p faktor-payments --test invoice_fencing payment_failed_dunning_defers_under_subscription_mutation_fence",
+  "expect": "FAILED",
+  "note": "A payment.failed webhook that ignores the subscription mutation fence records payment status, PastDue, grace and a dunning attempt while a plan/seat/cancel provider call is in flight; the deferred-webhook oracle must fail.",
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

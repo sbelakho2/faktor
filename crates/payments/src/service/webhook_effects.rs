@@ -265,25 +265,34 @@ impl PaymentService {
                 ..WebhookEffects::default()
             });
         }
+        if let Some(subscription_id) = invoice.subscription_id.as_deref() {
+            if Self::subscription_mutation_fence_active(tx, org, subscription_id)? {
+                return Err(PaymentError::Conflict(
+                    "a subscription mutation is in flight; retry the webhook".into(),
+                ));
+            }
+        }
         invoice.status = InvoiceStatus::PastDue;
         let mut subscription = invoice
             .subscription_id
             .as_deref()
-            .and_then(|id| subscription_by_id_tx(tx, org, id).ok().flatten());
+            .and_then(|id| subscription_by_id_tx(tx, org, id).ok().flatten())
+            .filter(|subscription| {
+                subscription
+                    .state
+                    .can_transition_to(SubscriptionState::PastDue)
+            });
         if let Some(sub) = subscription.as_mut() {
-            if sub.state.can_transition_to(SubscriptionState::PastDue) {
-                sub.state = SubscriptionState::PastDue;
-            }
+            sub.state = SubscriptionState::PastDue;
             sub.dunning_attempts = sub.dunning_attempts.saturating_add(1);
             sub.updated_ms = now;
             if sub.grace_end_ms.is_none() {
                 sub.grace_end_ms = Some(now.saturating_add(self.config.dunning.grace_ms.max(0)));
             }
-            if sub.dunning_attempts >= self.config.dunning.max_attempts
-                && sub.state != SubscriptionState::Canceled
-            {
+            if sub.dunning_attempts >= self.config.dunning.max_attempts {
                 sub.state = SubscriptionState::Canceled;
                 sub.canceled_ms = Some(now);
+                sub.cancel_at_period_end = false;
             }
         }
         Ok(WebhookEffects {
@@ -476,36 +485,38 @@ impl PaymentService {
                 ..WebhookEffects::default()
             });
         }
-        invoice.status = InvoiceStatus::PastDue;
-        let subscription = match invoice.subscription_id.as_deref() {
-            Some(id) if !Self::subscription_mutation_fence_active(tx, org, id)? => {
-                subscription_by_id_tx(tx, org, id)
-                    .ok()
-                    .flatten()
-                    .filter(|subscription| {
-                        subscription
-                            .state
-                            .can_transition_to(SubscriptionState::PastDue)
-                    })
-                    .map(|mut subscription| {
-                        subscription.dunning_attempts =
-                            subscription.dunning_attempts.saturating_add(1);
-                        subscription.state = SubscriptionState::PastDue;
-                        if subscription.grace_end_ms.is_none() {
-                            subscription.grace_end_ms =
-                                Some(now.saturating_add(self.config.dunning.grace_ms.max(0)));
-                        }
-                        subscription.updated_ms = now;
-                        if subscription.dunning_attempts >= self.config.dunning.max_attempts {
-                            subscription.state = SubscriptionState::Canceled;
-                            subscription.canceled_ms = Some(now);
-                            subscription.cancel_at_period_end = false;
-                        }
-                        subscription
-                    })
+        if let Some(subscription_id) = invoice.subscription_id.as_deref() {
+            if Self::subscription_mutation_fence_active(tx, org, subscription_id)? {
+                return Err(PaymentError::Conflict(
+                    "a subscription mutation is in flight; retry the webhook".into(),
+                ));
             }
-            _ => None,
-        };
+        }
+        invoice.status = InvoiceStatus::PastDue;
+        let subscription = invoice
+            .subscription_id
+            .as_deref()
+            .and_then(|id| subscription_by_id_tx(tx, org, id).ok().flatten())
+            .filter(|subscription| {
+                subscription
+                    .state
+                    .can_transition_to(SubscriptionState::PastDue)
+            })
+            .map(|mut subscription| {
+                subscription.dunning_attempts = subscription.dunning_attempts.saturating_add(1);
+                subscription.state = SubscriptionState::PastDue;
+                if subscription.grace_end_ms.is_none() {
+                    subscription.grace_end_ms =
+                        Some(now.saturating_add(self.config.dunning.grace_ms.max(0)));
+                }
+                subscription.updated_ms = now;
+                if subscription.dunning_attempts >= self.config.dunning.max_attempts {
+                    subscription.state = SubscriptionState::Canceled;
+                    subscription.canceled_ms = Some(now);
+                    subscription.cancel_at_period_end = false;
+                }
+                subscription
+            });
         Ok(WebhookEffects {
             subscription,
             invoice: Some(invoice),

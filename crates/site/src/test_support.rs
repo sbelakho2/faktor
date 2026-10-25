@@ -1,12 +1,16 @@
 #![allow(dead_code)]
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::body::Body;
+use axum::extract::ConnectInfo;
 use axum::http::{header, HeaderMap, Method, Request, StatusCode};
 use axum::Router;
 use faktor_cloud::{Clock, ManualClock};
-use faktor_payments::{PaymentService, SecretString, SqlitePaymentStore, StaticSecrets};
+use faktor_payments::{
+    PaymentProvider, PaymentService, SecretString, SqlitePaymentStore, StaticSecrets,
+};
 use http_body_util::BodyExt;
 use tempfile::TempDir;
 use tower::ServiceExt;
@@ -28,7 +32,11 @@ pub fn test_config() -> Config {
         base_url: "http://127.0.0.1:8080".into(),
         bind: "127.0.0.1:0".into(),
         cookie_secure: false,
-        trust_proxy: true,
+        trusted_proxy_cidrs: vec![
+            "127.0.0.1/32".parse().unwrap(),
+            "10.0.0.0/8".parse().unwrap(),
+            "::1/128".parse().unwrap(),
+        ],
         admin_email: Some("admin@example.com".into()),
         session_ttl_ms: 30 * 24 * 60 * 60 * 1000,
         idle_ttl_ms: 7 * 24 * 60 * 60 * 1000,
@@ -37,6 +45,14 @@ pub fn test_config() -> Config {
         local_webhook_secret: Some(SecretString::new(TEST_SECRET)),
     }
 }
+
+type CustomPaymentProviderFactory = Box<
+    dyn FnOnce(
+        Arc<SqlitePaymentStore>,
+        Arc<ManualClock>,
+        Arc<StaticSecrets>,
+    ) -> Arc<dyn PaymentProvider>,
+>;
 
 pub struct TestApp {
     #[allow(dead_code)]
@@ -71,10 +87,36 @@ impl TestApp {
         )
     }
 
+    pub fn build_with_custom_provider<F>(factory: F) -> Self
+    where
+        F: FnOnce(
+                Arc<SqlitePaymentStore>,
+                Arc<ManualClock>,
+                Arc<StaticSecrets>,
+            ) -> Arc<dyn PaymentProvider>
+            + 'static,
+    {
+        Self::build_inner_with(
+            faktor_payments::ProviderKind::Local,
+            None,
+            None,
+            Some(Box::new(factory)),
+        )
+    }
+
     fn build_inner(
         provider: faktor_payments::ProviderKind,
         transport: Option<Arc<dyn faktor_provider::egress::HttpTransport>>,
         mollie_base_url: Option<String>,
+    ) -> Self {
+        Self::build_inner_with(provider, transport, mollie_base_url, None)
+    }
+
+    fn build_inner_with(
+        provider: faktor_payments::ProviderKind,
+        transport: Option<Arc<dyn faktor_provider::egress::HttpTransport>>,
+        mollie_base_url: Option<String>,
+        factory: Option<CustomPaymentProviderFactory>,
     ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config();
@@ -93,23 +135,39 @@ impl TestApp {
             ("FAKTOR_SITE_PAYMENT_VAULT_KEY".into(), "11".repeat(32)),
         ]));
         let service_clock: Arc<dyn Clock> = clock.clone();
-        let payments = match provider {
-            faktor_payments::ProviderKind::Local => {
-                PaymentService::open_local(store, config.payments.clone(), service_clock, secrets)
-                    .unwrap()
+        let payments = match factory {
+            Some(factory) => {
+                let instance = factory(store.clone(), clock.clone(), secrets.clone());
+                PaymentService::with_provider(
+                    store,
+                    instance,
+                    config.payments.clone(),
+                    service_clock,
+                    secrets,
+                )
+                .unwrap()
             }
-            faktor_payments::ProviderKind::Mollie => {
-                let transport = transport.expect("Mollie tests inject a mock transport");
-                PaymentService::open_mollie(
+            None => match provider {
+                faktor_payments::ProviderKind::Local => PaymentService::open_local(
                     store,
                     config.payments.clone(),
                     service_clock,
                     secrets,
-                    Some(transport),
                 )
-                .unwrap()
-            }
-            faktor_payments::ProviderKind::Stripe => panic!("site tests do not use Stripe"),
+                .unwrap(),
+                faktor_payments::ProviderKind::Mollie => {
+                    let transport = transport.expect("Mollie tests inject a mock transport");
+                    PaymentService::open_mollie(
+                        store,
+                        config.payments.clone(),
+                        service_clock,
+                        secrets,
+                        Some(transport),
+                    )
+                    .unwrap()
+                }
+                faktor_payments::ProviderKind::Stripe => panic!("site tests do not use Stripe"),
+            },
         };
         let db = Arc::new(Db::open(&dir.path().join("site.db")).unwrap());
         let mailer = Arc::new(MemoryMailer::new());
@@ -134,6 +192,8 @@ impl TestApp {
         Client {
             router: self.router.clone(),
             jar: HashMap::new(),
+            peer: None,
+            forwarded_for: None,
         }
     }
 
@@ -173,12 +233,31 @@ pub struct TestClientResponse {
     pub body: String,
 }
 
+#[derive(Clone)]
 pub struct Client {
     router: Router,
     jar: HashMap<String, String>,
+    peer: Option<SocketAddr>,
+    forwarded_for: Option<String>,
 }
 
 impl Client {
+    #[allow(dead_code)]
+    pub fn with_peer(mut self, peer: SocketAddr) -> Self {
+        self.peer = Some(peer);
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn with_forwarded_for(mut self, value: &str) -> Self {
+        self.forwarded_for = Some(value.to_string());
+        self
+    }
+
+    fn forwarded_for(&self) -> &str {
+        self.forwarded_for.as_deref().unwrap_or("203.0.113.9")
+    }
+
     pub async fn get(&mut self, path: &str) -> TestClientResponse {
         self.request(Method::GET, path, None).await
     }
@@ -202,7 +281,7 @@ impl Client {
             .method(Method::POST)
             .uri(path)
             .header(header::CONTENT_TYPE, content_type)
-            .header("x-forwarded-for", "203.0.113.9")
+            .header("x-forwarded-for", self.forwarded_for())
             .header("origin", "http://127.0.0.1:8080")
             .header("sec-fetch-site", "same-origin");
         if !self.jar.is_empty() {
@@ -230,7 +309,7 @@ impl Client {
             .method(Method::POST)
             .uri(path)
             .header(header::CONTENT_TYPE, content_type)
-            .header("x-forwarded-for", "203.0.113.9")
+            .header("x-forwarded-for", self.forwarded_for())
             .header("origin", "http://127.0.0.1:8080")
             .header("sec-fetch-site", "same-origin");
         for (name, value) in extra_headers {
@@ -259,7 +338,7 @@ impl Client {
         let mut builder = Request::builder()
             .method(method)
             .uri(path)
-            .header("x-forwarded-for", "203.0.113.9")
+            .header("x-forwarded-for", self.forwarded_for())
             .header(header::USER_AGENT, "faktor-site-test")
             .header("origin", "http://127.0.0.1:8080")
             .header("sec-fetch-site", "same-origin");
@@ -284,7 +363,10 @@ impl Client {
         self.send(request).await
     }
 
-    async fn send(&mut self, request: Request<Body>) -> TestClientResponse {
+    async fn send(&mut self, mut request: Request<Body>) -> TestClientResponse {
+        if let Some(peer) = self.peer {
+            request.extensions_mut().insert(ConnectInfo(peer));
+        }
         let response = self.router.clone().oneshot(request).await.unwrap();
         let status = response.status();
         let headers = response.headers().clone();

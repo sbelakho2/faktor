@@ -11,11 +11,14 @@ pub mod security;
 pub mod web;
 
 #[cfg(test)]
+mod checkout_fence_tests;
+#[cfg(test)]
 mod test_support;
 #[cfg(test)]
 mod tests;
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 
 use axum::http::HeaderMap;
 use faktor_cloud::{Clock, SystemClock};
@@ -39,6 +42,9 @@ pub struct AppState {
     pub mailer: Arc<dyn Mailer>,
     pub limiter: security::RateLimiter,
     pub payments: Arc<PaymentService>,
+    /// Checkout fences owned by THIS process. A durable pending fence absent
+    /// from this set survived a crash and is reconciled immediately.
+    pub checkout_fences: Mutex<HashSet<String>>,
 }
 
 impl AppState {
@@ -56,6 +62,7 @@ impl AppState {
             mailer,
             limiter: security::RateLimiter::new(),
             payments,
+            checkout_fences: Mutex::new(HashSet::new()),
         })
     }
 
@@ -67,6 +74,25 @@ impl AppState {
         let mailer: Arc<dyn Mailer> = Arc::new(FileMailer::new(config.mail_dir())?);
         let config = Arc::new(config);
         Ok(Self::new(config, db, payments, mailer, clock))
+    }
+
+    pub fn checkout_fence_is_live(&self, fence_id: &str) -> bool {
+        self.checkout_fences
+            .lock()
+            .map(|owners| owners.contains(fence_id))
+            .unwrap_or(false)
+    }
+
+    pub fn own_checkout_fence(&self, fence_id: &str) {
+        if let Ok(mut owners) = self.checkout_fences.lock() {
+            owners.insert(fence_id.to_string());
+        }
+    }
+
+    pub fn release_checkout_fence(&self, fence_id: &str) {
+        if let Ok(mut owners) = self.checkout_fences.lock() {
+            owners.remove(fence_id);
+        }
     }
 
     pub fn now_ms(&self) -> i64 {

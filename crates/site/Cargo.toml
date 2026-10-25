@@ -12,6 +12,7 @@ tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7", features = ["fs", "limit", "set-header", "timeout", "trace"] }
 serde.workspace = true
 serde_json.workspace = true
+ipnet = "2.12"
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -30,6 +31,7 @@ faktor-provider.workspace = true
 faktor-security.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
 tempfile.workspace = true
 http-body-util = "0.1"
 faktor-provider = { workspace = true, features = ["test-utils"] }

@@ -2722,6 +2722,7 @@ impl OrchestratorRuntime {
             blocker_resolution: None,
             last_progress_ms: None,
             created_ms: now,
+            revision: 1,
             updated_ms: now,
             base_snapshot_id: None,
             run_base_snapshot: None,

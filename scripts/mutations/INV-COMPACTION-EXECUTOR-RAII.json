@@ -1,0 +1,15 @@
+{
+  "id": "INV-COMPACTION-EXECUTOR-RAII",
+  "surface": "compaction",
+  "file": "crates/server/src/native/longtask.rs",
+  "find": "        active.remove(&self.key);",
+  "replace": "        let _ = &self.key;",
+  "note": "Making the ActiveCompactionGuard Drop a no-op leaves the liveness registry believing a dead executor is alive after success/error/cancel/unwind, so stale-row reconciliation can never heal. The RAII witness must fail.",
+  "gate": "cargo test -p faktor-server --lib active_compaction_registration_is_raii_and_mutation_sensitive",
+  "expect": "FAILED",
+  "capabilities": [
+    "server.compaction_executor_raii"
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+}

@@ -7,11 +7,11 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use faktor_core::id::SessionId;
 use faktor_git::WorktreeManager;
 use faktor_terminal::{ProcessOwner, ProcessSupervisor};
 
 use crate::model::{validate_rel_path, GraphError, Revision};
+use crate::ImpactProcessOwner;
 
 pub struct GitAdapter {
     manager: Arc<WorktreeManager>,
@@ -21,10 +21,13 @@ pub struct GitAdapter {
 impl GitAdapter {
     /// The caller supplies the daemon/CLI supervisor; this crate never
     /// constructs one (the static-authority scan enforces the one owner).
-    pub fn new(supervisor: Arc<ProcessSupervisor>) -> Self {
+    /// The owner is a REAL workspace or the standalone daemon/system host:
+    /// git children are semantic shared resources, so a user session must
+    /// never own (and be able to kill) them.
+    pub fn new(supervisor: Arc<ProcessSupervisor>, owner: ImpactProcessOwner) -> Self {
         Self {
             manager: Arc::new(WorktreeManager::new(supervisor)),
-            owner: ProcessOwner::Session(SessionId::new(1)),
+            owner: owner.process_owner(),
         }
     }
 

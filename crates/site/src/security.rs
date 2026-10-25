@@ -1,6 +1,8 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 #![allow(clippy::items_after_test_module)]
 
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Mutex;
 
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
@@ -19,6 +21,10 @@ pub const CSRF_COOKIE: &str = "faktor_site_csrf";
 const MAX_COOKIE_HEADER: usize = 8192;
 const MAX_COOKIE_VALUE: usize = 256;
 const MAX_RATE_ENTRIES: usize = 4096;
+const MAX_FORWARDED_BYTES: usize = 1024;
+const MAX_FORWARDED_HOPS: usize = 32;
+const MAX_IP_LITERAL_BYTES: usize = 64;
+const PEER_IP_HEADER: &str = "x-faktor-peer-ip";
 
 pub fn random_secret() -> String {
     let mut bytes = [0u8; 32];
@@ -231,36 +237,179 @@ fn cookie(config: &Config, name: &str, value: &str, max_age_secs: i64) -> String
 }
 
 pub fn client_ip(headers: &HeaderMap, config: &Config) -> String {
-    if config.trust_proxy {
-        if let Some(forwarded) = headers
-            .get("x-forwarded-for")
-            .and_then(|value| value.to_str().ok())
-        {
-            if let Some(first) = forwarded.split(',').next() {
-                let candidate = first.trim();
-                if !candidate.is_empty() && candidate.len() <= 64 {
-                    return candidate.to_string();
+    let Some(peer) = single_ip_header(headers, PEER_IP_HEADER) else {
+        return "local".to_string();
+    };
+    if !config.trusts_proxy(peer) {
+        return peer.to_string();
+    }
+    match forwarded_chain(headers) {
+        Some(chain) => derived_client(&chain, peer, config).to_string(),
+        None => peer.to_string(),
+    }
+}
+
+/// Walks the forwarding chain from the hop nearest to the socket peer toward
+/// the origin. Every hop that sits inside `trusted_proxy_cidrs` is skipped; the
+/// first untrusted address is the client. An all-trusted chain yields the
+/// leftmost (originating) address.
+fn derived_client(chain: &[IpAddr], peer: IpAddr, config: &Config) -> IpAddr {
+    let mut client = peer;
+    for address in chain.iter().rev() {
+        if config.trusts_proxy(*address) {
+            client = *address;
+        } else {
+            return *address;
+        }
+    }
+    client
+}
+
+fn single_ip_header(headers: &HeaderMap, name: &str) -> Option<IpAddr> {
+    let raw = headers.get(name)?.to_str().ok()?;
+    parse_ip_literal(raw)
+}
+
+fn forwarded_chain(headers: &HeaderMap) -> Option<Vec<IpAddr>> {
+    parse_forwarded(headers).or_else(|| parse_x_forwarded_for(headers))
+}
+
+fn parse_forwarded(headers: &HeaderMap) -> Option<Vec<IpAddr>> {
+    let raw = joined_header(headers, "forwarded")?;
+    let elements = split_quoted(&raw, ',')?;
+    if elements.is_empty() || elements.len() > MAX_FORWARDED_HOPS {
+        return None;
+    }
+    let mut chain = Vec::with_capacity(elements.len());
+    for element in elements {
+        let pairs = split_quoted(element, ';')?;
+        let mut address = None;
+        for pair in pairs {
+            let (name, value) = pair.split_once('=')?;
+            if name.trim().eq_ignore_ascii_case("for") {
+                if address.is_some() {
+                    return None;
                 }
+                address = Some(forwarded_value_ip(value)?);
             }
         }
-        if let Some(real) = headers
-            .get("x-real-ip")
-            .and_then(|value| value.to_str().ok())
-        {
-            if !real.is_empty() && real.len() <= 64 {
-                return real.to_string();
+        chain.push(address?);
+    }
+    Some(chain)
+}
+
+fn parse_x_forwarded_for(headers: &HeaderMap) -> Option<Vec<IpAddr>> {
+    let raw = joined_header(headers, "x-forwarded-for")?;
+    let elements = raw.split(',').collect::<Vec<_>>();
+    if elements.is_empty() || elements.len() > MAX_FORWARDED_HOPS {
+        return None;
+    }
+    elements
+        .into_iter()
+        .map(|element| parse_ip_literal(element.trim()))
+        .collect()
+}
+
+fn joined_header(headers: &HeaderMap, name: &str) -> Option<String> {
+    let mut joined = String::new();
+    for value in headers.get_all(name) {
+        let value = value.to_str().ok()?;
+        if joined.len() + value.len() + usize::from(!joined.is_empty()) > MAX_FORWARDED_BYTES {
+            return None;
+        }
+        if !joined.is_empty() {
+            joined.push(',');
+        }
+        joined.push_str(value);
+    }
+    if joined.trim().is_empty() {
+        return None;
+    }
+    Some(joined)
+}
+
+fn split_quoted(raw: &str, delimiter: char) -> Option<Vec<&str>> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, ch) in raw.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            _ if ch == delimiter && !quoted => {
+                parts.push(&raw[start..index]);
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    if quoted || escaped {
+        return None;
+    }
+    parts.push(&raw[start..]);
+    Some(parts)
+}
+
+fn forwarded_value_ip(raw: &str) -> Option<IpAddr> {
+    let value = raw.trim();
+    let unquoted = if let Some(inner) = value.strip_prefix('"') {
+        let inner = inner.strip_suffix('"')?;
+        let mut unescaped = String::with_capacity(inner.len());
+        let mut escaped = false;
+        for ch in inner.chars() {
+            if escaped {
+                unescaped.push(ch);
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                return None;
+            } else {
+                unescaped.push(ch);
             }
         }
-    }
-    if let Some(peer) = headers
-        .get("x-faktor-peer-ip")
-        .and_then(|value| value.to_str().ok())
-    {
-        if !peer.is_empty() && peer.len() <= 64 {
-            return peer.to_string();
+        if escaped {
+            return None;
         }
+        unescaped
+    } else {
+        if value.contains('"') {
+            return None;
+        }
+        value.to_string()
+    };
+    parse_ip_literal(&unquoted)
+}
+
+fn parse_ip_literal(raw: &str) -> Option<IpAddr> {
+    let value = raw.trim();
+    if value.is_empty() || value.len() > MAX_IP_LITERAL_BYTES {
+        return None;
     }
-    "local".to_string()
+    let address = if let Some(rest) = value.strip_prefix('[') {
+        let (address, tail) = rest.split_once(']')?;
+        if !tail.is_empty() {
+            let port = tail.strip_prefix(':')?;
+            if port.is_empty()
+                || port.len() > 5
+                || !port.bytes().all(|byte| byte.is_ascii_digit())
+                || port.parse::<u16>().is_err()
+            {
+                return None;
+            }
+        }
+        address.parse::<Ipv6Addr>().ok().map(IpAddr::V6)?
+    } else if value.contains(':') {
+        value.parse::<Ipv6Addr>().ok().map(IpAddr::V6)?
+    } else {
+        value.parse::<Ipv4Addr>().ok().map(IpAddr::V4)?
+    };
+    Some(address.to_canonical())
 }
 
 pub fn client_tag(headers: &HeaderMap, config: &Config) -> String {
@@ -445,5 +594,151 @@ mod tests {
         assert!(cookie.contains("HttpOnly"));
         assert!(cookie.contains("Secure"));
         assert!(cookie.contains("SameSite=Lax"));
+    }
+
+    fn proxy_config(cidrs: &[&str]) -> Config {
+        let mut config = crate::test_support::test_config();
+        config.trusted_proxy_cidrs = cidrs.iter().map(|cidr| cidr.parse().unwrap()).collect();
+        config
+    }
+
+    fn request_headers(peer: Option<&str>, forwarded: &[(&'static str, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if let Some(peer) = peer {
+            headers.insert(
+                PEER_IP_HEADER,
+                axum::http::HeaderValue::from_str(peer).unwrap(),
+            );
+        }
+        for (name, value) in forwarded {
+            headers.insert(
+                axum::http::HeaderName::from_static(name),
+                axum::http::HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        headers
+    }
+
+    #[test]
+    fn untrusted_peer_cannot_spoof_forwarding_headers() {
+        let config = proxy_config(&["10.0.0.0/8"]);
+        for headers in [
+            request_headers(Some("198.51.100.7"), &[("x-forwarded-for", "1.2.3.4")]),
+            request_headers(
+                Some("198.51.100.7"),
+                &[("forwarded", "for=1.2.3.4;proto=https")],
+            ),
+            request_headers(
+                Some("198.51.100.7"),
+                &[("forwarded", "for=1.2.3.4"), ("x-forwarded-for", "1.2.3.4")],
+            ),
+        ] {
+            assert_eq!(client_ip(&headers, &config), "198.51.100.7");
+            assert_eq!(
+                headers.get(PEER_IP_HEADER).unwrap().to_str().unwrap(),
+                "198.51.100.7"
+            );
+        }
+        let no_peer = request_headers(None, &[("x-forwarded-for", "1.2.3.4")]);
+        assert_eq!(client_ip(&no_peer, &config), "local");
+    }
+
+    #[test]
+    fn trusted_peer_forwarding_headers_are_honored() {
+        let config = proxy_config(&["10.0.0.0/8"]);
+        let forwarded = request_headers(
+            Some("10.0.0.5"),
+            &[("forwarded", "for=203.0.113.9;proto=https")],
+        );
+        assert_eq!(client_ip(&forwarded, &config), "203.0.113.9");
+        let xff = request_headers(Some("10.0.0.5"), &[("x-forwarded-for", "203.0.113.9")]);
+        assert_eq!(client_ip(&xff, &config), "203.0.113.9");
+        let real = request_headers(Some("10.0.0.5"), &[("x-real-ip", "203.0.113.9")]);
+        assert_eq!(client_ip(&real, &config), "10.0.0.5");
+        let none = request_headers(Some("10.0.0.5"), &[]);
+        assert_eq!(client_ip(&none, &config), "10.0.0.5");
+    }
+
+    #[test]
+    fn multi_hop_trusted_chain_resolves_the_origin() {
+        let config = proxy_config(&["10.0.0.0/8", "192.0.2.0/24"]);
+        let headers = request_headers(
+            Some("10.0.0.5"),
+            &[("x-forwarded-for", "198.51.100.9, 10.0.0.6, 192.0.2.7")],
+        );
+        assert_eq!(client_ip(&headers, &config), "198.51.100.9");
+        let fully_trusted = request_headers(
+            Some("10.0.0.5"),
+            &[("x-forwarded-for", "192.0.2.8, 10.0.0.6, 192.0.2.7")],
+        );
+        assert_eq!(client_ip(&fully_trusted, &config), "192.0.2.8");
+    }
+
+    #[test]
+    fn mixed_chain_uses_the_rightmost_untrusted_address() {
+        let config = proxy_config(&["10.0.0.0/8"]);
+        let headers = request_headers(
+            Some("10.0.0.5"),
+            &[("x-forwarded-for", "1.2.3.4, 10.0.0.6, 198.51.100.8")],
+        );
+        assert_eq!(client_ip(&headers, &config), "198.51.100.8");
+        let headers = request_headers(
+            Some("10.0.0.5"),
+            &[("x-forwarded-for", "1.2.3.4, 198.51.100.8, 10.0.0.6")],
+        );
+        assert_eq!(client_ip(&headers, &config), "198.51.100.8");
+    }
+
+    #[test]
+    fn malformed_or_oversized_forwarding_headers_are_ignored() {
+        let config = proxy_config(&["10.0.0.0/8"]);
+        for value in [
+            "not-an-ip",
+            "203.0.113.9, not-an-ip",
+            "203.0.113.9,,198.51.100.1",
+            "unknown",
+            "[2001:db8::1",
+            "[2001:db8::1]:not-a-port",
+        ] {
+            let headers = request_headers(Some("10.0.0.5"), &[("x-forwarded-for", value)]);
+            assert_eq!(client_ip(&headers, &config), "10.0.0.5", "{value}");
+        }
+        for value in [
+            "for=_hidden",
+            "for=\"2001:db8::1",
+            "for=203.0.113.9, proto=https",
+            "for=203.0.113.9;for=198.51.100.1",
+        ] {
+            let headers = request_headers(Some("10.0.0.5"), &[("forwarded", value)]);
+            assert_eq!(client_ip(&headers, &config), "10.0.0.5", "{value}");
+        }
+        let oversized = format!("203.0.113.9, {}", "10.0.0.6, ".repeat(200));
+        let headers = request_headers(Some("10.0.0.5"), &[("x-forwarded-for", &oversized)]);
+        assert_eq!(client_ip(&headers, &config), "10.0.0.5");
+        let malformed_forwarded = request_headers(
+            Some("10.0.0.5"),
+            &[
+                ("forwarded", "not valid"),
+                ("x-forwarded-for", "203.0.113.9"),
+            ],
+        );
+        assert_eq!(client_ip(&malformed_forwarded, &config), "203.0.113.9");
+    }
+
+    #[test]
+    fn forwarding_addresses_are_strictly_normalized() {
+        let config = proxy_config(&["10.0.0.0/8"]);
+        let headers = request_headers(
+            Some("10.0.0.5"),
+            &[("x-forwarded-for", "2001:0DB8:0:0:0:0:0:1")],
+        );
+        assert_eq!(client_ip(&headers, &config), "2001:db8::1");
+        let headers = request_headers(
+            Some("10.0.0.5"),
+            &[("forwarded", "for=\"[2001:db8::1]:443\"")],
+        );
+        assert_eq!(client_ip(&headers, &config), "2001:db8::1");
+        let headers = request_headers(Some("10.0.0.5"), &[("x-forwarded-for", "::ffff:192.0.2.1")]);
+        assert_eq!(client_ip(&headers, &config), "192.0.2.1");
     }
 }

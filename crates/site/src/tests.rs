@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 use std::sync::Arc;
 
 use axum::http::StatusCode;
@@ -267,6 +268,43 @@ async fn csrf_and_rate_limit_are_enforced_with_retry_after() {
     let limited = limited.unwrap();
     assert_eq!(limited.status, StatusCode::TOO_MANY_REQUESTS);
     assert!(limited.headers.contains_key("retry-after"));
+}
+
+#[tokio::test]
+async fn spoofed_forwarded_headers_from_an_untrusted_peer_do_not_evade_ip_limits() {
+    let app = TestApp::build();
+    let peer = "198.51.100.7:4242".parse().unwrap();
+    let mut client = app.client().with_peer(peer);
+    let page = client.get("/login/").await;
+    let csrf = client.form_csrf(&page.body);
+    for attempt in 0..10 {
+        client = client.with_forwarded_for(&format!("203.0.113.{}", attempt + 1));
+        let email = format!("limit{attempt}@example.com");
+        let response = client
+            .post(
+                "/login/",
+                &[
+                    ("csrf", csrf.as_str()),
+                    ("email", email.as_str()),
+                    ("password", "wrong password value"),
+                ],
+            )
+            .await;
+        assert_ne!(response.status, StatusCode::TOO_MANY_REQUESTS);
+    }
+    client = client.with_forwarded_for("203.0.113.200");
+    let email = "limit-final@example.com".to_string();
+    let response = client
+        .post(
+            "/login/",
+            &[
+                ("csrf", csrf.as_str()),
+                ("email", email.as_str()),
+                ("password", "wrong password value"),
+            ],
+        )
+        .await;
+    assert_eq!(response.status, StatusCode::TOO_MANY_REQUESTS);
 }
 
 #[tokio::test]

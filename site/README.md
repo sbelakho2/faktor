@@ -86,13 +86,24 @@ then gets `Secure`) or set `FAKTOR_SITE_COOKIE_SECURE=1` explicitly.
 | `FAKTOR_SITE_BASE_URL` | `http://127.0.0.1:8080` | Canonical origin for links and cookies |
 | `FAKTOR_SITE_BIND` | `127.0.0.1:8080` | Axum listener |
 | `FAKTOR_SITE_COOKIE_SECURE` | derived from base URL | Force `Secure` cookies |
-| `FAKTOR_SITE_TRUST_PROXY` | `0` | Trust `X-Forwarded-For`/`X-Real-IP` |
+| `FAKTOR_SITE_TRUSTED_PROXY_CIDRS` | unset (trust none) | Comma-separated IPv4/IPv6 CIDRs of proxies whose `Forwarded`/`X-Forwarded-For` headers are trusted |
 | `FAKTOR_SITE_ADMIN_EMAIL` | unset | Email bootstrapped as platform admin |
 | `FAKTOR_SITE_BILLING_PROVIDER` | `local` | `local` or `mollie` |
 | `FAKTOR_SITE_WEBHOOK_SECRET` | generated for local | Local webhook HMAC secret |
 | `FAKTOR_SITE_PAYMENT_VAULT_KEY` | generated key file | Payment-token sealing key |
 | `FAKTOR_MOLLIE_BASE_URL` | `https://api.mollie.com/v2` | Mollie API base (point at a mock for tests; test mode uses a `test_` key on the same base) |
 | `FAKTOR_MOLLIE_API_KEY` | required for Mollie | Mollie API key (server-side only, never rendered or logged) |
+
+Forwarded client addresses are read only when the immediate TCP peer is inside
+`FAKTOR_SITE_TRUSTED_PROXY_CIDRS`; otherwise the socket peer is used and all
+forwarding headers are ignored. Within a trusted chain the rightmost untrusted
+address becomes the client, malformed or oversized headers are dropped, and
+addresses are normalized before rate-limit keys are derived. Leave the list
+unset when the listener is directly exposed, and list only the proxy's own
+addresses (for example `127.0.0.1/32` for a same-host reverse proxy, or the
+proxy subnet), and make each proxy append the peer it observed (or replace the
+header) before forwarding. An invalid CIDR refuses startup with a typed
+configuration error rather than silently trusting every peer.
 
 Email verification and password-reset messages use a local, mode-0600 outbox
 under `<data-dir>/outbox` by default. The `Mailer` trait is the production
@@ -179,7 +190,11 @@ have no PDF page.
 `docker/site.Dockerfile` builds Zola and the Rust service in stages and runs the
 binary with `/data` for durable SQLite state. The container is configured to
 listen on `0.0.0.0:8080`; set `FAKTOR_SITE_BASE_URL` to the HTTPS origin and mount
-`/data` on durable storage. `.woodpecker/site.yaml` adds the website gates to CI
+`/data` on durable storage. When TLS terminates at a reverse proxy, set
+`FAKTOR_SITE_TRUSTED_PROXY_CIDRS` to that proxy's CIDR(s); never enable
+forwarded-header trust for an internet-facing listener, because clients could
+then choose their own rate-limit identity. Keep the variable unset when the
+service is reached directly. `.woodpecker/site.yaml` adds the website gates to CI
 without touching certification lanes.
 
 Residual: production SMTP delivery (behind `Mailer`), live Mollie test-mode/

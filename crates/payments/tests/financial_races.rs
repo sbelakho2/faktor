@@ -7,11 +7,11 @@ use std::time::Duration;
 
 use faktor_cloud::Clock;
 use faktor_payments::{
-    CancelRequest, ChangePlanRequest, ClaimAcquisition, ConflictDomain, FinancialResourceType,
-    InvoiceStatus, LeaseAcquisition, LeaseClaim, LeaseState, OperationClaimDraft,
-    OperationClaimState, PaymentError, PaymentProvider, PaymentStatus, RefundOutcome, RefundStatus,
-    SqlitePaymentStore, SubscriptionState, TerminalOutcome, UnknownReconciliation,
-    WebhookDisposition,
+    CancelRequest, ChangePlanRequest, ChangeSeatsRequest, ClaimAcquisition, ConflictDomain,
+    FinancialResourceType, InvoiceStatus, LeaseAcquisition, LeaseClaim, LeaseState,
+    OperationClaimDraft, OperationClaimState, PaymentError, PaymentProvider, PaymentStatus,
+    RefundOutcome, RefundStatus, SqlitePaymentStore, SubscriptionState, TerminalOutcome,
+    UnknownReconciliation, WebhookDisposition,
 };
 use support::*;
 
@@ -1559,4 +1559,263 @@ async fn upgrade_during_an_in_flight_cancel_is_refused() {
         ITERATIONS,
         violations.join("\n")
     );
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FenceMutation {
+    ChangePlan,
+    ChangeSeats,
+    Cancel,
+}
+
+impl FenceMutation {
+    const ALL: [FenceMutation; 3] = [
+        FenceMutation::ChangePlan,
+        FenceMutation::ChangeSeats,
+        FenceMutation::Cancel,
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            FenceMutation::ChangePlan => "change_plan",
+            FenceMutation::ChangeSeats => "change_seats",
+            FenceMutation::Cancel => "cancel",
+        }
+    }
+
+    const fn call_kind(self) -> CallKind {
+        match self {
+            FenceMutation::ChangePlan | FenceMutation::ChangeSeats => CallKind::ChangePlan,
+            FenceMutation::Cancel => CallKind::Cancel,
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn payment_webhooks_never_bypass_a_subscription_mutation_fence() {
+    for mutation in FenceMutation::ALL {
+        for failed_webhook in [false, true] {
+            let fx = RaceFixture::new();
+            let subscription = fx.subscribe().await;
+            let method = fx.add_method().await;
+            let invoice = fx.issue_invoice(&subscription.id).await;
+            let provider_payment_id = if failed_webhook {
+                fx.provider.set_charge_status("pending");
+                let pending = fx
+                    .service
+                    .pay_invoice(
+                        &org(),
+                        pay_request(&invoice.id, &method.id, "race-pending-payment"),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(pending.payment.status, PaymentStatus::Pending);
+                pending.payment.provider_payment_id
+            } else {
+                format!("tr_{}_fenced", mutation.label())
+            };
+            let mut past_due = fx.store.subscription(ORG).unwrap().unwrap();
+            past_due.state = SubscriptionState::PastDue;
+            past_due.dunning_attempts = 1;
+            past_due.grace_end_ms = Some(fx.clock.now_ms() + 60_000);
+            fx.store.put_subscription(&past_due).unwrap();
+
+            let kind = mutation.call_kind();
+            let gate = fx.provider.block_before(kind);
+            let service = fx.service.clone();
+            let subscription_id = subscription.id.clone();
+            let task = tokio::spawn(async move {
+                match mutation {
+                    FenceMutation::ChangePlan => service
+                        .change_plan(
+                            &org(),
+                            ChangePlanRequest {
+                                subscription_id,
+                                plan_id: "team".into(),
+                                interval: None,
+                                idempotency_key: "race-fence-change-plan".into(),
+                            },
+                        )
+                        .await
+                        .map(|_| ()),
+                    FenceMutation::ChangeSeats => service
+                        .change_seats(
+                            &org(),
+                            ChangeSeatsRequest {
+                                subscription_id,
+                                quantity: 2,
+                                idempotency_key: "race-fence-change-seats".into(),
+                            },
+                        )
+                        .await
+                        .map(|_| ()),
+                    FenceMutation::Cancel => service
+                        .cancel(
+                            &org(),
+                            CancelRequest {
+                                subscription_id,
+                                at_period_end: false,
+                                idempotency_key: "race-fence-cancel".into(),
+                            },
+                        )
+                        .await
+                        .map(|_| ()),
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(5), fx.provider.wait_before(kind, 1))
+                .await
+                .expect("the subscription mutation did not reach the provider boundary");
+
+            let event_id = format!(
+                "evt_{}_{}",
+                mutation.label(),
+                if failed_webhook {
+                    "failed"
+                } else {
+                    "succeeded"
+                }
+            );
+            let (headers, body) = if failed_webhook {
+                fx.payment_failed_webhook(&provider_payment_id, &invoice.id, &event_id)
+            } else {
+                fx.payment_succeeded_webhook_for_invoice(
+                    &provider_payment_id,
+                    invoice.total_minor,
+                    &invoice.id,
+                    &event_id,
+                )
+            };
+            let delivered = fx
+                .service
+                .handle_webhook(&headers, &body, fx.clock.now_ms())
+                .await;
+
+            let during = fx.store.subscription(ORG).unwrap().unwrap();
+            if failed_webhook {
+                assert!(
+                    matches!(delivered, Err(PaymentError::Conflict(_))),
+                    "{} payment.failed applied inside a held mutation fence: {delivered:?}",
+                    mutation.label()
+                );
+                assert_eq!(
+                    during,
+                    past_due,
+                    "{} payment.failed wrote dunning over a held mutation fence",
+                    mutation.label()
+                );
+                assert_eq!(
+                    fx.invoice(&invoice.id).status,
+                    InvoiceStatus::Open,
+                    "{} deferred payment.failed recorded an invoice effect",
+                    mutation.label()
+                );
+            } else {
+                let outcome = delivered.unwrap();
+                assert_eq!(
+                    outcome.disposition,
+                    WebhookDisposition::Applied,
+                    "{} payment.succeeded was not applied",
+                    mutation.label()
+                );
+                assert_eq!(
+                    during,
+                    past_due,
+                    "{} payment.succeeded overwrote the fenced subscription",
+                    mutation.label()
+                );
+                assert_eq!(
+                    fx.invoice(&invoice.id).status,
+                    InvoiceStatus::Paid,
+                    "{} payment.succeeded did not settle its invoice",
+                    mutation.label()
+                );
+            }
+            assert!(
+                fx.ledger.committed(kind).is_empty(),
+                "{} webhook reached the provider or completed the blocked mutation",
+                mutation.label()
+            );
+
+            gate.open();
+            task.await.unwrap().unwrap();
+            assert_eq!(fx.ledger.committed(kind).len(), 1);
+
+            let final_invoice = fx.invoice(&invoice.id);
+            let final_subscription = fx.store.subscription(ORG).unwrap().unwrap();
+            if failed_webhook {
+                let retried = fx
+                    .service
+                    .handle_webhook(&headers, &body, fx.clock.now_ms())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    retried.disposition,
+                    WebhookDisposition::Applied,
+                    "{} deferred payment.failed was not applied exactly once on retry",
+                    mutation.label()
+                );
+                assert_eq!(
+                    fx.invoice(&invoice.id).status,
+                    InvoiceStatus::PastDue,
+                    "{} retried payment.failed did not dunn the invoice",
+                    mutation.label()
+                );
+                assert_eq!(fx.payments()[0].status, PaymentStatus::Failed);
+                let after = fx.store.subscription(ORG).unwrap().unwrap();
+                match mutation {
+                    FenceMutation::Cancel => {
+                        assert_eq!(after.state, SubscriptionState::Canceled);
+                        assert_eq!(
+                            after.dunning_attempts, past_due.dunning_attempts,
+                            "a canceled subscription must not accrue dunning after the fence"
+                        );
+                    }
+                    FenceMutation::ChangePlan | FenceMutation::ChangeSeats => {
+                        assert_eq!(after.state, SubscriptionState::Canceled);
+                        assert_eq!(after.dunning_attempts, past_due.dunning_attempts + 1);
+                        assert_eq!(after.canceled_ms, Some(fx.clock.now_ms()));
+                    }
+                }
+                assert_eq!(after.grace_end_ms, past_due.grace_end_ms);
+            } else {
+                assert_eq!(
+                    final_invoice.status,
+                    InvoiceStatus::Paid,
+                    "{} payment.succeeded did not remain settled",
+                    mutation.label()
+                );
+                match mutation {
+                    FenceMutation::ChangePlan => {
+                        assert_eq!(final_subscription.plan_id, "team");
+                        assert_eq!(final_subscription.state, SubscriptionState::PastDue);
+                    }
+                    FenceMutation::ChangeSeats => {
+                        assert_eq!(final_subscription.quantity, 2);
+                        assert_eq!(final_subscription.state, SubscriptionState::PastDue);
+                    }
+                    FenceMutation::Cancel => {
+                        assert_eq!(final_subscription.state, SubscriptionState::Canceled);
+                    }
+                }
+                assert_eq!(
+                    final_subscription.dunning_attempts,
+                    past_due.dunning_attempts,
+                    "{} payment.succeeded reset dunning across the fence",
+                    mutation.label()
+                );
+                assert_eq!(final_subscription.grace_end_ms, past_due.grace_end_ms);
+            }
+            let domain = ConflictDomain::SubscriptionMutation {
+                subscription_id: subscription.id.clone(),
+            };
+            assert!(
+                fx.store
+                    .active_for(ORG, &domain, &subscription.id)
+                    .unwrap()
+                    .is_none(),
+                "{} left the subscription mutation fence held",
+                mutation.label()
+            );
+        }
+    }
 }

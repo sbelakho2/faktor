@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=contract isolation=separate-process
 //! rust-analyzer/TypeScript LSP enrichment (feature `lsp`).
 //!
 //! The server is a supervised child (never `std::process::Command` here).
@@ -14,13 +15,13 @@ use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use faktor_core::id::SessionId;
-use faktor_terminal::{ProcessOwner, ProcessSupervisor, SpawnConfig};
+use faktor_terminal::{ProcessSupervisor, SpawnConfig};
 use serde_json::{json, Value};
 
 use crate::model::{
     file_id, symbol_id, Graph, GraphEdge, GraphError, GraphNode, NodeKind, Provenance,
 };
+use crate::ImpactProcessOwner;
 
 const MAX_LSP_FRAME_BYTES: usize = 16 * 1024 * 1024;
 /// After the last observed progress/status activity, wait this long for the
@@ -148,6 +149,7 @@ impl LspSession {
         root: &Path,
         options: &LspOptions,
         supervisor: Arc<ProcessSupervisor>,
+        owner: ImpactProcessOwner,
     ) -> Result<Self, GraphError> {
         let spawned = supervisor
             .spawn_detached_with_pipes(SpawnConfig {
@@ -155,7 +157,9 @@ impl LspSession {
                 args: options.args.clone(),
                 cwd: root.to_path_buf(),
                 env: faktor_terminal::EnvSpec::toolchain(),
-                owner: ProcessOwner::Session(SessionId::new(1)),
+                // The semantic server belongs to a REAL workspace (or the
+                // standalone daemon host), never to a fabricated session.
+                owner: owner.process_owner(),
                 ..Default::default()
             })
             .map_err(|e| GraphError::Malformed(format!("lsp spawn: {e}")))?;
@@ -836,6 +840,7 @@ pub fn enrich_graph(
     paths: &[String],
     options: &LspOptions,
     supervisor: &Arc<ProcessSupervisor>,
+    owner: ImpactProcessOwner,
 ) -> Result<LspStats, GraphError> {
     let mut stats = LspStats::default();
     let selected: Vec<String> = paths
@@ -849,7 +854,7 @@ pub fn enrich_graph(
     }
     let started = Instant::now();
     let expired = || started.elapsed() > options.max_duration;
-    let mut session = match LspSession::start(root, options, supervisor.clone()) {
+    let mut session = match LspSession::start(root, options, supervisor.clone(), owner) {
         Ok(session) => session,
         Err(error) => {
             stats.degraded = true;
@@ -1286,4 +1291,64 @@ fn uri_to_relative(uri: &str, root: &Path) -> Option<String> {
         .strip_prefix(root)
         .ok()
         .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+}
+
+#[cfg(all(test, unix))]
+mod process_ownership_tests {
+    use super::*;
+    use faktor_core::id::{SessionId, WorkspaceId};
+    use faktor_terminal::ProcessOwner;
+    use std::sync::Arc;
+
+    fn private_supervisor() -> (tempfile::TempDir, Arc<ProcessSupervisor>) {
+        let dir = tempfile::tempdir().unwrap();
+        let supervisor =
+            ProcessSupervisor::new(Arc::new(faktor_cas::Cas::new(dir.path().join("cas"))));
+        (dir, supervisor)
+    }
+
+    /// The LSP child is owned by the REAL workspace. Ending user session 1
+    /// must not signal it; workspace teardown is the one owner-scoped kill;
+    /// the reaped registry ends empty (no orphan).
+    #[test]
+    fn lsp_child_is_workspace_owned_and_survives_session_one_teardown() {
+        let (_cas, supervisor) = private_supervisor();
+        let root = tempfile::tempdir().unwrap();
+        let workspace = WorkspaceId::new(777);
+        let options = LspOptions {
+            command: "sleep".into(),
+            args: vec!["300".into()],
+            ..LspOptions::default()
+        };
+        let session = LspSession::start(
+            root.path(),
+            &options,
+            supervisor.clone(),
+            ImpactProcessOwner::Workspace(workspace),
+        )
+        .expect("fake language server spawn");
+        let pid = session.pid;
+        assert!(supervisor.pid_alive(pid));
+        let live = supervisor.alive();
+        assert_eq!(live.len(), 1, "one supervised semantic child: {live:?}");
+        assert_eq!(live[0].owner, ProcessOwner::Workspace(workspace));
+
+        let killed = supervisor.kill_all_for(ProcessOwner::Session(SessionId::new(1)));
+        assert!(
+            killed.is_empty(),
+            "session 1 must not own the semantic server: {killed:?}"
+        );
+        assert!(
+            supervisor.pid_alive(pid),
+            "session-1 teardown must not kill the workspace semantic server"
+        );
+
+        let killed = supervisor.kill_all_for(ProcessOwner::Workspace(workspace));
+        assert_eq!(killed, vec![live[0].id], "workspace teardown reaps it");
+        assert!(!supervisor.pid_alive(pid), "the server must be dead");
+        drop(session);
+        let _ = supervisor.reap();
+        assert!(supervisor.alive().is_empty());
+        assert_eq!(supervisor.registered(), 0, "no orphan registry row");
+    }
 }

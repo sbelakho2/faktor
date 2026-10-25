@@ -13,7 +13,7 @@ use faktor_core::id::WorkspaceId;
 use faktor_fs::{FsEvent, WorkspaceFileService, WorkspaceHandle};
 use faktor_impact::{
     AffectedOptions, BuildOptions, ChangedTarget, GenerationLimits, GraphBuilder, ImpactGraph,
-    ImpactSession, MaterialGeneration, RefreshMode, RefreshPolicy, Revision,
+    ImpactProcessOwner, ImpactSession, MaterialGeneration, RefreshMode, RefreshPolicy, Revision,
 };
 use faktor_semantic::fallback::{ImpactMetadata, ImpactMetadataResult, ImpactedFinding};
 use faktor_semantic::{
@@ -362,7 +362,10 @@ pub async fn graph_command(
     options: GraphOptions,
     supervisor: Arc<faktor_terminal::ProcessSupervisor>,
 ) -> Result<(), String> {
-    let git = faktor_impact::git::GitAdapter::new(supervisor.clone());
+    // The standalone impact CLI is the system semantic host: it has no
+    // durable workspace registration, so its git/LSP children belong to the
+    // daemon scope and no user session can reap them.
+    let git = faktor_impact::git::GitAdapter::new(supervisor.clone(), ImpactProcessOwner::Daemon);
     let root = options.root.canonicalize().map_err(|e| e.to_string())?;
     let revision = match git.revision(&root).await {
         Ok(revision) => revision,
@@ -391,6 +394,7 @@ pub async fn graph_command(
             &paths,
             &faktor_impact::lsp::LspOptions::default(),
             &supervisor,
+            ImpactProcessOwner::Daemon,
         )
         .map_err(|e| e.to_string())?;
         if stats.degraded {
@@ -432,7 +436,7 @@ pub async fn affected_command(
     supervisor: Arc<faktor_terminal::ProcessSupervisor>,
 ) -> Result<(), String> {
     let root = options.root.canonicalize().map_err(|e| e.to_string())?;
-    let git = faktor_impact::git::GitAdapter::new(supervisor.clone());
+    let git = faktor_impact::git::GitAdapter::new(supervisor.clone(), ImpactProcessOwner::Daemon);
     let revision = git.revision(&root).await.map_err(|e| e.to_string())?;
     let mut changed = options.values;
     if changed.is_empty() {
@@ -461,6 +465,7 @@ pub async fn affected_command(
             &paths,
             &faktor_impact::lsp::LspOptions::default(),
             &supervisor,
+            ImpactProcessOwner::Daemon,
         )
         .map_err(|e| e.to_string())?;
         if stats.degraded {

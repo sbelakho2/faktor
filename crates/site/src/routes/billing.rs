@@ -7,16 +7,27 @@ use axum::Form;
 use faktor_cloud::OrganizationId;
 use faktor_payments::{
     AddPaymentMethodRequest, BillingInterval, CancelRequest, Invoice, InvoiceStatus,
-    ProviderCheckout, WebhookDisposition, WebhookHeaders,
+    ProviderCheckoutRequest, WebhookDisposition, WebhookHeaders,
 };
 use serde::Deserialize;
 
 use crate::auth;
-use crate::billing::{self, org_id, CheckoutDraft, CheckoutRecord};
+use crate::billing::{self, org_id, CheckoutRecord};
 use crate::error::{SiteError, SiteResult};
 use crate::security::{looks_like_pan, random_secret, valid_secret_shape};
 use crate::web::{billing_pages, see_other};
 use crate::AppState;
+
+struct CheckoutFenceOwner<'a> {
+    state: &'a AppState,
+    fence_id: &'a str,
+}
+
+impl Drop for CheckoutFenceOwner<'_> {
+    fn drop(&mut self) {
+        self.state.release_checkout_fence(self.fence_id);
+    }
+}
 
 #[derive(Debug, Default, Deserialize)]
 pub struct BillingQuery {
@@ -203,35 +214,154 @@ async fn begin_subscription(
 
 async fn create_checkout_for_invoice(
     state: &AppState,
-    auth: &auth::AuthSession,
+    _auth: &auth::AuthSession,
     org: &OrganizationId,
     invoice: &Invoice,
     request_id: &str,
 ) -> SiteResult<CheckoutRecord> {
-    if !billing::invoice_is_open(invoice) {
-        return Err(SiteError::Conflict("That invoice is not open for payment."));
+    let wait_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut balance_changes = 0_u8;
+    loop {
+        let invoice = state.payments.invoice(org, &invoice.id)?;
+        if !billing::invoice_is_open(&invoice) {
+            return Err(SiteError::Conflict("That invoice is not open for payment."));
+        }
+        let overview = state.payments.overview(org)?;
+        let customer = overview
+            .customer
+            .as_ref()
+            .ok_or_else(|| SiteError::internal_message("billing customer is missing"))?;
+        let plan_id = invoice_plan(&invoice, &overview);
+        let interval =
+            crate::config::interval_name(invoice_interval(&invoice, &overview)).to_string();
+        let fence_id = billing::new_checkout_fence_id();
+        let provider_key = billing::checkout_provider_key(&fence_id);
+        let provider_request = billing::checkout_request(
+            org,
+            &customer.provider_customer_id,
+            &invoice,
+            &plan_id,
+            &state.config.base_url,
+            provider_key.clone(),
+        )?;
+        let provider_request =
+            serde_json::to_string(&provider_request).map_err(SiteError::internal)?;
+        let balance_generation = billing::checkout_balance_generation(&invoice);
+        let draft = billing::CheckoutFenceDraft {
+            id: &fence_id,
+            organization_id: org.as_str(),
+            invoice_id: &invoice.id,
+            balance_generation: &balance_generation,
+            request_id,
+            provider: state.payments.provider_kind().as_str(),
+            provider_idempotency_key: &provider_key,
+            provider_request: &provider_request,
+            plan_id: &plan_id,
+            interval: &interval,
+            amount_minor: invoice.balance_minor(),
+            currency: &invoice.currency,
+            now_ms: state.now_ms(),
+        };
+        let decision = {
+            let mut conn = state.db.conn()?;
+            let decision = billing::acquire_checkout_fence(&mut conn, &draft)?;
+            match decision {
+                billing::CheckoutFenceAcquisition::Pending(fence)
+                    if !state.checkout_fence_is_live(&fence.id) =>
+                {
+                    if fence.balance_generation != balance_generation {
+                        billing::supersede_checkout_fence(
+                            &conn,
+                            org.as_str(),
+                            &fence.id,
+                            state.now_ms(),
+                        )?;
+                        billing::CheckoutFenceAcquisition::Pending(fence)
+                    } else {
+                        let reclaimed = billing::reclaim_pending_checkout_fence(
+                            &mut conn,
+                            &fence,
+                            state.now_ms(),
+                        )?;
+                        if let billing::CheckoutFenceAcquisition::Acquired(fence) = &reclaimed {
+                            state.own_checkout_fence(&fence.id);
+                        }
+                        reclaimed
+                    }
+                }
+                billing::CheckoutFenceAcquisition::Acquired(fence) => {
+                    state.own_checkout_fence(&fence.id);
+                    billing::CheckoutFenceAcquisition::Acquired(fence)
+                }
+                other => other,
+            }
+        };
+        match decision {
+            billing::CheckoutFenceAcquisition::Existing(fence) => {
+                let conn = state.db.conn()?;
+                return billing::checkout_by_id(&conn, org.as_str(), &fence.id)?.ok_or_else(|| {
+                    SiteError::internal_message("the active checkout record is missing")
+                });
+            }
+            billing::CheckoutFenceAcquisition::Pending(_) => {
+                if tokio::time::Instant::now() >= wait_deadline {
+                    return Err(SiteError::Conflict(
+                        "A checkout for this invoice is already being opened; retry shortly.",
+                    ));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            billing::CheckoutFenceAcquisition::Acquired(fence) => {
+                let _owner = CheckoutFenceOwner {
+                    state,
+                    fence_id: &fence.id,
+                };
+                let latest = state.payments.invoice(org, &invoice.id)?;
+                if billing::checkout_balance_generation(&latest) != fence.balance_generation {
+                    let conn = state.db.conn()?;
+                    billing::supersede_checkout_fence(
+                        &conn,
+                        org.as_str(),
+                        &fence.id,
+                        state.now_ms(),
+                    )?;
+                    balance_changes = balance_changes.saturating_add(1);
+                    if balance_changes > 4 {
+                        return Err(SiteError::Conflict(
+                            "The invoice balance is changing; retry the checkout.",
+                        ));
+                    }
+                    continue;
+                }
+                let provider_request: ProviderCheckoutRequest =
+                    serde_json::from_str(&fence.provider_request).map_err(SiteError::internal)?;
+                let provider_checkout =
+                    match state.payments.create_checkout(org, provider_request).await {
+                        Ok(checkout) => checkout,
+                        Err(error) => {
+                            if error.is_definitive_dispatch_failure() {
+                                if let Ok(conn) = state.db.conn() {
+                                    let _ = billing::fail_checkout_fence(
+                                        &conn,
+                                        org.as_str(),
+                                        &fence.id,
+                                        state.now_ms(),
+                                    );
+                                }
+                            }
+                            return Err(error.into());
+                        }
+                    };
+                let mut conn = state.db.conn()?;
+                return billing::activate_checkout_fence(
+                    &mut conn,
+                    &fence,
+                    &provider_checkout,
+                    state.now_ms(),
+                );
+            }
+        }
     }
-    if let Some(existing) = {
-        let conn = state.db.conn()?;
-        billing::checkout_by_idempotency(&conn, org.as_str(), request_id)?
-    } {
-        return Ok(existing);
-    }
-    let overview = state.payments.overview(org)?;
-    let customer = overview
-        .customer
-        .as_ref()
-        .ok_or_else(|| SiteError::internal_message("billing customer is missing"))?;
-    let request = billing::checkout_request(
-        org,
-        &customer.provider_customer_id,
-        invoice,
-        &invoice_plan(invoice, &overview),
-        &state.config.base_url,
-        format!("site-provider-{request_id}"),
-    )?;
-    let provider_checkout = state.payments.create_checkout(org, request).await?;
-    store_checkout(state, auth, org, invoice, request_id, &provider_checkout)
 }
 
 fn invoice_plan(invoice: &Invoice, overview: &faktor_payments::PaymentsOverview) -> String {
@@ -247,46 +377,6 @@ fn invoice_plan(invoice: &Invoice, overview: &faktor_payments::PaymentsOverview)
         .and_then(|line| line.description.split_whitespace().next())
         .unwrap_or("faktor")
         .to_string()
-}
-
-fn store_checkout(
-    state: &AppState,
-    _auth: &auth::AuthSession,
-    org: &OrganizationId,
-    invoice: &Invoice,
-    request_id: &str,
-    provider_checkout: &ProviderCheckout,
-) -> SiteResult<CheckoutRecord> {
-    let url = billing::provider_checkout_url(provider_checkout);
-    let provider = state.payments.provider_kind().as_str();
-    let overview = state.payments.overview(org)?;
-    let plan_id = invoice_plan(invoice, &overview);
-    let interval = crate::config::interval_name(invoice_interval(invoice, &overview)).to_string();
-    let draft = CheckoutDraft {
-        organization_id: org.as_str(),
-        invoice_id: &invoice.id,
-        plan_id: &plan_id,
-        interval: &interval,
-        amount_minor: invoice.balance_minor(),
-        currency: &invoice.currency,
-        provider,
-        idempotency_key: request_id,
-        now_ms: state.now_ms(),
-    };
-    let conn = state.db.conn()?;
-    match billing::insert_checkout(
-        &conn,
-        &draft,
-        Some(provider_checkout.id.as_str()),
-        url.as_deref(),
-    ) {
-        Ok(checkout) => Ok(checkout),
-        Err(SiteError::Internal(_)) => {
-            billing::checkout_by_idempotency(&conn, org.as_str(), request_id)?
-                .ok_or_else(|| SiteError::internal_message("checkout could not be recorded"))
-        }
-        Err(error) => Err(error),
-    }
 }
 
 fn invoice_interval(

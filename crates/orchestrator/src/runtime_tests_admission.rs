@@ -189,6 +189,7 @@ async fn corrupt_registry_row_identity_ids_are_typed_refusals_never_panics() {
         blocker_resolution: None,
         last_progress_ms: None,
         created_ms: 1,
+        revision: 1,
         updated_ms: 1,
         base_snapshot_id: None,
         run_base_snapshot: None,

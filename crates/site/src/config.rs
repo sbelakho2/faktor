@@ -1,3 +1,5 @@
+// TEST-SEPARATION: oracle=contract isolation=pure-unit
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -5,10 +7,13 @@ use faktor_payments::{
     BillingInterval, CurrencySpec, MollieConfig, PaymentsConfig, PlanPrice, PriceCatalogue,
     ProviderKind, SecretString, StaticSecrets, TaxConfig, TaxRate,
 };
+use ipnet::IpNet;
 use thiserror::Error;
 
 const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8080";
 const DEFAULT_BIND: &str = "127.0.0.1:8080";
+const MAX_TRUSTED_PROXY_CIDRS: usize = 64;
+const MAX_TRUSTED_PROXY_CIDR_LEN: usize = 64;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -26,7 +31,7 @@ pub struct Config {
     pub base_url: String,
     pub bind: String,
     pub cookie_secure: bool,
-    pub trust_proxy: bool,
+    pub trusted_proxy_cidrs: Vec<IpNet>,
     pub admin_email: Option<String>,
     pub session_ttl_ms: i64,
     pub idle_ttl_ms: i64,
@@ -61,9 +66,8 @@ impl Config {
         let cookie_secure = std::env::var("FAKTOR_SITE_COOKIE_SECURE")
             .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
             .unwrap_or_else(|_| base_url.starts_with("https://"));
-        let trust_proxy = std::env::var("FAKTOR_SITE_TRUST_PROXY")
-            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        let trusted_proxy_cidrs =
+            parse_trusted_proxy_cidrs(std::env::var("FAKTOR_SITE_TRUSTED_PROXY_CIDRS").ok())?;
         let admin_email = std::env::var("FAKTOR_SITE_ADMIN_EMAIL")
             .ok()
             .map(|email| normalize_email(&email))
@@ -84,7 +88,7 @@ impl Config {
             base_url: validate_base_url(&base_url)?,
             bind,
             cookie_secure,
-            trust_proxy,
+            trusted_proxy_cidrs,
             admin_email,
             session_ttl_ms: 30 * 24 * 60 * 60 * 1000,
             idle_ttl_ms: 7 * 24 * 60 * 60 * 1000,
@@ -131,6 +135,12 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    pub fn trusts_proxy(&self, address: IpAddr) -> bool {
+        self.trusted_proxy_cidrs
+            .iter()
+            .any(|network| network.contains(&address))
     }
 
     pub fn payment_secrets(&self) -> Arc<StaticSecrets> {
@@ -268,6 +278,41 @@ pub fn normalize_email(raw: &str) -> String {
     raw.trim().to_ascii_lowercase()
 }
 
+fn parse_trusted_proxy_cidrs(raw: Option<String>) -> Result<Vec<IpNet>, ConfigError> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut networks = Vec::new();
+    for entry in raw.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            return Err(ConfigError::Invalid(
+                "trusted proxy CIDR list contains an empty entry".into(),
+            ));
+        }
+        if entry.len() > MAX_TRUSTED_PROXY_CIDR_LEN {
+            return Err(ConfigError::Invalid(
+                "trusted proxy CIDR entry is too long".into(),
+            ));
+        }
+        let network = entry.parse::<IpNet>().map_err(|_| {
+            ConfigError::Invalid(format!(
+                "invalid trusted proxy CIDR {entry:?}; expected IPv4 or IPv6 prefix notation"
+            ))
+        })?;
+        if networks.len() >= MAX_TRUSTED_PROXY_CIDRS {
+            return Err(ConfigError::Invalid(
+                "trusted proxy CIDR list exceeds the configured bound".into(),
+            ));
+        }
+        networks.push(network.trunc());
+    }
+    Ok(networks)
+}
+
 fn validate_base_url(raw: &str) -> Result<String, ConfigError> {
     let parsed = url::Url::parse(raw)
         .map_err(|_| ConfigError::Invalid("base URL must be an absolute http(s) URL".into()))?;
@@ -310,4 +355,53 @@ fn restrict_directory(path: &Path) -> Result<(), std::io::Error> {
     #[cfg(not(unix))]
     let _ = path;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trusted_proxy_cidrs_are_empty_by_default() {
+        assert!(parse_trusted_proxy_cidrs(None).unwrap().is_empty());
+        assert!(parse_trusted_proxy_cidrs(Some(String::new()))
+            .unwrap()
+            .is_empty());
+        assert!(parse_trusted_proxy_cidrs(Some("   ".into()))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn trusted_proxy_cidrs_accept_ipv4_and_ipv6_prefixes() {
+        let networks = parse_trusted_proxy_cidrs(Some(
+            " 10.0.0.0/8, 192.168.1.7/24 ,2001:db8::/32,::1/128 ".into(),
+        ))
+        .unwrap();
+        assert_eq!(networks.len(), 4);
+        assert!(networks.contains(&"10.0.0.0/8".parse::<IpNet>().unwrap()));
+        assert!(networks.contains(&"192.168.1.0/24".parse::<IpNet>().unwrap()));
+        assert!(networks.contains(&"2001:db8::/32".parse::<IpNet>().unwrap()));
+        assert!(networks.contains(&"::1/128".parse::<IpNet>().unwrap()));
+    }
+
+    #[test]
+    fn trusted_proxy_cidr_errors_are_typed_and_refuse_startup() {
+        for raw in [
+            "not-a-cidr",
+            "10.0.0.0/33",
+            "2001:db8::/129",
+            "10.0.0.0/8,,192.168.0.0/16",
+            "10.0.0.1",
+        ] {
+            let error = parse_trusted_proxy_cidrs(Some(raw.into())).unwrap_err();
+            assert!(matches!(error, ConfigError::Invalid(_)), "{raw}: {error}");
+        }
+        let too_many = (0..=MAX_TRUSTED_PROXY_CIDRS)
+            .map(|index| format!("10.{index}.0.0/16"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let error = parse_trusted_proxy_cidrs(Some(too_many)).unwrap_err();
+        assert!(matches!(error, ConfigError::Invalid(_)), "{error}");
+    }
 }

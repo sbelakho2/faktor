@@ -124,23 +124,43 @@ fn active_compactions() -> &'static Mutex<HashMap<ActiveKey, CancellationToken>>
     ACTIVE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Register the executor token ONLY when this operation is not already
-/// running in this process. Two concurrent `POST .../compaction` calls with
-/// the same operation id must not run two executors against one durable row.
-fn register_active_if_absent(
-    session: SessionId,
-    operation_id: &str,
-    token: CancellationToken,
-) -> bool {
-    let mut active = active_compactions()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    let key = (session.raw(), operation_id.to_string());
-    if active.contains_key(&key) {
-        return false;
+/// RAII registration of the ONE live executor for a compaction operation.
+///
+/// The in-process liveness registry is the ONLY authority that distinguishes
+/// a live operation from crash residue, so registration must converge with
+/// the executor's whole lifetime. Drop removes the key on every exit path —
+/// normal success, typed error, cancellation and panic/unwind — instead of
+/// relying on an explicit unregister that a panic can skip (which would make
+/// reconciliation believe a live executor exists until restart).
+struct ActiveCompactionGuard {
+    key: ActiveKey,
+}
+
+impl ActiveCompactionGuard {
+    /// Register the executor token ONLY when this operation is not already
+    /// running in this process. Two concurrent `POST .../compaction` calls
+    /// with the same operation id must not run two executors against one
+    /// durable row. `None` means another live executor owns the key.
+    fn register(session: SessionId, operation_id: &str, token: CancellationToken) -> Option<Self> {
+        let mut active = active_compactions()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let key = (session.raw(), operation_id.to_string());
+        if active.contains_key(&key) {
+            return None;
+        }
+        active.insert(key.clone(), token);
+        Some(Self { key })
     }
-    active.insert(key, token);
-    true
+}
+
+impl Drop for ActiveCompactionGuard {
+    fn drop(&mut self) {
+        let mut active = active_compactions()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        active.remove(&self.key);
+    }
 }
 
 fn operation_is_active(session: SessionId, operation_id: &str) -> bool {
@@ -231,13 +251,6 @@ fn cancel_active(session: SessionId, operation_id: &str) -> bool {
         }
         None => false,
     }
-}
-
-fn unregister_active(session: SessionId, operation_id: &str) {
-    let mut active = active_compactions()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    active.remove(&(session.raw(), operation_id.to_string()));
 }
 
 fn operation_json(op: &faktor_session::compaction::CompactionOperation) -> serde_json::Value {
@@ -440,7 +453,8 @@ pub(crate) async fn native_compaction_start(
     // will observe `cancelling`) or the operation does not exist yet
     // (typed 404). That closes the "prepared row with no owner" gap.
     let token = CancellationToken::new();
-    if !register_active_if_absent(handle.id(), &operation_id, token.clone()) {
+    let Some(guard) = ActiveCompactionGuard::register(handle.id(), &operation_id, token.clone())
+    else {
         // Same operation id is already running here: never run a second
         // executor. The current durable state is the truthful answer.
         return match handle.compaction_operation(&operation_id) {
@@ -448,7 +462,7 @@ pub(crate) async fn native_compaction_start(
             Ok(None) => wire_status(not_found("compaction operation")),
             Err(e) => api_err(&e),
         };
-    }
+    };
     let operation = match handle.begin_compaction_operation(
         &operation_id,
         req.target_tokens.unwrap_or(0) as i64,
@@ -457,13 +471,9 @@ pub(crate) async fn native_compaction_start(
         manifest_revision,
     ) {
         Ok(op) => op,
-        Err(e) => {
-            unregister_active(handle.id(), &operation_id);
-            return api_err(&e);
-        }
+        Err(e) => return api_err(&e),
     };
     if operation.is_terminal() {
-        unregister_active(handle.id(), &operation_id);
         return Json(operation_json(&operation)).into_response();
     }
     let outcome = execute_compaction(
@@ -479,7 +489,10 @@ pub(crate) async fn native_compaction_start(
         &token,
     )
     .await;
-    unregister_active(handle.id(), &operation_id);
+    // Unregister the executor as soon as it stops running. Every earlier
+    // return (or panic/unwind inside execute) drops the guard too, so the
+    // registry never outlives the executor it describes.
+    drop(guard);
     let _ = handle.prune_compaction_operations_keep_newest(64);
     match outcome {
         Ok(op) => Json(operation_json(&op)).into_response(),

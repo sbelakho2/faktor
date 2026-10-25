@@ -86,6 +86,34 @@ CREATE TABLE IF NOT EXISTS admin_audit (
 CREATE INDEX IF NOT EXISTS admin_audit_created_idx ON admin_audit(created_ms);
 "#;
 
+const SCHEMA_V2: &str = r#"
+CREATE TABLE IF NOT EXISTS billing_checkout_fences (
+    id TEXT PRIMARY KEY,
+    organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    invoice_id TEXT NOT NULL,
+    balance_generation TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending','open','expired','canceled','paid','superseded','failed')),
+    request_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    provider_idempotency_key TEXT NOT NULL UNIQUE,
+    provider_request TEXT NOT NULL,
+    plan_id TEXT NOT NULL,
+    interval TEXT NOT NULL,
+    amount_minor INTEGER NOT NULL,
+    currency TEXT NOT NULL,
+    provider_checkout_id TEXT,
+    checkout_url TEXT,
+    created_ms INTEGER NOT NULL,
+    updated_ms INTEGER NOT NULL,
+    expires_ms INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS billing_checkout_fences_active
+    ON billing_checkout_fences(organization_id, invoice_id)
+    WHERE status IN ('pending','open');
+CREATE INDEX IF NOT EXISTS billing_checkout_fences_invoice_idx
+    ON billing_checkout_fences(organization_id, invoice_id, created_ms);
+"#;
+
 pub struct Db {
     connection: Mutex<Connection>,
     path: Option<String>,
@@ -113,12 +141,18 @@ impl Db {
             let _: String =
                 connection.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
         }
-        let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let mut version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version < 1 {
             connection.execute_batch(SCHEMA_V1)?;
             connection.pragma_update(None, "user_version", 1)?;
+            version = 1;
         }
-        if version > 1 {
+        if version < 2 {
+            connection.execute_batch(SCHEMA_V2)?;
+            connection.pragma_update(None, "user_version", 2)?;
+            version = 2;
+        }
+        if version > 2 {
             return Err(SiteError::internal_message(
                 "site database was written by a newer schema version",
             ));
@@ -152,7 +186,15 @@ mod tests {
             let version: i64 = conn
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 1);
+            assert_eq!(version, 2);
+            let fence_columns: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM pragma_table_info('billing_checkout_fences') WHERE name IN ('invoice_id','balance_generation','provider_idempotency_key','expires_ms')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(fence_columns, 4);
             let orphan = conn.execute(
                 "INSERT INTO memberships (user_id, organization_id, role, created_ms) VALUES ('u','o','owner',0)",
                 [],

@@ -13,17 +13,18 @@ use std::time::Duration;
 use async_trait::async_trait;
 use faktor_cloud::{ManualClock, OrganizationId};
 use faktor_payments::{
-    sign_local_webhook, AddPaymentMethodRequest, BillingInterval, ConflictDomain, CurrencySpec,
-    DunningConfig, Invoice, IssueInvoiceRequest, LeaseAcquisition, LeaseClaim, OperationClaimState,
-    PayInvoiceRequest, Payment, PaymentError, PaymentProvider, PaymentService, PaymentStatus,
-    PaymentsConfig, PlanPrice, PriceCatalogue, ProviderCancelRequest, ProviderChangePlanRequest,
-    ProviderCharge, ProviderChargeRequest, ProviderCheckout, ProviderCheckoutRequest,
-    ProviderCustomer, ProviderCustomerRequest, ProviderInvoice, ProviderInvoiceRequest,
-    ProviderInvoiceSnapshot, ProviderKind, ProviderReconcileRequest, ProviderReconciled,
-    ProviderRefund, ProviderRefundRequest, ProviderSubscribeRequest, ProviderSubscription,
-    RefundRequest, RefundStatus, SqlitePaymentStore, StaticSecrets, SubscribeRequest,
-    SubscriptionState, TaxConfig, TerminalOutcome, UsageCharge, VerifiedWebhookEvent,
-    WebhookDisposition, WebhookHeaders,
+    sign_local_webhook, AddPaymentMethodRequest, BillingInterval, ClaimAcquisition, ConflictDomain,
+    CurrencySpec, DunningConfig, FinancialResourceType, Invoice, IssueInvoiceRequest,
+    LeaseAcquisition, LeaseClaim, OperationClaimDraft, OperationClaimState, PayInvoiceRequest,
+    Payment, PaymentError, PaymentProvider, PaymentService, PaymentStatus, PaymentsConfig,
+    PlanPrice, PriceCatalogue, ProviderCancelRequest, ProviderChangePlanRequest, ProviderCharge,
+    ProviderChargeRequest, ProviderCheckout, ProviderCheckoutRequest, ProviderCustomer,
+    ProviderCustomerRequest, ProviderInvoice, ProviderInvoiceRequest, ProviderInvoiceSnapshot,
+    ProviderKind, ProviderReconcileRequest, ProviderReconciled, ProviderRefund,
+    ProviderRefundRequest, ProviderSubscribeRequest, ProviderSubscription, RefundRequest,
+    RefundStatus, SqlitePaymentStore, StaticSecrets, SubscribeRequest, SubscriptionState,
+    TaxConfig, TerminalOutcome, UsageCharge, VerifiedWebhookEvent, WebhookDisposition,
+    WebhookHeaders,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -997,6 +998,34 @@ fn failed_payment_webhook(
     )
 }
 
+fn payment_failed_webhook(
+    provider_payment_id: &str,
+    invoice_id: &str,
+) -> (WebhookHeaders, Vec<u8>) {
+    let now_secs = NOW / 1000;
+    let body = serde_json::to_vec(&json!({
+        "id": format!("evt_payment_failed_{provider_payment_id}"),
+        "type": "payment_intent.payment_failed",
+        "created": now_secs,
+        "data": {"object": {
+            "id": provider_payment_id,
+            "status": "failed",
+            "amount": FULL,
+            "currency": "USD",
+            "metadata": {
+                "organization_id": ORG,
+                "local_invoice_id": invoice_id,
+            },
+        }},
+    }))
+    .unwrap();
+    let signature = sign_local_webhook(SECRET, now_secs, &body);
+    (
+        WebhookHeaders::from_pairs([("Stripe-Signature", signature.as_str())]),
+        body,
+    )
+}
+
 fn refund_truth_webhook(
     event_id: &str,
     provider_refund_id: &str,
@@ -1272,6 +1301,121 @@ async fn failed_payment_webhook_fails_the_pending_payment_and_releases_the_fence
     let paid = fx.service.invoice(&org(), &invoice.id).unwrap();
     assert_eq!(paid.amount_paid_minor, FULL);
     assert_eq!(paid.status, faktor_payments::InvoiceStatus::Paid);
+}
+
+#[tokio::test]
+async fn payment_failed_dunning_defers_under_subscription_mutation_fence() {
+    let fx = fixture();
+    let subscription = subscribe(&fx.service, "fence-sub").await;
+    let method = add_method(&fx.service).await;
+    let invoice = issue(&fx.service, &subscription.id).await;
+    fx.provider.set_charge_status("pending");
+    let pending = fx
+        .service
+        .pay_invoice(&org(), pay_request(&invoice.id, &method.id, "pay-failed"))
+        .await
+        .unwrap();
+    assert_eq!(pending.payment.status, PaymentStatus::Pending);
+
+    let key = "payment-failed-fence-holder";
+    let draft = OperationClaimDraft {
+        organization_id: ORG.into(),
+        idempotency_key: key.into(),
+        operation: "change_plan".into(),
+        resource_type: FinancialResourceType::Subscription,
+        resource_id: subscription.id.clone(),
+        request_digest: "payment-failed-digest".into(),
+        provider_idempotency_key: format!("{key}:change-plan"),
+        context: "{}".into(),
+        created_ms: NOW,
+    };
+    assert!(matches!(
+        fx.store.claim_operation(&draft).unwrap(),
+        ClaimAcquisition::Acquired
+    ));
+    let domain = ConflictDomain::SubscriptionMutation {
+        subscription_id: subscription.id.clone(),
+    };
+    let lease = match fx
+        .store
+        .try_acquire(
+            ORG,
+            &domain,
+            &subscription.id,
+            &LeaseClaim::new(key, key, "payment-failed-digest"),
+            None,
+        )
+        .unwrap()
+    {
+        LeaseAcquisition::Held(lease) => lease,
+        other => panic!("expected a held subscription mutation fence, got {other:?}"),
+    };
+
+    let (headers, body) = payment_failed_webhook(&pending.payment.provider_payment_id, &invoice.id);
+    let refused = fx
+        .service
+        .handle_webhook(&headers, &body, NOW)
+        .await
+        .expect_err("a held plan/seat/cancel mutation must defer the failed-payment webhook");
+    assert!(matches!(refused, PaymentError::Conflict(_)));
+    assert_eq!(
+        fx.service.invoice(&org(), &invoice.id).unwrap().status,
+        faktor_payments::InvoiceStatus::Open,
+        "a deferred webhook records no invoice effect"
+    );
+    assert_eq!(
+        fx.service.payments(&org(), 10).unwrap()[0].status,
+        PaymentStatus::Pending,
+        "a deferred webhook records no payment effect"
+    );
+    let fenced = fx.store.subscription(ORG).unwrap().unwrap();
+    assert_eq!(
+        fenced.state,
+        SubscriptionState::Active,
+        "a deferred webhook never writes dunning over the fenced mutation"
+    );
+    assert_eq!(fenced.dunning_attempts, 0);
+    assert!(fenced.grace_end_ms.is_none());
+    assert!(fenced.canceled_ms.is_none());
+
+    fx.store
+        .fail_claim(ORG, key, "conflict", "test fence release", NOW)
+        .unwrap();
+    fx.store.release_no_effect(ORG, &lease.id).unwrap();
+
+    let applied = fx
+        .service
+        .handle_webhook(&headers, &body, NOW)
+        .await
+        .unwrap();
+    assert_eq!(
+        applied.disposition,
+        WebhookDisposition::Applied,
+        "the unrecorded webhook must apply once on retry, never as a duplicate"
+    );
+    let failed_subscription = fx.store.subscription(ORG).unwrap().unwrap();
+    assert_eq!(failed_subscription.state, SubscriptionState::PastDue);
+    assert_eq!(failed_subscription.dunning_attempts, 1);
+    assert!(failed_subscription.grace_end_ms.is_some());
+    assert_eq!(
+        fx.service.invoice(&org(), &invoice.id).unwrap().status,
+        faktor_payments::InvoiceStatus::PastDue
+    );
+    assert_eq!(
+        fx.service.payments(&org(), 10).unwrap()[0].status,
+        PaymentStatus::Failed
+    );
+    assert!(fx
+        .store
+        .active_for(
+            ORG,
+            &ConflictDomain::InvoicePayment {
+                invoice_id: invoice.id.clone()
+            },
+            &invoice.id
+        )
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]

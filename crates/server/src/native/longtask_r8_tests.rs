@@ -207,6 +207,12 @@ async fn acceptance_a15_long_task_compaction_operation_contract() {
         "post-compaction inspection cites the durable summary revision: {started}"
     );
     assert!(started["result"]["reduction"].as_f64().unwrap() >= 0.25);
+    // Normal success converges registration: the executor guard removed the
+    // key before the response was produced (no explicit unregister path).
+    assert!(
+        !super::operation_is_active(handle.id(), "op-accept-1"),
+        "a completed executor must not remain registered"
+    );
     // The replacement context is the NEWEST suffix, not the store's
     // newest-first row order: the active user prompt must survive and the
     // oldest turn must be archived.
@@ -380,6 +386,10 @@ async fn acceptance_a15_long_task_compaction_operation_contract() {
     assert_eq!(refused["state"], "refused");
     assert_eq!(refused["terminal"], true);
     assert_eq!(refused["result"]["accepted"], false);
+    assert!(
+        !super::operation_is_active(handle.id(), "op-refuse"),
+        "a refused (error-shaped) terminal outcome must not remain registered"
+    );
     let rejected = refused["result"]["rejectedReason"].as_str().unwrap();
     assert!(
         rejected.contains("target") || rejected.contains("compactor rejected"),
@@ -1259,5 +1269,152 @@ fn manual_compaction_restart_and_tool_excerpt_guards_are_pinned() {
     assert!(
         !manual_compaction_guards_present(&no_excerpt),
         "the witness must detect a regression to the erased tool-result key"
+    );
+}
+
+/// RAII convergence: normal success, a typed error return and cancellation
+/// all remove the live-executor registration, and a second registration for
+/// the same key is refused until the first guard drops.
+#[test]
+fn active_executor_guard_removes_registration_on_success_error_and_cancel() {
+    let session = faktor_core::id::SessionId::new(9_001);
+    let token = faktor_core::cancellation::CancellationToken::new();
+    {
+        let guard = super::ActiveCompactionGuard::register(session, "op-success", token.clone())
+            .expect("first registration wins");
+        assert!(super::operation_is_active(session, "op-success"));
+        assert!(
+            super::ActiveCompactionGuard::register(session, "op-success", token).is_none(),
+            "one durable row must never get two live executors"
+        );
+        drop(guard);
+    }
+    assert!(
+        !super::operation_is_active(session, "op-success"),
+        "normal success must unregister"
+    );
+    assert!(
+        super::ActiveCompactionGuard::register(
+            session,
+            "op-success",
+            faktor_core::cancellation::CancellationToken::new()
+        )
+        .is_some(),
+        "the key is reusable after the first executor ended"
+    );
+
+    let session = faktor_core::id::SessionId::new(9_002);
+    let result: Result<(), &str> = {
+        let _guard = super::ActiveCompactionGuard::register(
+            session,
+            "op-error",
+            faktor_core::cancellation::CancellationToken::new(),
+        )
+        .expect("error-path registration");
+        assert!(super::operation_is_active(session, "op-error"));
+        Err("execute failed")
+    };
+    assert_eq!(result, Err("execute failed"));
+    assert!(
+        !super::operation_is_active(session, "op-error"),
+        "an error return must unregister"
+    );
+
+    let session = faktor_core::id::SessionId::new(9_003);
+    let token = faktor_core::cancellation::CancellationToken::new();
+    let guard = super::ActiveCompactionGuard::register(session, "op-cancel", token.clone())
+        .expect("cancel-path registration");
+    assert!(super::cancel_active(session, "op-cancel"));
+    assert!(token.is_cancelled());
+    assert!(
+        super::operation_is_active(session, "op-cancel"),
+        "cancellation only signals; the executor guard still owns liveness"
+    );
+    drop(guard);
+    assert!(
+        !super::operation_is_active(session, "op-cancel"),
+        "a cancelled executor must unregister on drop"
+    );
+}
+
+/// Panic/unwind inside the executor must drop the guard. The durable row is
+/// deliberately non-terminal; once the registration is gone, the status read
+/// reconciles the residue to `cancelled` instead of reporting a spinner until
+/// restart.
+#[tokio::test]
+async fn panic_during_execute_removes_registration_and_reconciliation_heals() {
+    let rig = Rig::new().await;
+    let handle = rig.handle();
+    let session = handle.id();
+    handle
+        .begin_compaction_operation("op-unwind", 0, 0.25, None, None)
+        .expect("prepared durable row");
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = super::ActiveCompactionGuard::register(
+            session,
+            "op-unwind",
+            faktor_core::cancellation::CancellationToken::new(),
+        )
+        .expect("executor registration");
+        assert!(super::operation_is_active(session, "op-unwind"));
+        panic!("executor panicked after registration");
+    }));
+    assert!(
+        unwound.is_err(),
+        "the panic must propagate through the test"
+    );
+    assert!(
+        !super::operation_is_active(session, "op-unwind"),
+        "an unwound executor must not leave a live registration"
+    );
+    let path = format!(
+        "/native/session/{}/context/compaction/op-unwind",
+        rig.session
+    );
+    let (status, body) = rig.send(reqwest::Method::GET, &path, None).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["state"], "cancelled",
+        "reconciliation must heal the residue after unwind: {body}"
+    );
+    assert_eq!(body["terminal"], true);
+    let _ = rig.handle.request_shutdown();
+}
+
+/// CASE MC-COMPACTION-RAII-GUARD (mutation witness): executor registration
+/// must be a Drop-owning guard with no manual unregister path left in the
+/// start route. Both mutations (deleted Drop, reintroduced manual
+/// registration) must make the witness fail.
+fn active_compaction_registration_is_raii(source: &str) -> bool {
+    source.contains("struct ActiveCompactionGuard")
+        && source.contains("impl Drop for ActiveCompactionGuard")
+        && source.contains("active.remove(&self.key);")
+        && source
+            .contains("ActiveCompactionGuard::register(handle.id(), &operation_id, token.clone())")
+        && !source.contains("unregister_active(")
+}
+
+#[test]
+fn active_compaction_registration_is_raii_and_mutation_sensitive() {
+    const SOURCE: &str = include_str!("longtask.rs");
+    assert!(
+        active_compaction_registration_is_raii(SOURCE),
+        "executor registration must be RAII (Drop removes the key)"
+    );
+    let no_drop = SOURCE.replace(
+        "impl Drop for ActiveCompactionGuard",
+        "impl GuardTeardown for ActiveCompactionGuard",
+    );
+    assert!(
+        !active_compaction_registration_is_raii(&no_drop),
+        "the witness must detect a removed Drop implementation"
+    );
+    let manual = SOURCE.replace(
+        "ActiveCompactionGuard::register(handle.id(), &operation_id, token.clone())",
+        "legacy_register_active_if_absent(handle.id(), &operation_id, token.clone())",
+    );
+    assert!(
+        !active_compaction_registration_is_raii(&manual),
+        "the witness must detect a reintroduced manual registration path"
     );
 }

@@ -1,0 +1,16 @@
+{
+  "id": "INV-BILLING-CHECKOUT-INVOICE-FENCE",
+  "surface": "payments.billing",
+  "file": "crates/site/src/billing.rs",
+  "find": "                if fence.balance_generation == draft.balance_generation\n                    && fence.expires_ms > draft.now_ms\n                {",
+  "replace": "                if false {",
+  "gate": "cargo test -p faktor-site --lib hosted_checkout_duplicate_requests_share_one_provider_object",
+  "expect": "FAILED",
+  "note": "A hosted checkout that ignores its invoice/balance fence mints a second provider checkout for two different request keys on one open balance; the one-object oracle must fail.",
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! `ledger` in-file unit tests (split from `ledger.rs` to stay under the
 //! source-size ceiling; module identity and `super::*` visibility unchanged).
 
@@ -329,6 +330,93 @@ fn memory_facts_upsert_and_query() {
     let facts = store.memory_facts(s.id).unwrap();
     assert_eq!(facts.len(), 1, "upsert must not duplicate");
     assert_eq!(facts[0].2, "rust+tokio");
+}
+
+/// The grouped CAS that makes handoff delivery exactly-once: two writers
+/// that both observed an ABSENT watermark can never both land, a stale
+/// expected value is refused byte-for-byte, and the section + watermark
+/// group is written atomically by the winner.
+#[test]
+fn memory_facts_cas_group_has_one_winner_and_rejects_stale_expected() {
+    use std::sync::{Arc, Barrier};
+    let (_d, store) = tmp_store();
+    let store = Arc::new(store);
+    let ws = store.create_workspace("/w").unwrap();
+    let s = store.create_session(ws, "t", "p", "m").unwrap();
+    let kind = "internal_context";
+    let section_key = "child-handoff/run/child-0";
+    let watermark_key = "child-handoff-delivered/run/child-0";
+    let barrier = Arc::new(Barrier::new(2));
+    let mut threads = Vec::new();
+    for _ in 0..2 {
+        let store = store.clone();
+        let barrier = barrier.clone();
+        threads.push(std::thread::spawn(move || {
+            barrier.wait();
+            let facts = [
+                (kind, section_key, "section"),
+                (kind, watermark_key, "rev:3"),
+            ];
+            store
+                .upsert_memory_facts_if_unchanged(s.id, kind, watermark_key, None, &facts)
+                .unwrap()
+        }));
+    }
+    let winners = threads
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .filter(|landed| *landed)
+        .count();
+    assert_eq!(winners, 1, "exactly one concurrent claim may land");
+    assert_eq!(
+        store
+            .get_memory_fact(s.id, kind, watermark_key)
+            .unwrap()
+            .unwrap()
+            .value,
+        "rev:3"
+    );
+    assert_eq!(
+        store
+            .get_memory_fact(s.id, kind, section_key)
+            .unwrap()
+            .unwrap()
+            .value,
+        "section"
+    );
+    // A stale expected watermark (the prior generation) loses.
+    let stale = [
+        (kind, section_key, "older section"),
+        (kind, watermark_key, "rev:4"),
+    ];
+    assert!(!store
+        .upsert_memory_facts_if_unchanged(s.id, kind, watermark_key, Some("rev:2"), &stale)
+        .unwrap());
+    assert_eq!(
+        store
+            .get_memory_fact(s.id, kind, watermark_key)
+            .unwrap()
+            .unwrap()
+            .value,
+        "rev:3",
+        "the stale writer must not overwrite the delivered generation"
+    );
+    // The exact observed bytes win and replace the group.
+    let next = [
+        (kind, section_key, "next section"),
+        (kind, watermark_key, "rev:4"),
+    ];
+    assert!(store
+        .upsert_memory_facts_if_unchanged(s.id, kind, watermark_key, Some("rev:3"), &next)
+        .unwrap());
+    assert_eq!(
+        store
+            .get_memory_fact(s.id, kind, watermark_key)
+            .unwrap()
+            .unwrap()
+            .value,
+        "rev:4"
+    );
 }
 
 #[test]

@@ -4500,6 +4500,7 @@ fn craft_child_row(
         blocker_resolution: None,
         last_progress_ms: None,
         created_ms: 1,
+        revision: 1,
         updated_ms: 1,
         base_snapshot_id: None,
         run_base_snapshot: None,
@@ -5234,8 +5235,7 @@ fn poisoned_exec_mirror_recovers_and_serves_reads() {
     }));
     assert!(poisoned.is_err(), "the poisoner must unwind");
     assert!(env.orchestrator.exec.is_poisoned());
-    // OWNERSHIP projection => reconciled recovery: the next read path
-    // serves the durable truth (no such child) instead of panicking.
+    // OWNERSHIP projection => reconciled recovery: the read path serves durable truth.
     let err = env
         .orchestrator
         .locate_child("missing-child")

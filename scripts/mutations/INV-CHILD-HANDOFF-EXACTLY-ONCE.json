@@ -2,11 +2,11 @@
   "id": "INV-CHILD-HANDOFF-EXACTLY-ONCE",
   "surface": "agent.communication",
   "file": "crates/orchestrator/src/runtime_handoff.rs",
-  "find": "        let watermark = child.updated_ms.to_string();",
-  "replace": "        let watermark = \"0\".to_string();",
-  "gate": "cargo test -p faktor-orchestrator --lib fault_probe_crash_before_parent_handoff_reattach_heals_exactly_once",
+  "find": "        let watermark = handoff_watermark(child.revision);",
+  "replace": "        let watermark = handoff_watermark(child.updated_ms as u64);",
+  "gate": "cargo test -p faktor-orchestrator --lib same_millisecond_retry_done_reattach_delivers_done_once",
   "expect": "FAILED",
-  "note": "A stale delivery watermark loses the exact terminal-state binding, so re-attach cannot tell an already-consumed handoff from an undelivered one; the exactly-once oracle must fail.",
+  "note": "Replacing the revision watermark with the wall-clock `updated_ms` reproduces the same-millisecond defect: a retried child's Done transition shares the failed delivery's timestamp, so re-attach suppresses the newer terminal result. The revision-watermark oracle must fail.",
   "capabilities": [
     "orchestrator.handoff_exactly_once"
   ],

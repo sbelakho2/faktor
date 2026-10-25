@@ -31,6 +31,40 @@ pub mod topology;
 pub mod git;
 #[cfg(feature = "lsp")]
 pub mod lsp;
+
+/// Who owns an impact semantic subprocess (git or LSP).
+///
+/// These children are workspace or system resources, NEVER session
+/// resources: a placeholder session id made ending session 1 kill semantic
+/// subprocesses shared by every session. The two legitimate scopes are the
+/// REAL workspace (workspace teardown reaps the child) and the standalone
+/// daemon/CLI host that has no durable workspace registry entry.
+#[cfg(any(feature = "git", feature = "lsp"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImpactProcessOwner {
+    /// Workspace-scoped semantic child: `ProcessOwner::Workspace(id)`.
+    Workspace(faktor_core::id::WorkspaceId),
+    /// The standalone system/daemon host: no user session owns the child.
+    Daemon,
+}
+
+#[cfg(any(feature = "git", feature = "lsp"))]
+impl ImpactProcessOwner {
+    pub fn process_owner(self) -> faktor_terminal::ProcessOwner {
+        match self {
+            Self::Workspace(workspace) => faktor_terminal::ProcessOwner::Workspace(workspace),
+            Self::Daemon => faktor_terminal::ProcessOwner::Daemon,
+        }
+    }
+}
+
+#[cfg(any(feature = "git", feature = "lsp"))]
+impl From<faktor_core::id::WorkspaceId> for ImpactProcessOwner {
+    fn from(workspace: faktor_core::id::WorkspaceId) -> Self {
+        Self::Workspace(workspace)
+    }
+}
+
 #[cfg(feature = "lsp")]
 pub use lsp::{enrich_graph, LspOptions, LspStats};
 

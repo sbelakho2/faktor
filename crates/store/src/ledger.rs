@@ -1779,6 +1779,67 @@ impl Store {
         })
     }
 
+    /// Atomically replace a GROUP of memory facts only when the named CAS
+    /// fact still holds `expected_value` (or is absent when `None`). The
+    /// comparison and every write share ONE transaction, so two concurrent
+    /// callers that observed the same prior value can never both land — the
+    /// exactly-once claim a durable delivery watermark needs. Returns
+    /// `false` (nothing written) when the fact appeared or changed since the
+    /// caller read it.
+    pub fn upsert_memory_facts_if_unchanged(
+        &self,
+        session_id: SessionId,
+        kind: &str,
+        key: &str,
+        expected_value: Option<&str>,
+        facts: &[(&str, &str, &str)],
+    ) -> StoreResult<bool> {
+        if facts.is_empty() {
+            return Ok(false);
+        }
+        let kind = kind.to_owned();
+        let key = key.to_owned();
+        let expected = expected_value.map(str::to_owned);
+        let fact_stamp = self.fact_timestamp();
+        let facts: Vec<(String, String, String)> = facts
+            .iter()
+            .map(|(kind, key, value)| (kind.to_string(), key.to_string(), value.to_string()))
+            .collect();
+        self.writer
+            .execute("upsert_memory_facts_if_unchanged", move |conn| {
+                let tx = conn.unchecked_transaction()?;
+                let current: Option<String> = tx
+                    .query_row(
+                        "SELECT value FROM memory_fact
+                         WHERE session_id = ?1 AND kind = ?2 AND key = ?3",
+                        params![session_id.raw() as i64, &kind, &key],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                let unchanged = match (&expected, &current) {
+                    (None, None) => true,
+                    (Some(expected), Some(current)) => expected == current,
+                    _ => false,
+                };
+                if !unchanged {
+                    return Ok(false);
+                }
+                for (kind, key, value) in facts {
+                    tx.execute(
+                        "INSERT INTO memory_fact(session_id, kind, key, value, updated_ms)
+                         VALUES (?1, ?2, ?3, ?4, ?5)
+                         ON CONFLICT(session_id, kind, key) DO UPDATE SET
+                             value = excluded.value,
+                             updated_ms = excluded.updated_ms
+                         WHERE memory_fact.value IS NOT excluded.value",
+                        params![session_id.raw() as i64, kind, key, value, fact_stamp],
+                    )?;
+                }
+                tx.commit()?;
+                Ok(true)
+            })
+    }
+
     /// Read ONE memory fact with its CAS timestamp (`updated_ms`). `None`
     /// means the fact does not exist.
     pub fn get_memory_fact(

@@ -3,7 +3,8 @@
 use std::path::PathBuf;
 
 use faktor_impact::{
-    AffectedOptions, ChangedTarget, GraphBuilder, ImpactGraph, LspOptions, Revision,
+    AffectedOptions, ChangedTarget, GraphBuilder, ImpactGraph, ImpactProcessOwner, LspOptions,
+    Revision,
 };
 
 static LIVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -51,6 +52,7 @@ fn fault_live_rust_analyzer_relationships() {
             ..LspOptions::default()
         },
         &supervisor,
+        ImpactProcessOwner::Daemon,
     )
     .unwrap();
     assert!(!stats.degraded, "lsp degraded: {:?}", stats.note);
@@ -116,6 +118,7 @@ fn fault_live_rust_analyzer_this_repository() {
             ..LspOptions::default()
         },
         &supervisor,
+        ImpactProcessOwner::Daemon,
     )
     .unwrap();
     eprintln!(

@@ -967,6 +967,58 @@ impl RaceFixture {
         )
     }
 
+    pub fn payment_succeeded_webhook_for_invoice(
+        &self,
+        provider_payment_id: &str,
+        amount_minor: i64,
+        invoice_id: &str,
+        event_id: &str,
+    ) -> (WebhookHeaders, Vec<u8>) {
+        let now_secs = self.clock.now_ms() / 1000;
+        let body = serde_json::to_vec(&serde_json::json!({
+            "id": event_id,
+            "type": "payment_intent.succeeded",
+            "created": now_secs,
+            "data": {"object": {
+                "id": provider_payment_id,
+                "amount": amount_minor,
+                "status": "succeeded",
+                "metadata": {"organization_id": ORG, "local_invoice_id": invoice_id},
+            }},
+        }))
+        .unwrap();
+        let signature = sign_local_webhook(WEBHOOK_SECRET, now_secs, &body);
+        (
+            WebhookHeaders::from_pairs([("Stripe-Signature", signature.as_str())]),
+            body,
+        )
+    }
+
+    pub fn payment_failed_webhook(
+        &self,
+        provider_payment_id: &str,
+        invoice_id: &str,
+        event_id: &str,
+    ) -> (WebhookHeaders, Vec<u8>) {
+        let now_secs = self.clock.now_ms() / 1000;
+        let body = serde_json::to_vec(&serde_json::json!({
+            "id": event_id,
+            "type": "payment_intent.payment_failed",
+            "created": now_secs,
+            "data": {"object": {
+                "id": provider_payment_id,
+                "status": "failed",
+                "metadata": {"organization_id": ORG, "local_invoice_id": invoice_id},
+            }},
+        }))
+        .unwrap();
+        let signature = sign_local_webhook(WEBHOOK_SECRET, now_secs, &body);
+        (
+            WebhookHeaders::from_pairs([("Stripe-Signature", signature.as_str())]),
+            body,
+        )
+    }
+
     pub async fn deliver_payment_succeeded(
         &self,
         provider_payment_id: &str,

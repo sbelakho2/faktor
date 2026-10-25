@@ -318,6 +318,7 @@ fn main() {
                 blocker_resolution: None,
                 last_progress_ms: None,
                 created_ms: index as i64 + 1,
+                revision: 1,
                 updated_ms: index as i64 + 1,
                 base_snapshot_id: None,
                 run_base_snapshot: None,

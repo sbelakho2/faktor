@@ -2567,13 +2567,42 @@ release_critical = true
 platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
+id = "INV-BILLING-CHECKOUT-INVOICE-FENCE"
+statement = "A hosted checkout is bound to one invoice and one durable balance generation: before the provider is called, one invoice-scoped fence is acquired transactionally, so two simultaneous requests with different idempotency keys create exactly one provider checkout and both receive the same provider id/url; the fence is replaceable only after expiry, cancellation, payment or a genuine balance generation change, and a crash after the fence reconciles through the persisted provider request without a second provider object."
+owner = "crates/site hosted checkout + crates/payments checkout creation"
+authority = "crates/site/src/billing.rs acquire_checkout_fence/activate_checkout_fence"
+unit_test = "hosted_checkout_duplicate_requests_share_one_provider_object"
+production_wiring = "hosted_checkout_duplicate_requests_share_one_provider_object"
+fault = ""
+mutation_witness = "hosted_checkout_duplicate_requests_share_one_provider_object"
+mutation_command = "node scripts/mutation-run.mjs INV-BILLING-CHECKOUT-INVOICE-FENCE"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-BILLING-PAYMENT-FAILED-DUNNING-FENCE"
+statement = "Every payment.failed webhook effect that would mutate subscription state (payment status, PastDue, grace and dunning attempts/cancelation) checks the SubscriptionMutation authority transactionally; under a held plan/seat/cancel mutation the event is refused unrecorded, the fenced subscription is byte-identical while it is held, and the event applies in order exactly once on retry after the fence is released."
+owner = "crates/payments webhook settlement"
+authority = "crates/payments/src/service/webhook_effects.rs payment.failed subscription mutation fence"
+unit_test = "payment_failed_dunning_defers_under_subscription_mutation_fence"
+production_wiring = "payment_failed_dunning_defers_under_subscription_mutation_fence"
+fault = ""
+mutation_witness = "payment_failed_dunning_defers_under_subscription_mutation_fence"
+mutation_command = "node scripts/mutation-run.mjs INV-BILLING-PAYMENT-FAILED-DUNNING-FENCE"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
 id = "INV-CHILD-HANDOFF-EXACTLY-ONCE"
-statement = "A child's terminal handoff and its delivery watermark are one durable binding: re-attach heals a crash before delivery exactly once and never resurrects a consumed handoff."
+statement = "A child's terminal handoff and its delivery watermark are one durable binding on the child's monotonic transition revision: re-attach heals a crash before delivery exactly once, delivers a newer terminal generation even when it shares the failed generation's millisecond, and never resurrects a consumed handoff."
 owner = "crates/orchestrator child handoff"
 authority = "crates/orchestrator/src/runtime_handoff.rs deliver_child_handoff/heal_pending_child_handoffs"
 unit_test = "fault_probe_crash_before_parent_handoff_reattach_heals_exactly_once"
 production_wiring = "parent_continuation_receives_structured_child_handoff_not_the_raw_transcript"
 fault = ""
+mutation_witness = "same_millisecond_retry_done_reattach_delivers_done_once"
 mutation_command = "node scripts/mutation-run.mjs INV-CHILD-HANDOFF-EXACTLY-ONCE"
 mutation_debt = ""
 release_critical = true
@@ -2740,6 +2769,32 @@ unit_test = "cancelled_child_reports_an_explicit_cancelled_handoff"
 production_wiring = "parent_continuation_receives_structured_child_handoff_not_the_raw_transcript"
 mutation_witness = "cancelled_child_reports_an_explicit_cancelled_handoff"
 mutation_command = "node scripts/mutation-run.mjs INV-HANDOFF-CANCELLED"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-IMPACT-SEMANTIC-OWNER"
+statement = "Impact LSP and git children are owned by the REAL workspace (or the standalone daemon/system host), never a fabricated session: ending user session 1 cannot kill them, while workspace teardown is an owner-scoped kill and the adapter leaves no live orphan."
+owner = "crates/impact semantic git/lsp"
+authority = "crates/impact/src/git.rs GitAdapter::new; crates/impact/src/lsp.rs LspSession::start"
+unit_test = "lsp_child_is_workspace_owned_and_survives_session_one_teardown"
+production_wiring = "git_children_are_workspace_owned_and_immune_to_session_one"
+mutation_witness = "impact_semantic_spawn_owners_are_workspace_scoped_and_mutation_sensitive"
+mutation_command = "node scripts/mutation-run.mjs INV-IMPACT-SEMANTIC-OWNER"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-COMPACTION-EXECUTOR-RAII"
+statement = "A compaction executor registration is RAII: normal success, typed error, cancellation and panic/unwind all remove the live-executor key, so stale-row reconciliation heals instead of believing a dead executor is alive until restart."
+owner = "crates/server compaction surface"
+authority = "crates/server/src/native/longtask.rs ActiveCompactionGuard"
+unit_test = "active_executor_guard_removes_registration_on_success_error_and_cancel"
+production_wiring = "acceptance_a15_long_task_compaction_operation_contract"
+mutation_witness = "active_compaction_registration_is_raii_and_mutation_sensitive"
+mutation_command = "node scripts/mutation-run.mjs INV-COMPACTION-EXECUTOR-RAII"
 mutation_debt = ""
 release_critical = true
 platforms = ["linux", "macos", "windows"]

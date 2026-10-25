@@ -39,6 +39,7 @@ async fn child_id_collision_across_live_runs_is_a_typed_conflict() {
         blocker_resolution: None,
         last_progress_ms: None,
         created_ms: 0,
+        revision: 0,
         updated_ms: 0,
         base_snapshot_id: None,
         run_base_snapshot: None,

@@ -1,8 +1,8 @@
 {
   "schema": "faktor-test-programme-registry/v1",
-  "generated_at": "2026-10-25T11:35:31.781Z",
-  "commit": "22ab79fcb6918feee3ed781e24e40deda63f8ace",
-  "tree": "37ba2b049a2fdf93a07b2384725fbc6bcdfc1f35",
+  "generated_at": "2026-10-25T15:50:02.092Z",
+  "commit": "ebeff825afea162a0d82f42762af9ea959fb872c",
+  "tree": "7ba4a1e99a1b0b9e893c7323040243872471ac4a",
   "layers": [
     "structural",
     "unit",
@@ -19,7 +19,7 @@
     "release"
   ],
   "counts": {
-    "rows": 1013,
+    "rows": 1017,
     "by_kind": {
       "acceptance-scenario": 40,
       "act-now": 8,
@@ -28,7 +28,7 @@
       "cli-command": 49,
       "config-key": 53,
       "control": 200,
-      "invariant": 191,
+      "invariant": 195,
       "jetbrains-contribution": 1,
       "native-route": 299,
       "provider-adapter": 6,
@@ -38,22 +38,22 @@
       "workflow": 16
     },
     "by_status": {
-      "deferred": 940,
+      "deferred": 944,
       "proven": 5,
       "stub": 68
     },
     "by_lane": {
-      "nightly": 545,
-      "pull": 682,
-      "trusted": 1012,
+      "nightly": 549,
+      "pull": 686,
+      "trusted": 1016,
       "weekly-live": 342
     },
     "by_layer": {
       "agent-evals": 1,
       "contracts": 436,
       "ide-screen-readers": 385,
-      "state-model-crash": 289,
-      "unit-property": 274
+      "state-model-crash": 293,
+      "unit-property": 278
     }
   },
   "rows": [
@@ -12610,6 +12610,36 @@
       "evidence": null
     },
     {
+      "id": "invariant.INV-BILLING-CHECKOUT-INVOICE-FENCE",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "hosted_checkout_duplicate_requests_share_one_provider_object"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-BILLING-CHECKOUT-INVOICE-FENCE",
+        "unit_test": "hosted_checkout_duplicate_requests_share_one_provider_object",
+        "wiring_test": "hosted_checkout_duplicate_requests_share_one_provider_object"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
       "id": "invariant.INV-BILLING-DUNNING-INVOICE-MONOTONIC",
       "kind": "invariant",
       "path": "tests/invariants.toml",
@@ -12693,6 +12723,36 @@
         "mutation": "node scripts/mutation-run.mjs INV-BILLING-LEASE-CLAIM-LOOKUP",
         "unit_test": "held_lease_for_claim_returns_only_the_indexed_match",
         "wiring_test": "held_lease_key_lookup_uses_the_idempotency_index"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-BILLING-PAYMENT-FAILED-DUNNING-FENCE",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "payment_failed_dunning_defers_under_subscription_mutation_fence"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-BILLING-PAYMENT-FAILED-DUNNING-FENCE",
+        "unit_test": "payment_failed_dunning_defers_under_subscription_mutation_fence",
+        "wiring_test": "payment_failed_dunning_defers_under_subscription_mutation_fence"
       },
       "adversarial": [
         "planted-mutation",
@@ -14002,6 +14062,37 @@
       "evidence": null
     },
     {
+      "id": "invariant.INV-COMPACTION-EXECUTOR-RAII",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "acceptance_a15_long_task_compaction_operation_contract",
+        "active_executor_guard_removes_registration_on_success_error_and_cancel"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-COMPACTION-EXECUTOR-RAII",
+        "unit_test": "active_executor_guard_removes_registration_on_success_error_and_cancel",
+        "wiring_test": "acceptance_a15_long_task_compaction_operation_contract"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
       "id": "invariant.INV-COMPACTION-MANUAL-DIGEST",
       "kind": "invariant",
       "path": "tests/invariants.toml",
@@ -14975,6 +15066,37 @@
         "mutation": "node scripts/mutation-run.mjs INV-IMPACT-BOUNDED-QUERY",
         "unit_test": "bounded_results_always_reserve_a_test_slot",
         "wiring_test": "crate_expansion_is_conservative_but_bounded"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-IMPACT-SEMANTIC-OWNER",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "git_children_are_workspace_owned_and_immune_to_session_one",
+        "lsp_child_is_workspace_owned_and_survives_session_one_teardown"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-IMPACT-SEMANTIC-OWNER",
+        "unit_test": "lsp_child_is_workspace_owned_and_survives_session_one_teardown",
+        "wiring_test": "git_children_are_workspace_owned_and_immune_to_session_one"
       },
       "adversarial": [
         "planted-mutation",

@@ -1,0 +1,28 @@
+{
+  "id": "INV-IMPACT-SEMANTIC-OWNER",
+  "surface": "task.intelligence",
+  "files": [
+    {
+      "file": "crates/impact/src/git.rs",
+      "find": "            owner: owner.process_owner(),",
+      "replace": "            owner: faktor_terminal::ProcessOwner::Session(faktor_core::id::SessionId::new(1)),"
+    },
+    {
+      "file": "crates/impact/src/lsp.rs",
+      "find": "                owner: owner.process_owner(),",
+      "replace": "                owner: faktor_terminal::ProcessOwner::Session(faktor_core::id::SessionId::new(1)),"
+    }
+  ],
+  "note": "Reintroducing the fabricated session-1 owner on both impact semantic spawn sites reproduces the kill-sharing defect: ending user session 1 would reap LSP/git children shared by every session. The ownership witness must fail.",
+  "gate": "cargo test -p faktor-impact --features runtime --test semantic_ownership",
+  "expect": "FAILED",
+  "capabilities": [
+    "impact.semantic_process_ownership"
+  ],
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}
