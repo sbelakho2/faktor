@@ -8,5 +8,7 @@
   "note": "A lenient float parse invents retry-after values from hostile input.",
   "capabilities": [
     "acquire.retry_after"
-  ]
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

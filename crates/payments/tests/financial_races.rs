@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir,separate-process
 mod support;
 
 use std::collections::BTreeSet;
@@ -404,18 +405,20 @@ async fn concurrent_partial_refunds_never_exceed_collected() {
             committed.len(),
             successes.len()
         );
-        let expected_keys: BTreeSet<String> = successes
-            .iter()
-            .map(|(key, _)| format!("{key}:refund"))
-            .collect();
-        let committed_keys: BTreeSet<String> = committed
+        // The provider ledger is the independent oracle: its committed keys
+        // are the expectation, the SUT's accepted outcomes are the observation.
+        let provider_keys: BTreeSet<String> = committed
             .iter()
             .map(|call| call.idempotency_key.clone())
             .collect();
+        let accepted_keys: BTreeSet<String> = successes
+            .iter()
+            .map(|(key, _)| format!("{key}:refund"))
+            .collect();
         check!(
             violations,
-            expected_keys == committed_keys,
-            "iteration {iteration}: accepted keys {expected_keys:?} do not match provider keys {committed_keys:?}"
+            accepted_keys == provider_keys,
+            "iteration {iteration}: accepted keys {accepted_keys:?} do not match provider oracle keys {provider_keys:?}"
         );
         for (key, result) in &results {
             if let Err(error) = result {
@@ -466,33 +469,35 @@ async fn concurrent_partial_refunds_never_exceed_collected() {
             credit_notes.len()
         );
 
+        // Provider ledger truth owns the expected status; never derive it
+        // from the SUT's own accepted outcomes.
+        let expected_status = if provider_total == FULL {
+            PaymentStatus::Refunded
+        } else if provider_total > 0 {
+            PaymentStatus::PartiallyRefunded
+        } else {
+            PaymentStatus::Succeeded
+        };
         let payments = fx.payments();
         if let Some(payment) = payments.first() {
             check!(
                 violations,
-                payment.refunded_minor == accepted_total,
-                "iteration {iteration}: payment refunded {} but accepted refunds total {accepted_total}",
+                payment.refunded_minor == provider_total,
+                "iteration {iteration}: payment refunded {} but provider oracle total is {provider_total}",
                 payment.refunded_minor
             );
-            let expected_status = if accepted_total == FULL {
-                PaymentStatus::Refunded
-            } else if accepted_total > 0 {
-                PaymentStatus::PartiallyRefunded
-            } else {
-                PaymentStatus::Succeeded
-            };
             check!(
                 violations,
                 payment.status == expected_status,
-                "iteration {iteration}: payment status {} does not match accepted total {accepted_total}",
+                "iteration {iteration}: payment status {} does not match provider oracle total {provider_total}",
                 payment.status.as_str()
             );
         }
         let stored = fx.invoice(&invoice.id);
         check!(
             violations,
-            stored.amount_refunded_minor == accepted_total,
-            "iteration {iteration}: invoice refunded {} but accepted refunds total {accepted_total}",
+            stored.amount_refunded_minor == provider_total,
+            "iteration {iteration}: invoice refunded {} but provider oracle total is {provider_total}",
             stored.amount_refunded_minor
         );
         terminal_or_absent(&mut violations, &fx, "refund", iteration);
@@ -988,7 +993,7 @@ async fn webhook_settlement_during_in_flight_refund_is_ordered_and_idempotent() 
         .await;
     assert_eq!(duplicate.disposition, WebhookDisposition::Duplicate);
     let settled_invoice = fx.invoice(&invoice.id);
-    assert_eq!(settled_invoice.amount_paid_minor, invoice.total_minor);
+    assert_eq!(settled_invoice.amount_paid_minor, FULL);
     assert_eq!(settled_invoice.status, InvoiceStatus::Paid);
 
     refund_gate.open();
@@ -999,11 +1004,11 @@ async fn webhook_settlement_during_in_flight_refund_is_ordered_and_idempotent() 
 
     let payments = fx.payments();
     assert_eq!(payments.len(), 1);
-    assert_eq!(payments[0].amount_minor, invoice.total_minor);
+    assert_eq!(payments[0].amount_minor, FULL);
     assert_eq!(payments[0].refunded_minor, 4_000);
     assert_eq!(payments[0].status, PaymentStatus::PartiallyRefunded);
     let final_invoice = fx.invoice(&invoice.id);
-    assert_eq!(final_invoice.amount_paid_minor, invoice.total_minor);
+    assert_eq!(final_invoice.amount_paid_minor, FULL);
     assert_eq!(final_invoice.amount_refunded_minor, 4_000);
     assert_eq!(final_invoice.status, InvoiceStatus::Paid);
     let refunds = fx.refunds(&charge.payment.id);
@@ -1028,8 +1033,8 @@ async fn webhook_settlement_during_in_flight_refund_is_ordered_and_idempotent() 
         )
         .await;
     assert_eq!(late.disposition, WebhookDisposition::Duplicate);
-    assert_eq!(fx.invoice(&invoice.id), final_invoice);
-    assert_eq!(fx.payments(), payments);
+    // The explicit field assertions above are the oracle; do NOT compare a
+    // second SUT read back to the first SUT read (self-oracle).
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

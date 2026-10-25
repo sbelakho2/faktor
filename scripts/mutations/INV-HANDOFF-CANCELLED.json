@@ -1,0 +1,15 @@
+{
+  "id": "INV-HANDOFF-CANCELLED",
+  "surface": "agent.communication",
+  "file": "crates/orchestrator/src/runtime_handoff.rs",
+  "find": "        if !matches!(\n            child.state,\n            ChildState::Done | ChildState::Failed | ChildState::Cancelled\n        ) {\n            return;\n        }",
+  "replace": "        if !matches!(child.state, ChildState::Done | ChildState::Failed) {\n            return;\n        }",
+  "gate": "cargo test -p faktor-orchestrator --lib cancelled_child_reports_an_explicit_cancelled_handoff",
+  "expect": "FAILED",
+  "note": "Removing Cancelled from the delivered terminal set turns a cancelled child into silence, so the parent infers no result instead of the typed `outcome: cancelled`; the INV-HANDOFF-CANCELLED oracle must fail.",
+  "capabilities": [
+    "orchestrator.handoff_cancelled_terminal"
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+}

@@ -2778,6 +2778,15 @@ impl SessionHandle {
                 _ => {}
             }
         }
+        // ONE index pass over the progress rows: the old per-transaction
+        // filter scanned the whole progress stream for every prepared txn
+        // (O(txns * progress) on a long edit-heavy session). The index is
+        // consumed by the open set below; terminal transactions' progress is
+        // validated but never emitted.
+        let mut progress_by_txn: BTreeMap<u64, Vec<ProgressRow>> = BTreeMap::new();
+        for row in progress {
+            progress_by_txn.entry(row.txn_id).or_default().push(row);
+        }
         // Assemble the OPEN transactions (prepared, never terminaled).
         let mut out: Vec<EditTxnOpenRow> = Vec::new();
         for (txn_id, (files, session, strategy)) in &prepared {
@@ -2785,7 +2794,7 @@ impl SessionHandle {
                 continue;
             }
             let mut progress_rows: Vec<EditTxnOpenProgress> = Vec::new();
-            for row in progress.iter().filter(|r| &r.txn_id == txn_id) {
+            for row in progress_by_txn.remove(txn_id).unwrap_or_default() {
                 let idx = usize::try_from(row.seq).map_err(|_| {
                     malformed_row("edit_txn_progress", &format!("seq {} overflows", row.seq))
                 })?;

@@ -4,6 +4,9 @@
   "find": "    return this.request('POST', '/native/session', {",
   "replace": "    return this.request('POST', '/session/create', {",
   "gate": "node --no-warnings --experimental-loader ./scripts/mutations/vscode-ts-loader.mjs apps/vscode/scripts/selftest.mjs",
+  "expect": "FAIL",
   "timeout_ms": 180000,
-  "note": "The client create route drifts back to the retired /session/create path; the daemon-router drift scan must fail."
+  "note": "The client create route drifts back to the retired /session/create path; the daemon-router drift scan must fail.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

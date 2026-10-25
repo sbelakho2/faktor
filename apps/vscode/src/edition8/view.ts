@@ -412,27 +412,64 @@ function sessionUsageText(snapshot: E8Snapshot): string | null {
 
 function routeSummary(snapshot: E8Snapshot, key: 'local' | 'hosted'): string | null {
   const route = objectAt(snapshot.usage, key);
-  if (route === null) return null;
-  const tokens = numberAt(route, 'tokens') ?? numberAt(route, 'totalTokens');
-  const cost = moneyMicro(
-    objectAt(route, 'costMicro') ?? objectAt(route, 'spentMicro') ?? null,
-  );
-  const state = text(route, 'state', 'status');
+  if (route !== null) {
+    const tokens = numberAt(route, 'tokens') ?? numberAt(route, 'totalTokens');
+    const cost = moneyMicro(
+      objectAt(route, 'costMicro') ?? objectAt(route, 'spentMicro') ?? null,
+    );
+    const state = text(route, 'state', 'status');
+    const parts: string[] = [];
+    if (tokens !== null) parts.push(`${exactNumber(tokens)} tokens`);
+    if (cost !== 'Unavailable') parts.push(cost);
+    if (state !== null) parts.push(state);
+    if (parts.length > 0) return parts.join(' · ');
+  }
+  // The billing fold is scoped by managed/BYOK money, not by route. The
+  // outcome ledger is the real route authority, so a missing legacy route
+  // block falls back to its served run cohorts instead of inventing zero.
+  const metrics = objectAt(snapshot.outcomes, 'metrics');
+  if (metrics === null) return null;
   const parts: string[] = [];
-  if (tokens !== null) parts.push(`${exactNumber(tokens)} tokens`);
-  if (cost !== 'Unavailable') parts.push(cost);
-  if (state !== null) parts.push(state);
-  return parts.length === 0 ? 'Served; no measured counters.' : parts.join(' · ');
+  if (key === 'local') {
+    const only = numberAt(metrics, 'localOnlyRuns');
+    const final = numberAt(metrics, 'localFinalRuns');
+    if (only !== null) parts.push(`${exactNumber(only)} local-only runs`);
+    if (final !== null) parts.push(`${exactNumber(final)} local-final runs`);
+    const state = text(metrics, 'localMeasurement');
+    if (state !== null) parts.push(`local classification ${state}`);
+  } else {
+    const hosted = numberAt(metrics, 'hostedOnlyRuns');
+    const withSteps = numberAt(metrics, 'runsWithSteps');
+    if (hosted !== null) parts.push(`${exactNumber(hosted)} hosted-only runs`);
+    if (withSteps !== null) parts.push(`${exactNumber(withSteps)} runs with steps`);
+  }
+  return parts.length === 0 ? null : parts.join(' · ');
 }
 
 function quotaSummary(snapshot: E8Snapshot): string | null {
-  const quota = text(snapshot.entitlements, 'quota');
-  const status = text(snapshot.entitlements, 'status');
-  const plan = text(snapshot.entitlements, 'plan_id', 'planId');
+  const entitlements = snapshot.entitlements;
+  if (entitlements === null) return null;
+  const limits = objectAt(entitlements, 'limits');
   const parts: string[] = [];
+  const plan = text(entitlements, 'plan_id', 'planId');
   if (plan !== null) parts.push(plan);
-  if (quota !== null) parts.push(quota);
+  const tokens = numberAt(limits, 'max_tokens_per_period');
+  if (tokens !== null) parts.push(`${exactNumber(tokens)} tokens/period`);
+  const managed =
+    stringAt(limits, 'max_managed_spend_micro_per_period') ??
+    numberAt(limits, 'max_managed_spend_micro_per_period');
+  if (managed !== null) parts.push(`${moneyMicro(managed)} managed cap`);
+  const minCredit =
+    stringAt(limits, 'min_credit_balance_micro') ??
+    numberAt(limits, 'min_credit_balance_micro');
+  if (minCredit !== null) parts.push(`${moneyMicro(minCredit)} credit floor`);
+  const active = booleanAt(entitlements, 'subscription_active');
+  const status = active === false ? 'inactive' : text(entitlements, 'subscription_status', 'status');
   if (status !== null) parts.push(status);
+  if (parts.length === 0) {
+    const quota = text(entitlements, 'quota');
+    if (quota !== null) parts.push(quota);
+  }
   return parts.length === 0 ? null : parts.join(' · ');
 }
 
@@ -769,19 +806,37 @@ function rowsForScreen(screenId: string, snapshot: E8Snapshot | null): readonly 
     case 'S53':
     case 'S27':
     case 'S54': {
-      const verified = (() => {
-        const value = numberAt(snapshot.outcomes, 'verifiedLandedChanges') ?? numberAt(snapshot.outcomes, 'verified_landed');
-        return value === null ? null : exactNumber(value);
-      })();
-      const failed = (() => {
-        const value = numberAt(snapshot.outcomes, 'failedAttempts') ?? numberAt(snapshot.outcomes, 'failed');
-        return value === null ? null : exactNumber(value);
-      })();
-      const vcsc = moneyMicro(
-        text(snapshot.outcomes, 'vcsc', 'vcscMicro') ?? text(snapshot.usage, 'vcsc'),
+      const metrics = objectAt(snapshot.outcomes, 'metrics');
+      const numberMetric = (...keys: string[]): number | null => {
+        for (const key of keys) {
+          const value = numberAt(metrics, key) ?? numberAt(snapshot.outcomes, key);
+          if (value !== null) return value;
+        }
+        return null;
+      };
+      const textMetric = (...keys: string[]): string | null => {
+        for (const key of keys) {
+          const value = text(metrics, key) ?? text(snapshot.outcomes, key);
+          if (value !== null) return value;
+        }
+        return null;
+      };
+      const verifiedCount = numberMetric('verifiedChanges', 'verifiedLandedChanges', 'verified_landed');
+      const verified = verifiedCount === null ? null : exactNumber(verifiedCount);
+      const runsCount = numberMetric('runs');
+      const runs = runsCount === null ? null : exactNumber(runsCount);
+      const moneyComplete = numberMetric('verifiedChangesMoneyComplete');
+      const vcscRaw = moneyMicro(
+        textMetric('verifiedCostPerSuccessfulChangeMicro', 'vcsc', 'vcscMicro') ??
+          text(snapshot.usage, 'vcsc'),
       );
+      const vcsc =
+        moneyComplete === 0
+          ? 'Unavailable (no money-settled verified changes)'
+          : vcscRaw;
       const spend = moneyMicro(
-        objectAt(snapshot.usage, 'attemptedSpendMicro') ??
+        textMetric('totalSpendMicro') ??
+          objectAt(snapshot.usage, 'attemptedSpendMicro') ??
           objectAt(snapshot.usage, 'attempted_micro') ??
           null,
       );
@@ -803,13 +858,13 @@ function rowsForScreen(screenId: string, snapshot: E8Snapshot | null): readonly 
         cap('gpu', 'GPU cost', 'Unavailable (not measured; never assumed zero)', 'unavailable');
         cap('spend', 'Attempted spend', spend);
         cap('verified', 'Verified landed changes', verified, verified === null ? 'unavailable' : 'served', 'S53');
-        cap('vcsc', 'Cost per verified change', vcsc, vcsc === 'Unavailable' ? 'unavailable' : 'served', 'S53');
+        cap('vcsc', 'Cost per verified change', vcsc, vcsc.startsWith('Unavailable') ? 'unavailable' : 'served', 'S53');
         cap('account', 'Account', account);
         return rows;
       }
       if (screenId === 'S53') {
-        cap('vcsc', 'Cost per verified change', vcsc, vcsc === 'Unavailable' ? 'unavailable' : 'served');
-        cap('failed', 'Failed/cancelled attempts', failed);
+        cap('vcsc', 'Cost per verified change', vcsc, vcsc.startsWith('Unavailable') ? 'unavailable' : 'served');
+        cap('runs', 'Recorded runs', runs);
         cap('spend', 'Attempted spend (eligible)', spend);
         cap('local', 'Local inference', local ?? 'Unavailable (not zero)');
         cap('hosted', 'Provider API', hosted ?? 'Unavailable (not zero)');
@@ -820,8 +875,8 @@ function rowsForScreen(screenId: string, snapshot: E8Snapshot | null): readonly 
       }
       cap('spend', 'Attempted spend', spend);
       cap('verified', 'Verified landed changes', verified);
-      cap('vcsc', 'Cost per verified change', vcsc, vcsc === 'Unavailable' ? 'unavailable' : 'served', 'S53');
-      cap('failed', 'Failed/cancelled attempts', failed);
+      cap('vcsc', 'Cost per verified change', vcsc, vcsc.startsWith('Unavailable') ? 'unavailable' : 'served', 'S53');
+      cap('runs', 'Recorded runs', runs);
       cap('local', 'Local inference', local ?? 'Unavailable (not zero)');
       cap('hosted', 'Provider API', hosted ?? 'Unavailable (not zero)');
       cap('quota', 'Subscription quota', quota);

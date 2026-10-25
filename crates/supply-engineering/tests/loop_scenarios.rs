@@ -551,10 +551,12 @@ fn capacitor_alternate_is_rejected_on_dielectric_esr_and_ripple() {
     ))
     .unwrap();
 
+    let integrity = outcome
+        .verify_integrity_only()
+        .expect("the fixture outcome must satisfy its own integrity bindings");
     assert!(
-        outcome.is_self_verified(),
-        "verification: {:?}",
-        outcome.verify_integrity_only()
+        integrity.receipt_valid && integrity.result_digest_matches,
+        "verification: {integrity:?}"
     );
     assert!(matches!(
         outcome.decision.recommended_action,
@@ -616,7 +618,7 @@ fn a_stored_result_survives_json_roundtrip_and_verifies() {
     let decoded: LoopOutcome = serde_json::from_str(&encoded).unwrap();
     let verification = decoded.verify_integrity_only().unwrap();
     assert!(
-        decoded.is_self_verified(),
+        verification.receipt_valid && verification.result_digest_matches,
         "roundtrip verification: {verification:?}"
     );
 }
@@ -791,10 +793,12 @@ fn tolerance_relaxation_updates_engineering_revision_and_supply_terms() {
     let signer = ReceiptSigner::generate();
     let outcome =
         faktor_supply_engineering::run_with_authority(&loop_request, &signer, &authority).unwrap();
+    let integrity = outcome
+        .verify_integrity_only()
+        .expect("the fixture outcome must satisfy its own integrity bindings");
     assert!(
-        outcome.is_self_verified(),
-        "verification: {:?}",
-        outcome.verify_integrity_only()
+        integrity.receipt_valid && integrity.result_digest_matches,
+        "verification: {integrity:?}"
     );
     assert_eq!(outcome.applied_relaxations.len(), 1);
     assert_eq!(outcome.requirement_set.revision, RevisionId::new(8));
@@ -858,10 +862,12 @@ fn cheaper_unit_price_loses_on_moq_freight_quality_and_cash() {
     );
     let outcome = run_ephemeral(&request(vec![incumbent, cheap], engineering, vec![])).unwrap();
 
+    let integrity = outcome
+        .verify_integrity_only()
+        .expect("the fixture outcome must satisfy its own integrity bindings");
     assert!(
-        outcome.is_self_verified(),
-        "verification: {:?}",
-        outcome.verify_integrity_only()
+        integrity.receipt_valid && integrity.result_digest_matches,
+        "verification: {integrity:?}"
     );
     assert_eq!(outcome.ranked[0].0, "incumbent");
     let recommended_total = outcome
@@ -955,10 +961,12 @@ fn one_thousand_candidates_rank_exactly_with_bounded_evaluations() {
         vec![],
     ))
     .unwrap();
+    let integrity = outcome
+        .verify_integrity_only()
+        .expect("the fixture outcome must satisfy its own integrity bindings");
     assert!(
-        outcome.is_self_verified(),
-        "verification: {:?}",
-        outcome.verify_integrity_only()
+        integrity.receipt_valid && integrity.result_digest_matches,
+        "verification: {integrity:?}"
     );
     // Breaks if candidates are dropped, double-ranked, or the ranked window is unbounded.
     assert_eq!(outcome.performance.evaluated_candidates, 1_000);
@@ -1151,6 +1159,7 @@ fn daemon_trusted_verification_refuses_a_foreign_signing_key() {
     )
     .unwrap();
     let trusted = ReceiptVerifier::trusting_key_id(&signer.key_id()).unwrap();
+    // TEST-SEPARATION-EXEMPT: self-attestation — the verifier is an independent trust anchor loaded from the isolated data dir; this checks the public authority contract, never a self-attested shortcut.
     assert!(outcome.is_verified(&trusted));
 
     // An attacker-signed outcome is self-consistent (its own key verifies its
@@ -1177,6 +1186,7 @@ fn daemon_trusted_verification_refuses_a_foreign_signing_key() {
     .unwrap();
     let forged: LoopOutcome =
         serde_json::from_str(&serde_json::to_string(&forged).unwrap()).unwrap();
+    // TEST-SEPARATION-EXEMPT: self-attestation — negative control: the attacker receipt is observed only to prove the trusted verifier refuses it immediately below.
     assert!(forged.is_self_verified(), "attacker receipt is self-signed");
     assert!(
         !forged.is_verified(&trusted),
@@ -1191,6 +1201,7 @@ fn ephemeral_mode_is_explicit_and_self_consistent_only() {
     let facts = capacitor_facts("baseline", 50.0, 1.2, "X7R", Some(2_000.0));
     let candidate = candidate("baseline", 1, facts, "1.00", "100.00", 100, 100, 30);
     let ephemeral = run_ephemeral(&request(vec![candidate], engineering, vec![])).unwrap();
+    // TEST-SEPARATION-EXEMPT: self-attestation — negative control: an ephemeral receipt is observed as self-consistent only to prove the data-dir trust set refuses it below.
     assert!(ephemeral.is_self_verified());
 
     let dir = tempfile::tempdir().unwrap();
@@ -1200,8 +1211,8 @@ fn ephemeral_mode_is_explicit_and_self_consistent_only() {
         ephemeral.verify_with_verifier(&trusted).is_err(),
         "an ephemeral key can never satisfy the data-dir trust set"
     );
+    // TEST-SEPARATION-EXEMPT: self-attestation — negative control: ephemeral self-consistency is followed by the trusted-verifier refusal asserted above.
     assert!(ephemeral.is_self_verified());
-    assert!(ephemeral.is_verified_with_verifier(&ReceiptVerifier::self_attested()));
 }
 
 #[test]
@@ -1219,6 +1230,7 @@ fn persistent_supply_decision_verifies_after_a_restart() {
     // A fresh process loads only durable state: the key file and history.
     let verifier = engineering_core::load_trusted_verifier(dir.path()).unwrap();
     let decoded: LoopOutcome = serde_json::from_slice(&stored).unwrap();
+    // TEST-SEPARATION-EXEMPT: self-attestation — the verifier is the durable data-dir trust anchor, not the receipt's own key; this asserts the restart authority contract.
     assert!(decoded.is_verified(&verifier));
 }
 
@@ -1525,6 +1537,7 @@ fn a_model_validity_override_is_bound_into_the_supply_response_and_receipts() {
         .unwrap();
     let outcome = run_with_authority(&overridden, &signer, &authority).unwrap();
     let verifier = ReceiptVerifier::trusting_key_id(&signer.key_id()).unwrap();
+    // TEST-SEPARATION-EXEMPT: self-attestation — the verifier is the independent data-dir trust anchor for the signed override payload.
     assert!(outcome.is_verified(&verifier));
     let selection = match &outcome.response.as_ref().unwrap().theory.state {
         GateState::Established(theory) => theory.selection.as_ref().unwrap(),
@@ -1740,10 +1753,12 @@ fn supplier_and_engineering_text_injection_is_data_only_and_executes_nothing() {
         outcome.authorization.orders_and_messages_require_grant,
         "orders/messages stay behind the explicit grant gate"
     );
+    let integrity = outcome
+        .verify_integrity_only()
+        .expect("injected text must not break deterministic integrity");
     assert!(
-        outcome.is_self_verified(),
-        "injected text must not break deterministic verification: {:?}",
-        outcome.verify_integrity_only()
+        integrity.receipt_valid && integrity.result_digest_matches,
+        "injected text must not break deterministic verification: {integrity:?}"
     );
 }
 

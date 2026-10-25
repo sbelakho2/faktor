@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=separate-process,read-only-artifacts
 // Revision 8 acceptance overlays (A01-A40) for the JetBrains host.
 //
 // Each row records a real host observation: the mapped screen(s) must build,

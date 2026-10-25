@@ -18,8 +18,11 @@
     }
   ],
   "gate": "cargo test -p faktor-pty --lib control_pipe_is_cloexec_at_creation",
+  "expect": "FAILED",
   "capabilities": [
     "pty.authority"
   ],
-  "note": "Forges the control pipe WITHOUT O_CLOEXEC on every implementation the host compiles: pipe2(..., 0) and both O_CLOEXEC FIFO opens. The creation-instant seam oracle observes the unprotected descriptors on pipe2 platforms AND on the Darwin FIFO platform, so a concurrently spawned child can hold either end on either host."
+  "note": "Forges the control pipe WITHOUT O_CLOEXEC on every implementation the host compiles: pipe2(..., 0) and both O_CLOEXEC FIFO opens. The creation-instant seam oracle observes the unprotected descriptors on pipe2 platforms AND on the Darwin FIFO platform, so a concurrently spawned child can hold either end on either host.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

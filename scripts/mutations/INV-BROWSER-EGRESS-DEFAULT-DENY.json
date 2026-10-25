@@ -8,5 +8,7 @@
   "note": "Inverting the default-deny first-party allowlist check blocks allowed hosts and admits unknowns.",
   "capabilities": [
     "browser.egress"
-  ]
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

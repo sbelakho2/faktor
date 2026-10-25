@@ -8,5 +8,7 @@
   "note": "Negating the doctor issue-count condition inverts its exit-code contract.",
   "capabilities": [
     "cli.surface"
-  ]
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

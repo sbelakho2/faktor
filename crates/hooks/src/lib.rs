@@ -1839,6 +1839,7 @@ mod tests {
         let daemon_dir = tempfile::tempdir().unwrap();
         let other = tempfile::tempdir().unwrap();
         let previous = std::env::current_dir().unwrap();
+        // TEST-SEPARATION-EXEMPT: shared-state — this test process exclusively owns and restores its cwd; the assertion is that the daemon cwd is NOT used.
         std::env::set_current_dir(daemon_dir.path()).unwrap();
         let hook_root = tempfile::tempdir().unwrap();
         let r = HookRegistry::try_new().unwrap();
@@ -1858,6 +1859,7 @@ mod tests {
             ..Default::default()
         };
         let verdict = r.run(HookEvent::PreTool, &input);
+        // TEST-SEPARATION-EXEMPT: shared-state — restoration of the test process's own cwd (see above).
         std::env::set_current_dir(previous).unwrap();
         assert!(matches!(verdict, HookVerdict::Allow), "{verdict:?}");
         let audit = r.audit();

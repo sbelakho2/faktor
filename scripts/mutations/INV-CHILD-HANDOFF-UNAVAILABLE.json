@@ -5,5 +5,7 @@
   "replace": "        let legacy = HandoffData::available(handle.get_task_ledger().ok().flatten());",
   "gate": "cargo test -p faktor-orchestrator --lib child_handoff_unreadable_ledger_is_unavailable_never_absent",
   "expect": "FAILED",
-  "note": "Reverts the explicit acquisition envelope to the collapsed `.ok().flatten()` shape: a failed legacy-ledger read becomes an apparently absent findings/changed_files component. The unavailable!=absent oracle must fail."
+  "note": "Reverts the explicit acquisition envelope to the collapsed `.ok().flatten()` shape: a failed legacy-ledger read becomes an apparently absent findings/changed_files component. The unavailable!=absent oracle must fail.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

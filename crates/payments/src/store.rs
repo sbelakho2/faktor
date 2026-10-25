@@ -547,6 +547,35 @@ pub struct ProviderObjectWrite {
     pub observed_ms: i64,
 }
 
+/// TRUE for a concurrent-writer/holder lock, never for a corrupt store.
+fn busy_error(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(code, _)
+            if matches!(
+                code.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
+/// Run one lock-taking statement with a bounded retry on SQLITE_BUSY/LOCKED.
+/// The caller has already installed a busy timeout; this covers the statements
+/// the busy handler does not retry (WAL activation and BEGIN IMMEDIATE).
+fn execute_retry_busy(conn: &Connection, sql: &str) -> Result<(), PaymentError> {
+    let mut attempt = 0;
+    loop {
+        match conn.execute_batch(sql) {
+            Ok(()) => return Ok(()),
+            Err(error) if busy_error(&error) && attempt < 100 => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(error) => return Err(store_err(error)),
+        }
+    }
+}
+
 /// The durable store.
 pub struct SqlitePaymentStore {
     conn: Mutex<Connection>,
@@ -567,12 +596,17 @@ impl SqlitePaymentStore {
     fn prepare(conn: Connection, path: Option<PathBuf>) -> Result<Self, PaymentError> {
         conn.busy_timeout(std::time::Duration::from_millis(5_000))
             .map_err(store_err)?;
-        conn.execute_batch(
+        // Two connections may initialize the same fresh database together
+        // (daemon restart overlap, a test racing two opens). WAL activation
+        // and BEGIN IMMEDIATE can surface SQLITE_BUSY even with a busy
+        // timeout, so both are retried with a bounded delay; a lock is never
+        // reported as a corrupt/unusable store.
+        execute_retry_busy(
+            &conn,
             "PRAGMA foreign_keys = ON;
              PRAGMA journal_mode = WAL;
              PRAGMA synchronous = FULL;",
-        )
-        .map_err(store_err)?;
+        )?;
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(store_err)?;
@@ -583,8 +617,23 @@ impl SqlitePaymentStore {
             )));
         }
         if version < PAYMENT_SCHEMA_VERSION {
-            conn.execute_batch("BEGIN IMMEDIATE").map_err(store_err)?;
+            execute_retry_busy(&conn, "BEGIN IMMEDIATE")?;
             let migration = (|| -> Result<(), PaymentError> {
+                // Re-read the version UNDER the write lock: a concurrent
+                // initializer may have completed the migration while this
+                // connection waited, and replaying SCHEMA would duplicate it.
+                let version: i64 = conn
+                    .query_row("PRAGMA user_version", [], |row| row.get(0))
+                    .map_err(store_err)?;
+                if version > PAYMENT_SCHEMA_VERSION {
+                    return Err(PaymentError::Store(format!(
+                        "payment database schema user_version {version} is newer than this build \
+                         ({PAYMENT_SCHEMA_VERSION})"
+                    )));
+                }
+                if version == PAYMENT_SCHEMA_VERSION {
+                    return Ok(());
+                }
                 if version == 0 {
                     conn.execute_batch(SCHEMA).map_err(store_err)?;
                 } else {
@@ -1042,7 +1091,8 @@ impl SqlitePaymentStore {
             "SELECT COUNT(*), \
              COALESCE(SUM(CASE WHEN status IN ('open','past_due') THEN 1 ELSE 0 END), 0), \
              COALESCE(SUM(CASE WHEN status IN ('open','past_due') THEN total_minor - amount_paid_minor ELSE 0 END), 0), \
-             COALESCE(SUM(CASE WHEN status = 'paid' THEN amount_paid_minor ELSE 0 END), 0) \
+             COALESCE(SUM(CASE WHEN status = 'paid' THEN amount_paid_minor ELSE 0 END), 0), \
+             COALESCE(SUM(json_extract(payload, '$.amount_refunded_minor')), 0) \
              FROM payment_invoice WHERE organization_id = ?1",
             params![organization_id],
             |row| {
@@ -1051,6 +1101,7 @@ impl SqlitePaymentStore {
                     open_invoice_count: row.get::<_, i64>(1)? as u64,
                     outstanding_minor: row.get(2)?,
                     paid_minor: row.get(3)?,
+                    refunded_minor: row.get(4)?,
                 })
             },
         )
@@ -1918,6 +1969,7 @@ pub struct InvoiceStats {
     pub open_invoice_count: u64,
     pub outstanding_minor: i64,
     pub paid_minor: i64,
+    pub refunded_minor: i64,
 }
 
 // ------------------------------------------------------------ tx helpers
@@ -1966,6 +2018,13 @@ pub(crate) fn put_subscription_tx(
     subscription: &PaymentSubscription,
 ) -> Result<(), PaymentError> {
     put_subscription_conn(tx, subscription)
+}
+
+pub(crate) fn subscription_tx(
+    conn: &Connection,
+    organization_id: &str,
+) -> Result<Option<PaymentSubscription>, PaymentError> {
+    subscription_conn(conn, organization_id)
 }
 
 fn subscription_conn(

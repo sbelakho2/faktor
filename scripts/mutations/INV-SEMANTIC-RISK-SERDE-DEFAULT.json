@@ -8,5 +8,7 @@
   "note": "Changing the wire casing makes the unknown risk level encode wrong.",
   "capabilities": [
     "semantic.risk_default"
-  ]
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

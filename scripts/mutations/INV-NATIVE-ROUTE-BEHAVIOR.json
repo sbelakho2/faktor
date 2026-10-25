@@ -5,5 +5,7 @@
   "replace": "    if true {\n",
   "gate": "cargo test -p faktor-server --lib every_registered_route_rejects_missing_credentials",
   "expect": "FAILED",
-  "note": "Disabling the shared auth gate lets unauthenticated calls reach every registered route method; the source-parsed behavioral route test must fail."
+  "note": "Disabling the shared auth gate lets unauthenticated calls reach every registered route method; the source-parsed behavioral route test must fail.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

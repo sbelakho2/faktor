@@ -4,5 +4,8 @@
   "find": "                        WHEN EXISTS (SELECT 1 FROM json_each(?1) WHERE type <> 'text') THEN 0",
   "replace": "                        WHEN EXISTS (SELECT 1 FROM json_each(?1) WHERE json_type(value) <> 'text') THEN 0",
   "gate": "cargo test -p faktor-store --lib queue_admission_files_column_accepts_only_json_string_arrays",
-  "note": "Restores the old json_type(value) predicate: JSON1 re-parses each text element, so ordinary string arrays are refused as corrupt."
+  "expect": "FAILED",
+  "note": "Restores the old json_type(value) predicate: JSON1 re-parses each text element, so ordinary string arrays are refused as corrupt.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

@@ -8,5 +8,7 @@
   "note": "Disarming instead of killing lets the spawned child survive the launch rollback.",
   "capabilities": [
     "browser.launch_rollback"
-  ]
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

@@ -8,5 +8,7 @@
   "note": "Disarming instead of killing leaves an idle/stop-shutdown child alive as an orphan.",
   "capabilities": [
     "browser.shutdown_orphans"
-  ]
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

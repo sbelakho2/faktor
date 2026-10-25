@@ -959,6 +959,11 @@ steps:
       - node scripts/check-ignored-tests.mjs
       # Invariant registry coverage (node-only; the rust static lane has no node).
       - node scripts/check-invariants.mjs
+      # Tester/SUT separation: test oracles own their expected values, state and
+      # process; new test files must declare oracle/isolation.
+      - node scripts/check-test-separation.mjs --selftest
+      - node scripts/check-test-separation.mjs --check
+      - node scripts/mutation-run.mjs --check-specs
       # DOGFOOD coverage law (scripts/dogfood.mjs): every repo surface —
       # production crates (unit-site + capability row), every discovered
       # native route/builtin tool/CLI command/provider kind, every VS Code

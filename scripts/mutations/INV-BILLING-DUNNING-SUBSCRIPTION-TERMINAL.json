@@ -1,0 +1,15 @@
+{
+  "id": "INV-BILLING-DUNNING-SUBSCRIPTION-TERMINAL",
+  "surface": "payments.billing",
+  "file": "crates/payments/src/service.rs",
+  "find": "                if !subscription\n                    .state\n                    .can_transition_to(SubscriptionState::PastDue)\n                {\n                    return Ok(Some(subscription));\n                }",
+  "replace": "                // mutated: canceled subscriptions may be resurrected as past_due",
+  "gate": "cargo test -p faktor-payments --test invoice_fencing payment_failure_cannot_regress_a_paid_invoice_or_canceled_subscription",
+  "expect": "FAILED",
+  "note": "Dunning that ignores the terminal canceled state resurrects a canceled subscription and resumes billing; the terminal-state oracle must fail.",
+  "capabilities": [
+    "payments.lease_fence"
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+}

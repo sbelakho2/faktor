@@ -5,5 +5,7 @@
   "replace": "pub(crate) fn semantic_source_revision(root: Option<&std::path::Path>) -> Option<String> {\n    let _ = root;\n    Some(\"session:0\".to_string())\n}",
   "gate": "cargo test -p faktor-agent --lib live_semantic_revision_is_content_derived_never_a_session_id",
   "expect": "FAILED",
-  "note": "A session-handle or synthetic revision makes the semantic snapshot identity unrelated to workspace content and aliases distinct trees."
+  "note": "A session-handle or synthetic revision makes the semantic snapshot identity unrelated to workspace content and aliases distinct trees.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

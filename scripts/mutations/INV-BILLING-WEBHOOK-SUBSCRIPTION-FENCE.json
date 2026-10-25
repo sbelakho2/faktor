@@ -1,0 +1,19 @@
+{
+  "id": "INV-BILLING-WEBHOOK-SUBSCRIPTION-FENCE",
+  "surface": "payments.billing",
+  "file": "crates/payments/src/service.rs",
+  "find": "        Ok(crate::lease::active_lease_conn(\n            tx,\n            org,\n            &ConflictDomain::SubscriptionMutation {\n                subscription_id: subscription_id.to_string(),\n            },\n        )?\n        .is_some())",
+  "replace": "        Ok(false)",
+  "gate": "cargo test -p faktor-payments --test invoice_fencing payment_webhook_cannot_activate_a_subscription_under_its_mutation_fence",
+  "expect": "FAILED",
+  "note": "A payment webhook that ignores the subscription mutation fence reactivates a past-due subscription while a plan/seat/cancel provider call is in flight; the fenced-webhook oracle must fail.",
+  "capabilities": [
+    "payments.lease_fence"
+  ],
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

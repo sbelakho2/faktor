@@ -1,0 +1,12 @@
+{
+  "id": "INV-EDITION8-READONLY-COMMERCIAL-PROVENANCE",
+  "file": "apps/vscode/src/edition8/html.ts",
+  "find": "  const rowsFirst = screenEntry.id === 'S53' || screenEntry.id === 'S27' || screenEntry.id === 'S54';",
+  "replace": "  const rowsFirst = false;",
+  "gate": "node --no-warnings apps/vscode/scripts/selftest.mjs",
+  "expect": "FAIL",
+  "timeout_ms": 180000,
+  "note": "Read-only commercial controls are no longer collapsed behind provenance.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+}

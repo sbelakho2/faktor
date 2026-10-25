@@ -4,8 +4,11 @@
   "find": "                                if t.len() > SUMMARY_MAX_CHARS.saturating_sub(text.len()) {\n                                    oversized = true;\n                                    return;\n                                }",
   "replace": "                                if false {\n                                    oversized = true;\n                                    return;\n                                }",
   "gate": "cargo test -p faktor-agent --lib compaction_summary_one_over_the_cap_is_refused",
+  "expect": "FAILED",
   "note": "Disables the cap check before appending; the refusal oracle must fail.",
   "capabilities": [
     "agent.authority"
-  ]
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

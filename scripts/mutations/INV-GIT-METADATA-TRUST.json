@@ -5,5 +5,7 @@
   "replace": "    let _ = back;",
   "gate": "cargo test -p faktor-agent --lib hostile_git_pointers_are_refused_without_authority_keys",
   "expect": "FAILED",
-  "note": "Removing the reciprocal gitdir binding lets an unbound external worktree layout be fingerprinted."
+  "note": "Removing the reciprocal gitdir binding lets an unbound external worktree layout be fingerprinted.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

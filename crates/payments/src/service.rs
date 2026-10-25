@@ -54,6 +54,7 @@ use crate::vault::PaymentTokenVault;
 mod export;
 mod invoice_ops;
 mod tokens;
+mod webhook_effects;
 mod webhooks;
 
 use export::{invoice_csv, invoices_csv};
@@ -316,6 +317,7 @@ impl PaymentService {
             open_invoice_count: stats.open_invoice_count,
             outstanding_minor: stats.outstanding_minor,
             paid_minor: stats.paid_minor,
+            refunded_minor: stats.refunded_minor,
             reconciliation,
             payment_method_count: methods.len() as u64,
             tax,
@@ -1688,31 +1690,10 @@ impl PaymentService {
         invoice_id: &str,
     ) -> Result<Option<PaymentSubscription>, PaymentError> {
         let org = organization.as_str();
-        let mut invoice = self
-            .store
-            .invoice(org, invoice_id)?
-            .ok_or_else(|| PaymentError::NotFound("invoice".into()))?;
-        invoice.status = InvoiceStatus::PastDue;
         let now = self.now_ms();
-        let mut subscription = match invoice.subscription_id.as_deref() {
-            Some(id) => self.store.subscription_by_id(org, id)?,
-            None => None,
-        };
-        if let Some(sub) = subscription.as_mut() {
-            sub.dunning_attempts = sub.dunning_attempts.saturating_add(1);
-            sub.updated_ms = now;
-            sub.state = SubscriptionState::PastDue;
-            let grace = self.config.dunning.grace_ms.max(0);
-            if sub.grace_end_ms.is_none() {
-                sub.grace_end_ms = Some(now.saturating_add(grace));
-            }
-            if sub.dunning_attempts >= self.config.dunning.max_attempts {
-                sub.state = SubscriptionState::Canceled;
-                sub.canceled_ms = Some(now);
-                sub.cancel_at_period_end = false;
-            }
-        }
-        self.store.record_atomic(
+        let max_attempts = self.config.dunning.max_attempts;
+        let grace = self.config.dunning.grace_ms.max(0);
+        let subscription = self.store.record_atomic(
             &IdempotencyWrite {
                 organization_id: org.to_string(),
                 key: format!("dunning:{}", uuid::Uuid::new_v4()),
@@ -1722,11 +1703,53 @@ impl PaymentService {
                 created_ms: now,
             },
             |tx| {
-                update_invoice_tx(tx, &invoice)?;
-                if let Some(subscription) = &subscription {
-                    put_subscription_tx(tx, subscription)?;
+                // Re-read inside the transaction: a webhook may have settled
+                // this invoice between the provider decline and this write.
+                let mut invoice = invoice_tx(tx, org, invoice_id)?
+                    .ok_or_else(|| PaymentError::NotFound("invoice".into()))?;
+                if invoice.status.can_transition_to(InvoiceStatus::PastDue) {
+                    invoice.status = InvoiceStatus::PastDue;
                 }
-                Ok(())
+                update_invoice_tx(tx, &invoice)?;
+                let Some(subscription_id) = invoice.subscription_id.as_deref() else {
+                    return Ok(None);
+                };
+                let Some(mut subscription) = subscription_by_id_tx(tx, org, subscription_id)?
+                else {
+                    return Ok(None);
+                };
+                // The subscription row belongs to a provider mutation while
+                // its fence is held; never overwrite that operation's result.
+                if crate::lease::active_lease_conn(
+                    tx,
+                    org,
+                    &ConflictDomain::SubscriptionMutation {
+                        subscription_id: subscription.id.clone(),
+                    },
+                )?
+                .is_some()
+                {
+                    return Ok(Some(subscription));
+                }
+                if !subscription
+                    .state
+                    .can_transition_to(SubscriptionState::PastDue)
+                {
+                    return Ok(Some(subscription));
+                }
+                subscription.dunning_attempts = subscription.dunning_attempts.saturating_add(1);
+                subscription.updated_ms = now;
+                subscription.state = SubscriptionState::PastDue;
+                if subscription.grace_end_ms.is_none() {
+                    subscription.grace_end_ms = Some(now.saturating_add(grace));
+                }
+                if subscription.dunning_attempts >= max_attempts {
+                    subscription.state = SubscriptionState::Canceled;
+                    subscription.canceled_ms = Some(now);
+                    subscription.cancel_at_period_end = false;
+                }
+                put_subscription_tx(tx, &subscription)?;
+                Ok(Some(subscription))
             },
         )?;
         Ok(subscription)
@@ -1744,60 +1767,87 @@ impl PaymentService {
 
     pub fn tick(&self, organization: &OrganizationId) -> Result<LifecycleOutcome, PaymentError> {
         let org = organization.as_str();
-        let Some(mut subscription) = self.store.subscription(org)? else {
-            return Err(PaymentError::NotFound("payment subscription".into()));
-        };
         let now = self.now_ms();
-        let mut changed = false;
-        if subscription.state == SubscriptionState::Trialing
-            && subscription.trial_end_ms.is_some_and(|trial| trial <= now)
-        {
-            if subscription.cancel_at_period_end {
-                subscription.state = SubscriptionState::Canceled;
-                subscription.canceled_ms = Some(now);
-                subscription.cancel_at_period_end = false;
-            } else {
-                subscription.state = SubscriptionState::Active;
-                let anchor = subscription.trial_end_ms.unwrap_or(now);
-                subscription.current_period_start_ms = anchor;
-                subscription.current_period_end_ms =
-                    anchor.saturating_add(subscription.interval.period_ms());
+        let max_attempts = self.config.dunning.max_attempts;
+        let (subscription, changed) = self.store.tx(|tx| {
+            let Some(mut subscription) = crate::store::subscription_tx(tx, org)? else {
+                return Err(PaymentError::NotFound("payment subscription".into()));
+            };
+            // A lifecycle tick mutates the same durable row as plan, seat and
+            // cancel operations. Those hold the subscription fenced across
+            // their provider call, so a tick that observes the fence must not
+            // write a stale period/cancelation over the in-flight result.
+            if crate::lease::active_lease_conn(
+                tx,
+                org,
+                &ConflictDomain::SubscriptionMutation {
+                    subscription_id: subscription.id.clone(),
+                },
+            )?
+            .is_some()
+                || crate::lease::active_lease_conn(
+                    tx,
+                    org,
+                    &ConflictDomain::Subscription {
+                        organization_id: org.to_string(),
+                    },
+                )?
+                .is_some()
+            {
+                return Ok((subscription, false));
             }
-            subscription.updated_ms = now;
-            changed = true;
-        }
-        if matches!(
-            subscription.state,
-            SubscriptionState::Active | SubscriptionState::PastDue
-        ) && now >= subscription.current_period_end_ms
-        {
-            if subscription.cancel_at_period_end {
-                subscription.state = SubscriptionState::Canceled;
-                subscription.canceled_ms = Some(now);
-                subscription.cancel_at_period_end = false;
-                changed = true;
-            } else {
-                subscription.current_period_start_ms = subscription.current_period_end_ms;
-                subscription.current_period_end_ms = subscription
-                    .current_period_end_ms
-                    .saturating_add(subscription.interval.period_ms());
+            let mut changed = false;
+            if subscription.state == SubscriptionState::Trialing
+                && subscription.trial_end_ms.is_some_and(|trial| trial <= now)
+            {
+                if subscription.cancel_at_period_end {
+                    subscription.state = SubscriptionState::Canceled;
+                    subscription.canceled_ms = Some(now);
+                    subscription.cancel_at_period_end = false;
+                } else {
+                    subscription.state = SubscriptionState::Active;
+                    let anchor = subscription.trial_end_ms.unwrap_or(now);
+                    subscription.current_period_start_ms = anchor;
+                    subscription.current_period_end_ms =
+                        anchor.saturating_add(subscription.interval.period_ms());
+                }
                 subscription.updated_ms = now;
                 changed = true;
             }
-        }
-        if subscription.state == SubscriptionState::PastDue {
-            let expired = subscription.grace_end_ms.is_some_and(|grace| grace <= now);
-            let exhausted = subscription.dunning_attempts >= self.config.dunning.max_attempts;
-            if expired || exhausted {
-                subscription.state = SubscriptionState::Canceled;
-                subscription.canceled_ms = Some(now);
-                subscription.cancel_at_period_end = false;
-                changed = true;
+            if matches!(
+                subscription.state,
+                SubscriptionState::Active | SubscriptionState::PastDue
+            ) && now >= subscription.current_period_end_ms
+            {
+                if subscription.cancel_at_period_end {
+                    subscription.state = SubscriptionState::Canceled;
+                    subscription.canceled_ms = Some(now);
+                    subscription.cancel_at_period_end = false;
+                    changed = true;
+                } else {
+                    subscription.current_period_start_ms = subscription.current_period_end_ms;
+                    subscription.current_period_end_ms = subscription
+                        .current_period_end_ms
+                        .saturating_add(subscription.interval.period_ms());
+                    subscription.updated_ms = now;
+                    changed = true;
+                }
             }
-        }
-        if changed {
-            self.store.put_subscription(&subscription)?;
-        }
+            if subscription.state == SubscriptionState::PastDue {
+                let expired = subscription.grace_end_ms.is_some_and(|grace| grace <= now);
+                let exhausted = subscription.dunning_attempts >= max_attempts;
+                if expired || exhausted {
+                    subscription.state = SubscriptionState::Canceled;
+                    subscription.canceled_ms = Some(now);
+                    subscription.cancel_at_period_end = false;
+                    changed = true;
+                }
+            }
+            if changed {
+                put_subscription_tx(tx, &subscription)?;
+            }
+            Ok((subscription, changed))
+        })?;
         Ok(LifecycleOutcome {
             subscription,
             changed,
@@ -3206,449 +3256,22 @@ impl PaymentService {
         OrganizationId::try_new(raw).map_err(|e| PaymentError::WebhookMalformed(e.to_string()))
     }
 
-    fn webhook_effects_tx(
-        &self,
-        tx: &rusqlite::Transaction<'_>,
+    /// True while a plan/seat/cancel operation owns the subscription row
+    /// across its provider call. Webhook and lifecycle writers must skip or
+    /// refuse subscription effects instead of writing over that result.
+    fn subscription_mutation_fence_active(
+        tx: &rusqlite::Connection,
         org: &str,
-        event: &VerifiedWebhookEvent,
-        now: i64,
-    ) -> Result<WebhookEffects, PaymentError> {
-        let object = event
-            .payload
-            .get("data")
-            .and_then(|data| data.get("object"));
-        let object_id = || {
-            object
-                .and_then(|object| object.get("id"))
-                .and_then(serde_json::Value::as_str)
-        };
-        let local_invoice_id = || {
-            object
-                .and_then(|object| object.pointer("/metadata/local_invoice_id"))
-                .and_then(serde_json::Value::as_str)
-        };
-        match event.event_type.as_str() {
-            "payment.succeeded" | "payment_intent.succeeded" | "charge.succeeded" => {
-                let Some(provider_payment_id) = object_id() else {
-                    return Ok(WebhookEffects::default());
-                };
-                let mut payment = payment_by_provider_id_tx(tx, org, provider_payment_id)?;
-                let mut invoice = match (payment.as_ref(), local_invoice_id()) {
-                    (Some(payment), _) => invoice_tx(tx, org, &payment.invoice_id)?,
-                    (None, Some(local_id)) => invoice_tx(tx, org, local_id)?,
-                    (None, None) => None,
-                };
-                let Some(invoice_ref) = invoice.as_mut() else {
-                    return Ok(WebhookEffects::default());
-                };
-                if invoice_ref.organization_id != org {
-                    return Ok(WebhookEffects::default());
-                }
-                let amount = object.and_then(|object| {
-                    object
-                        .get("amount_minor")
-                        .and_then(serde_json::Value::as_i64)
-                        .or_else(|| object.get("amount").and_then(serde_json::Value::as_i64))
-                        .or_else(|| {
-                            object
-                                .get("amount_received")
-                                .and_then(serde_json::Value::as_i64)
-                        })
-                });
-                if let Some(payment) = payment.as_mut() {
-                    if !payment.status.can_transition_to(PaymentStatus::Succeeded)
-                        && payment.status != PaymentStatus::Succeeded
-                    {
-                        return Ok(WebhookEffects::default());
-                    }
-                    payment.status = PaymentStatus::Succeeded;
-                } else {
-                    let recorded = amount.unwrap_or_else(|| invoice_ref.balance_minor());
-                    payment = Some(Payment {
-                        id: self.webhook_payment_id_tx(tx, org, &invoice_ref.id)?,
-                        organization_id: org.to_string(),
-                        invoice_id: invoice_ref.id.clone(),
-                        provider: self.provider.name().to_string(),
-                        provider_payment_id: provider_payment_id.to_string(),
-                        payment_method_id: None,
-                        amount_minor: recorded,
-                        refunded_minor: 0,
-                        currency: invoice_ref.currency.clone(),
-                        status: PaymentStatus::Succeeded,
-                        created_ms: now,
-                    });
-                }
-                let credited = amount
-                    .or_else(|| payment.as_ref().map(|payment| payment.amount_minor))
-                    .unwrap_or_else(|| invoice_ref.balance_minor())
-                    .clamp(0, invoice_ref.balance_minor());
-                invoice_ref.amount_paid_minor =
-                    checked_add(invoice_ref.amount_paid_minor, credited)?;
-                if invoice_ref.amount_paid_minor >= invoice_ref.total_minor
-                    && invoice_ref.status.can_transition_to(InvoiceStatus::Paid)
-                {
-                    invoice_ref.status = InvoiceStatus::Paid;
-                    invoice_ref.paid_ms = Some(now);
-                }
-                let subscription = invoice_ref
-                    .subscription_id
-                    .as_deref()
-                    .and_then(|id| subscription_by_id_tx(tx, org, id).ok().flatten())
-                    .filter(|subscription| {
-                        subscription
-                            .state
-                            .can_transition_to(SubscriptionState::Active)
-                    })
-                    .map(|mut subscription| {
-                        subscription.state = SubscriptionState::Active;
-                        subscription.dunning_attempts = 0;
-                        subscription.grace_end_ms = None;
-                        subscription.updated_ms = now;
-                        subscription
-                    });
-                Ok(WebhookEffects {
-                    subscription,
-                    invoice: Some(invoice_ref.clone()),
-                    payment,
-                    refund: None,
-                    credit_note: None,
-                    ..WebhookEffects::default()
-                })
-            }
-            "payment.processing"
-            | "payment_intent.processing"
-            | "charge.processing"
-            | "payment.requires_action"
-            | "payment_intent.requires_action"
-            | "charge.requires_action"
-            | "payment.pending" => {
-                let Some(provider_payment_id) = object_id() else {
-                    return Ok(WebhookEffects::default());
-                };
-                let Some(mut payment) = payment_by_provider_id_tx(tx, org, provider_payment_id)?
-                else {
-                    return Ok(WebhookEffects::default());
-                };
-                let next = match event.event_type.as_str() {
-                    "payment.requires_action"
-                    | "payment_intent.requires_action"
-                    | "charge.requires_action" => PaymentStatus::RequiresAction,
-                    "payment.pending" => PaymentStatus::Pending,
-                    _ => PaymentStatus::Processing,
-                };
-                if !payment.status.can_transition_to(next) {
-                    return Ok(WebhookEffects::default());
-                }
-                payment.status = next;
-                Ok(WebhookEffects {
-                    subscription: None,
-                    invoice: None,
-                    payment: Some(payment),
-                    refund: None,
-                    credit_note: None,
-                    ..WebhookEffects::default()
-                })
-            }
-            "payment.failed" | "payment_intent.payment_failed" | "charge.failed" => {
-                let Some(provider_payment_id) = object_id() else {
-                    return Ok(WebhookEffects::default());
-                };
-                let Some(mut payment) = payment_by_provider_id_tx(tx, org, provider_payment_id)?
-                else {
-                    return Ok(WebhookEffects::default());
-                };
-                if !payment.status.can_transition_to(PaymentStatus::Failed) {
-                    return Ok(WebhookEffects::default());
-                }
-                payment.status = PaymentStatus::Failed;
-                let Some(mut invoice) = invoice_tx(tx, org, &payment.invoice_id)? else {
-                    return Ok(WebhookEffects {
-                        subscription: None,
-                        invoice: None,
-                        payment: Some(payment),
-                        refund: None,
-                        credit_note: None,
-                        ..WebhookEffects::default()
-                    });
-                };
-                if invoice.organization_id != org
-                    || !invoice.status.can_transition_to(InvoiceStatus::PastDue)
-                {
-                    return Ok(WebhookEffects {
-                        subscription: None,
-                        invoice: None,
-                        payment: Some(payment),
-                        refund: None,
-                        credit_note: None,
-                        ..WebhookEffects::default()
-                    });
-                }
-                invoice.status = InvoiceStatus::PastDue;
-                let mut subscription = invoice
-                    .subscription_id
-                    .as_deref()
-                    .and_then(|id| subscription_by_id_tx(tx, org, id).ok().flatten());
-                if let Some(sub) = subscription.as_mut() {
-                    if sub.state.can_transition_to(SubscriptionState::PastDue) {
-                        sub.state = SubscriptionState::PastDue;
-                    }
-                    sub.dunning_attempts = sub.dunning_attempts.saturating_add(1);
-                    sub.updated_ms = now;
-                    if sub.grace_end_ms.is_none() {
-                        sub.grace_end_ms =
-                            Some(now.saturating_add(self.config.dunning.grace_ms.max(0)));
-                    }
-                    if sub.dunning_attempts >= self.config.dunning.max_attempts
-                        && sub.state != SubscriptionState::Canceled
-                    {
-                        sub.state = SubscriptionState::Canceled;
-                        sub.canceled_ms = Some(now);
-                    }
-                }
-                Ok(WebhookEffects {
-                    subscription,
-                    invoice: Some(invoice),
-                    payment: Some(payment),
-                    refund: None,
-                    credit_note: None,
-                    ..WebhookEffects::default()
-                })
-            }
-            "refund.succeeded" | "refund.updated" | "refund.failed" | "charge.refund.updated" => {
-                let provider_refund_id = object_id();
-                let local_refund_id = object
-                    .and_then(|object| object.pointer("/metadata/local_refund_id"))
-                    .and_then(serde_json::Value::as_str);
-                let mut refund = match local_refund_id {
-                    Some(local_id) => refund_by_id_tx(tx, org, local_id)?,
-                    None => {
-                        let Some(provider_refund_id) = provider_refund_id else {
-                            return Ok(WebhookEffects::default());
-                        };
-                        refund_by_provider_id_conn(tx, org, provider_refund_id)?
-                    }
-                };
-                let Some(refund_ref) = refund.as_mut() else {
-                    return Ok(WebhookEffects::default());
-                };
-                if refund_ref.organization_id != org || refund_ref.credit_note_id.is_some() {
-                    return Ok(WebhookEffects::default());
-                }
-                let provider_status = object
-                    .and_then(|object| object.get("status"))
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| {
-                        PaymentError::WebhookMalformed(
-                            "refund webhook carries no explicit provider status".into(),
-                        )
-                    })?;
-                let next = RefundStatus::parse(provider_status).ok_or_else(|| {
-                    PaymentError::WebhookMalformed(format!(
-                        "refund webhook carries unknown status {provider_status:?}"
-                    ))
-                })?;
-                if !refund_ref.status.can_transition_to(next) {
-                    return Ok(WebhookEffects::default());
-                }
-                if next != RefundStatus::Succeeded {
-                    refund_ref.status = next;
-                    return Ok(WebhookEffects {
-                        subscription: None,
-                        invoice: None,
-                        payment: None,
-                        refund: Some(refund_ref.clone()),
-                        credit_note: None,
-                        ..WebhookEffects::default()
-                    });
-                }
-                let Some(mut payment) = payment_tx(tx, org, &refund_ref.payment_id)? else {
-                    return Ok(WebhookEffects::default());
-                };
-                let Some(mut invoice) = invoice_tx(tx, org, &payment.invoice_id)? else {
-                    return Ok(WebhookEffects::default());
-                };
-                refund_ref.status = RefundStatus::Succeeded;
-                refund_ref.invoice_line_seq = bind_refund_invoice_line(&invoice);
-                let provider_refund = ProviderRefundObservation {
-                    provider: self.provider.name().to_string(),
-                    provider_refund_id: refund_ref.provider_refund_id.clone(),
-                    organization_id: org.to_string(),
-                    invoice_id: invoice.id.clone(),
-                    payment_id: payment.id.clone(),
-                    status: RefundStatus::Succeeded.as_str().to_string(),
-                    amount_minor: refund_ref.amount_minor,
-                    currency: refund_ref.currency.clone(),
-                    observed_ms: now,
-                    source: ProviderObservationSource::Webhook,
-                };
-                let mut note = settle_refund_ledger(
-                    &mut payment,
-                    &mut invoice,
-                    refund_ref,
-                    org,
-                    format!("cn_{}", uuid::Uuid::new_v4()),
-                    now,
-                )?;
-                let sequence = next_sequence_tx(tx, org, "credit_note")?;
-                note.number = format!("CN-{sequence:06}");
-                Ok(WebhookEffects {
-                    subscription: None,
-                    invoice: Some(invoice),
-                    payment: Some(payment),
-                    refund: Some(refund_ref.clone()),
-                    credit_note: Some(note),
-                    provider_refund: Some(provider_refund),
-                    ..WebhookEffects::default()
-                })
-            }
-            "invoice.paid" | "invoice.payment_succeeded" => {
-                self.webhook_invoice_paid_tx(tx, org, event, object, now)
-            }
-            "invoice.payment_failed" | "invoice.payment_action_required" => {
-                let provider_invoice_id = object_id();
-                let local_id = local_invoice_id();
-                let invoice = if let Some(local_id) = local_id {
-                    invoice_tx(tx, org, local_id)?
-                } else if let Some(provider_invoice_id) = provider_invoice_id {
-                    invoice_by_provider_id_tx(tx, provider_invoice_id)?
-                } else {
-                    None
-                };
-                let Some(mut invoice) = invoice else {
-                    return Ok(WebhookEffects::default());
-                };
-                if invoice.organization_id != org
-                    || !invoice.status.can_transition_to(InvoiceStatus::PastDue)
-                {
-                    return Ok(WebhookEffects::default());
-                }
-                invoice.status = InvoiceStatus::PastDue;
-                let subscription = invoice
-                    .subscription_id
-                    .as_deref()
-                    .and_then(|id| subscription_by_id_tx(tx, org, id).ok().flatten())
-                    .filter(|subscription| {
-                        subscription
-                            .state
-                            .can_transition_to(SubscriptionState::PastDue)
-                    })
-                    .map(|mut subscription| {
-                        subscription.dunning_attempts =
-                            subscription.dunning_attempts.saturating_add(1);
-                        subscription.state = SubscriptionState::PastDue;
-                        if subscription.grace_end_ms.is_none() {
-                            subscription.grace_end_ms =
-                                Some(now.saturating_add(self.config.dunning.grace_ms.max(0)));
-                        }
-                        subscription.updated_ms = now;
-                        if subscription.dunning_attempts >= self.config.dunning.max_attempts {
-                            subscription.state = SubscriptionState::Canceled;
-                            subscription.canceled_ms = Some(now);
-                        }
-                        subscription
-                    });
-                Ok(WebhookEffects {
-                    subscription,
-                    invoice: Some(invoice),
-                    payment: None,
-                    refund: None,
-                    credit_note: None,
-                    ..WebhookEffects::default()
-                })
-            }
-            "customer.subscription.updated" => {
-                let Some(provider_id) = object_id() else {
-                    return Ok(WebhookEffects::default());
-                };
-                let Some(mut subscription) = subscription_by_provider_id_tx(tx, provider_id)?
-                else {
-                    return Ok(WebhookEffects::default());
-                };
-                if subscription.organization_id != org
-                    || subscription.state == SubscriptionState::Canceled
-                {
-                    return Ok(WebhookEffects::default());
-                }
-                if let Some(status) = object
-                    .and_then(|object| object.get("status"))
-                    .and_then(serde_json::Value::as_str)
-                {
-                    if let Some(state) = SubscriptionState::parse(status) {
-                        if subscription.state.can_transition_to(state) {
-                            subscription.state = state;
-                            if state == SubscriptionState::Canceled {
-                                subscription.canceled_ms = Some(now);
-                            }
-                        }
-                    }
-                }
-                if let Some(quantity) = object
-                    .and_then(|object| object.get("quantity"))
-                    .and_then(serde_json::Value::as_u64)
-                {
-                    subscription.quantity = u32::try_from(quantity).map_err(|_| {
-                        PaymentError::WebhookMalformed("subscription quantity overflow".into())
-                    })?;
-                }
-                if let Some(cancel) = object
-                    .and_then(|object| object.get("cancel_at_period_end"))
-                    .and_then(serde_json::Value::as_bool)
-                {
-                    subscription.cancel_at_period_end = cancel;
-                }
-                if let Some(end) = object
-                    .and_then(|object| object.get("current_period_end"))
-                    .and_then(serde_json::Value::as_i64)
-                {
-                    let end = if end.abs() < 10_000_000_000 {
-                        end.saturating_mul(1000)
-                    } else {
-                        end
-                    };
-                    subscription.current_period_end_ms =
-                        subscription.current_period_end_ms.max(end);
-                }
-                subscription.updated_ms = now;
-                Ok(WebhookEffects {
-                    subscription: Some(subscription),
-                    invoice: None,
-                    payment: None,
-                    refund: None,
-                    credit_note: None,
-                    ..WebhookEffects::default()
-                })
-            }
-            "customer.subscription.deleted" | "subscription.cancelled" => {
-                let Some(provider_id) = object_id() else {
-                    return Ok(WebhookEffects::default());
-                };
-                let Some(mut subscription) = subscription_by_provider_id_tx(tx, provider_id)?
-                else {
-                    return Ok(WebhookEffects::default());
-                };
-                if subscription.organization_id != org {
-                    return Ok(WebhookEffects::default());
-                }
-                if subscription.state == SubscriptionState::Canceled
-                    && subscription.canceled_ms.is_some()
-                {
-                    return Ok(WebhookEffects::default());
-                }
-                subscription.state = SubscriptionState::Canceled;
-                subscription.canceled_ms = Some(now);
-                subscription.cancel_at_period_end = false;
-                subscription.updated_ms = now;
-                Ok(WebhookEffects {
-                    subscription: Some(subscription),
-                    invoice: None,
-                    payment: None,
-                    refund: None,
-                    credit_note: None,
-                    ..WebhookEffects::default()
-                })
-            }
-            _ => Ok(WebhookEffects::default()),
-        }
+        subscription_id: &str,
+    ) -> Result<bool, PaymentError> {
+        Ok(crate::lease::active_lease_conn(
+            tx,
+            org,
+            &ConflictDomain::SubscriptionMutation {
+                subscription_id: subscription_id.to_string(),
+            },
+        )?
+        .is_some())
     }
 }
 

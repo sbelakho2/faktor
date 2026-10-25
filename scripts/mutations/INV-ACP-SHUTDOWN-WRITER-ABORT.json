@@ -8,5 +8,7 @@
   "note": "Without abort() the shutdown blocks forever on the wedged writer.",
   "capabilities": [
     "acp.shutdown"
-  ]
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

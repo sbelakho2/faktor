@@ -1,0 +1,15 @@
+{
+  "id": "INV-PAYMENTS-REFUND-BOUND",
+  "surface": "payments.billing",
+  "file": "crates/payments/src/service/invoice_ops.rs",
+  "find": "        if request.amount_minor > available {",
+  "replace": "        if false {",
+  "gate": "cargo test -p faktor-payments --test lifecycle refunds_are_bounded_by_paid_and_credit_notes_number",
+  "expect": "FAILED",
+  "note": "Disabling the collected-minus-refunded bound lets a refund exceed the paid amount; the bounded-refund oracle must fail.",
+  "capabilities": [
+    "payments.refund_bound"
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+}

@@ -413,7 +413,7 @@ function convert() {
   });
 
   const perf = raw('perf.raw.json');
-  requireCounts(perf, { workloads: 11, failed: 0, baseline_present: 1 }, 'perf');
+  requireCounts(perf, { workloads: 12, failed: 0, baseline_present: 1 }, 'perf');
   writeGate('perf', {
     status: 'passed',
     counts: perf.counts,

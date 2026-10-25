@@ -414,7 +414,7 @@ async fn local_billing_flow_records_exact_money_receipts_methods_changes_and_can
     let remove = client
         .post(
             &format!("/account/billing/payment-methods/{}/remove/", methods[0].id),
-            &[("csrf", csrf.as_str())],
+            &[("csrf", csrf.as_str()), ("confirm", "yes")],
         )
         .await;
     assert_eq!(remove.status, StatusCode::SEE_OTHER);
@@ -426,6 +426,7 @@ async fn local_billing_flow_records_exact_money_receipts_methods_changes_and_can
                 ("csrf", csrf.as_str()),
                 ("plan_id", "team"),
                 ("interval", "annual"),
+                ("confirm", "yes"),
             ],
         )
         .await;
@@ -437,12 +438,74 @@ async fn local_billing_flow_records_exact_money_receipts_methods_changes_and_can
     let response = client
         .post(
             "/account/billing/cancel/",
-            &[("csrf", csrf.as_str()), ("at_period_end", "1")],
+            &[
+                ("csrf", csrf.as_str()),
+                ("at_period_end", "1"),
+                ("confirm", "yes"),
+            ],
         )
         .await;
     assert_eq!(response.status, StatusCode::SEE_OTHER);
     let overview = app.payments().overview(&org_id).unwrap();
     assert!(overview.subscription.unwrap().cancel_at_period_end);
+}
+
+#[tokio::test]
+async fn destructive_billing_forms_refuse_without_the_explicit_confirmation() {
+    let app = TestApp::build();
+    let mut client = signup_verified(&app, "guard@example.com").await;
+    let location = start_local_checkout(&mut client).await;
+    let _ = pay_local(&mut client, &location).await;
+    let org = app.org_for_email("guard@example.com");
+    let org_id = faktor_cloud::OrganizationId::try_new(org.clone()).unwrap();
+    let page = client.get("/account/billing/").await;
+    let csrf = client.form_csrf(&page.body);
+
+    let unconfirmed_change = client
+        .post(
+            "/account/billing/change-plan/",
+            &[
+                ("csrf", csrf.as_str()),
+                ("plan_id", "team"),
+                ("interval", "annual"),
+            ],
+        )
+        .await;
+    assert_eq!(unconfirmed_change.status, StatusCode::UNPROCESSABLE_ENTITY);
+    let unconfirmed_cancel = client
+        .post(
+            "/account/billing/cancel/",
+            &[("csrf", csrf.as_str()), ("at_period_end", "0")],
+        )
+        .await;
+    assert_eq!(unconfirmed_cancel.status, StatusCode::UNPROCESSABLE_ENTITY);
+    let overview = app.payments().overview(&org_id).unwrap();
+    assert_eq!(overview.subscription.as_ref().unwrap().plan_id, "solo");
+    assert!(!overview.subscription.unwrap().cancel_at_period_end);
+
+    let response = client
+        .post(
+            "/account/billing/payment-methods/add/",
+            &[
+                ("csrf", csrf.as_str()),
+                ("provider_token", "tok_test_visa_4242"),
+                ("brand", "Visa"),
+                ("last4", "4242"),
+                ("exp_month", "12"),
+                ("exp_year", "2030"),
+            ],
+        )
+        .await;
+    assert_eq!(response.status, StatusCode::SEE_OTHER);
+    let methods = app.payments().payment_methods(&org_id).unwrap();
+    let unconfirmed_remove = client
+        .post(
+            &format!("/account/billing/payment-methods/{}/remove/", methods[0].id),
+            &[("csrf", csrf.as_str())],
+        )
+        .await;
+    assert_eq!(unconfirmed_remove.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(app.payments().payment_methods(&org_id).unwrap().len(), 1);
 }
 
 #[tokio::test]

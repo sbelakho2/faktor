@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Edition 8 performance gate.
 //
-// Eleven workloads, each baseline-anchored per platform and chosen to fail an
+// Twelve workloads, each baseline-anchored per platform and chosen to fail an
 // O(n^2), unbounded or order-breaking path:
 //
 //   stream-order       10k events, bounded queue, zero dropped/duplicated/
@@ -16,6 +16,7 @@
 //   screen-open-72     open every one of the 72 screens sequentially
 //   screen-diff-72     render a diff on every one of the 72 screens
 //   concurrent-16-sessions  16 live sessions advance together
+//   usage-panel-5k-tasks   5,000 served task rows stay at a 20-row bound
 //
 // Bound: p95 <= 1.25x the committed per-platform baseline (floor 0.25 ms for
 // sub-millisecond noise); 3 runs, median. Missing baseline is never a pass.
@@ -46,6 +47,7 @@ import { bindingOf } from '../../apps/vscode/src/edition5/bindings.ts';
 import { buildPatch, EMPTY_DRAFT, stageControl } from '../../apps/vscode/src/edition5/view.ts';
 import { allControlViews, diffView, EMPTY_VIEW_CACHE } from '../../apps/vscode/src/edition8/host.ts';
 import { screenView } from '../../apps/vscode/src/edition8/view.ts';
+import { buildUsagePanel, usagePanelLines } from '../../apps/vscode/src/cockpit.ts';
 import { renderEdition8Html } from '../../apps/vscode/src/edition8/html.ts';
 import { edition8Snapshot } from '../../apps/vscode/scripts/fixtures/edition8.mjs';
 import { buildRegistry } from './registry.mjs';
@@ -506,6 +508,79 @@ const e8Html = renderEdition8Html({
 const e8HtmlMs = performance.now() - e8HtmlStart;
 const e8HtmlBytes = Buffer.byteLength(e8Html);
 
+const usageCredits = {
+  granted_micro: '0',
+  consumed_micro: '0',
+  refunded_micro: '0',
+  held_micro: '0',
+  pending_consumes: 0,
+};
+const usageTotals = {
+  input_tokens: 0,
+  output_tokens: 0,
+  cache_read_tokens: 0,
+  cache_write_tokens: 0,
+  reasoning_tokens: 0,
+  provider_cost_micro: '0',
+  managed_cost_micro: '0',
+  byok_cost_micro: '0',
+  events: 0,
+  corrected_events: 0,
+};
+const usageTaskRows = Array.from({ length: 5000 }, (_, index) => ({
+  task_id: index + 1,
+  run_id: `run-${index + 1}`,
+  totals: usageTotals,
+}));
+const boundedUsagePanel = buildUsagePanel({
+  identity: {
+    subject_kind: 'user',
+    subject_id: 'u1',
+    display_name: 'u',
+    email: null,
+    organization: 'org',
+    organization_name: 'Org',
+    role: 'owner',
+    effective_actions: ['billing_write', 'credits_grant'],
+  },
+  entitlements: {
+    organization_id: 'org',
+    billing_account_id: null,
+    plan_id: 'pro',
+    plan_found: true,
+    subscription_status: 'active',
+    subscription_expires_ms: null,
+    subscription_active: true,
+    features: [],
+    limits: { max_tokens_per_period: 100000 },
+    credits: usageCredits,
+    managed_spend_micro: '0',
+    byok_spend_micro: '0',
+    total_tokens: 0,
+    in_flight: [],
+    now_ms: 0,
+  },
+  usage: {
+    ok: true,
+    organization: 'org',
+    fold: { organization_id: 'org', totals: usageTotals, per_task: usageTaskRows, next_cursor: null },
+    credits: usageCredits,
+    items: [],
+    nextCursor: null,
+  },
+  refusal: null,
+  cursor: null,
+  hasPrev: false,
+  billing: null,
+});
+const usageLineSamples = [];
+let boundedUsageLines = [];
+for (let index = 0; index < 20; index += 1) {
+  const start = performance.now();
+  boundedUsageLines = usagePanelLines(boundedUsagePanel);
+  usageLineSamples.push(performance.now() - start);
+}
+
 const permissionRows = Array.from({ length: 2000 }, (_, index) => ({
   id: String(index + 1),
   sessionId: '7',
@@ -680,6 +755,22 @@ const workloads = [
       `changed digest ${changedDiff.patches.length} patches (S14 rows ${changedApprovalRows}); ` +
       `clock-only S56 patch ${clockPatch !== undefined ? 'yes' : 'NO'}; settings HTML ${e8HtmlBytes}B/${e8HtmlMs.toFixed(2)}ms`,
     id: 'screen-diff-72',
+  },
+  {
+    samples: usageLineSamples,
+    metric: {
+      served_task_rows: 5000,
+      rendered_task_rows: boundedUsagePanel.period.tasks.length,
+      lines: boundedUsageLines.length,
+      cap: 64,
+    },
+    passed:
+      boundedUsagePanel.period.tasksTotal === 5000 &&
+      boundedUsagePanel.period.tasks.length === 20 &&
+      boundedUsageLines.length <= 64 &&
+      boundedUsageLines.some((line) => line.includes('more task row(s) not shown')),
+    detail: `5,000 task rows -> ${boundedUsagePanel.period.tasks.length} rendered + bounded note; ${boundedUsageLines.length} lines`,
+    id: 'usage-panel-5k-tasks',
   },
   {
     samples: concurrentSamples,

@@ -14,6 +14,20 @@ use faktor_agent::runtime::{
 
 use super::*;
 
+/// Durable fact keys of ONE child handoff delivery. The key is
+/// RUN-QUALIFIED (`child-handoff/<run id>/<child id>`) because child ids are
+/// minted per run (`child-0` in every plan): a parent session may own more
+/// than one orchestration run, and a session-wide key would let one run's
+/// terminal child overwrite (or watermark-suppress) another run's handoff —
+/// a sibling-result leak. The run id is the same validated ASCII token the
+/// durable registry/plan rows carry.
+pub(crate) fn handoff_fact_keys(run_id: &str, child_id: &str) -> (String, String) {
+    (
+        format!("{PENDING_INTERNAL_CONTEXT_KEY_PREFIX}{run_id}/{child_id}"),
+        format!("{PENDING_INTERNAL_CONTEXT_DELIVERED_PREFIX}{run_id}/{child_id}"),
+    )
+}
+
 impl OrchestratorRuntime {
     /// The parent continuation boundary (audit: typed child handoff
     /// consumption): hand ONE finished child's BOUNDED typed handoff to the
@@ -32,9 +46,21 @@ impl OrchestratorRuntime {
     /// re-derives the handoff from the durable terminal row
     /// ([`Self::heal_pending_child_handoffs`]), so the result is never lost.
     /// A section the parent already consumed (empty value) is never re-armed.
-    pub(super) fn deliver_child_handoff(&self, parent: SessionId, child: &ChildRuntime) {
-        if !matches!(child.state, ChildState::Done | ChildState::Failed) {
-            // A Cancelled child has no outcome to report to the parent.
+    pub(super) fn deliver_child_handoff(
+        &self,
+        parent: SessionId,
+        run_id: &str,
+        child: &ChildRuntime,
+    ) {
+        // Cancellation is a terminal OUTCOME the parent must see: a cancelled
+        // child is not a success and not a failure, but suppressing its
+        // handoff made the parent context look as if the item simply never
+        // reported (unavailable rendered as absent). The typed row already
+        // carries `cancelled`, so the bounded handoff states it explicitly.
+        if !matches!(
+            child.state,
+            ChildState::Done | ChildState::Failed | ChildState::Cancelled
+        ) {
             return;
         }
         let child_session = match SessionId::try_from(child.session_id) {
@@ -98,11 +124,7 @@ impl OrchestratorRuntime {
                 return;
             }
         };
-        let key = format!("{PENDING_INTERNAL_CONTEXT_KEY_PREFIX}{}", child.child_id);
-        let watermark_key = format!(
-            "{PENDING_INTERNAL_CONTEXT_DELIVERED_PREFIX}{}",
-            child.child_id
-        );
+        let (key, watermark_key) = handoff_fact_keys(run_id, &child.child_id);
         let watermark = child.updated_ms.to_string();
         // Section + watermark are ONE store transaction: a crash can never
         // leave a delivered section whose watermark is missing (which would
@@ -156,6 +178,7 @@ impl OrchestratorRuntime {
     pub(super) fn heal_pending_child_handoffs(
         &self,
         parent: SessionId,
+        run_id: &str,
         children: &HashMap<String, ChildRuntime>,
     ) {
         let Ok(Some(handle)) = self.manager.get_session(parent) else {
@@ -167,15 +190,16 @@ impl OrchestratorRuntime {
         };
         let mut terminal: Vec<&ChildRuntime> = children
             .values()
-            .filter(|child| matches!(child.state, ChildState::Done | ChildState::Failed))
+            .filter(|child| {
+                matches!(
+                    child.state,
+                    ChildState::Done | ChildState::Failed | ChildState::Cancelled
+                )
+            })
             .collect();
         terminal.sort_by(|a, b| a.child_id.cmp(&b.child_id));
         for child in terminal {
-            let key = format!("{PENDING_INTERNAL_CONTEXT_KEY_PREFIX}{}", child.child_id);
-            let watermark_key = format!(
-                "{PENDING_INTERNAL_CONTEXT_DELIVERED_PREFIX}{}",
-                child.child_id
-            );
+            let (key, watermark_key) = handoff_fact_keys(run_id, &child.child_id);
             let handoff = handle.memory_fact_get(PENDING_INTERNAL_CONTEXT_KIND, &key);
             let watermark = handle.memory_fact_get(PENDING_INTERNAL_CONTEXT_KIND, &watermark_key);
             match (handoff, watermark) {
@@ -188,7 +212,7 @@ impl OrchestratorRuntime {
                 // delivered; only a NEWER terminal state is refreshed.
                 (Ok(Some(_)), Ok(Some(stamp))) => match Self::parse_delivery_watermark(&stamp) {
                     Some(ms) if ms >= child.updated_ms => {}
-                    Some(_) => self.deliver_child_handoff(parent, child),
+                    Some(_) => self.deliver_child_handoff(parent, run_id, child),
                     None => tracing::warn!(
                         session = parent.raw(),
                         watermark_key,
@@ -203,14 +227,38 @@ impl OrchestratorRuntime {
                 // crash hit before delivery.
                 (Ok(None), Ok(Some(stamp))) => match Self::parse_delivery_watermark(&stamp) {
                     Some(ms) if ms >= child.updated_ms => {}
-                    Some(_) => self.deliver_child_handoff(parent, child),
+                    Some(_) => self.deliver_child_handoff(parent, run_id, child),
                     None => tracing::warn!(
                         session = parent.raw(),
                         watermark_key,
                         "child handoff watermark is malformed; refusing to re-deliver (no duplicate)"
                     ),
                 },
-                (Ok(None), Ok(None)) => self.deliver_child_handoff(parent, child),
+                // Upgrade window: a pre-run-qualified pending section or
+                // watermark is still the ONCE delivery for this child. The
+                // parent consumes that section as before; re-delivering
+                // under the new key would duplicate it.
+                (Ok(None), Ok(None)) => {
+                    let legacy_key =
+                        format!("{PENDING_INTERNAL_CONTEXT_KEY_PREFIX}{}", child.child_id);
+                    let legacy_watermark_key = format!(
+                        "{PENDING_INTERNAL_CONTEXT_DELIVERED_PREFIX}{}",
+                        child.child_id
+                    );
+                    match (
+                        handle.memory_fact_get(PENDING_INTERNAL_CONTEXT_KIND, &legacy_key),
+                        handle.memory_fact_get(PENDING_INTERNAL_CONTEXT_KIND, &legacy_watermark_key),
+                    ) {
+                        (Ok(None), Ok(None)) => {
+                            self.deliver_child_handoff(parent, run_id, child)
+                        }
+                        (Err(error), _) | (_, Err(error)) => tracing::warn!(
+                            session = parent.raw(),
+                            "legacy child handoff read failed (left for the next re-attach): {error}"
+                        ),
+                        _ => {}
+                    }
+                }
             }
         }
     }

@@ -730,19 +730,33 @@ impl SessionHandle {
     /// restart mid-queue applies each message exactly once.
     pub fn orchestrator_ctl_ack(&self, seq: u64) -> faktor_core::Result<()> {
         let _guard = self.command_guard();
-        let rows = self.orchestrator_ctl_all()?;
-        let Some(mut row) = rows.into_iter().find(|r| r.seq == seq) else {
+        // Point lookup, not a full queue scan: applying a queued burst used
+        // to read every retained control row per ack (O(pending * retained)).
+        // The control row is uniquely keyed by `seq`, and the seq embedded in
+        // the value is checked so a hostile/misplaced row can never ack a
+        // different message.
+        let key = ctl_key(seq);
+        let Some(raw) = self.memory_fact_get(ROW_KIND_CONTROL, &key)? else {
             return Err(SessionError::NotFound(format!(
                 "control row {seq} of session {}",
                 self.id()
             ))
             .into());
         };
+        let mut row: ControlRow = serde_json::from_str(&raw)
+            .map_err(|e| SessionError::Internal(format!("child control row {seq} decode: {e}")))?;
+        if row.seq != seq {
+            return Err(SessionError::Internal(format!(
+                "child control row key/seq mismatch ({key:?} vs {})",
+                row.seq
+            ))
+            .into());
+        }
         if row.applied_ms.is_none() {
             row.applied_ms = Some(self.now_ms());
             let value = serde_json::to_string(&row)
                 .map_err(|e| SessionError::Internal(format!("control row serialization: {e}")))?;
-            self.upsert_memory_fact(ROW_KIND_CONTROL, &ctl_key(seq), &value)?;
+            self.upsert_memory_fact(ROW_KIND_CONTROL, &key, &value)?;
         }
         Ok(())
     }

@@ -1,0 +1,24 @@
+{
+  "id": "INV-HANDOFF-RUN-QUALIFIED",
+  "surface": "agent.communication",
+  "files": [
+    {
+      "file": "crates/orchestrator/src/runtime_handoff.rs",
+      "find": "        format!(\"{PENDING_INTERNAL_CONTEXT_KEY_PREFIX}{run_id}/{child_id}\"),",
+      "replace": "        format!(\"{PENDING_INTERNAL_CONTEXT_KEY_PREFIX}{child_id}\"),"
+    },
+    {
+      "file": "crates/orchestrator/src/runtime_handoff.rs",
+      "find": "        format!(\"{PENDING_INTERNAL_CONTEXT_DELIVERED_PREFIX}{run_id}/{child_id}\"),",
+      "replace": "        format!(\"{PENDING_INTERNAL_CONTEXT_DELIVERED_PREFIX}{child_id}\"),"
+    }
+  ],
+  "gate": "cargo test -p faktor-orchestrator --lib two_runs_of_one_parent_keep_distinct_child_handoffs",
+  "expect": "FAILED",
+  "note": "Dropping the run qualifier collides two runs' per-run `child-0` handoffs and watermark-suppresses one; the INV-HANDOFF-RUN-QUALIFIED oracle must fail.",
+  "capabilities": [
+    "orchestrator.handoff_run_qualified"
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+}

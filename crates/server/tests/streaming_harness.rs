@@ -1,3 +1,5 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=separate-process,isolated-data-dir,read-only-artifacts
+#![cfg(feature = "streaming-harness")]
 //! Manual loopback streaming-delivery harness (never part of the standing
 //! suites): one real daemon listener and one real TCP/SSE client.
 //!
@@ -9,17 +11,76 @@
 //! - 10_000 terminal lifetime rows walked with a keyset cursor (paging cost).
 //!
 //! Feature-gated (never part of the standing suites): run explicitly with
-//! `cargo test -p faktor-server --features streaming-harness --lib \
+//! `cargo test -p faktor-server --features streaming-harness --test streaming_harness \
 //!  streaming_delivery -- --nocapture --test-threads=1`
 
-use crate::api::tests::test_deps;
-use crate::{serve_arc, ServerDeps};
 use faktor_core::event::EventKind;
 use faktor_core::state::AgentState;
+use faktor_server::{serve_arc, ServerDeps};
 use faktor_session::SessionHandle;
 use futures_util::StreamExt as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+fn harness_deps(root: &std::path::Path) -> ServerDeps {
+    use faktor_agent::AgentRuntime;
+    use faktor_core::model::ModelCapabilities;
+    use faktor_provider::{FakeProvider, ProviderRegistry, ScriptedResponse};
+    use faktor_server::permission::ChannelPermissionRequester;
+    use faktor_server::ServerPassword;
+    use faktor_session::SessionManager;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let mut registry = ProviderRegistry::new();
+    registry
+        .try_register(Arc::new(FakeProvider::with_script(
+            "fake",
+            ModelCapabilities {
+                tools: true,
+                ..Default::default()
+            },
+            vec![ScriptedResponse::Text("pong".into()), ScriptedResponse::End],
+        )))
+        .unwrap();
+    let session = SessionManager::open(root.join("store"), root.join("cas"), true).unwrap();
+    let permissions = ChannelPermissionRequester::new(Duration::from_secs(5));
+    let agent = AgentRuntime::new(faktor_agent::AgentDeps {
+        session: session.clone(),
+        providers: Arc::new(registry),
+        chunk_sink: None,
+        permission_requester: permissions.clone(),
+        evidence: Arc::new(faktor_agent::NoEvidence),
+        tools: Arc::new(faktor_agent::ToolRegistry::new()),
+        cas: None,
+        workspaces: faktor_fs::WorkspaceFileService::new(),
+        edit: None,
+        snapshots: None,
+        sandbox: None,
+        supervisor: None,
+        verification: faktor_agent::VerificationService::disabled(),
+        model: "m".into(),
+        compaction_model: None,
+        compact_at_usage: 0.65,
+        instructions: "You are a test server agent.".into(),
+        hooks: None,
+        instructions_resolver: faktor_instructions::no_roots_resolver(),
+        routing: faktor_agent::FixedRoutingPolicy::passthrough(),
+        budgets: Arc::new(faktor_session::NoopBudget),
+        clock: Arc::new(faktor_core::time::SystemClock),
+        tool_call_mode: faktor_agent::ToolCallMode::Native,
+        tool_deadline_ms: 2000,
+        retry_policy: faktor_core::retry::RetryPolicy::default(),
+        semantic: faktor_agent::fallback_semantic_registry(),
+        context_prior: None,
+        secret_registry: None,
+        efficiency: Default::default(),
+        receipt_sink: None,
+    })
+    .unwrap();
+    let _ = ServerPassword::generate();
+    ServerDeps::new(session, agent, permissions).expect("harness server deps")
+}
 
 // ------------------------------------------------------------- SSE harness
 
@@ -225,7 +286,7 @@ fn producer_deltas(
 /// enabled the daemon notices a full close on its next bounded write (the
 /// <= 5 s idle heartbeat), so the harness waits inside that bound plus
 /// shutdown slack.
-async fn wait_for_server_death(server: &crate::ServerHandle) {
+async fn wait_for_server_death(server: &faktor_server::ServerHandle) {
     let deadline = Instant::now() + Duration::from_secs(15);
     while server.is_alive() {
         assert!(
@@ -236,7 +297,7 @@ async fn wait_for_server_death(server: &crate::ServerHandle) {
     }
 }
 
-async fn start_server(deps: ServerDeps) -> (crate::ServerHandle, String) {
+async fn start_server(deps: ServerDeps) -> (faktor_server::ServerHandle, String) {
     let token = deps.auth_token.as_str().to_string();
     let server = serve_arc(Arc::new(deps), 0).await.unwrap();
     (server, token)
@@ -249,7 +310,7 @@ async fn start_server(deps: ServerDeps) -> (crate::ServerHandle, String) {
 async fn streaming_delivery_deltas_200ps_10k() {
     const COUNT: u64 = 10_000;
     let dir = tempfile::tempdir().unwrap();
-    let deps = test_deps(dir.path());
+    let deps = harness_deps(dir.path());
     let session = deps.session.clone();
     let ws = session.create_workspace("/stream-harness").unwrap();
     let sid = session
@@ -326,7 +387,7 @@ async fn streaming_delivery_deltas_200ps_10k() {
 async fn streaming_delivery_catch_up_10k() {
     const COUNT: u64 = 10_000;
     let dir = tempfile::tempdir().unwrap();
-    let deps = test_deps(dir.path());
+    let deps = harness_deps(dir.path());
     let session = deps.session.clone();
     let ws = session.create_workspace("/stream-harness").unwrap();
     let sid = session
@@ -383,7 +444,7 @@ async fn streaming_delivery_catch_up_10k() {
 async fn streaming_delivery_state_burst_1k() {
     const COUNT: u64 = 1_000;
     let dir = tempfile::tempdir().unwrap();
-    let deps = test_deps(dir.path());
+    let deps = harness_deps(dir.path());
     let session = deps.session.clone();
     let ws = session.create_workspace("/stream-harness").unwrap();
     let sid = session
@@ -454,7 +515,7 @@ async fn streaming_delivery_terminal_10k_lines() {
     const COUNT: usize = 10_000;
     const PAGE: usize = 200;
     let dir = tempfile::tempdir().unwrap();
-    let deps = test_deps(dir.path());
+    let deps = harness_deps(dir.path());
     let session = deps.session.clone();
     let ws = session.create_workspace("/stream-harness").unwrap();
     let sid = session

@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-browser-profile
 // Test-only Revision 8 fixtures for the registry-driven harnesses.
 //
 // These are NOT product data and never ship in an activated panel: every
@@ -137,9 +138,9 @@ const sources = {
   sessionMeta: source('GET', '/native/sessions/s1/meta', { pinned: false, archived: false, updated_ms: NOW }),
   search: source('GET', '/native/transcript/search', { results: [{ role: 'assistant', snippet: 'the daemon contract is authoritative' }] }),
   transcript: source('GET', '/native/session/s1/turns', { turns: [{ role: 'user', text: 'Implement Rev8' }, { role: 'assistant', text: 'Reading the spec.' }] }),
-  usage: source('GET', '/native/usage', { attemptedSpendMicro: '1234567', local: { tokens: 30000 }, hosted: { tokens: 12000 }, run: { state: 'running' } }),
+  usage: source('GET', '/native/usage', { ok: true, organization: 'local', fold: { organization_id: 'local', totals: { input_tokens: 9000, output_tokens: 3000, cache_read_tokens: 0, cache_write_tokens: 0, reasoning_tokens: 0, provider_cost_micro: '450000', managed_cost_micro: '450000', byok_cost_micro: '0', events: 12, corrected_events: 0 }, per_task: [{ task_id: 1, run_id: '1', totals: { input_tokens: 9000, output_tokens: 3000, cache_read_tokens: 0, cache_write_tokens: 0, reasoning_tokens: 0, provider_cost_micro: '450000', managed_cost_micro: '450000', byok_cost_micro: '0', events: 12, corrected_events: 0 } }], next_cursor: null }, credits: { granted_micro: '10000000', consumed_micro: '450000', refunded_micro: '0', held_micro: '0', pending_consumes: 0 }, items: [], nextCursor: null }),
   sessionUsage: source('GET', '/native/session/s1/usage', { tokens: 12000, costMicro: '450000', context: { basis: 'observed', capacity: 200000, manifest: 'ctx-7' }, terminals: [{ id: 'term-1' }] }),
-  outcomes: source('GET', '/native/outcomes', { verifiedLandedChanges: 4, vcscMicro: '312500', failedAttempts: 1, verified: [{ id: 'o1' }], unverified: [], pending: [], receipts: [{ id: 'or1' }] }),
+  outcomes: source('GET', '/native/outcomes', { metrics: { runs: 5, verifiedChanges: 4, verifiedChangesMoneyComplete: 3, verifiedCostPerSuccessfulChangeMicro: '312500', totalSpendMicro: '1234567', localOnlyRuns: 4, localFinalRuns: 4, localMeasurement: 'measured', hostedOnlyRuns: 1, runsWithSteps: 5, scanned: 5, truncated: false }, runs: [{ run_id: '1', verified: true }, { run_id: '2', verified: false }], nextCursor: null }),
   verification: source('GET', '/native/session/s1/verification', { state: 'verified', candidate: { id: 'cand-1', digest: 'sha256:aaa' }, candidateDigest: 'sha256:aaa', criteria: { total: 3 }, diff: { base: 'HEAD', candidate: 'candidate-1' } }),
   checkpoints: source('GET', '/native/session/s1/checkpoints', { checkpoints: [{ id: 'cp-1', sequence: 1, coverage: 'full', created_at: '2026-10-18T00:00:00Z' }] }),
   taskRuns: source('GET', '/native/session/s1/task-runs', { run: { state: 'running' }, queued: [{ text: 'next message', state: 'queued' }], timeline: [{ kind: 'tool', state: 'running', detail: 'read_file' }], completion: { level: 'local', contract: 'criteria' } }),
@@ -148,7 +149,7 @@ const sources = {
   diagnostics: source('GET', '/native/diagnostics/preview', { runtime: { checksum: 'sha256:runtime', signature: 'not recorded', trust: 'machine' }, protocol: { status: 'compatible', expected: '1', received: '1' } }),
   updater: source('GET', '/native/updater/status', { state: 'idle' }),
   identity: source('GET', '/native/identity', { user: 'dev', organization: 'local', status: 'connected' }),
-  entitlements: source('GET', '/native/entitlements', { quota: 'unlimited', status: 'active' }),
+  entitlements: source('GET', '/native/entitlements', { organization_id: 'local', plan_id: 'team', plan_found: true, subscription_status: 'active', subscription_active: true, limits: { max_tokens_per_period: 100000, max_managed_spend_micro_per_period: '5000000' }, credits: { granted_micro: '10000000', consumed_micro: '450000', refunded_micro: '0', held_micro: '0', pending_consumes: 0 }, managed_spend_micro: '450000', byok_spend_micro: '0', total_tokens: 12000, in_flight: [], now_ms: NOW }),
   browser: source('GET', '/native/browser/status', { available: true, state: 'ready', url: 'http://127.0.0.1:3000' }),
   enterprise: source('GET', '/native/enterprise/status', { state: 'disabled', effectiveConfig: { locked: false } }),
   workers: source('GET', '/native/workers', { workers: [{ id: 'w1', state: 'ready' }] }),

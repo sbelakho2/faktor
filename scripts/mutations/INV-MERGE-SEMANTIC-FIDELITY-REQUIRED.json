@@ -5,5 +5,7 @@
   "replace": "            SemanticQualityRequirement::advisory(SemanticOp::Delta).with_compose_delta(true)",
   "gate": "cargo test -p faktor-orchestrator --lib required_semantic_delta_rejects_sub_compiler_fidelity",
   "expect": "FAILED",
-  "note": "Dropping the authoritative quality requirement lets a structural provider satisfy a compiler-exact merge obligation."
+  "note": "Dropping the authoritative quality requirement lets a structural provider satisfy a compiler-exact merge obligation.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

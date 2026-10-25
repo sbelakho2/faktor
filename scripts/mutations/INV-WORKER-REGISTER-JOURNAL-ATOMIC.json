@@ -5,5 +5,7 @@
   "replace": "        let mut entry = journal.clone();\n        entry.seq = state.journal.len() as i64 + 1;\n        let _ = entry;",
   "gate": "cargo test -p faktor-worker --lib crash_window_partial_registration_repairs_the_token_binding",
   "expect": "FAILED",
-  "note": "Dropping the registration journal row from the binding transaction leaves an unaudited identity binding."
+  "note": "Dropping the registration journal row from the binding transaction leaves an unaudited identity binding.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

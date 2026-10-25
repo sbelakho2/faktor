@@ -5,5 +5,7 @@
   "replace": "                        let receipt_json: String = tx.query_row(\n                            \"SELECT receipt_json FROM task_admission WHERE key = ?1\",\n                            params![key.as_str()],\n                            |r| r.get(0),\n                        )?;\n                        let _ = receipt_json;\n                        TaskAdmissionClaim::Fresh",
   "gate": "cargo test -p faktor-store --lib claim_fresh_then_complete_replays_the_exact_receipt_bytes",
   "expect": "assertion.*failed|left.*right",
-  "note": "A completed submission key is answered Fresh again instead of replaying the stored byte-exact receipt: the same logical start can execute a second time and the idempotent receipt contract is broken."
+  "note": "A completed submission key is answered Fresh again instead of replaying the stored byte-exact receipt: the same logical start can execute a second time and the idempotent receipt contract is broken.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

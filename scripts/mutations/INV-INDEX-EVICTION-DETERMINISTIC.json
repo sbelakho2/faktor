@@ -8,5 +8,7 @@
   "note": "Canonical admission is replaced by unconditional eviction: the surviving file set becomes insertion-order dependent (an older straggler displaces a newer resident), so the cap no longer holds the top (modified_ms, path) set.",
   "capabilities": [
     "index.authority"
-  ]
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

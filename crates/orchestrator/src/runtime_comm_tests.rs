@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! Child-agent / cross-agent communication probes (split from
 //! `runtime_tests.rs` to stay under the recorded source-size ceiling):
 //! crash-window handoff healing + outcome truth, nested-spawn refusal, and
@@ -31,7 +32,7 @@ async fn fault_probe_crash_before_parent_handoff_reattach_heals_exactly_once() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].state, ChildState::Done, "terminal rows persisted");
     let parent = env.manager.get_session(env.parent).unwrap().unwrap();
-    let key = format!("child-handoff/{}", rows[0].child_id);
+    let key = format!("child-handoff/run-handoff-crash/{}", rows[0].child_id);
     assert!(
         parent
             .memory_fact_get("internal_context", &key)
@@ -64,7 +65,10 @@ async fn fault_probe_crash_before_parent_handoff_reattach_heals_exactly_once() {
         section.contains("outcome: done"),
         "the handoff reports the child's durable terminal outcome: {section}"
     );
-    let watermark_key = format!("child-handoff-delivered/{}", rows[0].child_id);
+    let watermark_key = format!(
+        "child-handoff-delivered/run-handoff-crash/{}",
+        rows[0].child_id
+    );
     let watermark = rows[0].updated_ms.to_string();
     assert_eq!(
         parent
@@ -269,7 +273,7 @@ async fn approval_required_tool_result_does_not_stall_the_child_handoff() {
         "the child lifecycle is terminal (approval is a separate human queue)"
     );
     let parent = env.manager.get_session(env.parent).unwrap().unwrap();
-    let key = format!("child-handoff/{}", rows[0].child_id);
+    let key = format!("child-handoff/run-approval-required/{}", rows[0].child_id);
     let section = parent
         .memory_fact_get("internal_context", &key)
         .unwrap()
@@ -291,4 +295,235 @@ async fn approval_required_tool_result_does_not_stall_the_child_handoff() {
             .as_deref(),
         Some("")
     );
+}
+
+/// CASE INV-HANDOFF-RUN-QUALIFIED: child ids are minted PER RUN (`child-0` in
+/// every plan), so two runs of the SAME parent session both own a `child-0`.
+/// The durable handoff key is run-qualified, so neither delivery overwrites
+/// or watermark-suppresses the other; the parent's next turn consumes BOTH,
+/// each with its own run's goal.
+#[tokio::test]
+async fn two_runs_of_one_parent_keep_distinct_child_handoffs() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let mut scripts = roundtrip_script();
+    scripts.extend(roundtrip_script());
+    scripts.extend(empty_script());
+    let env = Arc::new(open_env(dir.path(), scripts, 0));
+
+    let first_plan = plan(
+        OwnershipModel::NoWrites,
+        vec![wi("alpha", WorkKind::Analysis, &[])],
+    );
+    let first = run_exec(
+        &env,
+        first_plan,
+        base_config(&env, "run-alpha"),
+        vec![spec("alpha")],
+    )
+    .await
+    .expect("first run completes");
+    assert!(first.complete, "{first:?}");
+
+    let second_plan = plan(
+        OwnershipModel::NoWrites,
+        vec![wi("beta", WorkKind::Analysis, &[])],
+    );
+    let second = run_exec(
+        &env,
+        second_plan,
+        base_config(&env, "run-beta"),
+        vec![spec("beta")],
+    )
+    .await
+    .expect("second run completes");
+    assert!(second.complete, "{second:?}");
+
+    // Both runs minted the SAME per-run child id; only the run qualifier
+    // keeps their durable deliveries apart.
+    assert_eq!(first.children[0].child_id, second.children[0].child_id);
+    let parent = env.manager.get_session(env.parent).unwrap().unwrap();
+    let alpha_key = format!("child-handoff/run-alpha/{}", first.children[0].child_id);
+    let beta_key = format!("child-handoff/run-beta/{}", second.children[0].child_id);
+    let alpha = parent
+        .memory_fact_get("internal_context", &alpha_key)
+        .unwrap()
+        .expect("the first run's handoff is still pending");
+    let beta = parent
+        .memory_fact_get("internal_context", &beta_key)
+        .unwrap()
+        .expect("the second run's handoff is still pending");
+    assert!(alpha.contains("work alpha"), "{alpha}");
+    assert!(!alpha.contains("work beta"), "no sibling leak: {alpha}");
+    assert!(beta.contains("work beta"), "{beta}");
+    assert!(!beta.contains("work alpha"), "no sibling leak: {beta}");
+    assert!(
+        parent
+            .memory_fact_get(
+                "internal_context",
+                &format!("child-handoff/{}", first.children[0].child_id)
+            )
+            .unwrap()
+            .is_none(),
+        "a session-wide key must never be written (collision surface)"
+    );
+
+    // The parent consumes BOTH exactly once in one turn.
+    let before = env.provider.count();
+    env.agent
+        .run_turn(env.parent, "continue both runs", &[])
+        .await
+        .expect("the parent continuation drives");
+    let system = env
+        .provider
+        .text_of(before)
+        .expect("parent request captured");
+    assert!(
+        system.contains("work alpha"),
+        "alpha handoff missing: {system}"
+    );
+    assert!(
+        system.contains("work beta"),
+        "beta handoff missing: {system}"
+    );
+    for key in [&alpha_key, &beta_key] {
+        assert_eq!(
+            parent
+                .memory_fact_get("internal_context", key)
+                .unwrap()
+                .as_deref(),
+            Some(""),
+            "each run-qualified handoff is acked exactly once"
+        );
+    }
+}
+
+/// CASE INV-HANDOFF-CANCELLED: a Cancelled child is a terminal OUTCOME,
+/// not an absence. Its parent handoff is delivered with the typed
+/// `outcome: cancelled` (never a fabricated success), so the parent knows
+/// the item stopped instead of inferring silence.
+#[tokio::test]
+async fn cancelled_child_reports_an_explicit_cancelled_handoff() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(open_env(dir.path(), empty_script(), 0));
+    let run = "run-cancelled-handoff";
+    let child_id = "child-0";
+    let session_id = craft_child_row(&env, run, child_id, "analysis", ChildState::Cancelled, None);
+    let child = env
+        .manager
+        .get_session(session_id)
+        .unwrap()
+        .expect("crafted child session");
+    child
+        .orchestrator_child_runtime_put(&faktor_session::child::ChildRuntimeBlockerRow {
+            child_id: child_id.into(),
+            state: "cancelled".into(),
+            blocker: None,
+            updated_ms: 77,
+        })
+        .unwrap();
+
+    let rows = OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, run).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].state, ChildState::Cancelled);
+    env.orchestrator
+        .deliver_child_handoff(env.parent, run, &rows[0]);
+
+    let parent = env.manager.get_session(env.parent).unwrap().unwrap();
+    let key = format!("child-handoff/{run}/{child_id}");
+    let section = parent
+        .memory_fact_get("internal_context", &key)
+        .unwrap()
+        .expect("a cancelled child's terminal outcome is delivered");
+    assert!(
+        section.contains("outcome: cancelled"),
+        "the handoff names the honest outcome: {section}"
+    );
+    assert!(
+        !section.contains("outcome: done") && !section.contains("outcome: failed"),
+        "cancellation is never reported as success or failure: {section}"
+    );
+}
+
+/// CASE MC-HANDOFF-RUN-KEY / MC-HANDOFF-CANCELLED (mutation witnesses): the handoff key MUST carry
+/// the run id, and cancellation MUST be in the delivered terminal set.
+fn handoff_key_guard_present(source: &str) -> bool {
+    source.contains("format!(\"{PENDING_INTERNAL_CONTEXT_KEY_PREFIX}{run_id}/{child_id}\")")
+        && source
+            .contains("format!(\"{PENDING_INTERNAL_CONTEXT_DELIVERED_PREFIX}{run_id}/{child_id}\")")
+}
+
+fn cancelled_handoff_guard_present(source: &str) -> bool {
+    source.contains("ChildState::Done | ChildState::Failed | ChildState::Cancelled")
+}
+
+#[test]
+fn handoff_run_qualification_and_cancellation_guards_are_pinned() {
+    const SOURCE: &str = include_str!("runtime_handoff.rs");
+    assert!(
+        handoff_key_guard_present(SOURCE),
+        "the child-handoff fact key lost its run qualifier (sibling overwrite)"
+    );
+    let unqualified = SOURCE.replace(
+        "format!(\"{PENDING_INTERNAL_CONTEXT_KEY_PREFIX}{run_id}/{child_id}\")",
+        "format!(\"{PENDING_INTERNAL_CONTEXT_KEY_PREFIX}{child_id}\")",
+    );
+    assert!(
+        !handoff_key_guard_present(&unqualified),
+        "the witness must detect a session-wide key regression"
+    );
+    assert!(
+        cancelled_handoff_guard_present(SOURCE),
+        "the delivered terminal set lost Cancelled (silent child outcome)"
+    );
+    let no_cancel = SOURCE.replace(
+        "ChildState::Done | ChildState::Failed | ChildState::Cancelled",
+        "ChildState::Done | ChildState::Failed",
+    );
+    assert!(
+        !cancelled_handoff_guard_present(&no_cancel),
+        "the witness must detect dropped cancellation delivery"
+    );
+}
+
+/// Upgrade-window exactly-once: a pre-run-qualified pending handoff from an
+/// older daemon is still THE delivery for that child. Re-attach healing must
+/// not re-deliver it under the run-qualified key (the parent would consume
+/// the result twice).
+#[tokio::test]
+async fn heal_does_not_duplicate_a_legacy_unqualified_handoff() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(open_env(dir.path(), empty_script(), 0));
+    let run = "run-legacy-hash";
+    let child_id = "child-0";
+    let _session = craft_child_row(&env, run, child_id, "analysis", ChildState::Done, None);
+    let rows = OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, run).unwrap();
+    let parent = env.manager.get_session(env.parent).unwrap().unwrap();
+    parent
+        .upsert_memory_fact(
+            "internal_context",
+            &format!("child-handoff/{child_id}"),
+            "[faktor:internal-context]\nlegacy delivery\n[/faktor:internal-context]",
+        )
+        .unwrap();
+    let mut children = std::collections::HashMap::new();
+    children.insert(child_id.to_string(), rows[0].clone());
+    env.orchestrator
+        .heal_pending_child_handoffs(env.parent, run, &children);
+    assert!(
+        parent
+            .memory_fact_get(
+                "internal_context",
+                &format!("child-handoff/{run}/{child_id}")
+            )
+            .unwrap()
+            .is_none(),
+        "a legacy pending section is the once delivery; healing must not duplicate it"
+    );
+    assert!(parent
+        .memory_fact_get("internal_context", &format!("child-handoff/{child_id}"))
+        .unwrap()
+        .is_some());
 }

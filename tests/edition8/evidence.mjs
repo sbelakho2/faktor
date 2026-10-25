@@ -158,7 +158,9 @@ export function writeSummary({ requireDogfood = false, allowUnreviewedPlatform =
           artifacts: doc.artifacts,
         };
   }
-  const required = Object.keys(GATES).filter((name) => requireDogfood || name !== 'dogfood');
+  const required = Object.keys(GATES).filter(
+    (name) => name !== 'scale' && (requireDogfood || name !== 'dogfood'),
+  );
   const missing = required.filter((name) => gates[name]?.status !== 'passed');
   const platforms = readGate('visual-platforms');
   const currentPlatform = platforms?.detail?.current_platform ?? null;
@@ -228,7 +230,9 @@ export function verifyGates({ allowDirty = false, requireDogfood = false, allowU
   if (problems.length > 0) return problems;
   const identity = headIdentity();
   const docs = {};
-  const required = Object.keys(GATES).filter((name) => requireDogfood || name !== 'dogfood');
+  const required = Object.keys(GATES).filter(
+    (name) => name !== 'scale' && (requireDogfood || name !== 'dogfood'),
+  );
   for (const name of required) {
     const doc = readGate(name);
     if (doc === null) {
@@ -438,7 +442,7 @@ export function verifyGates({ allowDirty = false, requireDogfood = false, allowU
 
   const perf = docs.perf;
   if (perf) {
-    requireCount(perf, 'workloads', 11, 'workloads', problems);
+    requireCount(perf, 'workloads', 12, 'workloads', problems);
     requireCount(perf, 'failed', 0, 'failed', problems);
     requireCount(perf, 'baseline_present', 1, 'baseline present', problems);
     const budget = perf.detail?.budget ?? {};

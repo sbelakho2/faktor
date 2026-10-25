@@ -1,0 +1,16 @@
+{
+  "id": "INV-EDITION8-ORG-SCOPED-COMMERCIAL-READS",
+  "file": "apps/vscode/src/edition8/source.ts",
+  "find": "      usage: readJson(\n        native,\n        'GET',\n        organization === null\n          ? '/native/usage'\n          : `/native/usage?org=${encodeURIComponent(organization)}&limit=1`,\n        null,\n        sources,\n        'usage',\n      ),",
+  "replace": "      usage: readJson(native, 'GET', '/native/usage', null, sources, 'usage'),",
+  "gate": "node --no-warnings apps/vscode/scripts/selftest.mjs",
+  "expect": "FAIL",
+  "timeout_ms": 180000,
+  "note": "Edition 8 drops the served organization and reads the legacy org-less usage alias.",
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

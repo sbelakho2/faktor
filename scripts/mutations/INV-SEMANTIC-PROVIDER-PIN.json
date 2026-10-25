@@ -5,5 +5,7 @@
   "replace": "            if let Some(pin) = &call.provider_pin {\n                let _ = pin;\n            }",
   "gate": "cargo test -p faktor-semantic --lib pinned_call_never_fails_over",
   "expect": "FAILED",
-  "note": "Dropping the pin lets a fail-over provider answer a call whose snapshot identity was derived from the selected provider."
+  "note": "Dropping the pin lets a fail-over provider answer a call whose snapshot identity was derived from the selected provider.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

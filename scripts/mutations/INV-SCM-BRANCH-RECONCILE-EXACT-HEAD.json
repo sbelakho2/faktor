@@ -8,5 +8,7 @@
   "note": "Negating the drift check turns a matching head into a conflict.",
   "capabilities": [
     "scm.branch_reconcile"
-  ]
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

@@ -8,5 +8,7 @@
   "note": "An unbounded writer channel removes the backpressure the flood test measures.",
   "capabilities": [
     "acp.writer_backpressure"
-  ]
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

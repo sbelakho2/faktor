@@ -166,6 +166,9 @@ steps:
       - node scripts/programme/check-core-dumps.mjs --selftest
       - node scripts/check-blob-hygiene.mjs --selftest
       - node scripts/check-blob-hygiene.mjs
+      - node scripts/check-test-separation.mjs --selftest
+      - node scripts/check-test-separation.mjs --check
+      - node scripts/mutation-run.mjs --check-specs
       - node scripts/programme/release-gate.mjs --selftest
       - node scripts/programme/select-tests.mjs --mode pull --base "${CI_COMMIT_BEFORE_SHA:-HEAD~1}" --fallback-full --out target/certification/programme/selection.json
       - node scripts/programme/run-selection.mjs --selection target/certification/programme/selection.json
@@ -187,6 +190,9 @@ steps:
         node scripts/programme/check-core-dumps.mjs --selftest
         node scripts/check-blob-hygiene.mjs --selftest
         node scripts/check-blob-hygiene.mjs
+        node scripts/check-test-separation.mjs --selftest
+        node scripts/check-test-separation.mjs --check
+        node scripts/mutation-run.mjs --check-specs
         node scripts/programme/release-gate.mjs --selftest
         node scripts/programme/select-tests.mjs --mode pull --base "${CI_COMMIT_BEFORE_SHA:-HEAD~1}" --fallback-full --out target/certification/programme/selection.json
         node scripts/programme/run-selection.mjs --selection target/certification/programme/selection.json
@@ -679,6 +685,11 @@ steps:
       - node scripts/check-ignored-tests.mjs
       # Invariant registry coverage (node-only; the rust static lane has no node).
       - node scripts/check-invariants.mjs
+      # Tester/SUT separation: no self-oracle, self-attestation, shared state,
+      # same-function expectation or in-daemon harness; new tests declare.
+      - node scripts/check-test-separation.mjs --selftest
+      - node scripts/check-test-separation.mjs --check
+      - node scripts/mutation-run.mjs --check-specs
       # DOGFOOD coverage law (scripts/dogfood.mjs): every repo surface —
       # production crates (unit-site + capability row), every discovered
       # native route/builtin tool/CLI command/provider kind, every VS Code

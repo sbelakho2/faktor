@@ -5,5 +5,7 @@
   "replace": "            let _ = other;",
   "gate": "cargo test -p faktor-worker --lib legacy_partial_binding_refuses_a_second_worker_and_never_authenticates",
   "expect": "FAILED",
-  "note": "Dropping the in-transaction hash scan lets a second worker bind a token already bound by a partial/crashed registration."
+  "note": "Dropping the in-transaction hash scan lets a second worker bind a token already bound by a partial/crashed registration.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

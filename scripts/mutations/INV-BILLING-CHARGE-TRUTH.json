@@ -1,0 +1,15 @@
+{
+  "id": "INV-BILLING-CHARGE-TRUTH",
+  "surface": "payments.billing",
+  "file": "crates/payments/src/service/invoice_ops.rs",
+  "find": "        if status != PaymentStatus::Failed\n            && (charge.amount_minor != balance || charge.currency != invoice.currency)\n        {",
+  "replace": "        if false {",
+  "gate": "cargo test -p faktor-payments --test invoice_fencing provider_charge_amount_mismatch_is_refused_without_crediting",
+  "expect": "FAILED",
+  "note": "Crediting an invoice from a provider charge whose amount/currency differs from the fenced request mixes currencies and misstates collected money; the charge-truth oracle must fail.",
+  "capabilities": [
+    "payments.invoice_truth"
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+}

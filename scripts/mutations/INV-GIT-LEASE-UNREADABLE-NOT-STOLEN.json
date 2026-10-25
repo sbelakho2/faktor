@@ -5,5 +5,7 @@
   "replace": "let old = true;",
   "gate": "cargo test -p faktor-git --lib unreadable_lease_residue_is_never_stolen_immediately",
   "expect": "FAILED",
-  "note": "Treating an unreadable lease residue as immediately old lets a second daemon steal the repository mutation lease after a transient read/permission failure."
+  "note": "Treating an unreadable lease residue as immediately old lets a second daemon steal the repository mutation lease after a transient read/permission failure.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

@@ -5,5 +5,7 @@
   "replace": "            if { seen.insert(id(addition)); true } {",
   "gate": "cargo test -p faktor-session --lib contract_merge_unions_by_id_preserves_state_is_idempotent_and_durable",
   "expect": "FAILED",
-  "note": "Appending duplicate ids breaks the union-by-id contract and lets a replay mutate the durable contract."
+  "note": "Appending duplicate ids breaks the union-by-id contract and lets a replay mutate the durable contract.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

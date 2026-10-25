@@ -1102,6 +1102,28 @@ export interface NativeBillingCapability {
   readonly cause: string | null;
 }
 
+/** Additive commercial record served with a wired payment plane. */
+export interface NativeBillingPayments {
+  readonly invoice_count: number;
+  readonly open_invoice_count: number;
+  readonly outstanding_minor: number;
+  readonly paid_minor: number;
+  readonly refunded_minor: number;
+  readonly payment_method_count: number;
+  readonly seats: number | null;
+  readonly currency: string | null;
+  readonly currency_exponent: number | null;
+  readonly tax: { readonly state: string; readonly cause: string | null; readonly default_jurisdiction: string | null };
+  readonly reconciliation: {
+    readonly unreconciled: number;
+    readonly matched: number;
+    readonly amount_mismatch: number;
+    readonly currency_mismatch: number;
+    readonly provider_invoice_missing: number;
+  };
+  readonly provider: { readonly provider: string; readonly state: string; readonly cause: string | null };
+}
+
 /** The derived trial view of one subscription. */
 export interface NativeBillingTrial {
   readonly state: string;
@@ -1150,6 +1172,7 @@ export interface NativeBillingOverview {
   readonly currency: NativeBillingCapability;
   readonly usage_export: NativeBillingCapability;
   readonly usage_export_formats: string[];
+  readonly payments: NativeBillingPayments | null;
   readonly now_ms: number;
 }
 
@@ -3123,6 +3146,75 @@ function validateBillingSubscription(object: JsonObject, path: string): NativeBi
   };
 }
 
+function fSafeInt(object: JsonObject, key: string, path: string): number {
+  const value = fNumber(object, key, path);
+  if (!Number.isSafeInteger(value)) {
+    throw new NativeProtocolError(path, `${key} exceeds the exact integer range`);
+  }
+  return value;
+}
+
+function fNullableSafeInt(object: JsonObject, key: string, path: string): number | null {
+  const raw = object[key];
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw !== 'number' || !Number.isSafeInteger(raw)) {
+    throw new NativeProtocolError(path, `${key} must be a safe integer or null`);
+  }
+  return raw;
+}
+
+function validateBillingPayments(view: JsonObject, path: string): NativeBillingPayments {
+  checkResponseKeys(view, path, [
+    'invoice_count',
+    'open_invoice_count',
+    'outstanding_minor',
+    'paid_minor',
+    'refunded_minor',
+    'payment_method_count',
+    'seats',
+    'currency',
+    'currency_exponent',
+    'tax',
+    'reconciliation',
+    'provider',
+  ]);
+  const tax = asObject(field(view, 'tax', path), `${path}.tax`);
+  const reconciliation = asObject(field(view, 'reconciliation', path), `${path}.reconciliation`);
+  const provider = asObject(field(view, 'provider', path), `${path}.provider`);
+  return {
+    invoice_count: fSafeInt(view, 'invoice_count', path),
+    open_invoice_count: fSafeInt(view, 'open_invoice_count', path),
+    outstanding_minor: fSafeInt(view, 'outstanding_minor', path),
+    paid_minor: fSafeInt(view, 'paid_minor', path),
+    refunded_minor: fSafeInt(view, 'refunded_minor', path),
+    payment_method_count: fSafeInt(view, 'payment_method_count', path),
+    seats: fNullableSafeInt(view, 'seats', path),
+    currency: fNullableString(view, 'currency', path),
+    currency_exponent: fNullableSafeInt(view, 'currency_exponent', path),
+    tax: {
+      state: fString(tax, 'state', `${path}.tax`),
+      cause: fNullableString(tax, 'cause', `${path}.tax`),
+      default_jurisdiction: fNullableString(tax, 'default_jurisdiction', `${path}.tax`),
+    },
+    reconciliation: {
+      unreconciled: fSafeInt(reconciliation, 'unreconciled', `${path}.reconciliation`),
+      matched: fSafeInt(reconciliation, 'matched', `${path}.reconciliation`),
+      amount_mismatch: fSafeInt(reconciliation, 'amount_mismatch', `${path}.reconciliation`),
+      currency_mismatch: fSafeInt(reconciliation, 'currency_mismatch', `${path}.reconciliation`),
+      provider_invoice_missing: fSafeInt(
+        reconciliation,
+        'provider_invoice_missing',
+        `${path}.reconciliation`,
+      ),
+    },
+    provider: {
+      provider: fString(provider, 'provider', `${path}.provider`),
+      state: fString(provider, 'state', `${path}.provider`),
+      cause: fNullableString(provider, 'cause', `${path}.provider`),
+    },
+  };
+}
+
 function validateBillingOverviewObject(view: JsonObject, path: string): NativeBillingOverview {
   checkResponseKeys(view, path, [
     'organization_id',
@@ -3143,6 +3235,7 @@ function validateBillingOverviewObject(view: JsonObject, path: string): NativeBi
   ]);
   const account = fNullableObject(view, 'account', path);
   const subscription = fNullableObject(view, 'subscription', path);
+  const payments = fNullableObject(view, 'payments', path);
   const trial = asObject(field(view, 'trial', path), `${path}.trial`);
   checkResponseKeys(trial, `${path}.trial`, ['state', 'ends_ms']);
   const formats = fStringArray(view, 'usage_export_formats', path);
@@ -3170,6 +3263,7 @@ function validateBillingOverviewObject(view: JsonObject, path: string): NativeBi
     currency: validateBillingCapability(view, 'currency', path),
     usage_export: validateBillingCapability(view, 'usage_export', path),
     usage_export_formats: formats,
+    payments: payments === null ? null : validateBillingPayments(payments, `${path}.payments`),
     now_ms: fEpochMs(view, 'now_ms', path),
   };
 }

@@ -5,5 +5,7 @@
   "replace": "        \"complete\" => next == \"complete\" || next == \"unavailable\",\n",
   "gate": "cargo test -p faktor-tests-accounting-modelcheck --test new_guard_money_state_and_classification",
   "expect": "must be refused typed|disagrees with the spec model|ACCEPTED an illegal transition",
-  "note": "Planting the complete -> unavailable edge makes a TERMINAL settlement projection regress; the new lifecycle property/witness gate must catch the accepted illegal transition."
+  "note": "Planting the complete -> unavailable edge makes a TERMINAL settlement projection regress; the new lifecycle property/witness gate must catch the accepted illegal transition.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

@@ -5,5 +5,7 @@
   "replace": "   \"capabilities\": [\n    {\n     \"id\": \"acquire\",",
   "gate": "node scripts/check-invariant-coverage.mjs --check",
   "expect": "FAIL",
-  "note": "Renames the unique acquire.health capability id into a malformed one: the mechanical capability check must fail on the bad id and on the now-missing unit binding."
+  "note": "Renames the unique acquire.health capability id into a malformed one: the mechanical capability check must fail on the bad id and on the now-missing unit binding.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

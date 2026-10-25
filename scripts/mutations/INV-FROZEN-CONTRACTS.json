@@ -4,5 +4,8 @@
   "find": "\"wire\": \"compact_rejected\"",
   "replace": "\"wire\": \"compaction_rejected\"",
   "gate": "cargo run -p faktor-contracts -- check",
-  "note": "Renames one frozen wire variant in the canonical contract: the compiled-vocabulary drift gate must detect the divergence."
+  "expect": "FAIL",
+  "note": "Renames one frozen wire variant in the canonical contract: the compiled-vocabulary drift gate must detect the divergence.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

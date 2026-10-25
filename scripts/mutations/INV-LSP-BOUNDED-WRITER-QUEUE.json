@@ -8,5 +8,7 @@
   "note": "Accepting a full bounded writer queue drops the enqueue and its completion instead of the typed Oversized refusal.",
   "capabilities": [
     "lsp.writer_backpressure"
-  ]
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

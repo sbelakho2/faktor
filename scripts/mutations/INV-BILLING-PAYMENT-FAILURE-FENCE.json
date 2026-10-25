@@ -1,0 +1,19 @@
+{
+  "id": "INV-BILLING-PAYMENT-FAILURE-FENCE",
+  "surface": "payments.billing",
+  "file": "crates/payments/src/service/webhook_effects.rs",
+  "find": "        let mut failed_payment = if event.event_type == \"invoice.payment_failed\" {\n            match provider_invoice_id {\n                Some(provider_payment_id) => {\n                    payment_by_provider_id_tx(tx, org, provider_payment_id)?\n                        .filter(|payment| payment.status.can_transition_to(PaymentStatus::Failed))\n                }\n                None => None,\n            }\n        } else {\n            None\n        };\n",
+  "replace": "        let mut failed_payment: Option<Payment> = None;\n",
+  "gate": "cargo test -p faktor-payments --test invoice_fencing failed_payment_webhook_fails_the_pending_payment_and_releases_the_fence",
+  "expect": "FAILED",
+  "note": "An id-only failed-payment webhook that only marks the invoice past due leaves the local payment pending and the invoice-payment fence held forever; the fence-release oracle must fail.",
+  "capabilities": [
+    "payments.lease_fence"
+  ],
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

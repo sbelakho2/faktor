@@ -60,6 +60,8 @@ export const SUITES = Object.freeze({
     layers: ['unit-property', 'state-model-crash'],
     commands: [
       'node scripts/check-invariants.mjs',
+      'node scripts/check-mutation-surfaces.mjs --check',
+      'node scripts/check-mutation-surfaces.mjs --selftest',
       'node scripts/check-invariant-coverage.mjs --check',
       'node scripts/check-invariant-coverage.mjs selftest',
     ],

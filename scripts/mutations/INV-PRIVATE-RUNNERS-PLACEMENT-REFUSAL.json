@@ -6,5 +6,7 @@
   "gate": "cargo test -p faktor-tests-production-wiring --test new_guard_entitlement_and_producers",
   "expect": "expected the typed entitlement refusal",
   "timeout_ms": 3600000,
-  "note": "Removing the private_runners gate makes the production placement adapter mint and lease a remote job for an unentitled plan; the new placement gate must catch it."
+  "note": "Removing the private_runners gate makes the production placement adapter mint and lease a remote job for an unentitled plan; the new placement gate must catch it.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

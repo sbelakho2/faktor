@@ -8,5 +8,7 @@
   "note": "Path-based create_dir_all follows the swapped symlink and writes outside the profile root.",
   "capabilities": [
     "browser.profile_confinement"
-  ]
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

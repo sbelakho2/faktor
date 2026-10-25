@@ -326,7 +326,35 @@ pub(crate) async fn native_compaction_start(
             rand::random::<u64>()
         ),
     };
-    let compaction_model = match req.model.as_deref().map(str::trim) {
+    // Explicit request model wins; `inherit`/absent falls back to the
+    // session's durable K-02 setting (mirrored by the settings route), so a
+    // "compact now" action honors the model the user selected for this
+    // session instead of silently running the deterministic router path.
+    let requested_model = match req.model.as_deref().map(str::trim) {
+        None | Some("") | Some("inherit") => None,
+        Some(raw) => Some(raw.to_string()),
+    };
+    let session_model = if requested_model.is_none() {
+        state
+            .deps
+            .foundation
+            .as_deref()
+            .and_then(|foundation| {
+                foundation
+                    .session_settings
+                    .get(
+                        session_u64(handle.id()),
+                        faktor_foundation::session_settings::COMPACTION_MODEL_KEY,
+                    )
+                    .ok()
+                    .flatten()
+            })
+            .and_then(|value| value.as_str().map(str::to_string))
+            .filter(|value| !value.is_empty() && value != "inherit")
+    } else {
+        None
+    };
+    let compaction_model = match requested_model.or(session_model).as_deref() {
         None | Some("") | Some("inherit") => None,
         Some(raw) => {
             let Some((provider, model_id)) = raw.split_once('/') else {
@@ -348,7 +376,27 @@ pub(crate) async fn native_compaction_start(
             Some((raw.to_string(), provider.to_string(), model_id.to_string()))
         }
     };
-    let min_reduction = req.min_reduction_ratio.unwrap_or(0.25);
+    // Explicit request wins; otherwise the SAME configured floor the
+    // `/context/compact` route honors (`faktor.context.compactionMinReduction`)
+    // — the operation route must not silently reject a plan the daemon's
+    // configured invariant would accept (or vice versa).
+    let min_reduction = req
+        .min_reduction_ratio
+        .or_else(|| {
+            state
+                .deps
+                .foundation
+                .as_deref()
+                .and_then(|foundation| {
+                    foundation
+                        .config
+                        .value("faktor.context.compactionMinReduction")
+                        .ok()
+                        .flatten()
+                })
+                .and_then(|value| value.as_f64())
+        })
+        .unwrap_or(0.25);
     if !(0.0..1.0).contains(&min_reduction) {
         return malformed("minReductionRatio must be in [0, 1)");
     }
@@ -550,14 +598,34 @@ pub(crate) async fn native_compaction_cancel(
 
 fn decode_checkpoint_turns(handle: &faktor_session::SessionHandle) -> Vec<RecentTurn> {
     match handle.context_checkpoint() {
-        Ok(Some(checkpoint)) => serde_json::from_slice(&checkpoint.payload).unwrap_or_else(|e| {
-            tracing::error!(
-                session = %handle.id(),
-                error = %e,
-                "context checkpoint turns are malformed; manual compaction falls back to the durable transcript"
-            );
-            Vec::new()
-        }),
+        Ok(Some(checkpoint)) => {
+            let turns: Vec<RecentTurn> = match serde_json::from_slice(&checkpoint.payload) {
+                Ok(turns) => turns,
+                Err(e) => {
+                    tracing::error!(
+                        session = %handle.id(),
+                        error = %e,
+                        "context checkpoint turns are malformed; manual compaction falls back to the durable transcript"
+                    );
+                    return Vec::new();
+                }
+            };
+            // The head digest is the canonical identity of the replacement
+            // context (the same guard the agent's restart path applies). A
+            // payload that does not hash to the recorded digest is corrupt
+            // or swapped; manual compaction must not re-certify it.
+            let actual = faktor_context::history_digest(&turns);
+            if checkpoint.digest != actual {
+                tracing::error!(
+                    session = %handle.id(),
+                    recorded = %checkpoint.digest,
+                    actual = %actual,
+                    "context checkpoint digest mismatch; manual compaction falls back to the durable transcript"
+                );
+                return Vec::new();
+            }
+            turns
+        }
         Ok(None) => Vec::new(),
         Err(e) => {
             tracing::error!(
@@ -618,9 +686,15 @@ fn load_turns(
                     }
                 }
                 "tool_result" => {
+                    // Durable tool-result parts carry the bounded `excerpt`
+                    // (`put_tool_result_part`); `output`/`text` are accepted
+                    // only for legacy rows. Reading the wrong key silently
+                    // erased every tool result from manual-compaction history
+                    // (no evidence extraction, no summary of tool storms).
                     let excerpt = part
                         .data
-                        .get("output")
+                        .get("excerpt")
+                        .or_else(|| part.data.get("output"))
                         .or_else(|| part.data.get("text"))
                         .and_then(|v| v.as_str())
                         .unwrap_or_default();
@@ -791,6 +865,32 @@ async fn execute_compaction(
             Compactor::new(Some(summarizer))
         }
         None => Compactor::deterministic_only(),
+    };
+    // The replacement context persists refs like `evidence://<id>` into the
+    // checkpoint: allocate them in the daemon's DURABLE evidence authority at
+    // this session's scope, so a restart can still retrieve the original
+    // tool output. A failed durable write keeps the raw output inline.
+    let workspace_id = match handle.row() {
+        Ok(row) => row.workspace_id.raw(),
+        Err(e) => return finish_failed(handle, operation_id, &e),
+    };
+    let task_id = handle
+        .task_id()
+        .ok()
+        .map(|task| task.raw())
+        .filter(|task| *task > 0);
+    let compactor = match compactor.with_evidence_scope(handle.id().raw(), workspace_id, task_id) {
+        Ok(compactor) => {
+            compactor.with_durable_evidence(state.deps.agent.evidence_authority().clone())
+        }
+        Err(error) => {
+            return finish_failed_with(
+                handle,
+                operation_id,
+                "compaction_evidence_scope",
+                &format!("compaction evidence scope: {error}"),
+            )
+        }
     };
     let plan = compactor
         .compact(

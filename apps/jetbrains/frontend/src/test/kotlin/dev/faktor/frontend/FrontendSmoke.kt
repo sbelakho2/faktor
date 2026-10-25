@@ -27,6 +27,7 @@ import dev.faktor.shared.NativeTerminalOutput
 import dev.faktor.shared.ProtocolAttachmentRef
 import dev.faktor.shared.parseNativeAgents
 import dev.faktor.shared.parseNativeAttachmentId
+import dev.faktor.shared.parseNativeBillingOverview
 import dev.faktor.shared.parseNativeBillingUsage
 import dev.faktor.shared.parseNativeBoardPage
 import dev.faktor.shared.parseNativeBoardPost
@@ -496,6 +497,31 @@ private const val ENTITLEMENTS_JSON = "{" +
     "\"started_ms\":1750000000000,\"ended_ms\":null}]," +
     "\"now_ms\":1750000000000" +
     "}}"
+
+private const val BILLING_OVERVIEW_PAYMENTS_JSON = "{" +
+    "\"ok\":true,\"billing\":{" +
+    "\"organization_id\":\"org-local\",\"account\":null,\"plan_id\":\"pro\"," +
+    "\"plan_found\":true,\"subscription\":null,\"subscription_active\":true," +
+    "\"trial\":{\"state\":\"none\",\"ends_ms\":null}," +
+    "\"payment\":{\"state\":\"available\",\"cause\":null}," +
+    "\"invoices\":{\"state\":\"available\",\"cause\":null}," +
+    "\"seats\":{\"state\":\"available\",\"cause\":null}," +
+    "\"tax\":{\"state\":\"available\",\"cause\":null}," +
+    "\"currency\":{\"state\":\"available\",\"cause\":null}," +
+    "\"usage_export\":{\"state\":\"available\",\"cause\":null}," +
+    "\"usage_export_formats\":[\"csv\",\"json\"]," +
+    "\"now_ms\":1760000000000," +
+    "\"payments\":{\"invoice_count\":3,\"open_invoice_count\":1," +
+    "\"outstanding_minor\":1900,\"paid_minor\":3800,\"refunded_minor\":500," +
+    "\"payment_method_count\":1,\"seats\":2,\"currency\":\"EUR\"," +
+    "\"currency_exponent\":2," +
+    "\"tax\":{\"state\":\"available\",\"cause\":null," +
+    "\"default_jurisdiction\":\"NL\",\"rates\":{}}," +
+    "\"reconciliation\":{\"unreconciled\":0,\"matched\":3," +
+    "\"amount_mismatch\":0,\"currency_mismatch\":0," +
+    "\"provider_invoice_missing\":0}," +
+    "\"provider\":{\"provider\":\"mollie\",\"state\":\"available\",\"cause\":null}" +
+    "}}}"
 
 private const val IDENTITY_JSON = "{" +
     "\"ok\":true,\"identity\":{\"subject_kind\":\"user\",\"subject_id\":\"u-1\"," +
@@ -3198,6 +3224,63 @@ object FrontendSmoke {
             assertEquals(false, panel.prevEnabled())
             assertEquals(true, panel.grantEnabled())
             assertTrue(panel.lines().any { it.contains("quota ") }, panel.lines().toString())
+        }
+
+        step("payment-plane detail renders and export follows the served capability") {
+            val overview = parseNativeBillingOverview(BILLING_OVERVIEW_PAYMENTS_JSON)
+            assertEquals(3L, overview.payments?.invoiceCount)
+            assertEquals(500L, overview.payments?.refundedMinor)
+            val model = usagePanelModelOf(
+                parseNativeIdentity(IDENTITY_JSON),
+                parseNativeEntitlements(ENTITLEMENTS_JSON),
+                parseNativeBillingUsage(BILLING_USAGE_JSON),
+                null, null, null, false, overview
+            )
+            assertEquals(true, model.exportEnabled())
+            val lines = model.lines()
+            assertTrue(
+                lines.any { it.contains("invoices 3 recorded") && it.contains("refunded €5.00") },
+                lines.toString()
+            )
+            assertTrue(lines.any { it.contains("seats 2") && it.contains("tax NL") }, lines.toString())
+            assertTrue(lines.any { it.contains("0 unreconciled") }, lines.toString())
+            val gated = usagePanelModelOf(
+                parseNativeIdentity(IDENTITY_JSON),
+                parseNativeEntitlements(ENTITLEMENTS_JSON),
+                parseNativeBillingUsage(BILLING_USAGE_JSON),
+                null, null, null, false,
+                overview.copy(
+                    usageExport = overview.usageExport.copy(
+                        state = "unavailable",
+                        cause = "usage_export_not_configured"
+                    )
+                )
+            )
+            assertEquals(false, gated.exportEnabled())
+            assertTrue(
+                gated.lines().any { it.contains("usage export unavailable") },
+                gated.lines().toString()
+            )
+            val many = (1L..5000L).map {
+                parseNativeBillingUsage(BILLING_USAGE_JSON).fold.perTask[0].copy(
+                    taskId = it,
+                    runId = "r$it"
+                )
+            }
+            val bounded = usagePanelModelOf(
+                parseNativeIdentity(IDENTITY_JSON),
+                parseNativeEntitlements(ENTITLEMENTS_JSON),
+                parseNativeBillingUsage(BILLING_USAGE_JSON).copy(
+                    fold = parseNativeBillingUsage(BILLING_USAGE_JSON).fold.copy(perTask = many)
+                ),
+                null, null, null, false
+            )
+            assertEquals(USAGE_MAX_TASK_ROWS, bounded.tasks.size)
+            assertEquals(5000, bounded.tasksTotal)
+            assertTrue(
+                bounded.lines().any { it.contains("more task row(s) not shown") },
+                bounded.lines().toString()
+            )
         }
 
         step("billing_disabled renders \"billing disabled locally\", never zeros") {

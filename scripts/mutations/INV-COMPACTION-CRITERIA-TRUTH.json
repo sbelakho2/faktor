@@ -1,0 +1,15 @@
+{
+  "id": "INV-COMPACTION-CRITERIA-TRUTH",
+  "surface": "compaction",
+  "file": "crates/agent/src/runtime/verification_attribution.rs",
+  "find": "                    \"required check: {}\",",
+  "replace": "                    \"goal: {}\",",
+  "gate": "cargo test -p faktor-agent --lib criteria_fact_survives_five_compacting_turns",
+  "expect": "FAILED",
+  "note": "Replaces the independently verifiable required-check criterion with the human goal; the external compaction oracle (fixture-owned goal + required-check token) must fail.",
+  "capabilities": [
+    "agent.criteria_truth"
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+}

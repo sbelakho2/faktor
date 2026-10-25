@@ -1,0 +1,15 @@
+{
+  "id": "INV-COMPACTION-MIN-REDUCTION",
+  "surface": "compaction",
+  "file": "crates/context/src/compactor.rs",
+  "find": "            let factor = (1.0 - self.min_reduction_ratio).clamp(0.0, 1.0);",
+  "replace": "            let factor = 1.0;",
+  "gate": "cargo test -p faktor-context --lib one_percent_summary_rejected_and_deterministic_fallback",
+  "expect": "FAILED",
+  "note": "Ignoring the configured minimum reduction makes a ~1% summary pass the hard cap; the compaction hard-invariant oracle must fail.",
+  "capabilities": [
+    "context.minimum_reduction"
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+}

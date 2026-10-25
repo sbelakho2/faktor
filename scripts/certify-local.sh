@@ -438,6 +438,12 @@ section_static_authority() {
     cargo test -p faktor-tests-static-authority
 }
 
+section_test_separation() {
+    node scripts/check-test-separation.mjs --selftest &&
+        node scripts/check-test-separation.mjs --check &&
+        node scripts/mutation-run.mjs --check-specs
+}
+
 section_branding() {
     bash scripts/branding-scan.sh || return 1
     local d found
@@ -679,10 +685,12 @@ else
         add_section section_capabilities capabilities "capability manifest + docs drift"
         add_section section_wiring_matrix wiring-matrix "capability/wiring matrix + planted violations"
         add_section section_evidence_selftest evidence-selftest "certification evidence verifier selftest"
+        add_section section_test_separation test-separation "tester/SUT separation scans + planted proofs"
     else
         add_skip capabilities-manifest "node is unavailable on this host; capability labels stay unknown"
         add_skip wiring-matrix "node is unavailable on this host; UI/setting/route wiring cannot be checked"
         add_skip evidence-selftest "node is unavailable on this host; certified evidence cannot be verified"
+        add_skip test-separation "node is unavailable on this host; test oracle/isolation scans cannot run"
     fi
     add_section section_signing_selftest signing-selftest "OS signing drivers selftest (unsigned markers + digest refusals)"
     add_section section_clippy clippy "cargo clippy -D warnings"
@@ -916,6 +924,7 @@ emit_manifest() {
         printf '      "workspace_tests": %s,\n' "$(section_passed workspace-tests)"
         printf '      "fault_smoke": %s,\n' "$(section_passed fault-smoke)"
         printf '      "static_authority": %s,\n' "$(section_passed static-authority)"
+        printf '      "test_separation": %s,\n' "$(section_passed test-separation)"
         printf '      "doctor_deep": %s,\n' "$(section_passed doctor-deep)"
         printf '      "release_cli_doctor": %s,\n' "$(section_passed release-cli)"
         printf '      "fault_scale": %s,\n' "$(section_passed fault-scale)"

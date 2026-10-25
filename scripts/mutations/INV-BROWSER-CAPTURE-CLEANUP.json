@@ -8,5 +8,7 @@
   "note": "A cancelled navigation that never closes leaves the page and its admission permit held.",
   "capabilities": [
     "browser.capture_cleanup"
-  ]
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

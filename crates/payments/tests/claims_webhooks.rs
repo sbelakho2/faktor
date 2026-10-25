@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir,separate-process
 //! Adversarial financial-operation claims and webhook truth tests.
 //!
 //! Every case deliberately crosses a crash, a duplicate delivery, an

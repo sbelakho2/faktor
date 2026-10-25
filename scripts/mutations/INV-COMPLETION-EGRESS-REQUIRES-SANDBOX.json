@@ -5,5 +5,7 @@
   "replace": "None => Ok(()),",
   "gate": "cargo test -p faktor-orchestrator --lib completion_push_without_a_sandbox_refuses_egress_typed",
   "expect": "FAILED",
-  "note": "An absent sandbox read as unrestricted egress turns a configuration omission into an ungated network path for completion steps."
+  "note": "An absent sandbox read as unrestricted egress turns a configuration omission into an ungated network path for completion steps.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

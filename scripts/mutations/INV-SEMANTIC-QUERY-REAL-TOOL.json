@@ -5,5 +5,7 @@
   "replace": "                None if false => {\n                    crate::semantic_tool::tool(self.deps.semantic.clone())\n                }",
   "gate": "cargo test -p faktor-agent --lib a_model_semantic_query_call_executes_against_the_registered_provider",
   "expect": "FAILED",
-  "note": "Removing the real semantic_query dispatch makes the advertised tool an unknown-tool refusal again."
+  "note": "Removing the real semantic_query dispatch makes the advertised tool an unknown-tool refusal again.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

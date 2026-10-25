@@ -10,6 +10,9 @@ use super::*;
 const SESSION_SETTINGS_FACT_KIND: &str = "session_settings";
 const SESSION_SETTINGS_REVISION_KEY: &str = "revision";
 const SESSION_SETTINGS_CONTEXT_WINDOW_KEY: &str = "contextWindow";
+/// Mirror of the accepted per-session compaction model (`provider/model`)
+/// the agent runtime reads at its next compaction. Empty/absent = inherit.
+const SESSION_SETTINGS_COMPACTION_MODEL_KEY: &str = "compactionModel";
 
 fn session_settings_revision(handle: &faktor_session::SessionHandle) -> u64 {
     handle
@@ -144,6 +147,13 @@ pub(crate) async fn native_session_settings_put(
                 session,
                 faktor_foundation::session_settings::COMPACTION_MODEL_KEY,
             );
+            if let Err(e) = handle.upsert_memory_fact(
+                SESSION_SETTINGS_FACT_KIND,
+                SESSION_SETTINGS_COMPACTION_MODEL_KEY,
+                "",
+            ) {
+                return api_err(&e);
+            }
             applied.push("compactionModel=inherit");
         } else {
             let Some((provider, model_id)) = model.split_once('/') else {
@@ -170,6 +180,19 @@ pub(crate) async fn native_session_settings_put(
                 &serde_json::Value::String(model.to_string()),
             ) {
                 return foundation_error(e);
+            }
+            // The AGENT reads its effective compaction model from the
+            // session's durable fact space (the foundation store is not
+            // reachable from the agent runtime). Mirror the accepted value;
+            // an absent/empty fact inherits the daemon config, exactly like
+            // `inherit`. Without this the setting was accepted, reported as
+            // `next_compaction`, and silently ignored by every compaction.
+            if let Err(e) = handle.upsert_memory_fact(
+                SESSION_SETTINGS_FACT_KIND,
+                SESSION_SETTINGS_COMPACTION_MODEL_KEY,
+                model,
+            ) {
+                return api_err(&e);
             }
             applied.push("compactionModel");
         }
@@ -243,6 +266,15 @@ pub(crate) async fn native_session_settings_put(
             if let Err(e) = handle.upsert_memory_fact(
                 SESSION_SETTINGS_FACT_KIND,
                 SESSION_SETTINGS_CONTEXT_WINDOW_KEY,
+                "",
+            ) {
+                return api_err(&e);
+            }
+        }
+        if key == "compactionModel" {
+            if let Err(e) = handle.upsert_memory_fact(
+                SESSION_SETTINGS_FACT_KIND,
+                SESSION_SETTINGS_COMPACTION_MODEL_KEY,
                 "",
             ) {
                 return api_err(&e);

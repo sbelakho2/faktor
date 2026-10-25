@@ -202,7 +202,12 @@ class Edition8Controller {
         return;
       case 'e8HostCommand': {
         const command = text(message.command, 64);
-        if (command === 'faktor.openChat' || command === 'faktor.startServer' || command === 'faktor.trustExecutable8') {
+        if (
+          command === 'faktor.openChat' ||
+          command === 'faktor.startServer' ||
+          command === 'faktor.trustExecutable8' ||
+          command === 'faktor.controlPlaneSignIn'
+        ) {
           await vscode.commands.executeCommand(command);
         }
         return;

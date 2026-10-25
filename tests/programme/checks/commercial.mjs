@@ -131,6 +131,100 @@ export const COMMERCIAL_ACTIONS = [
   },
 ];
 
+/**
+ * The website's commercial controls (the Faktor-owned billing surface). These
+ * are form POSTs, not native routes, so they are scanned separately: each
+ * handler must reach the real payment service seam, and each read must render
+ * the served invoices/refunds/seats/tax/currency facts.
+ */
+export const SITE_COMMERCIAL_ACTIONS = [
+  {
+    id: 'site.billing_checkout',
+    file: 'crates/site/src/routes/billing.rs',
+    handler: 'checkout_start',
+    via: ['begin_subscription', 'create_checkout_for_invoice'],
+    service: /state\.payments\.(subscribe|issue_invoice|create_checkout)\s*\(/,
+  },
+  {
+    id: 'site.billing_pay',
+    file: 'crates/site/src/routes/billing.rs',
+    handler: 'pay_invoice',
+    via: ['create_checkout_for_invoice'],
+    service: /state\.payments\.(invoice|create_checkout)\s*\(/,
+  },
+  {
+    id: 'site.billing_change_plan',
+    file: 'crates/site/src/routes/billing.rs',
+    handler: 'change_plan',
+    service: /state\.payments\.change_plan\s*\(/,
+  },
+  {
+    id: 'site.billing_cancel',
+    file: 'crates/site/src/routes/billing.rs',
+    handler: 'cancel',
+    service: /payments[\s\S]{0,40}\.cancel\s*\(/,
+  },
+  {
+    id: 'site.billing_add_method',
+    file: 'crates/site/src/routes/billing.rs',
+    handler: 'add_payment_method',
+    service: /state\.payments\.add_payment_method\s*\(/,
+  },
+  {
+    id: 'site.billing_remove_method',
+    file: 'crates/site/src/routes/billing.rs',
+    handler: 'remove_payment_method',
+    service: /state\.payments\.remove_payment_method\s*\(/,
+  },
+  {
+    id: 'site.invoices_read',
+    file: 'crates/site/src/routes/account.rs',
+    handler: 'invoices_get',
+    service: /state\.payments\.invoices\s*\(/,
+  },
+  {
+    id: 'site.invoice_read',
+    file: 'crates/site/src/routes/account.rs',
+    handler: 'invoice_get',
+    service: /state\.payments\.invoice\s*\(/,
+  },
+  {
+    id: 'site.receipt_read',
+    file: 'crates/site/src/routes/account.rs',
+    handler: 'receipt_get',
+    service: /state\.payments\.invoice\s*\(/,
+  },
+  {
+    id: 'site.invoices_export',
+    file: 'crates/site/src/routes/account.rs',
+    handler: 'invoices_export',
+    service: /state\.payments\.export_invoices\s*\(/,
+  },
+  {
+    id: 'site.usage_read',
+    file: 'crates/site/src/routes/account.rs',
+    handler: 'usage_get',
+    service: /state\.payments\.(overview|invoices)\s*\(/,
+  },
+  {
+    id: 'site.mollie_webhook',
+    file: 'crates/site/src/routes/webhook.rs',
+    handler: 'payments',
+    service: /\.handle_webhook\s*\(/,
+  },
+];
+
+/** Served commercial facts the website must render (not just store). */
+export const SITE_COMMERCIAL_SURFACES = [
+  { id: 'site.surface.tax', file: 'crates/site/src/web/billing_pages.rs', marker: /overview\.tax\.default_jurisdiction/ },
+  { id: 'site.surface.currency', file: 'crates/site/src/web/billing_pages.rs', marker: /overview\.currency/ },
+  { id: 'site.surface.seats', file: 'crates/site/src/web/billing_pages.rs', marker: /overview\.seats/ },
+  { id: 'site.surface.refund', file: 'crates/site/src/web/account_pages.rs', marker: /invoice\.amount_refunded_minor/ },
+  { id: 'site.surface.invoice', file: 'crates/site/src/web/account_pages.rs', marker: /invoice\.amount_paid_minor/ },
+  { id: 'site.surface.mollie_config', file: 'crates/site/src/config.rs', marker: /"mollie"\s*=>\s*ProviderKind::Mollie/ },
+  { id: 'site.surface.exact_money', file: 'crates/site/src/web/mod.rs', marker: /fn\s+group_thousands\s*\(/ },
+];
+
 /** Every `[billing]` setting that must have a real read path. */
 export const COMMERCIAL_SETTINGS = [
   'enabled',
@@ -189,7 +283,15 @@ function routeKey(method, path) {
  * Scan one tree. `actions`/`settings` may be overridden by the selftest;
  * production uses the exported constants.
  */
-export function scan(root = ROOT, { actions = COMMERCIAL_ACTIONS, settings = COMMERCIAL_SETTINGS } = {}) {
+export function scan(
+  root = ROOT,
+  {
+    actions = COMMERCIAL_ACTIONS,
+    settings = COMMERCIAL_SETTINGS,
+    siteActions = SITE_COMMERCIAL_ACTIONS,
+    surfaces = SITE_COMMERCIAL_SURFACES,
+  } = {},
+) {
   const routes = discoverNativeRoutes(root);
   const routeIndex = new Map(routes.map((route) => [routeKey(route.method, route.path), route]));
   const serverFiles = walk(root, 'crates/server/src');
@@ -260,6 +362,26 @@ export function scan(root = ROOT, { actions = COMMERCIAL_ACTIONS, settings = COM
     }
   }
 
+  for (const action of siteActions) {
+    const text = read(root, action.file) ?? '';
+    const body = bodyOf(text, action.handler);
+    if (body === null) {
+      problems.push(`site commercial action ${action.id}: handler ${action.handler} is absent from ${action.file}`);
+      continue;
+    }
+    const delegated = (action.via ?? []).map((name) => bodyOf(text, name) ?? '');
+    if (![body, ...delegated].some((slice) => action.service.test(slice))) {
+      problems.push(`site commercial action ${action.id}: handler never calls its payment service seam`);
+    }
+  }
+
+  for (const surface of surfaces) {
+    const text = read(root, surface.file) ?? '';
+    if (!surface.marker.test(text)) {
+      problems.push(`site commercial surface ${surface.id}: ${surface.file} does not render the served fact`);
+    }
+  }
+
   for (const setting of settings) {
     const consumer = new RegExp(`(?:self|config_billing|billing)\\.${setting}\\b`);
     if (!consumer.test(settingsText)) {
@@ -270,7 +392,13 @@ export function scan(root = ROOT, { actions = COMMERCIAL_ACTIONS, settings = COM
   return {
     problems,
     warnings: [],
-    counts: { actions: actions.length, settings: settings.length, routes: routes.length },
+    counts: {
+      actions: actions.length,
+      settings: settings.length,
+      routes: routes.length,
+      siteActions: siteActions.length,
+      surfaces: surfaces.length,
+    },
   };
 }
 
@@ -314,11 +442,11 @@ export function selftest() {
   };
 
   const root = fixture(clean);
-  const pass = scan(root, { actions: [action], settings: ['planted_field'] });
+  const pass = scan(root, { actions: [action], settings: ['planted_field'], siteActions: [], surfaces: [] });
   check('clean commercial fixture passes', pass.problems.length === 0, pass.problems.join('; '));
 
   const missingRoute = fixture({ ...clean, 'crates/server/src/api.rs': 'fn routes() {}\n' });
-  const routeResult = scan(missingRoute, { actions: [action], settings: ['planted_field'] });
+  const routeResult = scan(missingRoute, { actions: [action], settings: ['planted_field'], siteActions: [], surfaces: [] });
   check(
     'missing commercial route is caught',
     routeResult.problems.some((p) => p.includes('/native/planted') && p.includes('not registered')),
@@ -330,7 +458,7 @@ export function selftest() {
     'crates/server/src/native/planted.rs':
       'pub(crate) async fn planted_handler() -> Response { wire_status(malformed_body("inert")) }\n',
   });
-  const handlerResult = scan(inertHandler, { actions: [action], settings: ['planted_field'] });
+  const handlerResult = scan(inertHandler, { actions: [action], settings: ['planted_field'], siteActions: [], surfaces: [] });
   check(
     'handler without a service seam is caught',
     handlerResult.problems.some((p) => p.includes('never calls its billing service seam')),
@@ -341,7 +469,7 @@ export function selftest() {
     ...clean,
     'apps/vscode/src/nativeClient.ts': 'export class NativeClient {}\n',
   });
-  const clientResult = scan(missingClient, { actions: [action], settings: ['planted_field'] });
+  const clientResult = scan(missingClient, { actions: [action], settings: ['planted_field'], siteActions: [], surfaces: [] });
   check(
     'commercial route without a client is caught',
     clientResult.problems.some((p) => p.includes('VS Code client does not consume')),
@@ -352,6 +480,8 @@ export function selftest() {
   const settingResult = scan(missingSetting, {
     actions: [action],
     settings: ['planted_field', 'unread_field'],
+    siteActions: [],
+    surfaces: [],
   });
   check(
     'setting without a consumer is caught',
@@ -370,7 +500,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     for (const warning of result.warnings) console.error(`warning: ${warning}`);
     for (const problem of result.problems) console.error(`problem: ${problem}`);
     console.log(
-      `commercial matrix: ${result.counts.actions} actions, ${result.counts.settings} settings, ${result.counts.routes} routes; ${result.problems.length} problems`,
+      `commercial matrix: ${result.counts.actions} native actions, ${result.counts.siteActions} site actions, ${result.counts.surfaces} surfaces, ${result.counts.settings} settings, ${result.counts.routes} routes; ${result.problems.length} problems`,
     );
     process.exitCode = result.problems.length === 0 ? 0 : 1;
   }

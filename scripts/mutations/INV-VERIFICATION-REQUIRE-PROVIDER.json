@@ -5,5 +5,7 @@
   "replace": "            if false && request.require_provider && provider.is_native() {",
   "gate": "cargo test -p faktor-verify --lib require_provider_refuses_a_native_substitution",
   "expect": "FAILED",
-  "note": "Allowing the native baseline to serve a require_provider call lets Faktor impersonate an independent verifier."
+  "note": "Allowing the native baseline to serve a require_provider call lets Faktor impersonate an independent verifier.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

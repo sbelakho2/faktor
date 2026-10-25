@@ -1,0 +1,15 @@
+{
+  "id": "INV-CHILD-HANDOFF-EXACTLY-ONCE",
+  "surface": "agent.communication",
+  "file": "crates/orchestrator/src/runtime_handoff.rs",
+  "find": "        let watermark = child.updated_ms.to_string();",
+  "replace": "        let watermark = \"0\".to_string();",
+  "gate": "cargo test -p faktor-orchestrator --lib fault_probe_crash_before_parent_handoff_reattach_heals_exactly_once",
+  "expect": "FAILED",
+  "note": "A stale delivery watermark loses the exact terminal-state binding, so re-attach cannot tell an already-consumed handoff from an undelivered one; the exactly-once oracle must fail.",
+  "capabilities": [
+    "orchestrator.handoff_exactly_once"
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+}

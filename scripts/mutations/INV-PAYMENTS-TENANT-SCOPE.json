@@ -1,0 +1,15 @@
+{
+  "id": "INV-PAYMENTS-TENANT-SCOPE",
+  "surface": "payments.billing",
+  "file": "crates/payments/src/store.rs",
+  "find": "            \"SELECT payload FROM payment_invoice WHERE organization_id = ?1 AND id = ?2\",",
+  "replace": "            \"SELECT payload FROM payment_invoice WHERE organization_id = ?1 OR id = ?2\",",
+  "gate": "cargo test -p faktor-payments --test lifecycle tenant_isolation_and_auth_before_disclosure_shapes_are_real",
+  "expect": "FAILED",
+  "note": "Dropping the organization predicate from the invoice read lets one tenant resolve another tenant's invoice id; the tenant-isolation oracle must fail.",
+  "capabilities": [
+    "payments.tenant_scope"
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+}

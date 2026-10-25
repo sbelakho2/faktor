@@ -8,5 +8,7 @@
   "note": "Ignoring the caller's result bound makes the truncation assertion fail; the graph must never return an unbounded affected set.",
   "capabilities": [
     "impact.graph.bounded-deterministic-query"
-  ]
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

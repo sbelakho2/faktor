@@ -1,0 +1,12 @@
+{
+  "id": "INV-SITE-BILLING-DESTRUCTIVE-CONFIRM",
+  "file": "crates/site/src/routes/billing.rs",
+  "find": "    if form.confirm != \"yes\" {\n        return Err(SiteError::Unprocessable(\n            \"Confirm the cancellation boundary before submitting it.\",\n        ));\n    }",
+  "replace": "    let _ = &form.at_period_end;",
+  "gate": "cargo test -p faktor-site destructive_billing_forms_refuse_without_the_explicit_confirmation",
+  "expect": "FAIL",
+  "timeout_ms": 600000,
+  "note": "An immediate cancellation is applied without the explicit confirmation guard.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+}

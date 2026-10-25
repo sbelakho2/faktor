@@ -936,6 +936,7 @@ async fn verification_runs_in_the_session_root_never_the_daemon_cwd() {
     // run (restored afterwards; nothing else in this crate relies on a
     // process cwd — sessions and workspaces ride durable absolute roots).
     let original_cwd = std::env::current_dir().unwrap();
+    // TEST-SEPARATION-EXEMPT: shared-state — this test process exclusively owns and restores its cwd; no daemon or operator data dir is shared.
     std::env::set_current_dir(decoy.path()).unwrap();
     let outcome = {
         let runtime = AgentRuntime::new(deps).unwrap();
@@ -944,6 +945,7 @@ async fn verification_runs_in_the_session_root_never_the_daemon_cwd() {
             .await
             .unwrap()
     };
+    // TEST-SEPARATION-EXEMPT: shared-state — restoration of the test process's own cwd (see above).
     std::env::set_current_dir(&original_cwd).unwrap();
     assert_eq!(outcome.acceptance, Some(faktor_verify::Acceptance::Pass));
     assert_eq!(outcome.completion, Some(CompletionGate::VerifiedComplete));

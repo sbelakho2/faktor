@@ -1,9 +1,12 @@
 {
   "id": "INV-TRANSCRIPT-SCROLL-OWNERSHIP",
   "file": "apps/vscode/media/chat.js",
-  "find": "    var pin = transcriptKey === null || plan.pinned || transcriptPinRequested;",
+  "find": "    var pin =\n      transcriptKey === null || transcriptPinRequested || transcriptPinned;",
   "replace": "    var pin = true; // planted: every rebuild pins to the bottom",
   "gate": "node --no-warnings --experimental-loader ./scripts/mutations/vscode-ts-loader.mjs apps/vscode/scripts/selftest.mjs",
+  "expect": "FAIL",
   "timeout_ms": 180000,
-  "note": "A background transcript refresh now steals an unpinned reader's position (always pins to the bottom)."
+  "note": "A background transcript refresh now steals an unpinned reader's position (always pins to the bottom).",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

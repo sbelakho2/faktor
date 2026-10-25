@@ -132,6 +132,13 @@ pub(crate) fn sanitize_tool_pairing(messages: Vec<RequestMessage>) -> Vec<Reques
 /// Decode the durable context checkpoint's opaque payload into the exact
 /// compacted turns. A malformed payload is loud; the caller logs and falls
 /// back to the full transcript rather than silently changing context.
+///
+/// The checkpoint's canonical `digest` is verified against the decoded
+/// turns: the durable write records exactly that digest, so a payload whose
+/// content was changed under a still-valid chunk hash (or a head whose
+/// digest row was tampered/copied from another checkpoint) must never
+/// silently replace the conversation context after a restart. A digest that
+/// is not the canonical 64-hex history digest is a typed refusal.
 pub(crate) fn decode_checkpoint_turns(
     checkpoint: &faktor_session::ContextCheckpoint,
 ) -> faktor_core::Result<Vec<RecentTurn>> {
@@ -141,8 +148,21 @@ pub(crate) fn decode_checkpoint_turns(
             checkpoint.payload.len()
         )));
     }
-    serde_json::from_slice(&checkpoint.payload)
-        .map_err(|e| Error::malformed(format!("context checkpoint turns: {e}")))
+    let turns: Vec<RecentTurn> = serde_json::from_slice(&checkpoint.payload)
+        .map_err(|e| Error::malformed(format!("context checkpoint turns: {e}")))?;
+    if checkpoint.digest.len() != 64 || !checkpoint.digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(Error::malformed(
+            "context checkpoint digest is not the canonical 64-hex history digest",
+        ));
+    }
+    let actual = faktor_context::history_digest(&turns);
+    if actual != checkpoint.digest {
+        return Err(Error::malformed(format!(
+            "context checkpoint digest mismatch: head names {} but the payload is {}",
+            checkpoint.digest, actual
+        )));
+    }
+    Ok(turns)
 }
 
 /// Bound ONE historical tool-call argument value for the wire.

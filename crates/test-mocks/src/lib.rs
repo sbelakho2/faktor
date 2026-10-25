@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=property isolation=pure-unit
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
@@ -72,4 +73,15 @@ pub fn mcp_bin() -> PathBuf {
 
 pub fn lsp_bin() -> PathBuf {
     ensure("lsp-mock", LSP_SOURCE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hash;
+
+    #[test]
+    fn source_hash_is_stable_and_distinguishes_mock_sources() {
+        assert_eq!(hash("mock source a"), hash("mock source a"));
+        assert_ne!(hash("mock source a"), hash("mock source b"));
+    }
 }

@@ -514,6 +514,7 @@ mod tests {
         assert_eq!(render_search(&second_hits), first_search);
 
         let failed = [("t".to_string(), "m".to_string())];
+        // TEST-SEPARATION-EXEMPT: same-function-oracle — determinism property only; the canonical fixture assertions above own correctness.
         assert_eq!(
             render_tests(&failed, 1, 0, 0, 0),
             render_tests(&failed, 1, 0, 0, 0)
@@ -521,6 +522,7 @@ mod tests {
 
         let groups = [(0u64, 1u64, "x".to_string())];
         let important = ["y".to_string()];
+        // TEST-SEPARATION-EXEMPT: same-function-oracle — determinism property only; the canonical fixture assertions above own correctness.
         assert_eq!(
             render_log(&groups, &important, None),
             render_log(&groups, &important, None)

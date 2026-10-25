@@ -5,5 +5,7 @@
   "replace": "impl NetworkPolicy {\n    pub fn allows(&self, destination: &str) -> bool {\n        match self {\n            NetworkPolicy::DenyAll => false,\n            NetworkPolicy::AllowProviders { endpoints } => {\n                endpoints.iter().any(|rule| destination.starts_with(rule))\n            }\n            NetworkPolicy::AllowConfigured { endpoints, domains } => endpoints\n                .iter()\n                .chain(domains.iter())\n                .any(|rule| destination.starts_with(rule)),\n        }\n    }\n}\n\npub enum NetworkPolicy {",
   "gate": "node scripts/check-network-authority-singular.mjs",
   "expect": "network-authority:",
-  "note": "Reintroducing a raw prefix network matcher gives egress two authorities again; the singular-authority script check must fail."
+  "note": "Reintroducing a raw prefix network matcher gives egress two authorities again; the singular-authority script check must fail.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

@@ -1726,7 +1726,7 @@ impl OrchestratorRuntime {
         // that row and re-arms the handoff here; a consumed section (empty
         // value) is never re-delivered, and a pending one is refreshed to the
         // child's current terminal outcome.
-        self.heal_pending_child_handoffs(state.parent_session, &state.children);
+        self.heal_pending_child_handoffs(state.parent_session, run_id, &state.children);
         self.install_run(state)?;
         self.drive_to_outcome(run_id).await
     }
@@ -2637,7 +2637,7 @@ impl OrchestratorRuntime {
             // hands its BOUNDED typed handoff to the parent session as
             // durable internal context for the parent's next logical turn.
             // Best-effort by contract — never a reason to fail the run.
-            self.deliver_child_handoff(parent_session, &row);
+            self.deliver_child_handoff(parent_session, run_id, &row);
         }
         Ok(())
     }

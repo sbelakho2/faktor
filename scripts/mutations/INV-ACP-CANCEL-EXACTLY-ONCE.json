@@ -8,5 +8,7 @@
   "note": "Negating the id match means the cancel never fires for the running prompt.",
   "capabilities": [
     "acp.cancel"
-  ]
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

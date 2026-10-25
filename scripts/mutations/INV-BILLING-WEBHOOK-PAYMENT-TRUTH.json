@@ -1,0 +1,19 @@
+{
+  "id": "INV-BILLING-WEBHOOK-PAYMENT-TRUTH",
+  "surface": "payments.billing",
+  "file": "crates/payments/src/service/webhook_effects.rs",
+  "find": "            if amount.is_some_and(|amount| amount != payment.amount_minor)\n                || currency.is_some_and(|currency| currency != payment.currency)\n            {\n                return Err(PaymentError::Conflict(\n                    \"webhook payment truth does not match the recorded payment\".into(),\n                ));\n            }",
+  "replace": "            // mutated: webhook truth mismatch is accepted",
+  "gate": "cargo test -p faktor-payments --test invoice_fencing webhook_payment_truth_mismatch_for_a_recorded_payment_is_refused",
+  "expect": "FAILED",
+  "note": "Accepting a webhook amount/currency that contradicts the recorded provider payment lets a settled receipt be rewritten; the provider-truth oracle must fail.",
+  "capabilities": [
+    "payments.invoice_truth"
+  ],
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

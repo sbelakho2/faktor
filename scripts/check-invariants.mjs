@@ -34,6 +34,7 @@
 
 import { createHash } from 'node:crypto';
 import { provisionSupport, verifySupportSnapshot } from './mutation-support.mjs';
+import { campaignProblems, loadWorld, surfaceProblems } from './check-mutation-surfaces.mjs';
 import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { execSync, spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -634,6 +635,51 @@ function runCheck({ root, registryPath }) {
   };
 }
 
+/**
+ * Per-surface mutation manifest enforcement. The real checkout must declare
+ * tests/mutation-surfaces.json even before any campaign runs; fixture roots
+ * used by the registry selftests are exempt when they carry no manifest.
+ */
+function mutationSurfaceGate(root) {
+  const manifest = join(root, 'tests/mutation-surfaces.json');
+  if (!existsSync(manifest)) {
+    if (resolve(root) === SCRIPT_ROOT) {
+      return ['missing-per-surface-manifest: tests/mutation-surfaces.json is required'];
+    }
+    return [];
+  }
+  try {
+    const world = loadWorld(root);
+    return surfaceProblems(world).problems;
+  } catch (error) {
+    return [`per-surface-manifest: ${error.message}`];
+  }
+}
+
+/** One machine-readable campaign document consumed by the static gate. */
+function writeCampaignEvidence(root, entries, results, support) {
+  const out = join(root, 'target', 'certification', 'mutation-campaign.json');
+  const survivors = results.filter((result) => result.outcome === 'undetected').length;
+  const environmentFailures = results.filter((result) => result.outcome === 'environment').length;
+  const notRun = results.filter((result) => result.outcome === 'not_run').length;
+  const document = {
+    schema: 'faktor-mutation-campaign/v1',
+    generated_at: new Date().toISOString(),
+    root,
+    support,
+    specs_expected: entries.filter((entry) => typeof entry.mutation_command === 'string' && entry.mutation_command.trim() !== '').length,
+    specs_run: results.filter((result) => result.outcome !== 'not_run').length,
+    detected: results.filter((result) => result.outcome === 'detected').length,
+    survivors,
+    environment_failures: environmentFailures,
+    not_run: notRun,
+    results,
+  };
+  mkdirSync(dirname(out), { recursive: true });
+  writeFileSync(out, `${JSON.stringify(document, null, 2)}\n`);
+  return { out, document };
+}
+
 function main() {
   const args = process.argv.slice(2);
   if (args.includes('-h') || args.includes('--help')) {
@@ -661,6 +707,21 @@ function main() {
     console.error(
       `check-invariants: FAIL (${problems.length} problem(s) over ${counts.invariants} invariant(s))`,
     );
+    return 1;
+  }
+  // Per-surface gate: the invariant registry alone does not prove that every
+  // product surface has a planted mutation. A new surface/row kind, an
+  // unowned spec, a missing expected failure signature, or an invariant with
+  // no spec turns this red before any campaign is allowed to start.
+  const surfaceIssues = mutationSurfaceGate(root);
+  if (surfaceIssues.length > 0) {
+    for (const problem of surfaceIssues.slice(0, 40)) {
+      console.error(`mutation-surfaces: ${problem}`);
+    }
+    if (surfaceIssues.length > 40) {
+      console.error(`mutation-surfaces: ... ${surfaceIssues.length - 40} more violation(s)`);
+    }
+    console.error(`check-invariants: FAIL (${surfaceIssues.length} per-surface mutation violation(s))`);
     return 1;
   }
   if (mutations) {
@@ -729,13 +790,21 @@ function main() {
     } catch {
       // Evidence copy is best-effort; the console line is the record.
     }
+    // Evidence is always freshly written: stale documents from a previous
+    // campaign must never certify a run that did not happen.
+    const evidenceDir = join(root, 'target', 'certification', 'mutation-evidence');
+    rmSync(evidenceDir, { recursive: true, force: true });
+    mkdirSync(evidenceDir, { recursive: true });
     const mutationEnv = {
       ...process.env,
       FAKTOR_MUTATION_ROOT: scratch,
+      FAKTOR_MUTATION_EVIDENCE_DIR: evidenceDir,
       CARGO_TARGET_DIR: join(root, 'target', 'mutation-campaign'),
     };
     const missing = [];
     const undetected = [];
+    const expected = [];
+    let campaignResults = [];
     let proven = 0;
     try {
       for (const entry of entries) {
@@ -746,12 +815,13 @@ function main() {
           }
           continue;
         }
+        const spec = /mutation-run\.mjs\s+(\S+)/.exec(command);
+        expected.push({ id: spec === null ? entry.id : spec[1], command });
         // A mutation command exits 0 when its gate DETECTED the planted
         // violation, and non-zero when the mutation slipped through. The
         // command sees the isolated copy through FAKTOR_MUTATION_ROOT.
         try {
           execSync(command, { cwd: root, stdio: 'pipe', env: mutationEnv });
-          proven += 1;
         } catch {
           undetected.push(`${entry.id} (${command})`);
         }
@@ -761,6 +831,46 @@ function main() {
         console.error(`check-invariants --mutations: FAIL — ${supportAfter.reason}`);
         return 1;
       }
+      const results = expected.map(({ id, command }) => {
+        const path = join(evidenceDir, `${id}.json`);
+        if (!existsSync(path)) {
+          return {
+            id,
+            outcome: 'not_run',
+            exit_code: null,
+            reason: `mutation-run wrote no evidence for ${command}`,
+          };
+        }
+        try {
+          const evidence = JSON.parse(readFileSync(path, 'utf8'));
+          return {
+            id,
+            surface: evidence.surface ?? null,
+            gate: evidence.gate ?? null,
+            expect: evidence.expect ?? null,
+            outcome: typeof evidence.outcome === 'string' ? evidence.outcome : 'not_run',
+            exit_code: evidence.outcome === 'detected' ? 0 : 1,
+            reason: evidence.reason ?? '',
+            control: evidence.control ?? null,
+            mutant: evidence.mutant ?? null,
+          };
+        } catch (error) {
+          return {
+            id,
+            outcome: 'not_run',
+            exit_code: null,
+            reason: `unreadable evidence ${path}: ${error.message}`,
+          };
+        }
+      });
+      proven = results.filter((result) => result.outcome === 'detected' && result.exit_code === 0).length;
+      for (const result of results) {
+        if (result.outcome === 'detected' && result.exit_code === 0) continue;
+        if (!undetected.some((line) => line.startsWith(`${result.id} `))) {
+          undetected.push(`${result.id} (${result.outcome}: ${result.reason})`);
+        }
+      }
+      campaignResults = results;
     } finally {
       hasher.kill('SIGTERM');
       const deadline = Date.now() + 5000;
@@ -800,6 +910,20 @@ function main() {
     if (dirtyAfter !== null) {
       console.error(
         `check-invariants --mutations: FAIL — the trusted tree is dirty after the campaign (\`${dirtyAfter}\`)`,
+      );
+      return 1;
+    }
+    // The campaign document is published only after the isolation/barrier
+    // checks pass: evidence from an uncertified run is never consumable.
+    const campaign = writeCampaignEvidence(root, entries, campaignResults, support);
+    const world = loadWorld(root);
+    const campaignIssues = campaignProblems(world, campaign.out);
+    if (campaignIssues.length > 0) {
+      for (const problem of campaignIssues.slice(0, 40)) {
+        console.error(`mutation-campaign: ${problem}`);
+      }
+      console.error(
+        `check-invariants --mutations: FAIL (${campaignIssues.length} campaign evidence violation(s))`,
       );
       return 1;
     }

@@ -388,6 +388,190 @@ fn partial_unique_index_admits_exactly_one_held_lease_under_concurrency() {
 }
 
 #[test]
+fn two_connections_admit_exactly_one_held_lease() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("payment.db");
+    let domain = invoice_domain("inv_cross_process");
+    let resource = domain.logical_resource_id();
+    let barrier = Arc::new(Barrier::new(2));
+    let mut handles = Vec::new();
+    for key in ["cross-a", "cross-b"] {
+        let path = path.clone();
+        let domain = domain.clone();
+        let resource = resource.clone();
+        let barrier = barrier.clone();
+        handles.push(std::thread::spawn(move || {
+            let store = SqlitePaymentStore::open(&path).unwrap();
+            barrier.wait();
+            (
+                key,
+                store
+                    .try_acquire(ORG, &domain, &resource, &lease_claim(key, "digest"), None)
+                    .unwrap(),
+            )
+        }));
+    }
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let held = results
+        .iter()
+        .filter(|(_, result)| matches!(result, LeaseAcquisition::Held(_)))
+        .count();
+    let busy = results
+        .iter()
+        .filter(|(_, result)| matches!(result, LeaseAcquisition::Busy { .. }))
+        .count();
+    assert_eq!(
+        held, 1,
+        "exactly one different connection wins: {results:?}"
+    );
+    assert_eq!(busy, 1);
+
+    let store = SqlitePaymentStore::open(&path).unwrap();
+    assert_eq!(store.leases_needing_reconciliation(ORG).unwrap().len(), 1);
+}
+
+#[test]
+fn a_live_second_connection_refuses_the_same_claim_and_resource() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("payment.db");
+    let domain = invoice_domain("inv_live_second");
+    let resource = domain.logical_resource_id();
+    let first = SqlitePaymentStore::open(&path).unwrap();
+    let held = match first
+        .try_acquire(
+            ORG,
+            &domain,
+            &resource,
+            &lease_claim("live-a", "digest"),
+            None,
+        )
+        .unwrap()
+    {
+        LeaseAcquisition::Held(lease) => lease,
+        other => panic!("expected holder: {other:?}"),
+    };
+
+    let second = SqlitePaymentStore::open(&path).unwrap();
+    assert!(matches!(
+        second
+            .try_acquire(ORG, &domain, &resource, &lease_claim("live-b", "digest"), None)
+            .unwrap(),
+        LeaseAcquisition::Busy { holder } if holder.id == held.id
+    ));
+    assert!(matches!(
+        second
+            .try_acquire(ORG, &domain, &resource, &lease_claim("live-a", "digest"), None)
+            .unwrap(),
+        LeaseAcquisition::AlreadyHeldBySameClaim(lease) if lease.id == held.id
+    ));
+    assert!(matches!(
+        second.try_acquire(
+            ORG,
+            &domain,
+            &resource,
+            &lease_claim("live-a", "different-digest"),
+            None
+        ),
+        Err(PaymentError::IdempotencyConflict(_))
+    ));
+}
+
+#[test]
+fn held_lease_for_claim_returns_only_the_indexed_match() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("payment.db");
+    let store = SqlitePaymentStore::open(&path).unwrap();
+    let first_domain = invoice_domain("inv_lookup_a");
+    let second_domain = invoice_domain("inv_lookup_b");
+    let first = match store
+        .try_acquire(
+            ORG,
+            &first_domain,
+            &first_domain.logical_resource_id(),
+            &lease_claim("lookup-a", "digest"),
+            None,
+        )
+        .unwrap()
+    {
+        LeaseAcquisition::Held(lease) => lease,
+        other => panic!("expected holder: {other:?}"),
+    };
+    let second = match store
+        .try_acquire(
+            ORG,
+            &second_domain,
+            &second_domain.logical_resource_id(),
+            &lease_claim("lookup-b", "digest"),
+            None,
+        )
+        .unwrap()
+    {
+        LeaseAcquisition::Held(lease) => lease,
+        other => panic!("expected holder: {other:?}"),
+    };
+    assert_eq!(
+        store
+            .held_lease_for_claim(ORG, "lookup-a")
+            .unwrap()
+            .unwrap()
+            .id,
+        first.id
+    );
+    assert_eq!(
+        store
+            .held_lease_for_claim(ORG, "lookup-b")
+            .unwrap()
+            .unwrap()
+            .id,
+        second.id
+    );
+    assert!(store.held_lease_for_claim(ORG, "absent").unwrap().is_none());
+    store
+        .claim_operation(&claim_draft("lookup-a", "digest"))
+        .unwrap();
+    store
+        .fail_claim(ORG, "lookup-a", "conflict", "test", 2_000)
+        .unwrap();
+    store.release_no_effect(ORG, &first.id).unwrap();
+    assert!(store
+        .held_lease_for_claim(ORG, "lookup-a")
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn held_lease_key_lookup_uses_the_idempotency_index() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("payment.db");
+    drop(SqlitePaymentStore::open(&path).unwrap());
+    let conn = Connection::open(&path).unwrap();
+    let mut statement = conn
+        .prepare(
+            "EXPLAIN QUERY PLAN SELECT id FROM financial_mutation_lease \
+             WHERE organization_id = ?1 AND idempotency_key = ?2 AND state = 'held' \
+             ORDER BY acquired_ms, id LIMIT 1",
+        )
+        .unwrap();
+    let details: Vec<String> = statement
+        .query_map(params![ORG, "lookup-a"], |row| row.get(3))
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect();
+    assert!(
+        details
+            .iter()
+            .any(|detail| detail.contains("idx_financial_mutation_lease_key")),
+        "the claim lookup must use the idempotency index, got {details:?}"
+    );
+    assert!(
+        !details
+            .iter()
+            .any(|detail| detail.contains("SCAN financial_mutation_lease")),
+        "the claim lookup must not scan the lease table, got {details:?}"
+    );
+}
+
+#[test]
 fn restart_keeps_held_leases_as_reconciliation_obligations() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("payment.db");

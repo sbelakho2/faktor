@@ -5,5 +5,7 @@
   "replace": "        .find(|_oldest| true)\n        .map(|a| a.attempt)\n        .unwrap_or(1)",
   "gate": "cargo test -p faktor-worker --lib requeued_generation_attempt_is_leased_then_terminal",
   "expect": "FAILED",
-  "note": "Looking the attempt up by literal number instead of generation leaves a requeued generation stuck Pending/Leased forever."
+  "note": "Looking the attempt up by literal number instead of generation leaves a requeued generation stuck Pending/Leased forever.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

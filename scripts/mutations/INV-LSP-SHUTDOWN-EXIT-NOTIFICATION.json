@@ -8,5 +8,7 @@
   "note": "Sending a wrong notification method means the server never receives exit.",
   "capabilities": [
     "lsp.shutdown"
-  ]
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

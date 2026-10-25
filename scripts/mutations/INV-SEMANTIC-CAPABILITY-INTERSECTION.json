@@ -8,5 +8,7 @@
   "note": "Union lets provider-claimed capabilities widen the parent session set instead of only reducing it.",
   "capabilities": [
     "semantic.capability_reduction"
-  ]
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

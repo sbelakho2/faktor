@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=independent-reference isolation=separate-process
 //! Vicious trap benchmark for Faktor Supply + Engineering.
 //!
 //! The benchmark is split into an untrusted SUT and an independent oracle:

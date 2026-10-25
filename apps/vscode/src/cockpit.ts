@@ -768,6 +768,9 @@ export function proofIntegrationLines(proof: CockpitProofView | null): string[] 
 // a refusal is an explicit disabled/unavailable state carrying the refusal
 // text — zeros are NEVER rendered in its place.
 
+/** One bounded per-task row group; the tail is counted, never rendered. */
+export const USAGE_MAX_TASK_ROWS = 20;
+
 /** The exact limit names the daemon's plan config uses. */
 export const USAGE_LIMIT_MAX_TOKENS = 'max_tokens_per_period';
 export const USAGE_LIMIT_MANAGED_SPEND = 'max_managed_spend_micro_per_period';
@@ -824,6 +827,8 @@ export interface CockpitUsageTaskView {
 export interface CockpitUsagePeriodView extends CockpitUsageBucketView {
   readonly totalTokens: number;
   readonly tasks: readonly CockpitUsageTaskView[];
+  /** Total served per-task rows, including the bounded tail that is not rendered. */
+  readonly tasksTotal: number;
   /** The fold's own scan-bound cursor (informational; not the page cursor). */
   readonly scanCursor: string | null;
 }
@@ -1066,9 +1071,10 @@ export function buildUsagePanel(input: CockpitUsageInput): CockpitUsagePanel {
     label: 'Grant credits…',
     enabled,
   });
+  const exportAvailable = billing !== null && billing.usage_export.state === 'available';
   const actionRow = (billingEnabled: boolean, grantEnabled: boolean): CockpitAction[] => [
     grantAction(grantEnabled),
-    { key: 'usage-export', label: 'Download usage…', enabled: billingEnabled },
+    { key: 'usage-export', label: 'Download usage…', enabled: billingEnabled && exportAvailable },
     {
       key: 'change-plan',
       label: 'Change plan…',
@@ -1127,11 +1133,12 @@ export function buildUsagePanel(input: CockpitUsageInput): CockpitUsagePanel {
   const period: CockpitUsagePeriodView = {
     ...totals,
     totalTokens,
-    tasks: usage.fold.per_task.map((task) => ({
+    tasks: usage.fold.per_task.slice(0, USAGE_MAX_TASK_ROWS).map((task) => ({
       taskId: task.task_id,
       runId: task.run_id,
       totals: usageBucketView(task.totals),
     })),
+    tasksTotal: usage.fold.per_task.length,
     scanCursor: usage.fold.next_cursor,
   };
   return {
@@ -1158,6 +1165,19 @@ export function buildUsagePanel(input: CockpitUsageInput): CockpitUsagePanel {
 /** Exact micro-USD display of one canonical decimal money string. */
 function microText(value: string): string {
   return `${value}\u00b5$`;
+}
+
+/** Exact minor-unit money display; never converts through a float. */
+export function minorText(minor: number, currency: string | null, exponent: number | null): string {
+  if (currency === null || exponent === null || exponent < 0 || exponent > 6) return 'Unavailable';
+  const negative = minor < 0;
+  const digits = BigInt(Math.abs(minor)).toString().padStart(exponent + 1, '0');
+  const whole = digits.slice(0, digits.length - exponent).replace(/^0+(?=\d)/, '');
+  const fraction = exponent === 0 ? '' : `.${digits.slice(-exponent)}`;
+  const grouped = whole.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  const body = `${grouped}${fraction}`;
+  const symbol = currency === 'EUR' ? '€' : currency === 'USD' ? '$' : currency === 'GBP' ? '£' : null;
+  return `${negative ? '-' : ''}${symbol === null ? `${body} ${currency}` : `${symbol}${body}`}`;
 }
 
 /** One bounded line per quota row; `[EXCEEDED]` leads so it survives a clamp. */
@@ -1246,6 +1266,20 @@ export function usagePanelLines(panel: CockpitUsagePanel): string[] {
         ? `usage export available (${panel.billing.usage_export_formats.join(', ')})`
         : `usage export unavailable — ${panel.billing.usage_export.cause ?? 'unavailable'}`,
     );
+    const payments = panel.billing.payments ?? null;
+    if (payments !== null) {
+      const money = (value: number): string =>
+        minorText(value, payments.currency, payments.currency_exponent);
+      lines.push(
+        `invoices ${payments.invoice_count} recorded · ${payments.open_invoice_count} open · paid ${money(payments.paid_minor)} · refunded ${money(payments.refunded_minor)} · outstanding ${money(payments.outstanding_minor)}`,
+      );
+      lines.push(
+        `seats ${payments.seats === null ? 'unconfigured' : String(payments.seats)} · currency ${payments.currency ?? 'unconfigured'} · tax ${payments.tax.default_jurisdiction ?? payments.tax.state} · payment methods ${payments.payment_method_count}`,
+      );
+      lines.push(
+        `reconciliation ${payments.reconciliation.unreconciled} unreconciled · ${payments.reconciliation.matched} matched · ${payments.reconciliation.amount_mismatch + payments.reconciliation.currency_mismatch + payments.reconciliation.provider_invoice_missing} conflict(s)`,
+      );
+    }
   }
   if (panel.period !== null) {
     lines.push(
@@ -1257,6 +1291,11 @@ export function usagePanelLines(panel: CockpitUsagePanel): string[] {
     for (const task of panel.period.tasks) {
       lines.push(
         `task ${task.taskId} (${task.runId}) — in ${task.totals.inputTokens} · out ${task.totals.outputTokens} · cache ${task.totals.cacheReadTokens}/${task.totals.cacheWriteTokens} · reasoning ${task.totals.reasoningTokens} · managed ${microText(task.totals.managedCostMicro)} · BYOK ${microText(task.totals.byokCostMicro)}`,
+      );
+    }
+    if (panel.period.tasksTotal > panel.period.tasks.length) {
+      lines.push(
+        `${panel.period.tasksTotal - panel.period.tasks.length} more task row(s) not shown (bounded to ${panel.period.tasks.length})`,
       );
     }
     if (panel.period.scanCursor !== null) {

@@ -364,8 +364,14 @@ pub fn invoices_page(
             )
         })
         .collect::<String>();
+    let bound_note = if invoices.len() >= 100 {
+        " Showing the most recent 100 invoices; export the ledger for the full record."
+    } else {
+        ""
+    };
     let content = format!(
-        "<div class=\"actions no-print\"><a class=\"btn btn-outline btn-small\" href=\"/account/invoices/export/?format=csv\">Export CSV</a><a class=\"btn btn-outline btn-small\" href=\"/account/invoices/export/?format=json\">Export JSON</a></div><div class=\"panel span-12 mt-22\"><div class=\"panel-head\"><div><h2>Invoices and receipts</h2><p class=\"panel-sub\">Every amount is the recorded exact minor-unit value.</p></div></div>{}</div>",
+        "<div class=\"actions no-print\"><a class=\"btn btn-outline btn-small\" href=\"/account/invoices/export/?format=csv\">Export CSV</a><a class=\"btn btn-outline btn-small\" href=\"/account/invoices/export/?format=json\">Export JSON</a></div><div class=\"panel span-12 mt-22\"><div class=\"panel-head\"><div><h2>Invoices and receipts</h2><p class=\"panel-sub\">Every amount is the recorded exact minor-unit value.{}.</p></div></div>{}</div>",
+        bound_note,
         if rows.is_empty() {
             "<div class=\"empty\"><strong>No invoices.</strong>Start a plan checkout to create an invoice.</div>".to_string()
         } else {

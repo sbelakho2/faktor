@@ -8,5 +8,7 @@
   "note": "Removing the queue-full refusal drops the bounded writer completion instead of the typed Oversized refusal.",
   "capabilities": [
     "mcp.bounded_writer"
-  ]
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

@@ -4,6 +4,9 @@
   "find": "                    val room = cap - retained.size()",
   "replace": "                    val room = Int.MAX_VALUE - retained.size()",
   "gate": "bash apps/jetbrains/compile-and-smoke.sh --smoke Backend",
+  "expect": "FAIL",
   "timeout_ms": 1800000,
-  "note": "The BoundedDrainer ignores its byte cap: a flooding child accumulates unbounded retained output instead of the hard bound."
+  "note": "The BoundedDrainer ignores its byte cap: a flooding child accumulates unbounded retained output instead of the hard bound.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

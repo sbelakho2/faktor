@@ -1142,6 +1142,60 @@ async fn settings_that_claim_effect_are_consumed_by_their_routes() {
     assert!(!sessions["sessions"].as_array().unwrap().is_empty());
 }
 
+/// K-02 wiring: the accepted per-session compaction model is mirrored into
+/// the session fact space the agent runtime reads, so `next_compaction` is a
+/// real promise. `inherit`/`unset` clear the mirror (empty = inherit).
+#[tokio::test]
+async fn session_compaction_model_setting_is_mirrored_for_the_next_compaction() {
+    let rig = Rig::new().await;
+    let handle = rig
+        .deps
+        .session
+        .get_session(faktor_core::id::SessionId::new(rig.session))
+        .unwrap()
+        .unwrap();
+    let path = format!("/native/session/{}/settings", rig.session);
+    let (status, body) = rig.put(&path, json!({"compactionModel": "fake/m"})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["applied"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v.as_str() == Some("compactionModel")));
+    assert_eq!(
+        handle
+            .memory_fact_get("session_settings", "compactionModel")
+            .unwrap()
+            .as_deref(),
+        Some("fake/m"),
+        "the agent-visible mirror must carry the accepted model"
+    );
+
+    let (status, body) = rig.put(&path, json!({"compactionModel": "inherit"})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        handle
+            .memory_fact_get("session_settings", "compactionModel")
+            .unwrap()
+            .as_deref(),
+        Some(""),
+        "inherit clears the mirror"
+    );
+
+    let (status, body) = rig.put(&path, json!({"compactionModel": "fake/m"})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = rig.put(&path, json!({"unset": ["compactionModel"]})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        handle
+            .memory_fact_get("session_settings", "compactionModel")
+            .unwrap()
+            .as_deref(),
+        Some(""),
+        "unset clears the mirror"
+    );
+}
+
 #[tokio::test]
 async fn stored_only_settings_are_locked_and_refuse_a_save() {
     let rig = Rig::new().await;

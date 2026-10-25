@@ -5,5 +5,7 @@
   "replace": "        return (\n            OwnershipSet::new(Vec::new()),\n            OwnershipSet::new(Vec::new()),\n        );",
   "gate": "cargo test -p faktor-agent --lib a_generic_shell_owns_the_whole_workspace_for_writes",
   "expect": "assertion|full workspace",
-  "note": "The full-workspace sentinel of the mutating ExecuteShell branch is replaced with empty sets: a generic shell no longer serializes with every workspace writer."
+  "note": "The full-workspace sentinel of the mutating ExecuteShell branch is replaced with empty sets: a generic shell no longer serializes with every workspace writer.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

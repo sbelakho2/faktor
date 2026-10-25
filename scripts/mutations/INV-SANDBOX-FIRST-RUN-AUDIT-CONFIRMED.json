@@ -5,5 +5,7 @@
   "replace": "            Ok(Some(record)) => (Some(record), None), // (planted mutation) audit confirmation removed\n",
   "gate": "cargo test -p faktor-cli first_run_tests",
   "expect": "must never grant|no matching audit entry|not a recorded decision",
-  "note": "Removing the audit confirmation accepts a hand-forged or field-flipped sandbox decision document as an operator grant; the tamper-evidence tests must catch it."
+  "note": "Removing the audit confirmation accepts a hand-forged or field-flipped sandbox decision document as an operator grant; the tamper-evidence tests must catch it.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

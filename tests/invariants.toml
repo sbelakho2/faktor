@@ -2318,3 +2318,428 @@ mutation_command = "node scripts/mutation-run.mjs INV-APPROVAL-HUMAN-ONLY"
 mutation_debt = ""
 release_critical = true
 platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-PAYMENTS-TENANT-SCOPE"
+statement = "Every invoice, payment, refund and method read is organization-scoped: one tenant can never resolve another tenant's financial row, and a foreign id is an indistinguishable NotFound."
+owner = "crates/payments store/service"
+authority = "crates/payments/src/store.rs invoice_conn/payment_conn/refund_conn; crates/payments/src/service.rs tenant-scoped reads"
+unit_test = "tenant_isolation_and_auth_before_disclosure_shapes_are_real"
+production_wiring = "refunds_payments_and_defaults_are_tenant_scoped"
+fault = ""
+mutation_command = "node scripts/mutation-run.mjs INV-PAYMENTS-TENANT-SCOPE"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-PAYMENTS-REFUND-BOUND"
+statement = "A refund can never exceed the collected amount minus every already-reserved/settled refund, including concurrent partial refunds with different idempotency keys."
+owner = "crates/payments service invoice operations"
+authority = "crates/payments/src/service/invoice_ops.rs refund_fenced (available = paid - refunded)"
+unit_test = "refunds_are_bounded_by_paid_and_credit_notes_number"
+production_wiring = "refund_provider_error_releases_only_after_no_effect_proof"
+fault = ""
+mutation_command = "node scripts/mutation-run.mjs INV-PAYMENTS-REFUND-BOUND"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-PAYMENTS-WEBHOOK-WINDOW"
+statement = "A signed webhook is only accepted inside the configured timestamp window; stale and replayed deliveries are typed refusals, never applied state."
+owner = "crates/payments webhook"
+authority = "crates/payments/src/webhook.rs verify_webhook (timestamp window)"
+unit_test = "webhook_timestamp_window_is_enforced"
+production_wiring = "webhooks_are_atomic_ordered_and_monotonic"
+fault = ""
+mutation_command = "node scripts/mutation-run.mjs INV-PAYMENTS-WEBHOOK-WINDOW"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-PAYMENTS-LEASE-FENCE"
+statement = "A financial mutation lease is released only at a reconciled terminal outcome or a proven no-effect; an in-flight or unknown claim keeps the fence held."
+owner = "crates/payments financial mutation lease"
+authority = "crates/payments/src/lease.rs reconcile_unknown/release_terminal/release_no_effect"
+unit_test = "fence_release_is_refused_until_terminal_or_no_effect"
+production_wiring = "crash_after_fence_keeps_the_fence_and_reconciles_without_a_second_effect"
+fault = ""
+mutation_command = "node scripts/mutation-run.mjs INV-PAYMENTS-LEASE-FENCE"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-PAYMENTS-INVOICE-TRUTH"
+statement = "Provider invoice observations are versioned truth: an amount or currency mismatch is a typed reconciliation conflict and never rewrites the Faktor-authored invoice total."
+owner = "crates/payments invoice authority"
+authority = "crates/payments/src/service/webhooks.rs invoice observation reconciliation"
+unit_test = "provider_amount_mismatch_is_a_typed_conflict_and_never_rewrites_totals"
+production_wiring = "matching_webhook_updates_faktor_invoice_and_observation_atomically"
+fault = ""
+mutation_command = "node scripts/mutation-run.mjs INV-PAYMENTS-INVOICE-TRUTH"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-BILLING-WEBHOOK-PAYMENT-ID"
+statement = "A webhook-created provider payment owns an identity independent of any in-flight invoice-payment lease, so a second provider payment can never overwrite or alias another receipt."
+owner = "crates/payments webhook settlement"
+authority = "crates/payments/src/service.rs payment.succeeded webhook payment id"
+unit_test = "webhook_for_a_second_payment_during_in_flight_charge_keeps_both_receipts"
+production_wiring = "webhook_for_a_second_payment_during_in_flight_charge_keeps_both_receipts"
+fault = ""
+mutation_witness = "webhook_for_a_second_payment_during_in_flight_charge_keeps_both_receipts"
+mutation_command = "node scripts/mutation-run.mjs INV-BILLING-WEBHOOK-PAYMENT-ID"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-BILLING-PAYMENT-FAILURE-FENCE"
+statement = "A failed payment webhook fails the recorded local payment and releases its invoice-payment fence exactly once instead of leaving an unreconcilable held lease."
+owner = "crates/payments webhook settlement"
+authority = "crates/payments/src/service.rs invoice.payment_failed local payment transition"
+unit_test = "failed_payment_webhook_fails_the_pending_payment_and_releases_the_fence"
+production_wiring = "failed_payment_webhook_fails_the_pending_payment_and_releases_the_fence"
+fault = ""
+mutation_witness = "failed_payment_webhook_fails_the_pending_payment_and_releases_the_fence"
+mutation_command = "node scripts/mutation-run.mjs INV-BILLING-PAYMENT-FAILURE-FENCE"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-BILLING-WEBHOOK-PAYMENT-TRUTH"
+statement = "A payment webhook whose provider amount or currency contradicts the recorded receipt is a typed refusal and never rewrites the settled payment or credits the invoice."
+owner = "crates/payments webhook authority"
+authority = "crates/payments/src/service.rs payment.succeeded provider-truth comparison"
+unit_test = "webhook_payment_truth_mismatch_for_a_recorded_payment_is_refused"
+production_wiring = "webhook_payment_truth_mismatch_for_a_recorded_payment_is_refused"
+fault = ""
+mutation_witness = "webhook_payment_truth_mismatch_for_a_recorded_payment_is_refused"
+mutation_command = "node scripts/mutation-run.mjs INV-BILLING-WEBHOOK-PAYMENT-TRUTH"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-BILLING-CHARGE-TRUTH"
+statement = "A provider charge is credited only when its amount and currency equal the fenced local request; a mismatch is typed and leaves an unknown claim for reconciliation."
+owner = "crates/payments payment operations"
+authority = "crates/payments/src/service/invoice_ops.rs pay_invoice_fenced charge truth check"
+unit_test = "provider_charge_amount_mismatch_is_refused_without_crediting"
+production_wiring = "provider_charge_currency_mismatch_is_refused_without_crediting"
+fault = ""
+mutation_witness = "provider_charge_amount_mismatch_is_refused_without_crediting"
+mutation_command = "node scripts/mutation-run.mjs INV-BILLING-CHARGE-TRUTH"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-BILLING-REFUND-AMOUNT-TRUTH"
+statement = "A refund is settled only when the provider refund amount equals the reserved request; a mismatch is typed and keeps the reservation for reconciliation."
+owner = "crates/payments refund operations"
+authority = "crates/payments/src/service/invoice_ops.rs refund_fenced amount truth check"
+unit_test = "provider_refund_amount_mismatch_is_refused_and_keeps_the_reservation"
+production_wiring = "provider_refund_amount_mismatch_is_refused_and_keeps_the_reservation"
+fault = ""
+mutation_witness = "provider_refund_amount_mismatch_is_refused_and_keeps_the_reservation"
+mutation_command = "node scripts/mutation-run.mjs INV-BILLING-REFUND-AMOUNT-TRUTH"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-BILLING-REFUND-CURRENCY-TRUTH"
+statement = "A refund is settled only in the payment currency; a provider refund in another currency is a typed refusal that never enters the Faktor ledger."
+owner = "crates/payments refund operations"
+authority = "crates/payments/src/service/invoice_ops.rs refund_fenced currency truth check"
+unit_test = "provider_refund_currency_mismatch_is_refused_and_keeps_the_reservation"
+production_wiring = "provider_refund_currency_mismatch_is_refused_and_keeps_the_reservation"
+fault = ""
+mutation_witness = "provider_refund_currency_mismatch_is_refused_and_keeps_the_reservation"
+mutation_command = "node scripts/mutation-run.mjs INV-BILLING-REFUND-CURRENCY-TRUTH"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-BILLING-REFUND-COMMITTED"
+statement = "The refund bound reserves succeeded and still-pending refunds, so a released fence can never re-reserve money already committed to the provider."
+owner = "crates/payments refund operations"
+authority = "crates/payments/src/service/invoice_ops.rs refund_fenced committed_refunds_for_payment"
+unit_test = "pending_refund_commitment_blocks_a_second_refund_after_a_released_fence"
+production_wiring = "pending_refund_commitment_blocks_a_second_refund_after_a_released_fence"
+fault = ""
+mutation_witness = "pending_refund_commitment_blocks_a_second_refund_after_a_released_fence"
+mutation_command = "node scripts/mutation-run.mjs INV-BILLING-REFUND-COMMITTED"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-BILLING-LEASE-CLAIM-LOOKUP"
+statement = "Claim reconciliation resolves exactly the held lease bound to the claim key through an indexed single-row lookup, never another claim's lease and never an O(n) scan per claim."
+owner = "crates/payments financial mutation lease"
+authority = "crates/payments/src/lease.rs held_lease_for_claim"
+unit_test = "held_lease_for_claim_returns_only_the_indexed_match"
+production_wiring = "held_lease_key_lookup_uses_the_idempotency_index"
+fault = ""
+mutation_witness = "held_lease_for_claim_returns_only_the_indexed_match"
+mutation_command = "node scripts/mutation-run.mjs INV-BILLING-LEASE-CLAIM-LOOKUP"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-BILLING-TICK-FENCE"
+statement = "A lifecycle tick observes the subscription fence inside its write transaction and never overwrites an in-flight plan, seat or cancel result."
+owner = "crates/payments subscription lifecycle"
+authority = "crates/payments/src/service.rs tick transactional fence check"
+unit_test = "lifecycle_tick_cannot_write_under_the_subscription_fence"
+production_wiring = "lifecycle_tick_cannot_write_under_the_subscription_fence"
+fault = ""
+mutation_witness = "lifecycle_tick_cannot_write_under_the_subscription_fence"
+mutation_command = "node scripts/mutation-run.mjs INV-BILLING-TICK-FENCE"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-BILLING-DUNNING-INVOICE-MONOTONIC"
+statement = "A payment-failure callback only moves an invoice to past_due when the durable status permits it; a paid or void invoice is never regressed."
+owner = "crates/payments dunning"
+authority = "crates/payments/src/service.rs record_payment_failure invoice transition guard"
+unit_test = "payment_failure_cannot_regress_a_paid_invoice_or_canceled_subscription"
+production_wiring = "payment_failure_cannot_regress_a_paid_invoice_or_canceled_subscription"
+fault = ""
+mutation_witness = "payment_failure_cannot_regress_a_paid_invoice_or_canceled_subscription"
+mutation_command = "node scripts/mutation-run.mjs INV-BILLING-DUNNING-INVOICE-MONOTONIC"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-BILLING-DUNNING-SUBSCRIPTION-TERMINAL"
+statement = "Dunning never resurrects a canceled subscription; terminal states are refused by the subscription transition guard."
+owner = "crates/payments dunning"
+authority = "crates/payments/src/service.rs record_payment_failure subscription terminal guard"
+unit_test = "payment_failure_cannot_regress_a_paid_invoice_or_canceled_subscription"
+production_wiring = "payment_failure_cannot_regress_a_paid_invoice_or_canceled_subscription"
+fault = ""
+mutation_witness = "payment_failure_cannot_regress_a_paid_invoice_or_canceled_subscription"
+mutation_command = "node scripts/mutation-run.mjs INV-BILLING-DUNNING-SUBSCRIPTION-TERMINAL"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-BILLING-REFUND-WEBHOOK-TRUTH"
+statement = "A refund webhook settles only when its provider id, amount and currency equal the recorded refund; a contradiction is a typed refusal that leaves the reservation intact."
+owner = "crates/payments webhook authority"
+authority = "crates/payments/src/service.rs refund.succeeded webhook truth comparison"
+unit_test = "refund_webhook_truth_mismatch_is_refused_before_settlement"
+production_wiring = "refund_webhook_truth_mismatch_is_refused_before_settlement"
+fault = ""
+mutation_witness = "refund_webhook_truth_mismatch_is_refused_before_settlement"
+mutation_command = "node scripts/mutation-run.mjs INV-BILLING-REFUND-WEBHOOK-TRUTH"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-BILLING-WEBHOOK-SUBSCRIPTION-FENCE"
+statement = "A payment/invoice webhook observes the subscription mutation fence inside its transaction and never activates or dunns a subscription owned by an in-flight plan, seat or cancel operation."
+owner = "crates/payments webhook settlement"
+authority = "crates/payments/src/service.rs subscription_mutation_fence_active"
+unit_test = "payment_webhook_cannot_activate_a_subscription_under_its_mutation_fence"
+production_wiring = "payment_webhook_cannot_activate_a_subscription_under_its_mutation_fence"
+fault = ""
+mutation_witness = "payment_webhook_cannot_activate_a_subscription_under_its_mutation_fence"
+mutation_command = "node scripts/mutation-run.mjs INV-BILLING-WEBHOOK-SUBSCRIPTION-FENCE"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-CHILD-HANDOFF-EXACTLY-ONCE"
+statement = "A child's terminal handoff and its delivery watermark are one durable binding: re-attach heals a crash before delivery exactly once and never resurrects a consumed handoff."
+owner = "crates/orchestrator child handoff"
+authority = "crates/orchestrator/src/runtime_handoff.rs deliver_child_handoff/heal_pending_child_handoffs"
+unit_test = "fault_probe_crash_before_parent_handoff_reattach_heals_exactly_once"
+production_wiring = "parent_continuation_receives_structured_child_handoff_not_the_raw_transcript"
+fault = ""
+mutation_command = "node scripts/mutation-run.mjs INV-CHILD-HANDOFF-EXACTLY-ONCE"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-COMPACTION-MIN-REDUCTION"
+statement = "A successful compaction must achieve the configured minimum reduction; a summary that would leave the context above the hard cap is rejected and deterministic pruning takes over."
+owner = "crates/context compaction"
+authority = "crates/context/src/compactor.rs CompactionRequest::hard_cap/Compactor::compact"
+unit_test = "one_percent_summary_rejected_and_deterministic_fallback"
+production_wiring = "zero_reduction_never_accepted_even_at_target"
+fault = ""
+mutation_command = "node scripts/mutation-run.mjs INV-COMPACTION-MIN-REDUCTION"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-CHILD-HANDOFF-UNAVAILABLE"
+statement = "A child-handoff component that cannot be read is reported as typed Unavailable, never collapsed into an apparently absent component, so the parent cannot mistake a read failure for an empty result."
+owner = "crates/orchestrator child handoff"
+authority = "crates/orchestrator/src/merge.rs child_handoff (HandoffData availability envelope)"
+unit_test = "child_handoff_unreadable_ledger_is_unavailable_never_absent"
+production_wiring = "typed_child_handoff_is_bounded_and_never_inlines_the_child_transcript"
+fault = ""
+mutation_command = "node scripts/mutation-run.mjs INV-CHILD-HANDOFF-UNAVAILABLE"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-IMPACT-BOUNDED-QUERY"
+statement = "An affected-set query is always bounded by the caller's max_results, always reserves a test slot, and never returns an unbounded affected set."
+owner = "crates/impact query"
+authority = "crates/impact/src/query.rs affected (max_results clamp and test-slot reservation)"
+unit_test = "bounded_results_always_reserve_a_test_slot"
+production_wiring = "crate_expansion_is_conservative_but_bounded"
+fault = ""
+mutation_command = "node scripts/mutation-run.mjs INV-IMPACT-BOUNDED-QUERY"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-COMPACTION-CRITERIA-TRUTH"
+statement = "The acceptance-criteria fact carries the fixture-owned required-check token, not the human goal, and survives five compacting turns bounded and byte-identical in intent."
+owner = "crates/agent runtime/compaction criteria"
+authority = "crates/agent/src/runtime/verification_attribution.rs criteria fact derivation"
+unit_test = "criteria_fact_survives_five_compacting_turns"
+production_wiring = "task_rows_survive_five_compactions_byte_identical"
+fault = ""
+mutation_command = "node scripts/mutation-run.mjs INV-COMPACTION-CRITERIA-TRUTH"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-EDITION8-S55-CONNECT-PRIMARY"
+statement = "S55's Connect Account primary reaches the shipped control-plane sign-in command, never a generic chat opener."
+owner = "apps/vscode edition8"
+authority = "apps/vscode/src/edition8/html.ts HOST_PRIMARY S55"
+script_check = "edition8: commercial reads use the served organization and keep S55 sign-in reachable"
+mutation_witness = "edition8: commercial reads use the served organization and keep S55 sign-in reachable"
+mutation_command = "node scripts/mutation-run.mjs INV-EDITION8-S55-CONNECT-PRIMARY"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-EDITION8-ORG-SCOPED-COMMERCIAL-READS"
+statement = "Usage and outcomes reads use the organization served by identity so a billing-wired daemon never falls back to the refused org-less alias."
+owner = "apps/vscode edition8"
+authority = "apps/vscode/src/edition8/source.ts identity-first usagePath/outcomesPath"
+script_check = "edition8: commercial reads use the served organization and keep S55 sign-in reachable"
+mutation_witness = "edition8: commercial reads use the served organization and keep S55 sign-in reachable"
+mutation_command = "node scripts/mutation-run.mjs INV-EDITION8-ORG-SCOPED-COMMERCIAL-READS"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-EDITION8-READONLY-COMMERCIAL-PROVENANCE"
+statement = "Read-only commercial screens lead with served state and keep their control cards behind one provenance disclosure."
+owner = "apps/vscode edition8"
+authority = "apps/vscode/src/edition8/html.ts rowsFirst/controlsMarkup"
+script_check = "edition8: read-only commercial screens lead with served state and collapse provenance"
+mutation_witness = "edition8: read-only commercial screens lead with served state and collapse provenance"
+mutation_command = "node scripts/mutation-run.mjs INV-EDITION8-READONLY-COMMERCIAL-PROVENANCE"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-SITE-BILLING-DESTRUCTIVE-CONFIRM"
+statement = "Website cancellation refuses to apply without the explicit confirmation field; an immediate cancellation is never one click."
+owner = "crates/site billing"
+authority = "crates/site/src/routes/billing.rs cancel"
+script_check = "site billing cancellation requires the explicit confirmation field"
+mutation_witness = "site billing cancellation requires the explicit confirmation field"
+mutation_command = "node scripts/mutation-run.mjs INV-SITE-BILLING-DESTRUCTIVE-CONFIRM"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-COMPACTION-RESTART-DIGEST"
+statement = "A restarted turn accepts a durable context checkpoint only when its recorded head digest names the exact payload; a corrupt or swapped checkpoint is a typed Malformed refusal, never trusted."
+owner = "crates/agent runtime/compaction restart"
+authority = "crates/agent/src/runtime/request.rs decode_checkpoint_turns"
+unit_test = "context_checkpoint_digest_must_describe_the_payload"
+production_wiring = "checkpoint_reproduces_identical_context_digest_across_restart_and_skips_old_rows"
+mutation_witness = "context_checkpoint_digest_must_describe_the_payload"
+mutation_command = "node scripts/mutation-run.mjs INV-COMPACTION-RESTART-DIGEST"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-COMPACTION-MANUAL-DIGEST"
+statement = "Manual compaction verifies the checkpoint head digest against the canonical history digest before loading it and falls back to the durable transcript on mismatch."
+owner = "crates/server compaction surface"
+authority = "crates/server/src/native/longtask.rs decode_checkpoint_turns"
+unit_test = "manual_compaction_ignores_a_checkpoint_with_a_mismatched_digest"
+production_wiring = "manual_compaction_evidence_ids_are_durable"
+mutation_witness = "manual_compaction_ignores_a_checkpoint_with_a_mismatched_digest"
+mutation_command = "node scripts/mutation-run.mjs INV-COMPACTION-MANUAL-DIGEST"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-COMPACTION-TOOL-EXCERPT"
+statement = "Manual compaction reads the durable bounded tool-result `excerpt`, so huge historical tool output stays visible and its evidence id resolves after restart."
+owner = "crates/server compaction surface"
+authority = "crates/server/src/native/longtask.rs load_turns tool-result part"
+unit_test = "manual_compaction_evidence_ids_are_durable"
+production_wiring = "manual_compaction_ignores_a_checkpoint_with_a_mismatched_digest"
+mutation_witness = "manual_compaction_evidence_ids_are_durable"
+mutation_command = "node scripts/mutation-run.mjs INV-COMPACTION-TOOL-EXCERPT"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-HANDOFF-RUN-QUALIFIED"
+statement = "Child handoff fact keys carry the run id, so two runs of one parent that both mint `child-0` keep distinct deliveries neither of which overwrites or watermark-suppresses the other."
+owner = "crates/orchestrator child handoff"
+authority = "crates/orchestrator/src/runtime_handoff.rs handoff_fact_keys"
+unit_test = "two_runs_of_one_parent_keep_distinct_child_handoffs"
+production_wiring = "parent_continuation_receives_structured_child_handoff_not_the_raw_transcript"
+mutation_witness = "two_runs_of_one_parent_keep_distinct_child_handoffs"
+mutation_command = "node scripts/mutation-run.mjs INV-HANDOFF-RUN-QUALIFIED"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-HANDOFF-CANCELLED"
+statement = "A cancelled child is a terminal outcome: its parent handoff is delivered with the typed `outcome: cancelled`, never suppressed into apparent absence and never reported as success or failure."
+owner = "crates/orchestrator child handoff"
+authority = "crates/orchestrator/src/runtime_handoff.rs deliver_child_handoff terminal set"
+unit_test = "cancelled_child_reports_an_explicit_cancelled_handoff"
+production_wiring = "parent_continuation_receives_structured_child_handoff_not_the_raw_transcript"
+mutation_witness = "cancelled_child_reports_an_explicit_cancelled_handoff"
+mutation_command = "node scripts/mutation-run.mjs INV-HANDOFF-CANCELLED"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]

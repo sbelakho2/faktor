@@ -8,5 +8,7 @@
   "note": "Rotation must keep exactly MAX backup files; >= rotates one too many.",
   "capabilities": [
     "cloud.backup_retention"
-  ]
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

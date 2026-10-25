@@ -226,6 +226,7 @@ async fn verified_completion_records_once_and_replays_as_a_noop() {
     settle(&graph, parent, &run_id).await;
     let replayed = ledger.get(&run_id).unwrap().unwrap();
     assert_eq!(replayed, record, "the replay never rewrites the record");
+    // TEST-SEPARATION-EXEMPT: self-oracle — idempotence property; the expected value is the independently captured pre-replay row, not a recomputed verdict.
     assert_eq!(
         ledger.settlement(&run_id).unwrap().unwrap(),
         settlement,
@@ -762,6 +763,7 @@ async fn sequential_divergent_producers_repair_money_without_rewriting_the_recor
     // A third pass converges: no record movement, no settlement movement.
     settle(&graph, parent, &run_id).await;
     assert_eq!(ledger.get(&run_id).unwrap().unwrap(), frozen);
+    // TEST-SEPARATION-EXEMPT: self-oracle — convergence property; the expected value is the independently captured pre-repair projection.
     assert_eq!(ledger.settlement(&run_id).unwrap().unwrap(), settled);
     assert_eq!(ledger.count().unwrap(), 1);
 }

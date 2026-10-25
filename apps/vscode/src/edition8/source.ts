@@ -45,6 +45,12 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** Native routes wrap some singleton documents in their own named envelope. */
+function unwrapEnvelope(value: Json | null, key: string): Json | null {
+  if (isObject(value) && isObject(value[key])) return value[key];
+  return value;
+}
+
 async function readJson(
   native: NativeClient,
   method: 'GET' | 'POST',
@@ -248,6 +254,42 @@ export async function loadEdition8Snapshot(native: NativeClient, options: E8Snap
     readJson(native, 'GET', '/native/providers', null, sources, 'providers'),
   ]);
   const [health, ready, models, capabilities, config, descriptors, connections, providers] = critical;
+  // The commercial plane scopes usage/outcomes by organization. Identity is
+  // read once; the two dependent reads start as soon as it lands while every
+  // other independent read keeps running, so a commercial deployment adds no
+  // extra serial round trip to screen open.
+  const identityPromise = readJson(native, 'GET', '/native/identity', null, sources, 'identity').then(
+    (value) => unwrapEnvelope(value, 'identity'),
+  );
+  const commercialPromise = identityPromise.then((identity) => {
+    const organization =
+      isObject(identity) && typeof identity.organization === 'string' && identity.organization.length > 0
+        ? identity.organization
+        : null;
+    return {
+      identity,
+      usage: readJson(
+        native,
+        'GET',
+        organization === null
+          ? '/native/usage'
+          : `/native/usage?org=${encodeURIComponent(organization)}&limit=1`,
+        null,
+        sources,
+        'usage',
+      ),
+      outcomes: readJson(
+        native,
+        'GET',
+        organization === null
+          ? '/native/outcomes?limit=1'
+          : `/native/outcomes?org=${encodeURIComponent(organization)}&limit=1`,
+        null,
+        sources,
+        'outcomes',
+      ),
+    };
+  });
   const selected = firstModel(models);
   const parametersPromise =
     selected === null
@@ -290,11 +332,11 @@ export async function loadEdition8Snapshot(native: NativeClient, options: E8Snap
     sessionPath === null
       ? skip(sources, 'sessionMeta', 'GET', '/native/sessions/{id}/meta', 'No conversation is bound; session metadata is session-scoped.')
       : readJson(native, 'GET', `/native/sessions/${encodeURIComponent(session as string)}/meta`, null, sources, 'sessionMeta'),
-    readJson(native, 'GET', '/native/usage', null, sources, 'usage'),
+    commercialPromise.then((reads) => reads.usage),
     sessionPath === null
       ? skip(sources, 'sessionUsage', 'GET', '/native/session/{id}/usage', 'No conversation is bound; run usage is session-scoped.')
       : readJson(native, 'GET', `${sessionPath}/usage`, null, sources, 'sessionUsage'),
-    readJson(native, 'GET', '/native/outcomes?limit=1', null, sources, 'outcomes'),
+    commercialPromise.then((reads) => reads.outcomes),
     sessionPath === null
       ? skip(sources, 'verification', 'GET', '/native/session/{id}/verification', 'No conversation is bound; verification is session-scoped.')
       : readJson(native, 'GET', `${sessionPath}/verification`, null, sources, 'verification'),
@@ -312,7 +354,7 @@ export async function loadEdition8Snapshot(native: NativeClient, options: E8Snap
       : readJson(native, 'GET', `${sessionPath}/turns`, null, sources, 'turns'),
     readJson(native, 'GET', '/native/diagnostics/preview', null, sources, 'diagnostics'),
     readJson(native, 'GET', '/native/updater/status', null, sources, 'updater'),
-    readJson(native, 'GET', '/native/identity', null, sources, 'identity'),
+    commercialPromise.then((reads) => reads.identity),
     readJson(native, 'GET', '/native/entitlements', null, sources, 'entitlements'),
     readJson(native, 'GET', '/native/browser/status', null, sources, 'browser'),
     readJson(native, 'GET', '/native/enterprise/status', null, sources, 'enterprise'),
@@ -477,7 +519,7 @@ export async function loadEdition8Snapshot(native: NativeClient, options: E8Snap
     diagnostics: other[20],
     updater: other[21],
     identity: other[22],
-    entitlements: other[23],
+    entitlements: unwrapEnvelope(other[23], 'entitlements'),
     browser: other[24],
     enterprise: other[25],
     workers: other[26],

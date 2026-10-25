@@ -1,0 +1,19 @@
+{
+  "id": "INV-PAYMENTS-LEASE-FENCE",
+  "surface": "payments.billing",
+  "file": "crates/payments/src/lease.rs",
+  "find": "            let expected = outcome.claim_state();\n            if claim_state != expected {\n                return Err(PaymentError::Conflict(format!(\n                    \"lease {lease_id} claim is {} but the terminal outcome is {}\",",
+  "replace": "            let expected = outcome.claim_state();\n            if false && claim_state != expected {\n                return Err(PaymentError::Conflict(format!(\n                    \"lease {lease_id} claim is {} but the terminal outcome is {}\",",
+  "gate": "cargo test -p faktor-payments --test financial_races fence_release_is_refused_until_terminal_or_no_effect",
+  "expect": "FAILED",
+  "note": "Disabling the terminal-claim equality check lets a fence be released as terminal while its operation claim is still in flight, so a second financial mutation can enter the same domain; the premature-release oracle must fail.",
+  "capabilities": [
+    "payments.lease_fence"
+  ],
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

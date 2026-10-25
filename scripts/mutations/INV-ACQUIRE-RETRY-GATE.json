@@ -8,5 +8,7 @@
   "note": "Removing the reset clamp lets retry-after exceed the window reset.",
   "capabilities": [
     "acquire.retry_gate"
-  ]
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

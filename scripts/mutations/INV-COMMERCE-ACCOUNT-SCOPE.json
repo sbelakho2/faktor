@@ -8,5 +8,7 @@
   "note": "Ignoring the account scope applies account pricing to every context.",
   "capabilities": [
     "commerce.quote_scope"
-  ]
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

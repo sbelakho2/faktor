@@ -1,12 +1,18 @@
 {
   "id": "INV-COMMERCE-DIGEST-STABILITY",
   "file": "crates/commerce/src/bom.rs",
-  "find": "        for item in &self.0 {\n            let key = item.key();\n            hasher.update(key.as_bytes());\n        }",
-  "replace": "        let mut keys: Vec<String> = self.0.iter().map(BomItem::key).collect();\n        keys.sort();\n        for key in &keys {\n            hasher.update(key.as_bytes());\n        }",
+  "find": "        for item in &self.0 {\n            let canonical = normalized\n                .entry(item.q.as_str())\n                .or_insert_with(|| canonical_query(item.q.as_str()));\n            let key = item.key_from_normalized(canonical);\n            hasher.update(key.as_bytes());\n        }",
+  "replace": "        let mut keys: Vec<String> = self\n            .0\n            .iter()\n            .map(|item| item.key_from_normalized(&canonical_query(item.q.as_str())))\n            .collect();\n        keys.sort();\n        for key in &keys {\n            hasher.update(key.as_bytes());\n        }",
   "gate": "cargo test -p faktor-commerce --lib bom::tests::bom_digest_is_order_sensitive_and_deterministic",
   "expect": "FAILED",
   "note": "Sorting keys before hashing makes reordered BOMs share one digest.",
   "capabilities": [
     "commerce.digest_stability"
+  ],
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
   ]
 }

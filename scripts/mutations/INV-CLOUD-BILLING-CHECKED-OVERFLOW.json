@@ -8,5 +8,7 @@
   "note": "Saturating addition silently wraps billing overflow instead of refusing typed.",
   "capabilities": [
     "cloud.billing_overflow"
-  ]
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

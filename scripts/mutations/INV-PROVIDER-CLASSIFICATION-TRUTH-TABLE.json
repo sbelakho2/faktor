@@ -5,5 +5,7 @@
   "replace": "        400 => match hint {\n            Some(ErrorHint::Auth) | Some(ErrorHint::Permission) => ErrorKind::Permission,\n            Some(ErrorHint::RateLimited) => ErrorKind::Malformed,\n            None => ErrorKind::Malformed,\n        },",
   "gate": "cargo test -p faktor-provider --lib classify",
   "expect": "FAILED",
-  "note": "Drops the 400+rate-limit truth-table cell back to Malformed: the exhaustive status x hint test (and every adapter expectation generated from the table) must fail."
+  "note": "Drops the 400+rate-limit truth-table cell back to Malformed: the exhaustive status x hint test (and every adapter expectation generated from the table) must fail.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

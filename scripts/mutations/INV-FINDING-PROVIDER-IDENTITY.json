@@ -5,5 +5,7 @@
   "replace": "    if false {\n",
   "gate": "cargo test -p faktor-tests-economy --test new_guard_findings_validation",
   "expect": "unwrap_err|must never become a statement|must never be applied",
-  "note": "Skipping the provider-identity validation accepts a finding under another provider's name as if it answered the consult."
+  "note": "Skipping the provider-identity validation accepts a finding under another provider's name as if it answered the consult.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

@@ -1,0 +1,15 @@
+{
+  "id": "INV-BILLING-DUNNING-INVOICE-MONOTONIC",
+  "surface": "payments.billing",
+  "file": "crates/payments/src/service.rs",
+  "find": "                if invoice.status.can_transition_to(InvoiceStatus::PastDue) {\n                    invoice.status = InvoiceStatus::PastDue;\n                }",
+  "replace": "                invoice.status = InvoiceStatus::PastDue;",
+  "gate": "cargo test -p faktor-payments --test invoice_fencing payment_failure_cannot_regress_a_paid_invoice_or_canceled_subscription",
+  "expect": "FAILED",
+  "note": "A decline callback that unconditionally rewrites a paid invoice to past_due corrupts settled invoice truth; the monotonic-dunning oracle must fail.",
+  "capabilities": [
+    "payments.invoice_truth"
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+}

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-browser-profile,read-only-artifacts
 // A01–A40 executable acceptance for the Revision 8 VS Code surfaces.
 //
 // Each scenario is checked against the shipped view/controller/route modules

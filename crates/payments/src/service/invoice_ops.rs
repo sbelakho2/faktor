@@ -10,8 +10,6 @@
 
 use std::time::Duration;
 
-use rusqlite::OptionalExtension;
-
 use faktor_cloud::OrganizationId;
 
 use crate::authority::{ProviderPaymentObservation, ProviderRefundObservation};
@@ -260,6 +258,16 @@ impl PaymentService {
                 return Err(error);
             }
         };
+        if status != PaymentStatus::Failed
+            && (charge.amount_minor != balance || charge.currency != invoice.currency)
+        {
+            self.store
+                .mark_claim_unknown(org, &request.idempotency_key, now)?;
+            return Err(PaymentError::Provider(format!(
+                "provider charge {} {} does not match the requested {} {}",
+                charge.amount_minor, charge.currency, balance, invoice.currency
+            )));
+        }
         let payment = Payment {
             id: payment_id.clone(),
             organization_id: org.to_string(),
@@ -444,7 +452,7 @@ impl PaymentService {
         };
         let refunded = self
             .store
-            .refunded_for_payment(org, &current_payment.id)?
+            .committed_refunds_for_payment(org, &current_payment.id)?
             .max(current_payment.refunded_minor);
         let available = current_payment.amount_minor - refunded;
         if request.amount_minor > available {
@@ -510,12 +518,17 @@ impl PaymentService {
             }
         };
         let now = self.now_ms();
-        if remote.amount_minor != request.amount_minor {
+        if remote.amount_minor != request.amount_minor
+            || remote.currency != current_payment.currency
+        {
             self.store
                 .mark_claim_unknown(org, &request.idempotency_key, now)?;
             return Err(PaymentError::Provider(format!(
-                "provider refund amount {} does not match the requested {}",
-                remote.amount_minor, request.amount_minor
+                "provider refund {} {} does not match the requested {} {}",
+                remote.amount_minor,
+                remote.currency,
+                request.amount_minor,
+                current_payment.currency
             )));
         }
         let status = match RefundStatus::parse(&remote.status) {
@@ -1069,28 +1082,5 @@ impl PaymentService {
                 }
             }
         }
-    }
-
-    pub(crate) fn webhook_payment_id_tx(
-        &self,
-        tx: &rusqlite::Connection,
-        org: &str,
-        invoice_id: &str,
-    ) -> Result<String, PaymentError> {
-        let key: Option<String> = tx
-            .query_row(
-                "SELECT idempotency_key FROM financial_mutation_lease \
-                 WHERE organization_id = ?1 AND conflict_domain = 'invoice_payment' \
-                 AND logical_resource_id = ?2 AND state = 'held' \
-                 ORDER BY acquired_ms DESC, id DESC LIMIT 1",
-                rusqlite::params![org, invoice_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|error| PaymentError::Store(format!("read invoice payment fence: {error}")))?;
-        Ok(match key {
-            Some(key) => operation_resource_id("pay", org, "pay_invoice", &key),
-            None => format!("pay_{}", uuid::Uuid::new_v4()),
-        })
     }
 }

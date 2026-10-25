@@ -5,5 +5,7 @@
   "replace": "    fn fidelity(&self) -> SemanticFidelity {\n        self.descriptor()\n            .fidelity\n            .unwrap_or(SemanticFidelity::CompilerExact)\n    }\n\n    fn completeness(&self) -> SemanticCompleteness {\n        self.descriptor()\n            .completeness\n            .unwrap_or(SemanticCompleteness::ConservativeComplete)\n    }",
   "gate": "cargo test -p faktor-orchestrator --lib required_semantic_delta_blocks_an_undeclared_provider",
   "expect": "FAILED",
-  "note": "Defaulting missing fidelity/completeness to the strongest trust level lets silent providers satisfy compiler-exact obligations."
+  "note": "Defaulting missing fidelity/completeness to the strongest trust level lets silent providers satisfy compiler-exact obligations.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

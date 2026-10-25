@@ -96,11 +96,6 @@ pub(crate) fn execute_loop_with(
     }
 }
 
-#[cfg(test)]
-pub(crate) fn execute_verify(args: Value) -> Result<Value, Error> {
-    execute_verify_with(args, &engineering_core::ReceiptVerifier::self_attested())
-}
-
 pub(crate) fn execute_verify_with(
     args: Value,
     verifier: &engineering_core::ReceiptVerifier,
@@ -597,7 +592,9 @@ mod tests {
 
     #[test]
     fn malformed_verification_input_is_refused() {
-        let error = execute_verify(json!({"not": "an outcome"})).unwrap_err();
+        let verifier =
+            engineering_core::ReceiptVerifier::trusting_key_id(&"11".repeat(32)).unwrap();
+        let error = execute_verify_with(json!({"not": "an outcome"}), &verifier).unwrap_err();
         assert!(error.to_string().contains("invalid loop outcome"));
     }
 

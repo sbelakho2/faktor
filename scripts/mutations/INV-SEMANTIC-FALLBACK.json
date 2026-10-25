@@ -1,12 +1,14 @@
 {
   "id": "INV-SEMANTIC-FALLBACK",
   "file": "crates/semantic/src/fallback.rs",
-  "find": "        SemanticCapabilities::CONTEXT\n            .union(SemanticCapabilities::DELTA)\n            .union(SemanticCapabilities::AFFECTED)\n            .union(SemanticCapabilities::EXPLAIN)",
-  "replace": "        SemanticCapabilities::NONE",
+  "find": "        let mut caps = SemanticCapabilities::CONTEXT\n            .union(SemanticCapabilities::DELTA)\n            .union(SemanticCapabilities::AFFECTED)\n            .union(SemanticCapabilities::EXPLAIN);",
+  "replace": "        let mut caps = SemanticCapabilities::NONE;",
   "gate": "cargo test -p faktor-semantic --lib fallback_serves_every_operation_when_no_provider_is_registered",
   "expect": "FAILED",
   "note": "Declaring NONE removes the fallback's heuristic context/delta/affected/explain services that provider-less runtimes depend on.",
   "capabilities": [
     "semantic.fallback"
-  ]
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

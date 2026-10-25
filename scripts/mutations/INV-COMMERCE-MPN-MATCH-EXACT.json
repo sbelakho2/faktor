@@ -8,5 +8,7 @@
   "note": "Negated MPN comparisons make different part numbers look like exact matches.",
   "capabilities": [
     "commerce.matching"
-  ]
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

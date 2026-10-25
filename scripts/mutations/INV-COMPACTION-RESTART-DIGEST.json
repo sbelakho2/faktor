@@ -1,0 +1,15 @@
+{
+  "id": "INV-COMPACTION-RESTART-DIGEST",
+  "surface": "compaction",
+  "file": "crates/agent/src/runtime/request.rs",
+  "find": "    if actual != checkpoint.digest {",
+  "replace": "    if false {",
+  "gate": "cargo test -p faktor-agent --lib context_checkpoint_digest_must_describe_the_payload",
+  "expect": "FAILED",
+  "note": "Dropping the durable head/payload digest comparison lets a corrupt or swapped checkpoint be trusted as the replacement context; the restart-digest oracle (MC-COMPACTION-RESTART-DIGEST) must fail.",
+  "capabilities": [
+    "agent.compaction_restart_digest"
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+}

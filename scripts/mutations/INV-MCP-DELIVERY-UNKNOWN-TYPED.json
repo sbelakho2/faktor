@@ -8,5 +8,7 @@
   "note": "Marking delivery-unknown retryable breaks the never-retryable typed contract.",
   "capabilities": [
     "mcp.delivery_unknown"
-  ]
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

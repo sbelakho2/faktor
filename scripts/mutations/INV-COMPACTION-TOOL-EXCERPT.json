@@ -1,0 +1,15 @@
+{
+  "id": "INV-COMPACTION-TOOL-EXCERPT",
+  "surface": "compaction",
+  "file": "crates/server/src/native/longtask.rs",
+  "find": ".get(\"excerpt\")",
+  "replace": ".get(\"output\")",
+  "gate": "cargo test -p faktor-server --lib manual_compaction_evidence_ids_are_durable",
+  "expect": "FAILED",
+  "note": "Reading the legacy `output` key erases the durable bounded tool-result excerpt from manual-compaction history, so the evidence id never resolves; the MC-COMPACTION-TOOL-EXCERPT oracle must fail.",
+  "capabilities": [
+    "server.manual_compaction_tool_excerpt"
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+}

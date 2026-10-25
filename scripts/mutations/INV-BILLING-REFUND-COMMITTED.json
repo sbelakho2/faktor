@@ -1,0 +1,15 @@
+{
+  "id": "INV-BILLING-REFUND-COMMITTED",
+  "surface": "payments.billing",
+  "file": "crates/payments/src/service/invoice_ops.rs",
+  "find": "            .committed_refunds_for_payment(org, &current_payment.id)?",
+  "replace": "            .refunded_for_payment(org, &current_payment.id)?",
+  "gate": "cargo test -p faktor-payments --test invoice_fencing pending_refund_commitment_blocks_a_second_refund_after_a_released_fence",
+  "expect": "FAILED",
+  "note": "Counting only succeeded refunds lets a still-pending refund be reserved twice and over-refunds the provider; the committed-reservation oracle must fail.",
+  "capabilities": [
+    "payments.refund_bound"
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+}

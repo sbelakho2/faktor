@@ -8,5 +8,7 @@
   ],
   "gate": "node scripts/check-invariant-coverage.mjs --check",
   "expect": "undiscovered-capability: native\\.get\\.ghost-probe",
-  "note": "Creates a brand-new server module whose chained /ghost-probe route has no manifest row. The recursive production-module walk must discover native.get.ghost-probe AND native.post.ghost-probe and turn check-invariant-coverage --check red: route discovery is closed over new modules, not only the historically enumerated lifecycle.rs/worker_plane.rs files."
+  "note": "Creates a brand-new server module whose chained /ghost-probe route has no manifest row. The recursive production-module walk must discover native.get.ghost-probe AND native.post.ghost-probe and turn check-invariant-coverage --check red: route discovery is closed over new modules, not only the historically enumerated lifecycle.rs/worker_plane.rs files.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

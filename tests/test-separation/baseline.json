@@ -1,0 +1,6864 @@
+{
+  "schema": "faktor-test-separation/v1",
+  "files": {
+    "apps/jetbrains/backend/src/test/kotlin/dev/faktor/backend/BackendProcessManagerTest.kt": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "separate-process",
+        "read-only-artifacts"
+      ],
+      "tests": 0
+    },
+    "apps/jetbrains/backend/src/test/kotlin/dev/faktor/backend/NativeClientTest.kt": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "separate-process",
+        "read-only-artifacts"
+      ],
+      "tests": 0
+    },
+    "apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/ChangeReviewAdapterTest.kt": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "separate-process",
+        "read-only-artifacts"
+      ],
+      "tests": 0
+    },
+    "apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/ControlPlaneCredentialSmoke.kt": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "separate-process",
+        "read-only-artifacts"
+      ],
+      "tests": 0
+    },
+    "apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/Edition5AcceptanceSmoke.kt": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "separate-process",
+        "read-only-artifacts"
+      ],
+      "tests": 0
+    },
+    "apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/Edition5ControlExercise.kt": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "separate-process",
+        "read-only-artifacts"
+      ],
+      "tests": 0
+    },
+    "apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/Edition8AcceptanceSmoke.kt": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "separate-process",
+        "read-only-artifacts"
+      ],
+      "tests": 0
+    },
+    "apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/Edition8ControlExercise.kt": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "separate-process",
+        "read-only-artifacts"
+      ],
+      "tests": 0
+    },
+    "apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/Edition8DaemonDogfood.kt": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "separate-process",
+        "read-only-artifacts"
+      ],
+      "tests": 0
+    },
+    "apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/Edition8Evidence.kt": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "separate-process",
+        "read-only-artifacts"
+      ],
+      "tests": 0
+    },
+    "apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/Edition8LiveAcceptance.kt": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "separate-process",
+        "read-only-artifacts"
+      ],
+      "tests": 0
+    },
+    "apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/Edition8UxAudit.kt": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "separate-process",
+        "read-only-artifacts"
+      ],
+      "tests": 0
+    },
+    "apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/Edition8WorkflowSmoke.kt": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "separate-process",
+        "read-only-artifacts"
+      ],
+      "tests": 0
+    },
+    "apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/EdtWorkHarness.kt": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "separate-process",
+        "read-only-artifacts"
+      ],
+      "tests": 0
+    },
+    "apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/FaktorConfigurableTest.kt": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "separate-process",
+        "read-only-artifacts"
+      ],
+      "tests": 0
+    },
+    "apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/FrontendSmoke.kt": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "separate-process",
+        "read-only-artifacts"
+      ],
+      "tests": 0
+    },
+    "apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/FrontendTestSupport.kt": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "separate-process",
+        "read-only-artifacts"
+      ],
+      "tests": 0
+    },
+    "apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/IdeJourneyTest.kt": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "separate-process",
+        "read-only-artifacts"
+      ],
+      "tests": 0
+    },
+    "apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsHostMatrixSmoke.kt": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "separate-process",
+        "read-only-artifacts"
+      ],
+      "tests": 0
+    },
+    "apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParityMatrix.kt": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "separate-process",
+        "read-only-artifacts"
+      ],
+      "tests": 0
+    },
+    "apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParitySmoke.kt": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "separate-process",
+        "read-only-artifacts"
+      ],
+      "tests": 0
+    },
+    "apps/vscode/scripts/acceptance-edition5.mjs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-browser-profile",
+        "read-only-artifacts"
+      ],
+      "tests": 6
+    },
+    "apps/vscode/scripts/edition5-acceptance.mjs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-browser-profile",
+        "read-only-artifacts"
+      ],
+      "tests": 0
+    },
+    "apps/vscode/scripts/edition5-control-exercise.mjs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-browser-profile",
+        "read-only-artifacts"
+      ],
+      "tests": 0
+    },
+    "apps/vscode/scripts/edition5-dogfood.mjs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-browser-profile",
+        "read-only-artifacts"
+      ],
+      "tests": 0
+    },
+    "apps/vscode/scripts/edition8-acceptance.mjs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-browser-profile",
+        "read-only-artifacts"
+      ],
+      "tests": 47
+    },
+    "apps/vscode/scripts/edition8-contrast.mjs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-browser-profile",
+        "read-only-artifacts"
+      ],
+      "tests": 0
+    },
+    "apps/vscode/scripts/edition8-control-exercise.mjs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-browser-profile",
+        "read-only-artifacts"
+      ],
+      "tests": 11
+    },
+    "apps/vscode/scripts/edition8-dogfood.mjs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-browser-profile",
+        "read-only-artifacts"
+      ],
+      "tests": 2
+    },
+    "apps/vscode/scripts/edition8-optical.mjs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-browser-profile",
+        "read-only-artifacts"
+      ],
+      "tests": 1
+    },
+    "apps/vscode/scripts/edition8-ux-audit.mjs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-browser-profile",
+        "read-only-artifacts"
+      ],
+      "tests": 0
+    },
+    "apps/vscode/scripts/edition8-visual.mjs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-browser-profile",
+        "read-only-artifacts"
+      ],
+      "tests": 0
+    },
+    "apps/vscode/scripts/edition8-workflows.mjs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-browser-profile",
+        "read-only-artifacts"
+      ],
+      "tests": 6
+    },
+    "apps/vscode/scripts/edition8/host.mjs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-browser-profile",
+        "read-only-artifacts"
+      ],
+      "tests": 0
+    },
+    "apps/vscode/scripts/exercise-edition5.mjs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-browser-profile",
+        "read-only-artifacts"
+      ],
+      "tests": 0
+    },
+    "apps/vscode/scripts/fixtures/edition5.mjs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-browser-profile",
+        "read-only-artifacts"
+      ],
+      "tests": 1
+    },
+    "apps/vscode/scripts/fixtures/edition8.mjs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-browser-profile"
+      ],
+      "tests": 0
+    },
+    "apps/vscode/scripts/generate-edition5.mjs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-browser-profile",
+        "read-only-artifacts"
+      ],
+      "tests": 0
+    },
+    "apps/vscode/scripts/generate-edition8.mjs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-browser-profile",
+        "read-only-artifacts"
+      ],
+      "tests": 1
+    },
+    "apps/vscode/scripts/render-edition5.mjs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-browser-profile",
+        "read-only-artifacts"
+      ],
+      "tests": 0
+    },
+    "apps/vscode/scripts/render-edition8.mjs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-browser-profile",
+        "read-only-artifacts"
+      ],
+      "tests": 0
+    },
+    "apps/vscode/scripts/render-webview.mjs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-browser-profile",
+        "read-only-artifacts"
+      ],
+      "tests": 0
+    },
+    "apps/vscode/scripts/selftest.mjs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "read-only-artifacts"
+      ],
+      "tests": 353
+    },
+    "apps/vscode/scripts/stream-probe.mjs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-browser-profile",
+        "read-only-artifacts"
+      ],
+      "tests": 0
+    },
+    "apps/vscode/scripts/transcript-deny-check.mjs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-browser-profile",
+        "read-only-artifacts"
+      ],
+      "tests": 0
+    },
+    "apps/vscode/scripts/verify-vsix.mjs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-browser-profile",
+        "read-only-artifacts"
+      ],
+      "tests": 2
+    },
+    "crates/acp/src/acp_hostile_framing.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 6
+    },
+    "crates/acp/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/acp/src/protocol.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 17
+    },
+    "crates/acp/src/tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 35
+    },
+    "crates/acp/tests/acp.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 38
+    },
+    "crates/acp/tests/interop.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 20
+    },
+    "crates/acquire/src/cache.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/acquire/src/capability.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/acquire/src/coalesce.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/acquire/src/ctx.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/acquire/src/error.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/acquire/src/health.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/acquire/src/http.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/acquire/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/acquire/src/mechanism.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/acquire/src/provenance.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/acquire/src/quota.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/acquire/src/request.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/acquire/src/retry.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/acquire/src/tests/cache.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/acquire/src/tests/coalesce.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/acquire/src/tests/health.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 6
+    },
+    "crates/acquire/src/tests/http.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 15
+    },
+    "crates/acquire/src/tests/mod.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/acquire/src/tests/planner.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 16
+    },
+    "crates/acquire/src/tests/quota.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/acquire/src/tests/retry.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/acquire/src/tests/scan.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/acquire/tests/redirect_policy_alignment.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/acquire/tests/security_certification.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/agent/src/activation.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 15
+    },
+    "crates/agent/src/credits.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 6
+    },
+    "crates/agent/src/lib_tests_quality.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 16
+    },
+    "crates/agent/src/lib_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 35
+    },
+    "crates/agent/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/agent/src/loop_detect.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 20
+    },
+    "crates/agent/src/outcome_ledger_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 29
+    },
+    "crates/agent/src/outcome_ledger.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/agent/src/runtime/compaction_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 29
+    },
+    "crates/agent/src/runtime/compaction.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/agent/src/runtime/contract_compiler_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 14
+    },
+    "crates/agent/src/runtime/contract_eval.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 22
+    },
+    "crates/agent/src/runtime/durable_faults_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/agent/src/runtime/extreme_scale_probes.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/agent/src/runtime/fixtures_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/agent/src/runtime/goal_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 13
+    },
+    "crates/agent/src/runtime/longtask_e2e_probes.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/agent/src/runtime/longtask_probes.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/agent/src/runtime/media_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/agent/src/runtime/mod.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/agent/src/runtime/output_budget_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/agent/src/runtime/output_budget.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/agent/src/runtime/provider_loop_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 10
+    },
+    "crates/agent/src/runtime/request_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 17
+    },
+    "crates/agent/src/runtime/retrieval_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 32
+    },
+    "crates/agent/src/runtime/retrieval.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/agent/src/runtime/retry_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 11
+    },
+    "crates/agent/src/runtime/routing_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 12
+    },
+    "crates/agent/src/runtime/scheduler_faults_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/agent/src/runtime/settlement_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 25
+    },
+    "crates/agent/src/runtime/settlement.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/agent/src/runtime/shell_changes_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 33
+    },
+    "crates/agent/src/runtime/shell_changes.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/agent/src/runtime/test_rebind.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/agent/src/runtime/tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/agent/src/runtime/tool_loop_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 48
+    },
+    "crates/agent/src/runtime/tool_loop.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/agent/src/runtime/turn_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/agent/src/runtime/turn/drive_phases_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/agent/src/runtime/turn/drive_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 24
+    },
+    "crates/agent/src/runtime/turn/internal_context_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 6
+    },
+    "crates/agent/src/runtime/turn/mod.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/agent/src/runtime/turn/parent_context.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/agent/src/runtime/turn/queue_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 26
+    },
+    "crates/agent/src/runtime/turn/queue.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/agent/src/runtime/turn/state_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 50
+    },
+    "crates/agent/src/runtime/turn/state.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/agent/src/runtime/verification_attribution_more_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/agent/src/runtime/verification_attribution_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 59
+    },
+    "crates/agent/src/semantic_tool.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/agent/src/stall.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 20
+    },
+    "crates/agent/src/tool_json.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 12
+    },
+    "crates/agent/src/tool.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 25
+    },
+    "crates/agent/src/wire_plan.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 23
+    },
+    "crates/agent/tests/lazy_tool_exposure.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/anthropic/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 23
+    },
+    "crates/approval/src/model.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/approval/src/store.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/approval/tests/approval.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 20
+    },
+    "crates/approval/tests/independent_process_wave.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/browser/src/capture.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 10
+    },
+    "crates/browser/src/cdp.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 10
+    },
+    "crates/browser/src/console.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/browser/src/download.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 8
+    },
+    "crates/browser/src/egress.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 21
+    },
+    "crates/browser/src/interception.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/browser/src/launch.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/browser/src/manager.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 8
+    },
+    "crates/browser/src/network.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/browser/src/page.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/browser/src/profile.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 6
+    },
+    "crates/browser/tests/adversarial_broker.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 12
+    },
+    "crates/browser/tests/browser.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 45
+    },
+    "crates/browser/tests/egress.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 30
+    },
+    "crates/cas/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 35
+    },
+    "crates/cas/src/retention.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/ci-tools/src/capability.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/ci-tools/src/flake.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/ci-tools/src/github.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/ci-tools/src/iana.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/ci-tools/src/lane_marker.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/ci-tools/src/license.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/ci-tools/tests/impact_validate.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 11
+    },
+    "crates/cli/src/acquire_certification.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 10
+    },
+    "crates/cli/src/approval.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/cli/src/billing_debits.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/cli/src/billing_report_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 8
+    },
+    "crates/cli/src/billing_report.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/cli/src/bootstrap.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/cli/src/config.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/cli/src/config/billing.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 8
+    },
+    "crates/cli/src/config/commerce_config_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 12
+    },
+    "crates/cli/src/config/commerce.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/cli/src/config/completion_cfg_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 17
+    },
+    "crates/cli/src/config/completion.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/cli/src/config/first_run_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 24
+    },
+    "crates/cli/src/config/first_run.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/cli/src/config/provider.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/cli/src/config/quality_declaration_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/cli/src/config/tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 30
+    },
+    "crates/cli/src/daemon/builder.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/cli/src/daemon/foundation_settings.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/cli/src/daemon/serve.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 10
+    },
+    "crates/cli/src/embeddings.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/cli/src/engineering.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/cli/src/evidence.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 13
+    },
+    "crates/cli/src/graph.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 26
+    },
+    "crates/cli/src/impact.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 6
+    },
+    "crates/cli/src/indep_coding_audit_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/cli/src/main_acp_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 10
+    },
+    "crates/cli/src/main_cli_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 32
+    },
+    "crates/cli/src/main_doctor_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 29
+    },
+    "crates/cli/src/main_serve_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 26
+    },
+    "crates/cli/src/main_value_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/cli/src/main_worker_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 19
+    },
+    "crates/cli/src/main.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/cli/src/mcp_bridge.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/cli/src/mcp_oauth.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/cli/src/payload_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 11
+    },
+    "crates/cli/src/payload.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/cli/src/scm_daemon_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 9
+    },
+    "crates/cli/src/scm_daemon.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/cli/src/sso_auth_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 6
+    },
+    "crates/cli/src/sso_auth.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/cli/src/supply.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/cli/src/test_memory_guard.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/cli/src/tools_market.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 40
+    },
+    "crates/cli/src/tools_supply_engineering.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/cli/src/tools.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 42
+    },
+    "crates/cli/src/worker_node.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/cli/tests/release_attestation.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/cli/tests/usage_scenarios.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 13
+    },
+    "crates/cloud/src/billing_rollup_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 8
+    },
+    "crates/cloud/src/billing.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 12
+    },
+    "crates/cloud/src/durability.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 20
+    },
+    "crates/cloud/src/error.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/cloud/src/ids.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/cloud/src/layered_config.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/cloud/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/cloud/src/model.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/cloud/src/money.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/cloud/src/oidc_net.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/cloud/src/oidc.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/cloud/src/query_plan_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/cloud/src/rbac.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/cloud/src/service.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 23
+    },
+    "crates/cloud/src/sso_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/cloud/src/sso.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/cloud/src/store.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 26
+    },
+    "crates/cloud/src/value.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/cloud/tests/billing_correctness_audit.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 16
+    },
+    "crates/cloud/tests/billing_periods.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/cloud/tests/billing_vendor.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 6
+    },
+    "crates/cloud/tests/billing.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 33
+    },
+    "crates/cloud/tests/commercial_wave_spotcheck.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 6
+    },
+    "crates/cloud/tests/control_plane.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 6
+    },
+    "crates/cloud/tests/durability_memory.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/cloud/tests/enterprise.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 13
+    },
+    "crates/cloud/tests/external_identity.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 8
+    },
+    "crates/cloud/tests/oidc_network.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 24
+    },
+    "crates/cloud/tests/report_schedule.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 6
+    },
+    "crates/cloud/tests/value_entitlements.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 8
+    },
+    "crates/commerce-connectors/src/alibaba/api.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/commerce-connectors/src/alibaba/auth.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/commerce-connectors/src/alibaba/dictionary.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/commerce-connectors/src/alibaba/extract.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/commerce-connectors/src/alibaba/mod.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 17
+    },
+    "crates/commerce-connectors/src/alibaba/normalize.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/commerce-connectors/src/aop.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/commerce-connectors/src/browser.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/commerce-connectors/src/canary.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 6
+    },
+    "crates/commerce-connectors/src/china1688/auth.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/commerce-connectors/src/china1688/dictionary.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/commerce-connectors/src/china1688/mod.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 22
+    },
+    "crates/commerce-connectors/src/china1688/normalize.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/commerce-connectors/src/context.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/commerce-connectors/src/contract/bridge.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/commerce-connectors/src/contract/capture.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/commerce-connectors/src/contract/dom.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/commerce-connectors/src/contract/extract.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 10
+    },
+    "crates/commerce-connectors/src/digikey/mod.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 8
+    },
+    "crates/commerce-connectors/src/digikey/normalize.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 6
+    },
+    "crates/commerce-connectors/src/http.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 6
+    },
+    "crates/commerce-connectors/src/lcsc/mod.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 8
+    },
+    "crates/commerce-connectors/src/lcsc/normalize.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/commerce-connectors/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/commerce-connectors/src/mouser/mod.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 12
+    },
+    "crates/commerce-connectors/src/mouser/normalize.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 11
+    },
+    "crates/commerce-connectors/src/normalize.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 15
+    },
+    "crates/commerce-connectors/src/secrets.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 8
+    },
+    "crates/commerce-connectors/src/self_scan.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/commerce-connectors/tests/connectors.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/commerce-connectors/tests/marketplace_auth.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/commerce-connectors/tests/marketplace_identity.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/commerce-connectors/tests/security_certification.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/commerce/src/bom.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 8
+    },
+    "crates/commerce/src/cache.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/commerce/src/connector.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 6
+    },
+    "crates/commerce/src/identity.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 13
+    },
+    "crates/commerce/src/jobs.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/commerce/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/commerce/src/matching.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/commerce/src/money.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 9
+    },
+    "crates/commerce/src/no_float_scan.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/commerce/src/offer.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 19
+    },
+    "crates/commerce/src/packaging.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/commerce/src/quantity.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/commerce/src/query_plan_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/commerce/src/query.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/commerce/src/ranking.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/commerce/src/result.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/commerce/src/store.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/commerce/src/text.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 12
+    },
+    "crates/commerce/tests/acquire_store.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 47
+    },
+    "crates/commerce/tests/common/mod.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/commerce/tests/matching_ranking.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 23
+    },
+    "crates/commerce/tests/quote_resolution.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 35
+    },
+    "crates/commerce/tests/reconcile_errors.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 15
+    },
+    "crates/context/src/artifact.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/context/src/budget.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/context/src/compactor.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 23
+    },
+    "crates/context/src/compiler.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 19
+    },
+    "crates/context/src/estimator.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 9
+    },
+    "crates/context/src/information.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 15
+    },
+    "crates/context/src/ledger.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 14
+    },
+    "crates/context/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 15
+    },
+    "crates/context/src/longtask_probes.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 6
+    },
+    "crates/context/src/planner.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 16
+    },
+    "crates/context/src/selection.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 9
+    },
+    "crates/context/src/tokenizer.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 10
+    },
+    "crates/context/src/wire_plan.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 37
+    },
+    "crates/context/tests/alloc_probe.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/contracts/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/contracts/tests/frozen_contracts.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/core/src/attachment.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/core/src/authority.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/core/src/billing.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/core/src/blocker.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/core/src/cancellation.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 20
+    },
+    "crates/core/src/capability.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/core/src/command.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 16
+    },
+    "crates/core/src/completion.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/core/src/contract_compile.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 42
+    },
+    "crates/core/src/contract.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/core/src/entitlement.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/core/src/error.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/core/src/event.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/core/src/hash.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/core/src/hostile_corpus_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 17
+    },
+    "crates/core/src/id.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 10
+    },
+    "crates/core/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/core/src/lock.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/core/src/model.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 43
+    },
+    "crates/core/src/op.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/core/src/path.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 12
+    },
+    "crates/core/src/resource.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/core/src/retry.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 8
+    },
+    "crates/core/src/state.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 32
+    },
+    "crates/core/src/time.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/deepseek/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 9
+    },
+    "crates/edit/src/diff.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 16
+    },
+    "crates/edit/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 39
+    },
+    "crates/engineering-cad/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/engineering-core/src/attestation.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/engineering-core/src/digest.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/engineering-core/src/gate.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/engineering-core/src/graph.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 9
+    },
+    "crates/engineering-core/src/receipt.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/engineering-core/src/requirements.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 13
+    },
+    "crates/engineering-core/src/value.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/engineering-core/tests/attestation.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 16
+    },
+    "crates/engineering-core/tests/authority_bindings.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/engineering-core/tests/gates.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 16
+    },
+    "crates/engineering-eda/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/engineering-knowledge/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/engineering-knowledge/tests/packs.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 11
+    },
+    "crates/engineering-knowledge/tests/selection.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 6
+    },
+    "crates/engineering-models/src/bolt.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/engineering-models/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/engineering-models/src/molding.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/engineering-models/src/mosfet.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/engineering-models/tests/domain_models.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 23
+    },
+    "crates/engineering-models/tests/traps.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 9
+    },
+    "crates/engineering-solvers/src/case.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/engineering-solvers/tests/adapters.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/engineering-units/src/dimension.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/engineering-units/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/engineering-units/src/math.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/engineering-units/src/uncertainty.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 6
+    },
+    "crates/engineering-units/src/unit.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/evidence/src/attestation.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/evidence/src/compress.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 14
+    },
+    "crates/evidence/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/evidence/src/normalize.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 16
+    },
+    "crates/evidence/src/provenance.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/evidence/src/render.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 9
+    },
+    "crates/evidence/src/retrieve.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 15
+    },
+    "crates/evidence/src/store.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 17
+    },
+    "crates/evidence/src/types.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 9
+    },
+    "crates/foundation/src/browser.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/foundation/src/config_consumers.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/foundation/src/config.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 8
+    },
+    "crates/foundation/src/context.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/foundation/src/customization.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/foundation/src/db.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/foundation/src/diagnostics.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/foundation/src/instructions.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 6
+    },
+    "crates/foundation/src/models.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/foundation/src/policy.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/foundation/src/presets.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/foundation/src/providers.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 9
+    },
+    "crates/foundation/src/runtime_trust.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/foundation/src/session_settings.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/foundation/src/vault.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/foundation/tests/r8_acceptance.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/foundation/tests/rev8_contracts.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/freshness/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 10
+    },
+    "crates/fs/src/atomic.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 26
+    },
+    "crates/fs/src/entry_state.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 12
+    },
+    "crates/fs/src/fs_atomic_hostile.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 9
+    },
+    "crates/fs/src/fs_hostile_paths.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/fs/src/fs_property_hostile.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/fs/src/fs_walk_hostile.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/fs/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 63
+    },
+    "crates/fs/src/platform/mod.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/fs/src/platform/unix.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/fs/src/platform/windows.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 35
+    },
+    "crates/fs/src/rooted.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 18
+    },
+    "crates/fs/src/tree_manifest.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 24
+    },
+    "crates/fs/src/workspace_service.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/gateway/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/git/src/git_hostile.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 10
+    },
+    "crates/git/src/guard.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 13
+    },
+    "crates/git/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 42
+    },
+    "crates/git/tests/mutation_lock_budget.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/google/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 19
+    },
+    "crates/hooks/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 25
+    },
+    "crates/impact/src/build.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/impact/src/generation.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 6
+    },
+    "crates/impact/src/query.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 6
+    },
+    "crates/impact/tests/adapters.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 17
+    },
+    "crates/impact/tests/affected.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 11
+    },
+    "crates/impact/tests/freshness.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 15
+    },
+    "crates/impact/tests/git_adapter.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/impact/tests/independent_wave_material.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/impact/tests/live_rust_analyzer.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/impact/tests/material_inputs.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 8
+    },
+    "crates/impact/tests/workspace_containment.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 6
+    },
+    "crates/index/src/cold.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 19
+    },
+    "crates/index/src/coverage.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/index/src/embedding.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 14
+    },
+    "crates/index/src/federation.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/index/src/generation.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 8
+    },
+    "crates/index/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 29
+    },
+    "crates/index/src/service/legacy_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/index/src/service/mod.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/index/src/service/tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 53
+    },
+    "crates/index/src/state.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 9
+    },
+    "crates/index/tests/independent_wave_freshness.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/instructions/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 51
+    },
+    "crates/kiwi/src/client.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/kiwi/src/wire.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/kiwi/tests/loopback.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 12
+    },
+    "crates/kiwi/tests/support/mod.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/learning/src/episode.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 9
+    },
+    "crates/learning/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/learning/src/miner.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 9
+    },
+    "crates/learning/src/service.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 13
+    },
+    "crates/learning/src/store.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 10
+    },
+    "crates/lsp/src/diagnostics.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/lsp/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 29
+    },
+    "crates/lsp/src/lsp_hostile_internals.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 6
+    },
+    "crates/lsp/src/semantic.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 10
+    },
+    "crates/lsp/tests/live_rust_analyzer.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/mcp/src/framing_property_hostile.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/mcp/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 15
+    },
+    "crates/mcp/src/mcp_hostile_framing.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/mcp/src/oauth.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/mcp/src/remote.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 9
+    },
+    "crates/mcp/tests/oauth_http.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 10
+    },
+    "crates/mcp/tests/remote_http.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 15
+    },
+    "crates/memory/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 25
+    },
+    "crates/memory/src/management.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/ollama/src/cold_start_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/ollama/src/cold_start.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/ollama/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 56
+    },
+    "crates/ollama/src/resolved_model_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/openai/src/chat_lowering_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/openai/src/lib_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 49
+    },
+    "crates/openai/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/orchestrator/src/caps.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 10
+    },
+    "crates/orchestrator/src/completion_steps_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 33
+    },
+    "crates/orchestrator/src/completion_steps.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/orchestrator/src/graph.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/orchestrator/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 44
+    },
+    "crates/orchestrator/src/merge_semantic.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/orchestrator/src/merge_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 25
+    },
+    "crates/orchestrator/src/merge.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/orchestrator/src/placement.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/orchestrator/src/proof_probe.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/orchestrator/src/runtime_comm_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 8
+    },
+    "crates/orchestrator/src/runtime_tests_admission.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/orchestrator/src/runtime_tests_collision.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/orchestrator/src/runtime_tests_perf.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/orchestrator/src/runtime_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 61
+    },
+    "crates/orchestrator/src/runtime.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/orchestrator/src/shadow_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 33
+    },
+    "crates/orchestrator/src/shadow.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/orchestrator/src/task_executor_tests/mod.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/orchestrator/src/task_executor_tests/tests_admission.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 17
+    },
+    "crates/orchestrator/src/task_executor_tests/tests_cancel_f068.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/orchestrator/src/task_executor_tests/tests_control_settlement.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/orchestrator/src/task_executor_tests/tests_control.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 44
+    },
+    "crates/orchestrator/src/task_executor_tests/tests_core.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 25
+    },
+    "crates/orchestrator/src/task_executor_tests/tests_verification.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 35
+    },
+    "crates/orchestrator/src/task_executor/integration.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/orchestrator/src/task_executor/mod.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/orchestrator/src/task_executor/recovery.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 8
+    },
+    "crates/orchestrator/src/task_executor/settlement.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/orchestrator/src/task_executor/verification.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/orchestrator/src/tournament.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 10
+    },
+    "crates/payments/src/authority.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir",
+        "separate-process"
+      ],
+      "tests": 3
+    },
+    "crates/payments/src/catalog.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir",
+        "separate-process"
+      ],
+      "tests": 4
+    },
+    "crates/payments/src/local.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir",
+        "separate-process"
+      ],
+      "tests": 1
+    },
+    "crates/payments/src/mollie.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir",
+        "separate-process"
+      ],
+      "tests": 4
+    },
+    "crates/payments/src/money.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir",
+        "separate-process"
+      ],
+      "tests": 3
+    },
+    "crates/payments/src/secrets.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir",
+        "separate-process"
+      ],
+      "tests": 1
+    },
+    "crates/payments/src/store.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir",
+        "separate-process"
+      ],
+      "tests": 4
+    },
+    "crates/payments/src/stripe.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir",
+        "separate-process"
+      ],
+      "tests": 3
+    },
+    "crates/payments/src/vault.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir",
+        "separate-process"
+      ],
+      "tests": 3
+    },
+    "crates/payments/src/webhook.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir",
+        "separate-process"
+      ],
+      "tests": 2
+    },
+    "crates/payments/tests/claims_webhooks.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir",
+        "separate-process"
+      ],
+      "tests": 9
+    },
+    "crates/payments/tests/final_lifecycle_probe.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir",
+        "separate-process"
+      ],
+      "tests": 3
+    },
+    "crates/payments/tests/financial_mutation_lease.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir",
+        "separate-process"
+      ],
+      "tests": 12
+    },
+    "crates/payments/tests/financial_races.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir",
+        "separate-process"
+      ],
+      "tests": 11
+    },
+    "crates/payments/tests/invoice_authority.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir",
+        "separate-process"
+      ],
+      "tests": 6
+    },
+    "crates/payments/tests/invoice_fencing.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir",
+        "separate-process"
+      ],
+      "tests": 20
+    },
+    "crates/payments/tests/lifecycle.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir",
+        "separate-process"
+      ],
+      "tests": 12
+    },
+    "crates/payments/tests/providers.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir",
+        "separate-process"
+      ],
+      "tests": 10
+    },
+    "crates/payments/tests/subscription_fencing.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir",
+        "separate-process"
+      ],
+      "tests": 10
+    },
+    "crates/payments/tests/support/mod.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir",
+        "separate-process"
+      ],
+      "tests": 0
+    },
+    "crates/payments/tests/tokens.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir",
+        "separate-process"
+      ],
+      "tests": 4
+    },
+    "crates/protocol/src/error.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/protocol/src/native.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/protocol/src/schema.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 8
+    },
+    "crates/protocol/tests/schema_artifact.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/provider/src/adversarial_egress_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 11
+    },
+    "crates/provider/src/adversarial_transport_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 14
+    },
+    "crates/provider/src/catalog/builtin.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 13
+    },
+    "crates/provider/src/catalog/mod.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 29
+    },
+    "crates/provider/src/classify.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 11
+    },
+    "crates/provider/src/config.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/provider/src/egress.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 50
+    },
+    "crates/provider/src/egress/budget_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 13
+    },
+    "crates/provider/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 28
+    },
+    "crates/provider/src/resolver.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 9
+    },
+    "crates/provider/src/sanitize.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 13
+    },
+    "crates/provider/src/testing.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/provider/src/transport.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 31
+    },
+    "crates/provider/tests/env_proxy_egress.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/pty/src/guardian_hostile.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 8
+    },
+    "crates/pty/src/guardian/ledger.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 14
+    },
+    "crates/pty/src/guardian/mod.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 15
+    },
+    "crates/pty/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/pty/src/pty_hostile_output.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/pty/src/ring.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/pty/src/unix.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 23
+    },
+    "crates/pty/src/validation.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/pty/src/win_common.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 11
+    },
+    "crates/pty/src/windows.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 11
+    },
+    "crates/pty/tests/guardian.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/pty/tests/windows_lifecycle.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/router/src/budget_model.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/router/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/router/src/outcomes.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 9
+    },
+    "crates/router/src/quality_authority_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 13
+    },
+    "crates/router/src/stability.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 13
+    },
+    "crates/router/src/tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 63
+    },
+    "crates/sandbox/src/adversarial_sandbox_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 14
+    },
+    "crates/sandbox/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 26
+    },
+    "crates/scheduler/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 55
+    },
+    "crates/scheduler/src/modelcheck.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 8
+    },
+    "crates/scheduler/src/path_identity.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 8
+    },
+    "crates/scm/src/completion.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/scm/src/error.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/scm/src/github.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/scm/src/ids.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/scm/src/query_plan_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/scm/src/reconcile.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 6
+    },
+    "crates/scm/src/store.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 14
+    },
+    "crates/scm/src/sync.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/scm/src/token.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/scm/src/webhook.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 12
+    },
+    "crates/scm/tests/completion_adapter.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/scm/tests/github_adapter.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 11
+    },
+    "crates/scm/tests/github_token.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 6
+    },
+    "crates/search/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 34
+    },
+    "crates/security/src/adversarial_destination_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 11
+    },
+    "crates/security/src/adversarial_property_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 6
+    },
+    "crates/security/src/adversarial_secret_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 16
+    },
+    "crates/security/src/destination.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 25
+    },
+    "crates/security/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 43
+    },
+    "crates/security/src/network.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 8
+    },
+    "crates/security/src/payload.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 21
+    },
+    "crates/security/src/registry.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 18
+    },
+    "crates/security/src/secret.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/semantic/src/cache.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 6
+    },
+    "crates/semantic/src/enrichment.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 11
+    },
+    "crates/semantic/src/external.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 15
+    },
+    "crates/semantic/src/fallback.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 19
+    },
+    "crates/semantic/src/health.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/semantic/src/intelligence.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 10
+    },
+    "crates/semantic/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/semantic/src/quality.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/semantic/src/registry.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 29
+    },
+    "crates/semantic/src/risk.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/semantic/src/types.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 20
+    },
+    "crates/semantic/tests/spec_consistency.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/server/src/adversarial_auth_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 11
+    },
+    "crates/server/src/adversarial_control_plane_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/server/src/adversarial_dto_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 9
+    },
+    "crates/server/src/adversarial_sse_bounds_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 9
+    },
+    "crates/server/src/api.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/server/src/api/deps_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/server/src/api/deps.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/server/src/api/health_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/server/src/api/health.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/server/src/api/lifecycle_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/server/src/api/lifecycle.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/server/src/api/router_misc_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 18
+    },
+    "crates/server/src/api/router_projection_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 10
+    },
+    "crates/server/src/api/router_task_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 25
+    },
+    "crates/server/src/api/router.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/server/src/api/tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/server/src/auth.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 19
+    },
+    "crates/server/src/control_plane_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 9
+    },
+    "crates/server/src/enterprise_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 9
+    },
+    "crates/server/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/server/src/native/admission_recovery.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/server/src/native/agents.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/server/src/native/attachment.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 10
+    },
+    "crates/server/src/native/billing_payments_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/server/src/native/billing_payments.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/server/src/native/billing_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 21
+    },
+    "crates/server/src/native/billing.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/server/src/native/browser_surface.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/server/src/native/concurrency_probe_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/server/src/native/control_plane.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/server/src/native/evidence.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/server/src/native/foundation_ext.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/server/src/native/foundation_r8_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 19
+    },
+    "crates/server/src/native/foundation_r8.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/server/src/native/foundation_rev8_contracts_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 12
+    },
+    "crates/server/src/native/foundation.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/server/src/native/longtask_r8_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/server/src/native/longtask.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/server/src/native/lsp.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/server/src/native/mcp_oauth_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 8
+    },
+    "crates/server/src/native/mcp_oauth.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/server/src/native/mcp_remote_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 12
+    },
+    "crates/server/src/native/mcp_surface.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/server/src/native/mod.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/server/src/native/models.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/server/src/native/outcomes_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/server/src/native/outcomes.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/server/src/native/proof_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 8
+    },
+    "crates/server/src/native/proof.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/server/src/native/scm_webhook_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/server/src/native/scm_webhook.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/server/src/native/semantic.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 6
+    },
+    "crates/server/src/native/session_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 37
+    },
+    "crates/server/src/native/session.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/server/src/native/sso_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 11
+    },
+    "crates/server/src/native/sso.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/server/src/native/task.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 21
+    },
+    "crates/server/src/native/terminal_authority_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 34
+    },
+    "crates/server/src/native/terminal_authority.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/server/src/native/terminal.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/server/src/native/updater.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/server/src/native/usage.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/server/src/native/value_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/server/src/native/value.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/server/src/native/workers_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 9
+    },
+    "crates/server/src/native/workers.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/server/src/native/worktrees_api.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/server/src/permission.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 17
+    },
+    "crates/server/src/updater_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 9
+    },
+    "crates/server/src/worker_plane_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 13
+    },
+    "crates/server/src/worker_plane.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/server/tests/attachment_decode_alloc.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/server/tests/streaming_harness.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "separate-process",
+        "isolated-data-dir",
+        "read-only-artifacts"
+      ],
+      "tests": 4
+    },
+    "crates/session/src/actor.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 15
+    },
+    "crates/session/src/artifacts.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/session/src/attachments.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 10
+    },
+    "crates/session/src/billing_read.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/session/src/board.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 14
+    },
+    "crates/session/src/budget_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 32
+    },
+    "crates/session/src/budget.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/session/src/checkpoints.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/session/src/child.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 20
+    },
+    "crates/session/src/compaction.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 14
+    },
+    "crates/session/src/extreme_scale_probes.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/session/src/handle.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 27
+    },
+    "crates/session/src/hostile_corpus_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 10
+    },
+    "crates/session/src/journal.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 10
+    },
+    "crates/session/src/ledger/mod.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/session/src/ledger/tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 36
+    },
+    "crates/session/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/session/src/manager.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 29
+    },
+    "crates/session/src/memory.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 11
+    },
+    "crates/session/src/messages.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 17
+    },
+    "crates/session/src/ops.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 37
+    },
+    "crates/session/src/payload.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/session/src/process.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/session/src/read_service.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 8
+    },
+    "crates/session/src/recovery.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 19
+    },
+    "crates/session/src/retention.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/session/src/task/contract_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/session/src/task/mod.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/session/src/task/tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 55
+    },
+    "crates/session/src/task/verification_scope_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/session/src/verification_job.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 13
+    },
+    "crates/session/src/wedge.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/session/tests/alloc_probe.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/session/tests/concurrency_probe.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/site/src/db.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/site/src/error.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/site/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/site/src/security.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/site/src/tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 22
+    },
+    "crates/site/src/web/mod.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/snapshot/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 46
+    },
+    "crates/store/src/attachments.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 17
+    },
+    "crates/store/src/billing_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/store/src/billing_typed_ledger_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 15
+    },
+    "crates/store/src/billing.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/store/src/connection.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 32
+    },
+    "crates/store/src/extreme_longtask_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/store/src/extreme_scale_probes.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/store/src/hostile_corpus_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 26
+    },
+    "crates/store/src/index.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/store/src/journal_authority_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 13
+    },
+    "crates/store/src/ledger_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 30
+    },
+    "crates/store/src/ledger_typed_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 10
+    },
+    "crates/store/src/ledger.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/store/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/store/src/messages.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 19
+    },
+    "crates/store/src/migration/concurrent_migration_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/store/src/migration/ladder_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 13
+    },
+    "crates/store/src/migration/legacy_import_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/store/src/migration/legacy_import.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/store/src/migration/mod.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/store/src/migration/pruning_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 6
+    },
+    "crates/store/src/migration/pruning.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/store/src/migration/schema_head_guard_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/store/src/migration/typed_ledger_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/store/src/migration/verification_scope_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/store/src/outcome_ledger.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 15
+    },
+    "crates/store/src/prompt_admission.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 11
+    },
+    "crates/store/src/query_plan_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/store/src/schema.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/store/src/session_command_txn_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 10
+    },
+    "crates/store/src/session_listing_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/store/src/sessions_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 30
+    },
+    "crates/store/src/sessions_typed_ledger_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 9
+    },
+    "crates/store/src/sessions.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/store/src/task_admission.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 16
+    },
+    "crates/store/src/task_completion_guard.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/store/src/tasks_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 16
+    },
+    "crates/store/src/tasks.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/store/src/verification_job_store_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/store/src/verification_scope_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/store/tests/rev8_session_delete.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/supply-core/src/basis.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/supply-core/src/decision.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 6
+    },
+    "crates/supply-core/src/distribution.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/supply-core/src/graph.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 8
+    },
+    "crates/supply-core/src/money.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 8
+    },
+    "crates/supply-cost/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 19
+    },
+    "crates/supply-engineering/src/tool_schema.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/supply-engineering/src/tool_schema/tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/supply-engineering/tests/loop_scenarios.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 24
+    },
+    "crates/supply-execution/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 26
+    },
+    "crates/supply-logistics/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 26
+    },
+    "crates/supply-planning/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 24
+    },
+    "crates/supply-quality/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 24
+    },
+    "crates/supply-supplier/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 21
+    },
+    "crates/terminal/src/agent_home_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/terminal/src/agent_home.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/terminal/src/budget_hostile.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 9
+    },
+    "crates/terminal/src/budget.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 16
+    },
+    "crates/terminal/src/containment_policy_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/terminal/src/filesystem_hostile.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 12
+    },
+    "crates/terminal/src/final_surface_probes.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/terminal/src/guardian_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 11
+    },
+    "crates/terminal/src/guardian.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 6
+    },
+    "crates/terminal/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/terminal/src/macos_sandbox_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 6
+    },
+    "crates/terminal/src/sandbox_hostile.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 8
+    },
+    "crates/terminal/src/sandbox/linux.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/terminal/src/sandbox/macos.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/terminal/src/supervisor_hostile.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/terminal/src/tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 80
+    },
+    "crates/terminal/src/windows_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 9
+    },
+    "crates/test-mocks/src/lib.rs": {
+      "oracle": "property",
+      "isolation": [
+        "pure-unit"
+      ],
+      "tests": 1
+    },
+    "crates/updater/src/channel.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/updater/src/compat.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/updater/src/error.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/updater/src/install.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 17
+    },
+    "crates/updater/src/keys.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/updater/src/manifest.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 10
+    },
+    "crates/updater/src/query_plan_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/updater/src/release.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 24
+    },
+    "crates/updater/src/service.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/updater/src/store.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 14
+    },
+    "crates/updater/src/transport.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/updater/src/updater_hostile.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/updater/src/version.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/updater/src/win_exec.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/updater/tests/anti_rollback.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 13
+    },
+    "crates/updater/tests/interop_vector.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/updater/tests/lifecycle.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 19
+    },
+    "crates/updater/tests/release_flip.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/updater/tests/release.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 21
+    },
+    "crates/verify/src/claims.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/verify/src/criteria.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 14
+    },
+    "crates/verify/src/derive.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 28
+    },
+    "crates/verify/src/exec.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 28
+    },
+    "crates/verify/src/inventory.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 38
+    },
+    "crates/verify/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 23
+    },
+    "crates/verify/src/manifest.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 13
+    },
+    "crates/verify/src/native.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 13
+    },
+    "crates/verify/src/provider.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 13
+    },
+    "crates/verify/src/rebind.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 34
+    },
+    "crates/verify/src/review.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 14
+    },
+    "crates/verify/src/test_declaration.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/verify/tests/fixtures/rebind/cart.test.ts": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/verify/tests/fixtures/rebind/CartTest.kt": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/verify/tests/fixtures/rebind/CartTotalsTest.kt": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/verify/tests/fixtures/rebind/hooks-removed.test.ts": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/verify/tests/fixtures/rebind/hooks.test.ts": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/verify/tests/fixtures/rebind/skipped.test.ts": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/verify/tests/fixtures/rebind/totals.test.ts": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/verify/tests/fixtures/rebind/weakened.test.ts": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/verify/tests/rebind_adapters.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 26
+    },
+    "crates/winjob/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/winjob/tests/windows_tree.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "crates/worker/src/error.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "crates/worker/src/ids.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "crates/worker/src/lib.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/worker/src/model.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "crates/worker/src/query_plan_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "crates/worker/src/runtime_tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "crates/worker/src/runtime.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/worker/src/service.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "crates/worker/src/store.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 17
+    },
+    "crates/worker/src/tests.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 36
+    },
+    "scripts/dogfood.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "pure-unit"
+      ],
+      "tests": 17
+    },
+    "scripts/edition5/acceptance-jetbrains.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "pure-unit"
+      ],
+      "tests": 1
+    },
+    "scripts/edition5/fake-openai.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "pure-unit"
+      ],
+      "tests": 0
+    },
+    "scripts/edition5/run.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "pure-unit"
+      ],
+      "tests": 0
+    },
+    "scripts/edition8/codegen.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "pure-unit"
+      ],
+      "tests": 0
+    },
+    "scripts/edition8/daemon-acceptance.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "pure-unit"
+      ],
+      "tests": 0
+    },
+    "scripts/edition8/fake-ollama.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "pure-unit"
+      ],
+      "tests": 0
+    },
+    "scripts/edition8/fake-openai.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "pure-unit"
+      ],
+      "tests": 0
+    },
+    "scripts/edition8/jetbrains-acceptance.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "pure-unit"
+      ],
+      "tests": 0
+    },
+    "scripts/edition8/jetbrains-control-exercise.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "pure-unit"
+      ],
+      "tests": 4
+    },
+    "scripts/edition8/jetbrains-visual.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "pure-unit"
+      ],
+      "tests": 0
+    },
+    "scripts/edition8/jetbrains-workflows.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "pure-unit"
+      ],
+      "tests": 0
+    },
+    "scripts/edition8/ledger.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "pure-unit"
+      ],
+      "tests": 0
+    },
+    "scripts/edition8/run.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "pure-unit"
+      ],
+      "tests": 0
+    },
+    "scripts/edition8/scale-probe.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "pure-unit"
+      ],
+      "tests": 1
+    },
+    "scripts/mutation-run.mjs": {
+      "oracle": "mutation",
+      "isolation": [
+        "isolated-worktree",
+        "read-only-artifacts"
+      ],
+      "tests": 9
+    },
+    "scripts/mutation-support.mjs": {
+      "oracle": "mutation",
+      "isolation": [
+        "isolated-worktree",
+        "read-only-artifacts"
+      ],
+      "tests": 0
+    },
+    "scripts/vscode-e2e/calibration-host.cjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "pure-unit"
+      ],
+      "tests": 0
+    },
+    "scripts/vscode-e2e/edition8-host-smoke.cjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "pure-unit"
+      ],
+      "tests": 0
+    },
+    "scripts/vscode-e2e/extension-host-smoke.cjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "pure-unit"
+      ],
+      "tests": 1
+    },
+    "tests/accounting-modelcheck/src/lib.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "tests/accounting-modelcheck/tests/new_guard_money_state_and_classification.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "tests/acp-official/src/lib.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "tests/acp-official/tests/common/mod.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "tests/acp-official/tests/official_client.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 14
+    },
+    "tests/economy/tests/new_guard_findings_validation.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "tests/economy/tests/new_guard_fold_properties.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "tests/edition5/acceptance.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "tests/edition5/dead-control.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "tests/edition5/evidence.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "tests/edition5/perf-delta.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "tests/edition5/registry.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "tests/edition5/settings-contract.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 8
+    },
+    "tests/edition5/visual-contracts.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "tests/edition8/acceptance.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "tests/edition8/assistive.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "tests/edition8/contrast.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "tests/edition8/copy-retention.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "tests/edition8/evidence.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "tests/edition8/optical.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "tests/edition8/perf.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "tests/edition8/platforms.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "tests/edition8/png.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "tests/edition8/registry.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "tests/edition8/visual-contracts.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "tests/edition8/workflows.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "tests/fault/src/campaigns/abort_txn.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "tests/fault/src/campaigns/cas.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "tests/fault/src/campaigns/edit_txn.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "tests/fault/src/campaigns/mod.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "tests/fault/src/campaigns/recovery_runtime_txn.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "tests/fault/src/campaigns/recovery_txn.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "tests/fault/src/campaigns/scheduler_dag.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "tests/fault/src/campaigns/session_commands.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "tests/fault/src/campaigns/store_journal.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "tests/fault/src/lib.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 17
+    },
+    "tests/fuzz-seeds/src/acp_frame.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "tests/fuzz-seeds/src/campaign.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "tests/fuzz-seeds/src/destination_policy.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "tests/fuzz-seeds/src/event_payload.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "tests/fuzz-seeds/src/fixtures.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "tests/fuzz-seeds/src/lib.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "tests/fuzz-seeds/src/line_framing.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "tests/fuzz-seeds/src/path_normalization.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "tests/fuzz-seeds/src/supply_chain.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "tests/fuzz-seeds/src/tokenizer_pricing.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "tests/fuzz-seeds/src/tool_json.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "tests/integration/src/lib.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 6
+    },
+    "tests/integration/tests/provider_fixtures.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "tests/longrun/examples/compaction_handoff_measure.rs": {
+      "oracle": "external-fixture",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "tests/longrun/examples/indep_longrun_audit.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "tests/longrun/src/lib.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "tests/longrun/tests/extreme_scale.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "tests/production-wiring/build.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "tests/production-wiring/src/harness.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "tests/production-wiring/src/lib.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "tests/production-wiring/tests/adapter_fields.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "tests/production-wiring/tests/approval_gate.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "tests/production-wiring/tests/approval_hardening.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "tests/production-wiring/tests/commerce.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "tests/production-wiring/tests/commercial_settlement.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "tests/production-wiring/tests/completion_scm_adapter_contract.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "tests/production-wiring/tests/completion_scm.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "tests/production-wiring/tests/contract_intelligence.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "tests/production-wiring/tests/efficiency_switches.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "tests/production-wiring/tests/entitlement_seams.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 7
+    },
+    "tests/production-wiring/tests/independent_billing_outbox.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "tests/production-wiring/tests/marketplace_auth.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "tests/production-wiring/tests/new_guard_entitlement_and_producers.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "tests/production-wiring/tests/outcome_ledger.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 6
+    },
+    "tests/production-wiring/tests/payments_mollie.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "tests/production-wiring/tests/retrieval.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "tests/production-wiring/tests/route_class_wiring.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "tests/production-wiring/tests/semantic_native.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "tests/production-wiring/tests/vision.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "tests/programme/checks/auth-order.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "tests/programme/checks/commercial.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 9
+    },
+    "tests/programme/checks/core-dumps.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "tests/programme/checks/route-authority.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "tests/programme/checks/settlement.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 4
+    },
+    "tests/programme/checks/wiring.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 5
+    },
+    "tests/programme/discovery.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "tests/programme/evidence.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 2
+    },
+    "tests/programme/generators/hostile.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "tests/programme/generators/schedules.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "tests/programme/lanes.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "tests/programme/model.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "tests/programme/probes/auth_matrix.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "tests/programme/probes/ordering.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "tests/programme/probes/rev8.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "tests/programme/probes/routes.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "tests/programme/registry.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "tests/programme/selector.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 9
+    },
+    "tests/quality/src/lib.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 9
+    },
+    "tests/quality/src/memory_pager_plan_tests.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 3
+    },
+    "tests/router-properties/src/lib.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 10
+    },
+    "tests/security/src/lib.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 6
+    },
+    "tests/static-authority/src/lib.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 108
+    },
+    "tests/streams/src/lib.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 62
+    },
+    "tests/supply-engineering-traps/src/contract.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "separate-process"
+      ],
+      "tests": 0
+    },
+    "tests/supply-engineering-traps/src/fixtures.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "separate-process"
+      ],
+      "tests": 4
+    },
+    "tests/supply-engineering-traps/src/lib.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "separate-process"
+      ],
+      "tests": 0
+    },
+    "tests/supply-engineering-traps/src/main.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "separate-process"
+      ],
+      "tests": 0
+    },
+    "tests/supply-engineering-traps/src/oracle/expectations.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "separate-process"
+      ],
+      "tests": 0
+    },
+    "tests/supply-engineering-traps/src/oracle/mod.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "separate-process"
+      ],
+      "tests": 0
+    },
+    "tests/supply-engineering-traps/src/sut/engineering.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "separate-process"
+      ],
+      "tests": 0
+    },
+    "tests/supply-engineering-traps/src/sut/kernel.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "separate-process"
+      ],
+      "tests": 0
+    },
+    "tests/supply-engineering-traps/src/sut/mod.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "separate-process"
+      ],
+      "tests": 0
+    },
+    "tests/supply-engineering-traps/src/sut/supply.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "separate-process"
+      ],
+      "tests": 0
+    },
+    "tests/supply-engineering-traps/tests/traps.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "separate-process"
+      ],
+      "tests": 11
+    },
+    "tests/verification/auth_matrix.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 1
+    },
+    "tests/verification/sqlite_exec.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "tests/verification/tail_perf.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "tests/verification/webview_xss.mjs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 6
+    },
+    "tests/visual/src/lib.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 12
+    },
+    "tests/visual/src/runner.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 0
+    },
+    "tests/visual/tests/pixel_regression.rs": {
+      "oracle": "independent-reference",
+      "isolation": [
+        "isolated-data-dir"
+      ],
+      "tests": 13
+    }
+  }
+}

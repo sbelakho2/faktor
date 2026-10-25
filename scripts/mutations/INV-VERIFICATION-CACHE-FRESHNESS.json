@@ -4,6 +4,9 @@
   "find": "    if (this.key === null || this.key !== key) {",
   "replace": "    if (this.key === null) {",
   "gate": "node --no-warnings --experimental-loader ./scripts/mutations/vscode-ts-loader.mjs apps/vscode/scripts/selftest.mjs",
+  "expect": "FAIL",
   "timeout_ms": 180000,
-  "note": "EvidenceAuthorityCache.read ignores the authority key: a changed key still returns the previous view."
+  "note": "EvidenceAuthorityCache.read ignores the authority key: a changed key still returns the previous view.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

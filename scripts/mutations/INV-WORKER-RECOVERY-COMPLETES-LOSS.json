@@ -5,5 +5,7 @@
   "replace": "        let _ = (organization, now, &mut report);",
   "gate": "cargo test -p faktor-worker --lib crash_after_end_lease_is_completed_by_recovery",
   "expect": "FAILED",
-  "note": "Skipping interrupted-lease completion strands a job whose end_lease/requeue tail was cut by a crash."
+  "note": "Skipping interrupted-lease completion strands a job whose end_lease/requeue tail was cut by a crash.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

@@ -5,5 +5,7 @@
   "replace": "Some(snapshots) => snapshots.checkpoints(handle.id()).unwrap_or_default(),",
   "gate": "cargo test -p faktor-agent --lib unreadable_checkpoint_store_fails_the_edit_evidence_gate_closed",
   "expect": "FAILED",
-  "note": "Mapping a checkpoint-store failure to \"no prior expectations\" erases the anti-drift evidence at the high-risk edit gate."
+  "note": "Mapping a checkpoint-store failure to \"no prior expectations\" erases the anti-drift evidence at the high-risk edit gate.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

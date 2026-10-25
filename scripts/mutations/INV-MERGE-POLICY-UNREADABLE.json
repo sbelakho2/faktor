@@ -5,5 +5,7 @@
   "replace": "            Err(_) => Ok(false),",
   "gate": "cargo test -p faktor-orchestrator --lib unreadable_child_policy_blocks_a_fresh_merge",
   "expect": "FAILED",
-  "note": "Downgrading an unreadable durable merge policy to advisory lets an unknown requirement merge without semantic verification."
+  "note": "Downgrading an unreadable durable merge policy to advisory lets an unknown requirement merge without semantic verification.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

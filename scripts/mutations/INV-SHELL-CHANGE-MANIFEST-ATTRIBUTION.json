@@ -5,5 +5,7 @@
   "replace": "                    false.then(|| ShellFileChange {",
   "gate": "cargo test -p faktor-agent --lib shell_creates_deletes_renames_reach_change_accounting",
   "expect": "assertion|left.*right",
-  "note": "The manifest diff no longer reports MODIFIED files (only adds/deletes): a shell that rewrote files has those changes silently dropped from the durable change accounting and the turn ledger."
+  "note": "The manifest diff no longer reports MODIFIED files (only adds/deletes): a shell that rewrote files has those changes silently dropped from the durable change accounting and the turn ledger.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

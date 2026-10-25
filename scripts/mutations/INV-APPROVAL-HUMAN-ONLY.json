@@ -8,5 +8,7 @@
   "capabilities": [
     "approval.human_only"
   ],
-  "note": "Dropping the human-operator refusal lets an Agent principal reach the decision path; the dedicated oracle must fail because agents can never approve."
+  "note": "Dropping the human-operator refusal lets an Agent principal reach the decision path; the dedicated oracle must fail because agents can never approve.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

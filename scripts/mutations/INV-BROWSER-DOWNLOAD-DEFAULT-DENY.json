@@ -8,5 +8,7 @@
   "note": "Flipping the download policy default to enabled breaks the default-deny test.",
   "capabilities": [
     "browser.download_policy"
-  ]
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

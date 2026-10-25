@@ -31,6 +31,9 @@ const val USAGE_LIMIT_ACTIVE_TASKS = "max_active_tasks"
 const val USAGE_LIMIT_CHILDREN_PER_TASK = "max_children_per_task"
 const val USAGE_LIMIT_ATTEMPTS_PER_TASK = "max_provider_attempts_per_task"
 
+/** One bounded per-task row group; the tail is counted, never rendered. */
+const val USAGE_MAX_TASK_ROWS = 20
+
 /** One quota/limit row; a `ceiling` breaches at/above, a `floor` below. */
 data class UsageQuotaRow(
     val limit: String,
@@ -73,6 +76,8 @@ data class UsagePanelModel(
     val manageDisabledReason: String? = null,
     val totals: NativeUsageBuckets?,
     val tasks: List<NativeBillingTaskUsage>,
+    /** Total served per-task rows, including the bounded tail. */
+    val tasksTotal: Int = 0,
     val credits: NativeCreditBalance?,
     val quotas: List<UsageQuotaRow>,
     val inFlight: List<NativeInFlightTxn>,
@@ -94,8 +99,8 @@ data class UsagePanelModel(
     /** The owner-only plan/cancel affordances. */
     fun manageEnabled(): Boolean = canManageBilling && state == "ok"
 
-    /** The usage download is available whenever the billing surface is. */
-    fun exportEnabled(): Boolean = state == "ok"
+    /** The usage download is available only when the served capability says so. */
+    fun exportEnabled(): Boolean = state == "ok" && billing?.usageExport?.state == "available"
 
     /** The bounded display lines of the panel: formatted once per model. */
     private val cachedLines: List<String> by lazy { buildLines() }
@@ -169,6 +174,25 @@ data class UsagePanelModel(
                     "usage export unavailable — ${billing.usageExport.cause ?: "unavailable"}"
                 }
             )
+            billing.payments?.let { payments ->
+                out.add(
+                    "invoices ${payments.invoiceCount} recorded · ${payments.openInvoiceCount} open · " +
+                        "paid ${minorMoney(payments.paidMinor, payments.currency, payments.currencyExponent)} · " +
+                        "refunded ${minorMoney(payments.refundedMinor, payments.currency, payments.currencyExponent)} · " +
+                        "outstanding ${minorMoney(payments.outstandingMinor, payments.currency, payments.currencyExponent)}"
+                )
+                out.add(
+                    "seats ${payments.seats ?: "unconfigured"} · " +
+                        "currency ${payments.currency ?: "unconfigured"} · " +
+                        "tax ${payments.taxJurisdiction ?: payments.taxState} · " +
+                        "payment methods ${payments.paymentMethodCount}"
+                )
+                out.add(
+                    "reconciliation ${payments.reconciliationUnreconciled} unreconciled · " +
+                        "${payments.reconciliationMatched} matched · " +
+                        "${payments.reconciliationConflicts} conflict(s)"
+                )
+            }
         }
         if (totals != null) {
             out.add(
@@ -182,7 +206,8 @@ data class UsagePanelModel(
                     "${micro(totals.providerCostMicro)} · events ${totals.events} " +
                     "(corrected ${totals.correctedEvents})"
             )
-            for (task in tasks) {
+            val shownTasks = tasks.take(USAGE_MAX_TASK_ROWS)
+            for (task in shownTasks) {
                 out.add(
                     "task ${task.taskId} (${task.runId}) — in ${task.totals.inputTokens} · " +
                         "out ${task.totals.outputTokens} · cache ${task.totals.cacheReadTokens}/" +
@@ -190,6 +215,10 @@ data class UsagePanelModel(
                         "managed ${micro(task.totals.managedCostMicro)} · " +
                         "BYOK ${micro(task.totals.byokCostMicro)}"
                 )
+            }
+            val totalTasks = maxOf(tasksTotal, tasks.size)
+            if (totalTasks > shownTasks.size) {
+                out.add("${totalTasks - shownTasks.size} more task row(s) not shown (bounded to ${shownTasks.size})")
             }
         }
         for (quota in quotas) {
@@ -228,6 +257,24 @@ data class UsagePanelModel(
         }
         return out.map { bound(it, 480) }
     }
+}
+
+/** Exact minor-unit money text; no floating point and no second currency code. */
+internal fun minorMoney(minor: Long, currency: String?, exponent: Long?): String {
+    if (currency == null || exponent == null || exponent < 0 || exponent > 6) return "Unavailable"
+    val negative = minor < 0
+    val digits = BigInteger.valueOf(minor).abs().toString().padStart(exponent.toInt() + 1, '0')
+    val whole = digits.dropLast(exponent.toInt()).trimStart('0').ifEmpty { "0" }
+    val fraction = if (exponent == 0L) "" else "." + digits.takeLast(exponent.toInt())
+    val grouped = whole.reversed().chunked(3).joinToString(",").reversed()
+    val body = "$grouped$fraction"
+    val symbol = when (currency) {
+        "EUR" -> "€"
+        "USD" -> "$"
+        "GBP" -> "£"
+        else -> null
+    }
+    return (if (negative) "-" else "") + if (symbol == null) "$body $currency" else "$symbol$body"
 }
 
 /** Exact micro-unit display of one money value, memoized by exact value. */
@@ -338,7 +385,8 @@ fun usagePanelModelOf(
     }
     return common.copy(
         totals = usage.fold.totals,
-        tasks = usage.fold.perTask,
+        tasks = usage.fold.perTask.take(USAGE_MAX_TASK_ROWS),
+        tasksTotal = usage.fold.perTask.size,
         credits = usage.credits,
         quotas = quotaRowsOf(entitlements)
     )

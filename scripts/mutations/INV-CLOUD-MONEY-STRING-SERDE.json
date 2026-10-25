@@ -8,5 +8,7 @@
   "note": "Serializing money as a JSON number breaks the quoted-decimal wire contract.",
   "capabilities": [
     "cloud.money_strings"
-  ]
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

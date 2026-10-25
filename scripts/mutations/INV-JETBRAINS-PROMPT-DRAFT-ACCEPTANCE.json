@@ -4,6 +4,9 @@
   "find": "    retained?.takeIf { it.sessionId == sessionId && it.text == text }",
   "replace": "    retained?.takeIf { it.sessionId != sessionId || it.text != text }",
   "gate": "bash apps/jetbrains/compile-and-smoke.sh --smoke JetBrainsParity",
+  "expect": "FAIL",
   "timeout_ms": 1800000,
-  "note": "The selection rule is inverted: an identical retry mints a NEW submission id while edits reuse the retained one."
+  "note": "The selection rule is inverted: an identical retry mints a NEW submission id while edits reuse the retained one.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

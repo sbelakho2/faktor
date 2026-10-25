@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// TEST-SEPARATION: oracle=mutation isolation=isolated-worktree,read-only-artifacts
 // Generic planted-mutation runner for tests/invariants.toml.
 //
 // A spec under scripts/mutations/ names the byte-level edits of production
@@ -98,6 +99,25 @@ const ISOLATION_EXCLUDES = new Set(['target', '.git', 'node_modules', '.idea']);
 const SPEC_DIR = join(SCRIPT_ROOT, 'scripts/mutations');
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000;
 const OUTPUT_TAIL_BYTES = 64 * 1024;
+/** Oracle and isolation vocabulary shared with scripts/check-test-separation.mjs. */
+const MUTATION_ORACLES = new Set([
+  'mutation',
+  'external-fixture',
+  'independent-reference',
+  'property',
+  'contract',
+  'differential',
+]);
+const MUTATION_ISOLATIONS = new Set([
+  'isolated-worktree',
+  'isolated-copy',
+  'separate-process',
+  'isolated-data-dir',
+  'read-only-artifacts',
+]);
+const DEFAULT_EVIDENCE_DIR = join(SCRIPT_ROOT, 'target', 'certification', 'mutation-evidence');
+/** Per-spec HOME/TMP data dir: the SUT never shares daemon state with the runner. */
+let ACTIVE_DATA_DIR = null;
 
 /** TRUE for any path with an excluded component below `root`. */
 function excludedUnder(root, path) {
@@ -206,6 +226,19 @@ function gateEnvironment() {
     env.CARGO_TARGET_DIR = join(SCRIPT_ROOT, 'target', 'mutation-campaign');
   }
   env.FAKTOR_MUTATION_SOURCE_ROOT = SCRIPT_ROOT;
+  env.FAKTOR_MUTATION_ORACLE_ROOT = SCRIPT_ROOT;
+  env.FAKTOR_MUTATION_SUT_ROOT = GATE_ROOT;
+  env.FAKTOR_MUTATION_RUNNER_PID = String(process.pid);
+  if (ACTIVE_DATA_DIR !== null) {
+    env.FAKTOR_MUTATION_DATA_DIR = ACTIVE_DATA_DIR;
+    // The SUT's scratch/HOME state is per spec and lives outside both the
+    // oracle checkout and the isolated worktree copy. This keeps durable
+    // daemon state, sockets and temp files from leaking between the oracle
+    // and the system under test.
+    env.TMPDIR = join(ACTIVE_DATA_DIR, 'tmp');
+    env.TMP = env.TMPDIR;
+    env.TEMP = env.TMPDIR;
+  }
   return env;
 }
 
@@ -266,15 +299,43 @@ function cleanGateArtifacts(spec) {
   return null;
 }
 
-/** Append one outcome line to FAKTOR_MUTATION_LOG when the campaign sets it. */
-function recordOutcome(spec, outcome, detail) {
+/**
+ * Append one human log line (when the campaign sets FAKTOR_MUTATION_LOG) and
+ * always write one machine-readable evidence document. An evidence write
+ * failure is an environment failure: a campaign that cannot certify what it
+ * ran must fail closed.
+ */
+function recordOutcome(spec, outcome, detail, extra = {}) {
   const log = process.env.FAKTOR_MUTATION_LOG;
-  if (typeof log !== 'string' || log.trim() === '') return;
-  try {
-    appendFileSync(log, `${spec.id}\t${outcome}\t${detail.replace(/\s+/g, ' ').slice(0, 400)}\n`);
-  } catch {
-    // Diagnostics must never change the verdict.
+  if (typeof log === 'string' && log.trim() !== '') {
+    try {
+      appendFileSync(log, `${spec.id}\t${outcome}\t${detail.replace(/\s+/g, ' ').slice(0, 400)}\n`);
+    } catch {
+      // Diagnostics must never change the verdict.
+    }
   }
+  const dir = process.env.FAKTOR_MUTATION_EVIDENCE_DIR || DEFAULT_EVIDENCE_DIR;
+  const record = {
+    schema: 'faktor-mutation-evidence/v1',
+    id: spec.id,
+    surface: spec.surface ?? null,
+    gate: spec.gate,
+    expect: spec.expect ?? null,
+    oracle: spec.oracle ?? null,
+    declared_isolation: spec.isolation ?? null,
+    outcome,
+    reason: detail,
+    timestamp: new Date().toISOString(),
+    ...extra,
+    isolation: {
+      sut_root: GATE_ROOT,
+      oracle_root: SCRIPT_ROOT,
+      data_dir: ACTIVE_DATA_DIR,
+      cargo_target_dir: gateEnvironment().CARGO_TARGET_DIR,
+    },
+  };
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, `${spec.id}.json`), `${JSON.stringify(record, null, 2)}\n`);
 }
 
 function cleanupGateRoot() {
@@ -543,15 +604,48 @@ function validateSpec(spec, checkFind) {
   if (spec.gate.includes('\n')) {
     problems.push(`${where}: gate must be a single command line`);
   }
-  if (spec.expect !== undefined) {
-    if (typeof spec.expect !== 'string' || spec.expect.trim() === '') {
-      problems.push(`${where}: 'expect' must be a non-empty regex string when present`);
-    } else {
-      try {
-        new RegExp(spec.expect);
-      } catch (error) {
-        problems.push(`${where}: 'expect' is not a valid regex: ${error.message}`);
+  if (spec.gate !== spec.gate.trim()) {
+    problems.push(`${where}: gate must not carry surrounding whitespace`);
+  }
+  if (spec.surface !== undefined && (typeof spec.surface !== 'string' || spec.surface.trim() === '')) {
+    problems.push(`${where}: 'surface' must be a non-empty string when present`);
+  }
+  // Every spec names the exact failure signature that proves the ORACLE ran
+  // and failed. Without it a toolchain/compile/other failure could be
+  // mistaken for detection.
+  if (typeof spec.expect !== 'string' || spec.expect.trim() === '') {
+    problems.push(`${where}: missing non-empty 'expect' failure signature`);
+  } else {
+    try {
+      new RegExp(spec.expect);
+    } catch (error) {
+      problems.push(`${where}: 'expect' is not a valid regex: ${error.message}`);
+    }
+  }
+  // A mutation spec is a test: it must name the oracle that decides the
+  // verdict and the isolation that keeps the SUT out of the oracle tree.
+  if (typeof spec.oracle !== 'string' || !MUTATION_ORACLES.has(spec.oracle)) {
+    problems.push(
+      `${where}: missing or unknown 'oracle' (expected one of ${[...MUTATION_ORACLES].join('|')})`,
+    );
+  }
+  if (!Array.isArray(spec.isolation) || spec.isolation.length === 0) {
+    problems.push(`${where}: missing non-empty 'isolation' array`);
+  } else {
+    for (const isolation of spec.isolation) {
+      if (!MUTATION_ISOLATIONS.has(isolation)) {
+        problems.push(
+          `${where}: unknown isolation '${isolation}' (expected one of ${[...MUTATION_ISOLATIONS].join('|')})`,
+        );
       }
+    }
+    if (!spec.isolation.includes('isolated-worktree') && !spec.isolation.includes('isolated-copy')) {
+      problems.push(`${where}: mutation gate must run in an isolated-worktree or isolated-copy`);
+    }
+    if (spec.isolation.includes('isolated-data-dir') === false && spec.isolation.includes('isolated-copy') === false) {
+      // The runner creates a per-spec HOME/TMP regardless; the declaration
+      // must make the state boundary explicit for reviewers.
+      problems.push(`${where}: isolation must declare the per-spec data dir (isolated-data-dir)`);
     }
   }
   if (checkFind && problems.length === 0) {
@@ -751,7 +845,20 @@ async function runOne(id) {
   // that have none (no network, no install, never a fabricated detection).
   materializeGateDependencies(SCRIPT_ROOT, GATE_ROOT);
   try {
+    if (resolve(GATE_ROOT) === resolve(SCRIPT_ROOT)) {
+      console.error(
+        'mutation-run: refusing to mutate the oracle checkout; FAKTOR_MUTATION_ROOT must name a separate worktree/copy',
+      );
+      return 2;
+    }
+    ACTIVE_DATA_DIR = mkdtempSync(join(tmpdir(), `faktor-mutation-data-${spec.id}-`));
+    mkdirSync(join(ACTIVE_DATA_DIR, 'tmp'), { recursive: true });
     const planned = [];
+    // Several edits may target ONE file. Each edit is composed onto the text
+    // produced by the preceding edit (never onto a pristine snapshot that a
+    // later write would overwrite), so a multi-file/multi-edit spec lands
+    // EVERY planted change before the mutant gate runs.
+    const editPlans = new Map();
     for (const edit of specEdits(spec)) {
       const abs = resolve(GATE_ROOT, edit.file);
       if (edit.mode === 'create') {
@@ -762,22 +869,29 @@ async function runOne(id) {
         planned.push({ mode: 'create', abs, content: edit.content });
         continue;
       }
-      const original = readFileSync(abs);
-      const find = Buffer.from(edit.find, 'utf8');
-      if (original.indexOf(find) === -1) {
+      let plan = editPlans.get(abs);
+      if (plan === undefined) {
+        const original = readFileSync(abs);
+        plan = { mode: 'edit', abs, original, text: original.toString('utf8') };
+        editPlans.set(abs, plan);
+      }
+      const at = plan.text.indexOf(edit.find);
+      if (at === -1) {
         console.error(`mutation-run: find anchor not found in the scratch copy of ${edit.file}`);
         return 2;
       }
-      const at = original.indexOf(find);
+      if (plan.text.indexOf(edit.find, at + edit.find.length) !== -1) {
+        console.error(`mutation-run: find anchor is no longer unique after a preceding edit in ${edit.file}`);
+        return 2;
+      }
+      plan.text = `${plan.text.slice(0, at)}${edit.replace}${plan.text.slice(at + edit.find.length)}`;
+    }
+    for (const plan of editPlans.values()) {
       planned.push({
         mode: 'edit',
-        abs,
-        original,
-        mutated: Buffer.concat([
-          original.subarray(0, at),
-          Buffer.from(edit.replace, 'utf8'),
-          original.subarray(at + find.length),
-        ]),
+        abs: plan.abs,
+        original: plan.original,
+        mutated: Buffer.from(plan.text, 'utf8'),
       });
     }
 
@@ -789,7 +903,10 @@ async function runOne(id) {
       console.error(
         `mutation-run: ${spec.id} FAILED — the gate environment could not be stabilized (${preClean}); an environment failure is not a detection`,
       );
-      recordOutcome(spec, 'environment', preClean);
+      recordOutcome(spec, 'environment', preClean, {
+        control: null,
+        mutant: null,
+      });
       return 1;
     }
 
@@ -797,12 +914,21 @@ async function runOne(id) {
     // failure with the mutation live says nothing about the oracle.
     const control = await runGate(spec);
     const controlReason = controlProblem(control);
+    const controlInfo = {
+      exit_code: control.code,
+      signal: control.signal ?? null,
+      timed_out: control.timedOut === true,
+      ok: controlReason === null,
+    };
     if (controlReason !== null) {
       console.error(`mutation-run: ${spec.id} FAILED — ${controlReason}`);
       if ((control.tail ?? '').trim() !== '') {
         console.error(`mutation-run: control output tail:\n${control.tail.trimEnd()}`);
       }
-      recordOutcome(spec, 'undetected', controlReason);
+      recordOutcome(spec, 'undetected', controlReason, {
+        control: controlInfo,
+        mutant: null,
+      });
       return 1;
     }
 
@@ -810,6 +936,28 @@ async function runOne(id) {
     let reason = '';
     let tail = '';
     let postCleanProblem = null;
+    let mutantInfo = {
+      exit_code: null,
+      signal: null,
+      timed_out: false,
+      ok: false,
+    };
+    // Invalidate AGAIN between the control and the mutant: a fast control
+    // build and the mutation write can share one whole second, after which
+    // cargo considers the control artifact fresh and the "mutant" gate would
+    // silently re-run the PRISTINE binary (observed: a planted key regression
+    // exited 0). The shared cache is part of the certified environment, so
+    // this second invalidation is mandatory, not an optimization.
+    const betweenClean = cleanGateArtifacts(spec);
+    if (betweenClean !== null) {
+      const detail = `the gate environment could not be invalidated between control and mutant (${betweenClean}); an environment failure is not a detection`;
+      console.error(`mutation-run: ${spec.id} FAILED — ${detail}`);
+      recordOutcome(spec, 'environment', detail, {
+        control: controlInfo,
+        mutant: null,
+      });
+      return 1;
+    }
     active = planned;
     try {
       for (const entry of planned) {
@@ -822,6 +970,12 @@ async function runOne(id) {
       }
       const result = await runGate(spec);
       tail = result.tail ?? '';
+      mutantInfo = {
+        exit_code: result.code,
+        signal: result.signal ?? null,
+        timed_out: result.timedOut === true,
+        ok: result.code !== 0 && result.timedOut !== true,
+      };
       const how = howOf(result);
       if (result.error !== undefined) {
         reason = `the gate could not be spawned: ${result.error}`;
@@ -853,16 +1007,26 @@ async function runOne(id) {
       reason = `the shared gate cache could not be invalidated after the mutated run (${postCleanProblem}); a possibly poisoned cache cannot certify a detection`;
     }
     if (detected) {
-      recordOutcome(spec, 'detected', reason === '' ? 'gate red with the mutation live' : reason);
+      recordOutcome(spec, 'detected', reason === '' ? 'gate red with the mutation live' : reason, {
+        control: controlInfo,
+        mutant: mutantInfo,
+      });
       return 0;
     }
     console.error(`mutation-run: ${spec.id} FAILED — ${reason}`);
     if (tail.trim() !== '') {
       console.error(`mutation-run: gate output tail:\n${tail.trimEnd()}`);
     }
-    recordOutcome(spec, 'undetected', reason);
+    recordOutcome(spec, 'undetected', reason, {
+      control: controlInfo,
+      mutant: mutantInfo,
+    });
     return 1;
   } finally {
+    if (ACTIVE_DATA_DIR !== null) {
+      rmSync(ACTIVE_DATA_DIR, { recursive: true, force: true });
+      ACTIVE_DATA_DIR = null;
+    }
     cleanupGateRoot();
   }
 }

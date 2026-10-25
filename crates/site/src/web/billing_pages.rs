@@ -6,7 +6,7 @@ use faktor_payments::{
 use crate::auth::AuthSession;
 use crate::billing::{plan, PLANS};
 use crate::error::html_escape;
-use crate::web::layout::{account_page, csrf_input, hidden};
+use crate::web::layout::{account_page, csrf_input};
 use crate::web::{date, money, status_badge};
 
 pub struct BillingData<'a> {
@@ -58,15 +58,29 @@ pub fn billing(
         html_escape(data.overview.tax.default_jurisdiction.as_deref().unwrap_or("unconfigured"))
     );
     let stats = format!(
-        "<article class=\"panel span-4\"><div class=\"panel-head\"><div><h2>Record</h2><p class=\"panel-sub\">Exact minor units, no floating point.</p></div></div><div class=\"row-between\"><div><p class=\"stat\">{}</p><p class=\"stat-label\">Paid total</p></div><div><p class=\"stat\">{}</p><p class=\"stat-label\">Outstanding</p></div></div><dl class=\"kv mt-22\"><dt>Invoices</dt><dd>{} / {} open</dd><dt>Payment methods</dt><dd>{}</dd></dl></article>",
-        money(data.overview.paid_minor, "EUR"),
-        money(data.overview.outstanding_minor, "EUR"),
+        "<article class=\"panel span-4\"><div class=\"panel-head\"><div><h2>Record</h2><p class=\"panel-sub\">Exact minor units, no floating point.</p></div></div><div class=\"row-between\"><div><p class=\"stat\">{}</p><p class=\"stat-label\">Paid total</p></div><div><p class=\"stat\">{}</p><p class=\"stat-label\">Outstanding</p></div></div><dl class=\"kv mt-22\"><dt>Refunded</dt><dd>{}</dd><dt>Invoices</dt><dd>{} / {} open</dd><dt>Seats</dt><dd>{}</dd><dt>Currency</dt><dd>{}</dd><dt>Payment methods</dt><dd>{}</dd></dl></article>",
+        money(data.overview.paid_minor, data.overview.currency.as_deref().unwrap_or("EUR")),
+        money(data.overview.outstanding_minor, data.overview.currency.as_deref().unwrap_or("EUR")),
+        money(data.overview.refunded_minor, data.overview.currency.as_deref().unwrap_or("EUR")),
         data.overview.invoice_count,
         data.overview.open_invoice_count,
+        data.overview.seats.map_or_else(|| "unconfigured".to_string(), |seats| seats.to_string()),
+        html_escape(data.overview.currency.as_deref().unwrap_or("unconfigured")),
         data.overview.payment_method_count
     );
+    let plan_disabled_reason = if subscription.is_some() {
+        "<p class=\"plan-note\">A live subscription exists; use <strong>Change plan</strong> above. The plan cards are disabled so a second checkout cannot be started.</p>"
+    } else if data.overview.provider.state != "available" {
+        &format!(
+            "<p class=\"plan-note\">Checkout is disabled: the payment provider is {}. No payment can start until an operator restores it.</p>",
+            html_escape(data.overview.provider.state)
+        )
+    } else {
+        ""
+    };
     let plan_cards = format!(
-        "<div class=\"plan-grid\">{}</div>",
+        "{}<div class=\"plan-grid\">{}</div>",
+        plan_disabled_reason,
         plan_cards(auth, csrf, data, subscription.is_some())
     );
     let invoices = invoice_rows(auth, csrf, data.invoices);
@@ -118,14 +132,14 @@ fn current_subscription(
         })
         .collect::<String>();
     let change = format!(
-        "<form class=\"auth-form mt-22\" method=\"post\" action=\"/account/billing/change-plan/\">{}<div class=\"field-row\"><div class=\"field\"><label for=\"change_plan\">Plan</label><select id=\"change_plan\" name=\"plan_id\">{}</select></div><div class=\"field\"><label for=\"change_interval\">Interval</label><select id=\"change_interval\" name=\"interval\"><option value=\"monthly\"{}>Monthly</option><option value=\"annual\"{}>Annual</option></select></div></div><div class=\"form-actions\"><button class=\"btn btn-outline btn-small\" type=\"submit\">Change plan</button></div></form>",
+        "<form class=\"auth-form mt-22\" method=\"post\" action=\"/account/billing/change-plan/\">{}<div class=\"field-row\"><div class=\"field\"><label for=\"change_plan\">Plan</label><select id=\"change_plan\" name=\"plan_id\">{}</select></div><div class=\"field\"><label for=\"change_interval\">Interval</label><select id=\"change_interval\" name=\"interval\"><option value=\"monthly\"{}>Monthly</option><option value=\"annual\"{}>Annual</option></select></div></div><div class=\"field\"><label class=\"checkbox-field\"><input type=\"checkbox\" name=\"confirm\" value=\"yes\" required> I understand the change applies immediately and any proration is recorded on the next invoice.</label></div><div class=\"form-actions\"><button class=\"btn btn-outline btn-small\" type=\"submit\">Change plan</button></div></form>",
         csrf_input(csrf),
         plan_options,
         if interval == BillingInterval::Monthly { " selected" } else { "" },
         if interval == BillingInterval::Annual { " selected" } else { "" }
     );
     let cancel = format!(
-        "<form class=\"auth-form mt-22\" method=\"post\" action=\"/account/billing/cancel/\">{}<div class=\"field\"><label for=\"cancel_mode\">Cancellation</label><select id=\"cancel_mode\" name=\"at_period_end\"><option value=\"1\" selected>At period end</option><option value=\"0\">Immediately</option></select></div><div class=\"form-actions\"><button class=\"btn btn-outline btn-small\" type=\"submit\">Cancel subscription</button></div></form>",
+        "<form class=\"auth-form mt-22\" method=\"post\" action=\"/account/billing/cancel/\">{}<div class=\"field\"><label for=\"cancel_mode\">Cancellation</label><select id=\"cancel_mode\" name=\"at_period_end\"><option value=\"1\" selected>At period end</option><option value=\"0\">Immediately</option></select></div><div class=\"field\"><label class=\"checkbox-field\"><input type=\"checkbox\" name=\"confirm\" value=\"yes\" required> I understand that cancellation denies new admissions; immediate cancellation denies them now.</label></div><div class=\"form-actions\"><button class=\"btn btn-outline btn-small\" type=\"submit\">Cancel subscription</button></div></form>",
         csrf_input(csrf)
     );
     let requested_by = format!(
@@ -165,11 +179,10 @@ fn plan_cards(
         .iter()
         .map(|plan| {
             let monthly = format!(
-                "<form method=\"post\" action=\"/account/billing/checkout/\">{}<input type=\"hidden\" name=\"plan_id\" value=\"{}\"><input type=\"hidden\" name=\"interval\" value=\"monthly\"><input type=\"hidden\" name=\"request_id\" value=\"{}\">{}<button class=\"btn btn-outline btn-block btn-small\" type=\"submit\"{}>Choose monthly {}</button></form>",
+                "<form method=\"post\" action=\"/account/billing/checkout/\">{}<input type=\"hidden\" name=\"plan_id\" value=\"{}\"><input type=\"hidden\" name=\"interval\" value=\"monthly\"><input type=\"hidden\" name=\"request_id\" value=\"{}\"><button class=\"btn btn-outline btn-block btn-small\" type=\"submit\"{}>Choose monthly {}</button></form>",
                 csrf_input(csrf),
                 plan.id,
                 html_escape(data.request_id),
-                hidden("action", if has_subscription { "change" } else { "subscribe" }),
                 if disabled { " disabled" } else { "" },
                 money(plan.monthly_minor, "EUR")
             );
@@ -253,7 +266,7 @@ fn payment_methods(
             .map(|method| {
                 let default = if method.is_default { status_badge("active") } else { String::new() };
                 let remove = format!(
-                    "<form class=\"inline-form\" method=\"post\" action=\"/account/billing/payment-methods/{}/remove/\">{}<button class=\"btn btn-outline btn-small\" type=\"submit\">Remove</button></form>",
+                    "<form class=\"inline-form\" method=\"post\" action=\"/account/billing/payment-methods/{}/remove/\">{}<label class=\"checkbox-field\"><input type=\"checkbox\" name=\"confirm\" value=\"yes\" required> Confirm</label><button class=\"btn btn-outline btn-small\" type=\"submit\">Remove</button></form>",
                     html_escape(method.id.as_str()),
                     csrf_input(csrf)
                 );

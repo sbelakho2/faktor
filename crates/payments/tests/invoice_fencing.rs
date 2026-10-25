@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir,separate-process
 //! Invoice/payment/refund resource-fence adversarial tests.
 //!
 //! Every case uses different idempotency keys and a provider gate/barrier so
@@ -12,16 +13,17 @@ use std::time::Duration;
 use async_trait::async_trait;
 use faktor_cloud::{ManualClock, OrganizationId};
 use faktor_payments::{
-    sign_local_webhook, AddPaymentMethodRequest, BillingInterval, CurrencySpec, DunningConfig,
-    Invoice, IssueInvoiceRequest, OperationClaimState, PayInvoiceRequest, Payment, PaymentError,
-    PaymentProvider, PaymentService, PaymentStatus, PaymentsConfig, PlanPrice, PriceCatalogue,
-    ProviderCancelRequest, ProviderChangePlanRequest, ProviderCharge, ProviderChargeRequest,
-    ProviderCheckout, ProviderCheckoutRequest, ProviderCustomer, ProviderCustomerRequest,
-    ProviderInvoice, ProviderInvoiceRequest, ProviderInvoiceSnapshot, ProviderKind,
-    ProviderReconcileRequest, ProviderReconciled, ProviderRefund, ProviderRefundRequest,
-    ProviderSubscribeRequest, ProviderSubscription, RefundRequest, RefundStatus,
-    SqlitePaymentStore, StaticSecrets, SubscribeRequest, TaxConfig, UsageCharge,
-    VerifiedWebhookEvent, WebhookDisposition, WebhookHeaders,
+    sign_local_webhook, AddPaymentMethodRequest, BillingInterval, ConflictDomain, CurrencySpec,
+    DunningConfig, Invoice, IssueInvoiceRequest, LeaseAcquisition, LeaseClaim, OperationClaimState,
+    PayInvoiceRequest, Payment, PaymentError, PaymentProvider, PaymentService, PaymentStatus,
+    PaymentsConfig, PlanPrice, PriceCatalogue, ProviderCancelRequest, ProviderChangePlanRequest,
+    ProviderCharge, ProviderChargeRequest, ProviderCheckout, ProviderCheckoutRequest,
+    ProviderCustomer, ProviderCustomerRequest, ProviderInvoice, ProviderInvoiceRequest,
+    ProviderInvoiceSnapshot, ProviderKind, ProviderReconcileRequest, ProviderReconciled,
+    ProviderRefund, ProviderRefundRequest, ProviderSubscribeRequest, ProviderSubscription,
+    RefundRequest, RefundStatus, SqlitePaymentStore, StaticSecrets, SubscribeRequest,
+    SubscriptionState, TaxConfig, TerminalOutcome, UsageCharge, VerifiedWebhookEvent,
+    WebhookDisposition, WebhookHeaders,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -167,6 +169,10 @@ struct GateProvider {
     refund_error: Mutex<Option<PaymentError>>,
     charge_status: Mutex<Option<String>>,
     refund_status: Mutex<Option<String>>,
+    charge_amount: Mutex<Option<i64>>,
+    charge_currency: Mutex<Option<String>>,
+    refund_amount: Mutex<Option<i64>>,
+    refund_currency: Mutex<Option<String>>,
     last_charge: Mutex<Option<ProviderCharge>>,
     last_refund: Mutex<Option<ProviderRefund>>,
 }
@@ -192,6 +198,10 @@ impl GateProvider {
             refund_error: Mutex::new(None),
             charge_status: Mutex::new(None),
             refund_status: Mutex::new(None),
+            charge_amount: Mutex::new(None),
+            charge_currency: Mutex::new(None),
+            refund_amount: Mutex::new(None),
+            refund_currency: Mutex::new(None),
             last_charge: Mutex::new(None),
             last_refund: Mutex::new(None),
         }
@@ -223,6 +233,22 @@ impl GateProvider {
 
     fn set_refund_status(&self, status: &str) {
         *self.refund_status.lock().unwrap() = Some(status.to_string());
+    }
+
+    fn set_charge_amount(&self, amount_minor: i64) {
+        *self.charge_amount.lock().unwrap() = Some(amount_minor);
+    }
+
+    fn set_charge_currency(&self, currency: &str) {
+        *self.charge_currency.lock().unwrap() = Some(currency.to_string());
+    }
+
+    fn set_refund_amount(&self, amount_minor: i64) {
+        *self.refund_amount.lock().unwrap() = Some(amount_minor);
+    }
+
+    fn set_refund_currency(&self, currency: &str) {
+        *self.refund_currency.lock().unwrap() = Some(currency.to_string());
     }
 
     async fn wait_charge(&self) {
@@ -323,6 +349,12 @@ impl PaymentProvider for GateProvider {
             if let Some(status) = self.charge_status.lock().unwrap().clone() {
                 charge.status = status;
             }
+            if let Some(amount) = *self.charge_amount.lock().unwrap() {
+                charge.amount_minor = amount;
+            }
+            if let Some(currency) = self.charge_currency.lock().unwrap().clone() {
+                charge.currency = currency;
+            }
             *self.last_charge.lock().unwrap() = Some(charge.clone());
         }
         if self.block_charge.load(Ordering::SeqCst) {
@@ -345,6 +377,12 @@ impl PaymentProvider for GateProvider {
         if let Ok(refund) = result.as_mut() {
             if let Some(status) = self.refund_status.lock().unwrap().clone() {
                 refund.status = status;
+            }
+            if let Some(amount) = *self.refund_amount.lock().unwrap() {
+                refund.amount_minor = amount;
+            }
+            if let Some(currency) = self.refund_currency.lock().unwrap().clone() {
+                refund.currency = currency;
             }
             *self.last_refund.lock().unwrap() = Some(refund.clone());
         }
@@ -384,6 +422,7 @@ struct Fx {
     path: std::path::PathBuf,
     store: Arc<SqlitePaymentStore>,
     provider: Arc<GateProvider>,
+    clock: Arc<ManualClock>,
     service: Arc<PaymentService>,
 }
 
@@ -408,6 +447,7 @@ fn fixture() -> Fx {
         path,
         store,
         provider,
+        clock,
         service,
     }
 }
@@ -927,6 +967,610 @@ async fn webhook_settlement_during_in_flight_payment_does_not_double_apply() {
     assert_eq!(payments.len(), 1);
     assert_eq!(payments[0].amount_minor, FULL);
     assert_eq!(payments_paid(&fx, &invoice.id), FULL);
+}
+
+fn failed_payment_webhook(
+    provider_payment_id: &str,
+    invoice_id: &str,
+) -> (WebhookHeaders, Vec<u8>) {
+    let now_secs = NOW / 1000;
+    let body = serde_json::to_vec(&json!({
+        "id": format!("evt_failed_{provider_payment_id}"),
+        "type": "invoice.payment_failed",
+        "created": now_secs,
+        "data": {"object": {
+            "id": provider_payment_id,
+            "status": "failed",
+            "amount": FULL,
+            "currency": "USD",
+            "metadata": {
+                "organization_id": ORG,
+                "local_invoice_id": invoice_id,
+            },
+        }},
+    }))
+    .unwrap();
+    let signature = sign_local_webhook(SECRET, now_secs, &body);
+    (
+        WebhookHeaders::from_pairs([("Stripe-Signature", signature.as_str())]),
+        body,
+    )
+}
+
+fn refund_truth_webhook(
+    event_id: &str,
+    provider_refund_id: &str,
+    local_refund_id: Option<&str>,
+    amount_minor: i64,
+    currency: &str,
+) -> (WebhookHeaders, Vec<u8>) {
+    let now_secs = NOW / 1000;
+    let mut metadata = serde_json::json!({"organization_id": ORG});
+    if let Some(local_refund_id) = local_refund_id {
+        metadata["local_refund_id"] = serde_json::Value::String(local_refund_id.to_string());
+    }
+    let body = serde_json::to_vec(&json!({
+        "id": event_id,
+        "type": "refund.succeeded",
+        "created": now_secs,
+        "data": {"object": {
+            "id": provider_refund_id,
+            "status": "succeeded",
+            "amount": amount_minor,
+            "amount_minor": amount_minor,
+            "currency": currency,
+            "metadata": metadata,
+        }},
+    }))
+    .unwrap();
+    let signature = sign_local_webhook(SECRET, now_secs, &body);
+    (
+        WebhookHeaders::from_pairs([("Stripe-Signature", signature.as_str())]),
+        body,
+    )
+}
+
+#[tokio::test]
+async fn refund_webhook_truth_mismatch_is_refused_before_settlement() {
+    let fx = fixture();
+    let (invoice, payment) = paid_payment(&fx).await;
+    fx.provider.set_refund_status("pending");
+    let pending = fx
+        .service
+        .refund(
+            &org(),
+            refund_request(&payment.id, 4_000, "refund-webhook-pending"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pending.refund.status, RefundStatus::Pending);
+    let provider_refund_id = pending.refund.provider_refund_id.clone();
+
+    let (headers, body) = refund_truth_webhook(
+        "evt_refund_truth_amount",
+        &provider_refund_id,
+        None,
+        4_001,
+        "USD",
+    );
+    let error = fx
+        .service
+        .handle_webhook(&headers, &body, NOW)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, PaymentError::Conflict(_)));
+
+    let (headers, body) = refund_truth_webhook(
+        "evt_refund_truth_currency",
+        &provider_refund_id,
+        None,
+        4_000,
+        "EUR",
+    );
+    let error = fx
+        .service
+        .handle_webhook(&headers, &body, NOW)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, PaymentError::Conflict(_)));
+
+    let (headers, body) = refund_truth_webhook(
+        "evt_refund_truth_id",
+        "re_foreign_refund",
+        Some(&pending.refund.id),
+        4_000,
+        "USD",
+    );
+    let error = fx
+        .service
+        .handle_webhook(&headers, &body, NOW)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, PaymentError::Conflict(_)));
+
+    assert_eq!(
+        fx.store
+            .refund_by_id(ORG, &pending.refund.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        RefundStatus::Pending
+    );
+    assert_eq!(fx.provider.refund_calls(), 1);
+
+    let (headers, body) = refund_truth_webhook(
+        "evt_refund_truth_ok",
+        &provider_refund_id,
+        None,
+        4_000,
+        "USD",
+    );
+    let applied = fx
+        .service
+        .handle_webhook(&headers, &body, NOW)
+        .await
+        .unwrap();
+    assert_eq!(applied.disposition, WebhookDisposition::Applied);
+    let settled = fx
+        .store
+        .refund_by_id(ORG, &pending.refund.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(settled.status, RefundStatus::Succeeded);
+    let paid = fx.service.payments(&org(), 10).unwrap();
+    assert_eq!(paid[0].refunded_minor, 4_000);
+    assert_eq!(
+        fx.service
+            .invoice(&org(), &invoice.id)
+            .unwrap()
+            .amount_refunded_minor,
+        4_000
+    );
+    assert_eq!(fx.provider.refund_calls(), 1);
+    let domain = ConflictDomain::PaymentRefund {
+        payment_id: payment.id.clone(),
+    };
+    assert!(fx
+        .store
+        .active_for(ORG, &domain, &payment.id)
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn webhook_for_a_second_payment_during_in_flight_charge_keeps_both_receipts() {
+    let fx = fixture();
+    let subscription = subscribe(&fx.service, "fence-sub").await;
+    let method = add_method(&fx.service).await;
+    let invoice = issue(&fx.service, &subscription.id).await;
+    fx.provider.block_charge();
+    let service = fx.service.clone();
+    let invoice_id = invoice.id.clone();
+    let method_id = method.id.clone();
+    let task = tokio::spawn(async move {
+        service
+            .pay_invoice(&org(), pay_request(&invoice_id, &method_id, "pay-inflight"))
+            .await
+    });
+    fx.provider.wait_charge().await;
+    let in_flight_payment_id = fx.provider.last_charge_id();
+
+    let second_provider_payment = "tr_checkout_second";
+    let second_amount = 4_000;
+    let (headers, body) = webhook(second_provider_payment, second_amount, &invoice.id);
+    let settled = fx
+        .service
+        .handle_webhook(&headers, &body, NOW)
+        .await
+        .unwrap();
+    assert_eq!(settled.disposition, WebhookDisposition::Applied);
+    let after_webhook = fx.service.payments(&org(), 10).unwrap();
+    assert_eq!(after_webhook.len(), 1);
+    assert_eq!(
+        after_webhook[0].provider_payment_id, second_provider_payment,
+        "the webhook must not reuse the in-flight charge's local payment id"
+    );
+    assert_eq!(after_webhook[0].amount_minor, second_amount);
+    assert_eq!(payments_paid(&fx, &invoice.id), second_amount);
+
+    fx.provider.release_charge();
+    let first = task.await.unwrap().unwrap();
+    assert_eq!(first.payment.provider_payment_id, in_flight_payment_id);
+    let payments = fx.service.payments(&org(), 10).unwrap();
+    assert_eq!(payments.len(), 2, "both provider receipts stay durable");
+    assert!(payments.iter().any(|payment| {
+        payment.provider_payment_id == second_provider_payment
+            && payment.amount_minor == second_amount
+    }));
+    assert!(payments.iter().any(|payment| {
+        payment.provider_payment_id == in_flight_payment_id && payment.amount_minor == FULL
+    }));
+    let paid = fx.service.invoice(&org(), &invoice.id).unwrap();
+    assert_eq!(paid.amount_paid_minor, FULL);
+    assert_eq!(paid.status, faktor_payments::InvoiceStatus::Paid);
+    assert_eq!(fx.provider.charge_calls(), 1);
+    assert_eq!(fx.provider.refund_calls(), 0);
+}
+
+#[tokio::test]
+async fn webhook_payment_truth_mismatch_for_a_recorded_payment_is_refused() {
+    let fx = fixture();
+    let (invoice, payment) = paid_payment(&fx).await;
+    assert_eq!(payment.status, PaymentStatus::Succeeded);
+    let (headers, body) = webhook(&payment.provider_payment_id, FULL - 1, &invoice.id);
+    let refused = fx
+        .service
+        .handle_webhook(&headers, &body, NOW)
+        .await
+        .expect_err("a provider amount that contradicts the recorded payment is refused");
+    assert!(matches!(refused, PaymentError::Conflict(_)));
+    let payments = fx.service.payments(&org(), 10).unwrap();
+    assert_eq!(payments.len(), 1);
+    assert_eq!(payments[0], payment);
+    assert_eq!(payments_paid(&fx, &invoice.id), FULL);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_payment_webhook_fails_the_pending_payment_and_releases_the_fence() {
+    let fx = fixture();
+    let subscription = subscribe(&fx.service, "fence-sub").await;
+    let method = add_method(&fx.service).await;
+    let invoice = issue(&fx.service, &subscription.id).await;
+    fx.provider.set_charge_status("pending");
+    let pending = fx
+        .service
+        .pay_invoice(&org(), pay_request(&invoice.id, &method.id, "pay-pending"))
+        .await
+        .unwrap();
+    assert_eq!(pending.payment.status, PaymentStatus::Pending);
+    assert_eq!(pending.payment.amount_minor, FULL);
+    assert_eq!(fx.provider.charge_calls(), 1);
+    let domain = ConflictDomain::InvoicePayment {
+        invoice_id: invoice.id.clone(),
+    };
+    assert!(fx
+        .store
+        .active_for(ORG, &domain, &invoice.id)
+        .unwrap()
+        .is_some());
+
+    let (headers, body) = failed_payment_webhook(&pending.payment.provider_payment_id, &invoice.id);
+    let failed = fx
+        .service
+        .handle_webhook(&headers, &body, NOW)
+        .await
+        .unwrap();
+    assert_eq!(failed.disposition, WebhookDisposition::Applied);
+    let payments = fx.service.payments(&org(), 10).unwrap();
+    assert_eq!(payments.len(), 1);
+    assert_eq!(payments[0].status, PaymentStatus::Failed);
+    let after = fx.service.invoice(&org(), &invoice.id).unwrap();
+    assert_eq!(after.amount_paid_minor, 0);
+    assert_eq!(after.status, faktor_payments::InvoiceStatus::PastDue);
+    assert!(
+        fx.store
+            .active_for(ORG, &domain, &invoice.id)
+            .unwrap()
+            .is_none(),
+        "a failed payment must release the invoice-payment fence"
+    );
+    assert_eq!(
+        fx.store.leases_needing_reconciliation(ORG).unwrap().len(),
+        0
+    );
+
+    fx.provider.set_charge_status("succeeded");
+    let retried = fx
+        .service
+        .pay_invoice(&org(), pay_request(&invoice.id, &method.id, "pay-retry"))
+        .await
+        .unwrap();
+    assert_eq!(retried.payment.status, PaymentStatus::Succeeded);
+    assert_eq!(fx.provider.charge_calls(), 2);
+    let final_payments = fx.service.payments(&org(), 10).unwrap();
+    assert_eq!(final_payments.len(), 2);
+    let paid = fx.service.invoice(&org(), &invoice.id).unwrap();
+    assert_eq!(paid.amount_paid_minor, FULL);
+    assert_eq!(paid.status, faktor_payments::InvoiceStatus::Paid);
+}
+
+#[tokio::test]
+async fn provider_charge_amount_mismatch_is_refused_without_crediting() {
+    let fx = fixture();
+    let subscription = subscribe(&fx.service, "fence-sub").await;
+    let method = add_method(&fx.service).await;
+    let invoice = issue(&fx.service, &subscription.id).await;
+    fx.provider.set_charge_amount(FULL + 1);
+    let error = fx
+        .service
+        .pay_invoice(&org(), pay_request(&invoice.id, &method.id, "pay-amount"))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, PaymentError::Provider(_)));
+    assert_eq!(fx.provider.charge_calls(), 1);
+    assert_eq!(
+        fx.store
+            .operation_claim(ORG, "pay-amount")
+            .unwrap()
+            .unwrap()
+            .state,
+        OperationClaimState::Unknown
+    );
+    assert_eq!(fx.service.payments(&org(), 10).unwrap().len(), 0);
+    assert_eq!(payments_paid(&fx, &invoice.id), 0);
+    let domain = ConflictDomain::InvoicePayment {
+        invoice_id: invoice.id.clone(),
+    };
+    assert!(fx
+        .store
+        .active_for(ORG, &domain, &invoice.id)
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test]
+async fn provider_charge_currency_mismatch_is_refused_without_crediting() {
+    let fx = fixture();
+    let subscription = subscribe(&fx.service, "fence-sub").await;
+    let method = add_method(&fx.service).await;
+    let invoice = issue(&fx.service, &subscription.id).await;
+    fx.provider.set_charge_currency("EUR");
+    let error = fx
+        .service
+        .pay_invoice(&org(), pay_request(&invoice.id, &method.id, "pay-currency"))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, PaymentError::Provider(_)));
+    assert_eq!(fx.provider.charge_calls(), 1);
+    assert_eq!(fx.service.payments(&org(), 10).unwrap().len(), 0);
+    assert_eq!(payments_paid(&fx, &invoice.id), 0);
+}
+
+#[tokio::test]
+async fn provider_refund_amount_mismatch_is_refused_and_keeps_the_reservation() {
+    let fx = fixture();
+    let (invoice, payment) = paid_payment(&fx).await;
+    fx.provider.set_refund_amount(3_999);
+    let error = fx
+        .service
+        .refund(&org(), refund_request(&payment.id, 4_000, "refund-amount"))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, PaymentError::Provider(_)));
+    assert_eq!(fx.provider.refund_calls(), 1);
+    assert_eq!(
+        fx.store
+            .refunds_for_payment(ORG, &payment.id)
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(
+        fx.service
+            .invoice(&org(), &invoice.id)
+            .unwrap()
+            .amount_refunded_minor,
+        0
+    );
+    let domain = ConflictDomain::PaymentRefund {
+        payment_id: payment.id.clone(),
+    };
+    assert!(fx
+        .store
+        .active_for(ORG, &domain, &payment.id)
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        fx.store
+            .operation_claim(ORG, "refund-amount")
+            .unwrap()
+            .unwrap()
+            .state,
+        OperationClaimState::Unknown
+    );
+}
+
+#[tokio::test]
+async fn provider_refund_currency_mismatch_is_refused_and_keeps_the_reservation() {
+    let fx = fixture();
+    let (invoice, payment) = paid_payment(&fx).await;
+    fx.provider.set_refund_currency("EUR");
+    let error = fx
+        .service
+        .refund(
+            &org(),
+            refund_request(&payment.id, 4_000, "refund-currency"),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, PaymentError::Provider(_)));
+    assert_eq!(fx.provider.refund_calls(), 1);
+    assert_eq!(
+        fx.store
+            .refunds_for_payment(ORG, &payment.id)
+            .unwrap()
+            .len(),
+        0
+    );
+    let current = fx.service.payments(&org(), 10).unwrap();
+    assert_eq!(current[0].refunded_minor, 0);
+    assert_eq!(
+        fx.service
+            .invoice(&org(), &invoice.id)
+            .unwrap()
+            .amount_refunded_minor,
+        0
+    );
+    let domain = ConflictDomain::PaymentRefund {
+        payment_id: payment.id.clone(),
+    };
+    assert!(fx
+        .store
+        .active_for(ORG, &domain, &payment.id)
+        .unwrap()
+        .is_some());
+    assert_eq!(fx.provider.refund_calls(), 1);
+}
+
+#[tokio::test]
+async fn pending_refund_commitment_blocks_a_second_refund_after_a_released_fence() {
+    let fx = fixture();
+    let (invoice, payment) = paid_payment(&fx).await;
+    fx.provider.set_refund_status("pending");
+    let pending = fx
+        .service
+        .refund(&org(), refund_request(&payment.id, 4_000, "refund-pending"))
+        .await
+        .unwrap();
+    assert_eq!(pending.refund.status, RefundStatus::Pending);
+    assert_eq!(fx.provider.refund_calls(), 1);
+    let domain = ConflictDomain::PaymentRefund {
+        payment_id: payment.id.clone(),
+    };
+    let lease = fx
+        .store
+        .active_for(ORG, &domain, &payment.id)
+        .unwrap()
+        .expect("the pending refund holds its reservation");
+    fx.store
+        .release_terminal(ORG, &lease.id, TerminalOutcome::Succeeded)
+        .unwrap();
+
+    let error = fx
+        .service
+        .refund(&org(), refund_request(&payment.id, 7_000, "refund-over"))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, PaymentError::RefundExceedsPaid { .. }));
+    assert_eq!(
+        fx.provider.refund_calls(),
+        1,
+        "the pending refund stays committed and the provider is never called"
+    );
+    assert_eq!(
+        fx.store
+            .refunds_for_payment(ORG, &payment.id)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        fx.service
+            .invoice(&org(), &invoice.id)
+            .unwrap()
+            .amount_refunded_minor,
+        0
+    );
+}
+
+#[tokio::test]
+async fn payment_webhook_cannot_activate_a_subscription_under_its_mutation_fence() {
+    let fx = fixture();
+    let subscription = subscribe(&fx.service, "fence-sub").await;
+    let invoice = issue(&fx.service, &subscription.id).await;
+    let mut past_due = fx.store.subscription(ORG).unwrap().unwrap();
+    past_due.state = SubscriptionState::PastDue;
+    past_due.grace_end_ms = Some(NOW + 60_000);
+    fx.store.put_subscription(&past_due).unwrap();
+    let domain = ConflictDomain::SubscriptionMutation {
+        subscription_id: subscription.id.clone(),
+    };
+    let holder = LeaseClaim::new("webhook-holder", "webhook-holder", "digest");
+    assert!(matches!(
+        fx.store
+            .try_acquire(ORG, &domain, &subscription.id, &holder, None)
+            .unwrap(),
+        LeaseAcquisition::Held(_)
+    ));
+
+    let (headers, body) = webhook("tr_settle_fenced", FULL, &invoice.id);
+    let applied = fx
+        .service
+        .handle_webhook(&headers, &body, NOW)
+        .await
+        .unwrap();
+    assert_eq!(applied.disposition, WebhookDisposition::Applied);
+    assert_eq!(
+        fx.service.invoice(&org(), &invoice.id).unwrap().status,
+        faktor_payments::InvoiceStatus::Paid
+    );
+    assert_eq!(fx.service.payments(&org(), 10).unwrap().len(), 1);
+    assert_eq!(
+        fx.store.subscription(ORG).unwrap().unwrap().state,
+        SubscriptionState::PastDue,
+        "the webhook must not write over the fenced subscription mutation"
+    );
+    assert_eq!(fx.provider.charge_calls(), 0);
+}
+
+#[tokio::test]
+async fn lifecycle_tick_cannot_write_under_the_subscription_fence() {
+    let fx = fixture();
+    let started = fx
+        .service
+        .subscribe(
+            &org(),
+            SubscribeRequest {
+                plan_id: "pro".into(),
+                interval: BillingInterval::Monthly,
+                seats: 1,
+                trial_days: Some(7),
+                customer_email: "tick@example.com".into(),
+                customer_name: "Tick".into(),
+                idempotency_key: "tick-sub".into(),
+            },
+        )
+        .await
+        .unwrap()
+        .subscription;
+    assert_eq!(started.state, SubscriptionState::Trialing);
+    let domain = ConflictDomain::SubscriptionMutation {
+        subscription_id: started.id.clone(),
+    };
+    let holder = LeaseClaim::new("tick-holder", "tick-holder", "digest");
+    assert!(matches!(
+        fx.store
+            .try_acquire(ORG, &domain, &started.id, &holder, None)
+            .unwrap(),
+        LeaseAcquisition::Held(_)
+    ));
+    fx.clock.advance(8 * 24 * 60 * 60 * 1000);
+    let outcome = fx.service.tick(&org()).unwrap();
+    assert!(!outcome.changed);
+    assert_eq!(outcome.subscription.state, SubscriptionState::Trialing);
+    let stored = fx.store.subscription(ORG).unwrap().unwrap();
+    assert_eq!(stored.state, SubscriptionState::Trialing);
+    assert_eq!(
+        stored.current_period_start_ms,
+        started.current_period_start_ms
+    );
+}
+
+#[tokio::test]
+async fn payment_failure_cannot_regress_a_paid_invoice_or_canceled_subscription() {
+    let fx = fixture();
+    let (invoice, _payment) = paid_payment(&fx).await;
+    let mut subscription = fx.store.subscription(ORG).unwrap().unwrap();
+    subscription.state = SubscriptionState::Canceled;
+    subscription.canceled_ms = Some(NOW);
+    subscription.cancel_at_period_end = false;
+    fx.store.put_subscription(&subscription).unwrap();
+    let returned = fx
+        .service
+        .record_payment_failure(&org(), &invoice.id)
+        .unwrap()
+        .expect("the canceled subscription is still returned");
+    assert_eq!(returned.state, SubscriptionState::Canceled);
+    assert_eq!(returned.dunning_attempts, subscription.dunning_attempts);
+    let after_invoice = fx.service.invoice(&org(), &invoice.id).unwrap();
+    assert_eq!(after_invoice.status, faktor_payments::InvoiceStatus::Paid);
+    assert_eq!(after_invoice.amount_paid_minor, FULL);
+    assert_eq!(
+        fx.store.subscription(ORG).unwrap().unwrap().state,
+        SubscriptionState::Canceled
+    );
+    assert_eq!(fx.provider.charge_calls(), 1);
+    assert_eq!(fx.provider.refund_calls(), 0);
 }
 
 fn payments_paid(fx: &Fx, invoice_id: &str) -> i64 {

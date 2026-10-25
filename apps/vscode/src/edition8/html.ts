@@ -155,6 +155,10 @@ const PRIMARY_SCREEN_ACTIONS: Readonly<
 const HOST_PRIMARY: Readonly<Record<string, { readonly command: string; readonly label: string }>> = {
   S34: { command: 'faktor.startServer', label: 'Start Faktor' },
   S35: { command: 'faktor.trustExecutable8', label: 'Confirm Path' },
+  // Spec S55 primary: the optional control-plane sign-in. It opens the
+  // endpoint/organization prompt; it never claims a connection before the
+  // host has stored and verified the credential.
+  S55: { command: 'faktor.controlPlaneSignIn', label: 'Connect Account' },
 };
 
 // The registry job text is design direction. The surface shows one plain
@@ -442,10 +446,16 @@ function screenMarkup(screen: E8ScreenView, initial: boolean, host: 'vscode' | '
     screen.rows.length === 0
       ? ''
       : `<h3 class="e8-section-title">Current state</h3><section class="e8-data" aria-label="Served ${esc(screenEntry.id)} state">${screen.rows.map(rowMarkup).join('\n')}</section>`;
-  // S54 is read-only: served usage categories lead, and the two read-only
-  // control cards follow as provenance instead of pushing every number
-  // below the 480px fold.
+  // S54 is read-only: served usage categories lead, and the read-only
+  // control cards stay behind a collapsed provenance disclosure instead of
+  // pushing every number below the 480px fold. Expanding it keeps the same
+  // control contract (and focus order) one disclosure away.
   const rowsFirst = screenEntry.id === 'S53' || screenEntry.id === 'S27' || screenEntry.id === 'S54';
+  const controlsMarkup = !showControls
+    ? ''
+    : rowsFirst
+      ? `<details class="e8-provenance"><summary>Control provenance (read-only) · ${screen.controls.length}</summary>${groupControls(screen.controls)}</details>`
+      : groupControls(screen.controls);
   return `<section class="e8-screen" id="e8-screen-${screenEntry.id}" data-screen="${screenEntry.id}" data-group="${esc(screenEntry.group)}" data-destination="${destinationOf(screenEntry)}" data-surface="${screenEntry.surface}" data-primary="${primary.kind}"${initial ? '' : ' hidden'} aria-labelledby="e8-screen-title-${screenEntry.id}">
     <header class="e8-screen-head">
       <div class="e8-kicker">${esc(screenEntry.group)}</div>
@@ -474,7 +484,7 @@ function screenMarkup(screen: E8ScreenView, initial: boolean, host: 'vscode' | '
     ${screen.staleText === null ? '' : `<div class="e8-banner e8-warn" role="alert">${esc(screen.staleText)}</div>`}
     ${screen.emptyText === null || screen.emptyText.startsWith('No served state yet') ? '' : `<div class="e8-banner e8-empty" role="status">${esc(screen.emptyText)}</div>`}
     ${rowsFirst ? rowsMarkup : ''}
-    ${showControls ? groupControls(screen.controls) : ''}
+    ${controlsMarkup}
     ${rowsFirst ? '' : rowsMarkup}
   </section>`;
 }

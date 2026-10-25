@@ -1,0 +1,15 @@
+{
+  "id": "INV-BILLING-REFUND-AMOUNT-TRUTH",
+  "surface": "payments.billing",
+  "file": "crates/payments/src/service/invoice_ops.rs",
+  "find": "        if remote.amount_minor != request.amount_minor",
+  "replace": "        if false",
+  "gate": "cargo test -p faktor-payments --test invoice_fencing provider_refund_amount_mismatch_is_refused_and_keeps_the_reservation",
+  "expect": "FAILED",
+  "note": "Settling a refund whose provider amount differs from the reserved request misstates cash; the refund-truth oracle must fail.",
+  "capabilities": [
+    "payments.refund_bound"
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+}

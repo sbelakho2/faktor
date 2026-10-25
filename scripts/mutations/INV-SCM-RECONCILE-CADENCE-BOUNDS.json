@@ -8,5 +8,7 @@
   "note": "Dropping the jitter<=interval bound accepts a hostile cadence policy the reconciler must refuse.",
   "capabilities": [
     "scm.reconcile_cadence"
-  ]
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

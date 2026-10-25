@@ -1,0 +1,15 @@
+{
+  "id": "INV-BILLING-LEASE-CLAIM-LOOKUP",
+  "surface": "payments.billing",
+  "file": "crates/payments/src/lease.rs",
+  "find": "                     WHERE organization_id = ?1 AND idempotency_key = ?2 AND state = 'held' \\\n                     ORDER BY acquired_ms, id LIMIT 1",
+  "replace": "                     WHERE organization_id = ?1 AND (idempotency_key = ?2 OR ?2 <> '') \\\n                     AND state = 'held' ORDER BY acquired_ms, id LIMIT 1",
+  "gate": "cargo test -p faktor-payments --test financial_mutation_lease held_lease_for_claim_returns_only_the_indexed_match",
+  "expect": "FAILED",
+  "note": "Replacing the exact claim-key predicate with a tautology returns another claim's held lease (and scans the fence table), so reconciliation can settle the wrong resource; the indexed single-match oracle must fail.",
+  "capabilities": [
+    "payments.lease_fence"
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+}

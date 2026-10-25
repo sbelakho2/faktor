@@ -1151,7 +1151,27 @@ data class NativeBillingOverview(
     val currency: NativeBillingCapability,
     val usageExport: NativeBillingCapability,
     val usageExportFormats: List<String>,
-    val nowMs: Long
+    val nowMs: Long,
+    /** The additive real payment-plane record; null on a local-only snapshot. */
+    val payments: NativeBillingPayments? = null
+)
+
+/** Served invoice/refund/seat/tax/currency facts of a wired payment plane. */
+data class NativeBillingPayments(
+    val invoiceCount: Long,
+    val openInvoiceCount: Long,
+    val outstandingMinor: Long,
+    val paidMinor: Long,
+    val refundedMinor: Long,
+    val paymentMethodCount: Long,
+    val seats: Long?,
+    val currency: String?,
+    val currencyExponent: Long?,
+    val taxState: String,
+    val taxJurisdiction: String?,
+    val reconciliationUnreconciled: Long,
+    val reconciliationMatched: Long,
+    val reconciliationConflicts: Long
 )
 
 /** The typed proration result of one plan change (never a fabricated delta). */
@@ -2466,6 +2486,29 @@ private fun parseBillingSubscription(v: JsonView): NativeBillingSubscription =
         updatedMs = v.field("updated_ms").long()
     )
 
+private fun parseBillingPayments(v: JsonView): NativeBillingPayments {
+    val tax = v.field("tax")
+    val reconciliation = v.field("reconciliation")
+    return NativeBillingPayments(
+        invoiceCount = v.field("invoice_count").long(),
+        openInvoiceCount = v.field("open_invoice_count").long(),
+        outstandingMinor = v.field("outstanding_minor").long(),
+        paidMinor = v.field("paid_minor").long(),
+        refundedMinor = v.field("refunded_minor").long(),
+        paymentMethodCount = v.field("payment_method_count").long(),
+        seats = v.optionalField("seats")?.long(),
+        currency = v.optionalField("currency")?.string(),
+        currencyExponent = v.optionalField("currency_exponent")?.long(),
+        taxState = tax.field("state").string(),
+        taxJurisdiction = tax.optionalField("default_jurisdiction")?.string(),
+        reconciliationUnreconciled = reconciliation.field("unreconciled").long(),
+        reconciliationMatched = reconciliation.field("matched").long(),
+        reconciliationConflicts = reconciliation.field("amount_mismatch").long() +
+            reconciliation.field("currency_mismatch").long() +
+            reconciliation.field("provider_invoice_missing").long()
+    )
+}
+
 private fun parseBillingOverview(v: JsonView): NativeBillingOverview {
     val trial = v.field("trial")
     return NativeBillingOverview(
@@ -2486,7 +2529,8 @@ private fun parseBillingOverview(v: JsonView): NativeBillingOverview {
         currency = parseBillingCapability(v, "currency"),
         usageExport = parseBillingCapability(v, "usage_export"),
         usageExportFormats = v.field("usage_export_formats").stringArray(),
-        nowMs = v.field("now_ms").long()
+        nowMs = v.field("now_ms").long(),
+        payments = v.optionalField("payments")?.let { parseBillingPayments(it) }
     )
 }
 

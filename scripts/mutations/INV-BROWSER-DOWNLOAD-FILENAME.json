@@ -8,5 +8,7 @@
   "note": "Dropping last-component extraction lets path traversal survive filename sanitization.",
   "capabilities": [
     "browser.download_filename"
-  ]
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

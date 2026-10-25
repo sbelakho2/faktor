@@ -4,6 +4,9 @@
   "find": "            } catch (e: ProtocolBlocked) {\n                // Durable corruption/incompatibility: reconnect would replay\n                // the same offending sequence forever. Stable, no retry.\n                blockedHere = e\n                break\n            } catch (e: Exception) {",
   "replace": "            } catch (e: ProtocolBlocked) {\n                attempt = minOf(attempt + 1, MAX_BACKOFF_ATTEMPT)\n            } catch (e: Exception) {",
   "gate": "bash apps/jetbrains/compile-and-smoke.sh --smoke NativeBridge",
+  "expect": "FAIL",
   "timeout_ms": 1800000,
-  "note": "Durable protocol violations no longer latch the blocked state: the client keeps reconnecting/replaying instead of stopping."
+  "note": "Durable protocol violations no longer latch the blocked state: the client keeps reconnecting/replaying instead of stopping.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

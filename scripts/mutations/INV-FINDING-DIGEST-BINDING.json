@@ -5,5 +5,7 @@
   "replace": "    if false {\n",
   "gate": "cargo test -p faktor-tests-economy --test new_guard_findings_validation",
   "expect": "unwrap_err|must never become a statement|must never be applied|must never reach",
-  "note": "Skipping the snapshot-digest validation accepts an unvalidated provider finding bound to another repository state and applies it to the contract."
+  "note": "Skipping the snapshot-digest validation accepts an unvalidated provider finding bound to another repository state and applies it to the contract.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

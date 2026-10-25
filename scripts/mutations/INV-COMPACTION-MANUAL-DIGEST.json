@@ -1,0 +1,15 @@
+{
+  "id": "INV-COMPACTION-MANUAL-DIGEST",
+  "surface": "compaction",
+  "file": "crates/server/src/native/longtask.rs",
+  "find": "            if checkpoint.digest != actual {",
+  "replace": "            if false {",
+  "note": "Dropping the manual-compaction checkpoint digest comparison re-certifies a payload the durable head does not describe; the MC-MANUAL-COMPACTION-RESTART-DIGEST oracle must fail.",
+  "gate": "cargo test -p faktor-server --lib manual_compaction_ignores_a_checkpoint_with_a_mismatched_digest",
+  "expect": "FAILED",
+  "capabilities": [
+    "server.manual_compaction_restart_digest"
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+}

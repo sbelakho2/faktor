@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-browser-profile,read-only-artifacts
 // Faktor VS Code webview headless-Chrome verification harness.
 //
 // Renders the REAL media/chat.css + media/chat.js + media/composer-state.js +

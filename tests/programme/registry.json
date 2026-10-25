@@ -1,8 +1,8 @@
 {
   "schema": "faktor-test-programme-registry/v1",
-  "generated_at": "2026-10-24T03:18:29.354Z",
-  "commit": "909c0861aa1d55db85ac6c459d4b9ea91a1eab3b",
-  "tree": "22c535cc454bb5fd83a47fb089c93f984d782eb4",
+  "generated_at": "2026-10-25T11:35:31.781Z",
+  "commit": "22ab79fcb6918feee3ed781e24e40deda63f8ace",
+  "tree": "37ba2b049a2fdf93a07b2384725fbc6bcdfc1f35",
   "layers": [
     "structural",
     "unit",
@@ -19,7 +19,7 @@
     "release"
   ],
   "counts": {
-    "rows": 981,
+    "rows": 1013,
     "by_kind": {
       "acceptance-scenario": 40,
       "act-now": 8,
@@ -28,7 +28,7 @@
       "cli-command": 49,
       "config-key": 53,
       "control": 200,
-      "invariant": 159,
+      "invariant": 191,
       "jetbrains-contribution": 1,
       "native-route": 299,
       "provider-adapter": 6,
@@ -38,22 +38,22 @@
       "workflow": 16
     },
     "by_status": {
-      "deferred": 837,
-      "proven": 76,
+      "deferred": 940,
+      "proven": 5,
       "stub": 68
     },
     "by_lane": {
-      "nightly": 513,
-      "pull": 650,
-      "trusted": 980,
+      "nightly": 545,
+      "pull": 682,
+      "trusted": 1012,
       "weekly-live": 342
     },
     "by_layer": {
       "agent-evals": 1,
       "contracts": 436,
       "ide-screen-readers": 385,
-      "state-model-crash": 257,
-      "unit-property": 242
+      "state-model-crash": 289,
+      "unit-property": 274
     }
   },
   "rows": [
@@ -1240,7 +1240,7 @@
       ],
       "evidence_kind": "state-model",
       "oracle": "Overflow/negative/malformed cursors and duplicate concurrent streams are typed and bounded; no 5xx, no panic, no event duplication across one session.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "report_row": "widen-ordering"
       },
@@ -1249,58 +1249,7 @@
         "replay",
         "corruption"
       ],
-      "evidence": {
-        "passed": true,
-        "cases": [
-          {
-            "name": "cursor-18446744073709551616",
-            "passed": true,
-            "observed": {
-              "status": 400,
-              "aborted": false
-            }
-          },
-          {
-            "name": "cursor--1",
-            "passed": true,
-            "observed": {
-              "status": 400,
-              "aborted": false
-            }
-          },
-          {
-            "name": "cursor-abc",
-            "passed": true,
-            "observed": {
-              "status": 400,
-              "aborted": false
-            }
-          },
-          {
-            "name": "cursor-1&after=2",
-            "passed": true,
-            "observed": {
-              "status": 400,
-              "aborted": false
-            }
-          },
-          {
-            "name": "two-concurrent-streams",
-            "passed": true,
-            "observed": {
-              "first": "bounded",
-              "second": "bounded"
-            }
-          },
-          {
-            "name": "stream-auth-before-data",
-            "passed": true,
-            "observed": {
-              "status": 401
-            }
-          }
-        ]
-      }
+      "evidence": null
     },
     {
       "id": "act-now.hostile-generators",
@@ -1518,8 +1467,8 @@
               "annotated": 0
             },
             "crates/agent/src/runtime/compaction.rs": {
-              "reads": 2,
-              "annotated": 0
+              "reads": 3,
+              "annotated": 1
             },
             "crates/agent/src/runtime/retrieval.rs": {
               "reads": 2,
@@ -1538,7 +1487,7 @@
               "annotated": 0
             }
           },
-          "settlement_reads": 14
+          "settlement_reads": 15
         }
       }
     },
@@ -1785,7 +1734,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "acp"
       },
@@ -1796,14 +1745,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "acp",
-          "help_bytes": 260,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.approval",
@@ -1822,7 +1764,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "approval"
       },
@@ -1833,14 +1775,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "approval",
-          "help_bytes": 796,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.billing",
@@ -1859,7 +1794,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "billing"
       },
@@ -1870,14 +1805,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "billing",
-          "help_bytes": 1584,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.bootstrap",
@@ -1896,7 +1824,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "bootstrap"
       },
@@ -1907,14 +1835,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "bootstrap",
-          "help_bytes": 670,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.build",
@@ -1933,7 +1854,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "build"
       },
@@ -1944,14 +1865,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "build",
-          "help_bytes": 324,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.commerce",
@@ -1970,7 +1884,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "commerce"
       },
@@ -1981,14 +1895,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "commerce",
-          "help_bytes": 967,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.commerce.clear-cache",
@@ -2007,7 +1914,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "commerce.clear-cache"
       },
@@ -2018,14 +1925,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "commerce.clear-cache",
-          "help_bytes": 255,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.commerce.doctor",
@@ -2044,7 +1944,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "commerce.doctor"
       },
@@ -2055,14 +1955,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "commerce.doctor",
-          "help_bytes": 316,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.commerce.login",
@@ -2081,7 +1974,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "commerce.login"
       },
@@ -2092,14 +1985,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "commerce.login",
-          "help_bytes": 366,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.commerce.logout",
@@ -2118,7 +2004,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "commerce.logout"
       },
@@ -2129,14 +2015,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "commerce.logout",
-          "help_bytes": 334,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.commerce.status",
@@ -2155,7 +2034,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "commerce.status"
       },
@@ -2166,14 +2045,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "commerce.status",
-          "help_bytes": 244,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.doctor",
@@ -2192,7 +2064,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "doctor"
       },
@@ -2203,14 +2075,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "doctor",
-          "help_bytes": 838,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.engineering",
@@ -2229,7 +2094,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "engineering"
       },
@@ -2240,14 +2105,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "engineering",
-          "help_bytes": 689,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.enterprise",
@@ -2266,7 +2124,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "enterprise"
       },
@@ -2277,14 +2135,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "enterprise",
-          "help_bytes": 1098,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.enterprise.artifact",
@@ -2303,7 +2154,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "enterprise.artifact"
       },
@@ -2314,14 +2165,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "enterprise.artifact",
-          "help_bytes": 489,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.enterprise.artifact.eligible",
@@ -2340,7 +2184,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "enterprise.artifact.eligible"
       },
@@ -2351,14 +2195,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "enterprise.artifact.eligible",
-          "help_bytes": 321,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.enterprise.artifact.list",
@@ -2377,7 +2214,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "enterprise.artifact.list"
       },
@@ -2388,14 +2225,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "enterprise.artifact.list",
-          "help_bytes": 333,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.enterprise.artifact.register",
@@ -2414,7 +2244,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "enterprise.artifact.register"
       },
@@ -2425,14 +2255,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "enterprise.artifact.register",
-          "help_bytes": 669,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.enterprise.audit",
@@ -2451,7 +2274,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "enterprise.audit"
       },
@@ -2462,14 +2285,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "enterprise.audit",
-          "help_bytes": 378,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.enterprise.config",
@@ -2488,7 +2304,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "enterprise.config"
       },
@@ -2499,14 +2315,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "enterprise.config",
-          "help_bytes": 298,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.enterprise.deletion",
@@ -2525,7 +2334,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "enterprise.deletion"
       },
@@ -2536,14 +2345,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "enterprise.deletion",
-          "help_bytes": 495,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.enterprise.deletion.advance",
@@ -2562,7 +2364,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "enterprise.deletion.advance"
       },
@@ -2573,14 +2375,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "enterprise.deletion.advance",
-          "help_bytes": 313,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.enterprise.deletion.show",
@@ -2599,7 +2394,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "enterprise.deletion.show"
       },
@@ -2610,14 +2405,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "enterprise.deletion.show",
-          "help_bytes": 288,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.enterprise.deletion.start",
@@ -2636,7 +2424,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "enterprise.deletion.start"
       },
@@ -2647,14 +2435,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "enterprise.deletion.start",
-          "help_bytes": 371,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.enterprise.gc",
@@ -2673,7 +2454,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "enterprise.gc"
       },
@@ -2684,14 +2465,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "enterprise.gc",
-          "help_bytes": 379,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.enterprise.settings",
@@ -2710,7 +2484,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "enterprise.settings"
       },
@@ -2721,14 +2495,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "enterprise.settings",
-          "help_bytes": 260,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.enterprise.status",
@@ -2747,7 +2514,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "enterprise.status"
       },
@@ -2758,14 +2525,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "enterprise.status",
-          "help_bytes": 278,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.impact",
@@ -2784,7 +2544,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "impact"
       },
@@ -2795,14 +2555,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "impact",
-          "help_bytes": 576,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.mcp",
@@ -2821,7 +2574,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "mcp"
       },
@@ -2832,14 +2585,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "mcp",
-          "help_bytes": 458,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.run",
@@ -2858,7 +2604,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "run"
       },
@@ -2869,14 +2615,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "run",
-          "help_bytes": 548,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.sandbox",
@@ -2895,7 +2634,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "sandbox"
       },
@@ -2906,14 +2645,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "sandbox",
-          "help_bytes": 807,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.sandbox.choose",
@@ -2932,7 +2664,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "sandbox.choose"
       },
@@ -2943,14 +2675,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "sandbox.choose",
-          "help_bytes": 593,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.sandbox.status",
@@ -2969,7 +2694,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "sandbox.status"
       },
@@ -2980,14 +2705,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "sandbox.status",
-          "help_bytes": 328,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.serve",
@@ -3006,7 +2724,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "serve"
       },
@@ -3017,14 +2735,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "serve",
-          "help_bytes": 266,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.sessions",
@@ -3043,7 +2754,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "sessions"
       },
@@ -3054,14 +2765,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "sessions",
-          "help_bytes": 152,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.supply",
@@ -3080,7 +2784,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "supply"
       },
@@ -3091,14 +2795,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "supply",
-          "help_bytes": 1707,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.updater",
@@ -3117,7 +2814,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "updater"
       },
@@ -3128,14 +2825,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "updater",
-          "help_bytes": 2322,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.updater.abort",
@@ -3154,7 +2844,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "updater.abort"
       },
@@ -3165,14 +2855,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "updater.abort",
-          "help_bytes": 415,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.updater.activate",
@@ -3191,7 +2874,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "updater.activate"
       },
@@ -3202,14 +2885,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "updater.activate",
-          "help_bytes": 555,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.updater.apply",
@@ -3228,7 +2904,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "updater.apply"
       },
@@ -3239,14 +2915,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "updater.apply",
-          "help_bytes": 353,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.updater.check",
@@ -3265,7 +2934,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "updater.check"
       },
@@ -3276,14 +2945,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "updater.check",
-          "help_bytes": 570,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.updater.downgrade",
@@ -3302,7 +2964,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "updater.downgrade"
       },
@@ -3313,14 +2975,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "updater.downgrade",
-          "help_bytes": 875,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.updater.finalize",
@@ -3339,7 +2994,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "updater.finalize"
       },
@@ -3350,14 +3005,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "updater.finalize",
-          "help_bytes": 623,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.updater.recover",
@@ -3376,7 +3024,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "updater.recover"
       },
@@ -3387,14 +3035,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "updater.recover",
-          "help_bytes": 281,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.updater.rollback",
@@ -3413,7 +3054,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "updater.rollback"
       },
@@ -3424,14 +3065,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "updater.rollback",
-          "help_bytes": 318,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.updater.stage",
@@ -3450,7 +3084,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "updater.stage"
       },
@@ -3461,14 +3095,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "updater.stage",
-          "help_bytes": 771,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.updater.status",
@@ -3487,7 +3114,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "updater.status"
       },
@@ -3498,14 +3125,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "updater.status",
-          "help_bytes": 299,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.worker",
@@ -3524,7 +3144,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "worker"
       },
@@ -3535,14 +3155,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "worker",
-          "help_bytes": 656,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "cli.worker.run",
@@ -3561,7 +3174,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "command": "worker.run"
       },
@@ -3572,14 +3185,7 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": {
-        "passed": true,
-        "observed": {
-          "command": "worker.run",
-          "help_bytes": 478,
-          "unknown_flag_exit": 2
-        }
-      }
+      "evidence": null
     },
     {
       "id": "config.faktor.agent.maxConsecutiveFailures",
@@ -12973,6 +12579,398 @@
       "evidence": null
     },
     {
+      "id": "invariant.INV-BILLING-CHARGE-TRUTH",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "provider_charge_amount_mismatch_is_refused_without_crediting",
+        "provider_charge_currency_mismatch_is_refused_without_crediting"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-BILLING-CHARGE-TRUTH",
+        "unit_test": "provider_charge_amount_mismatch_is_refused_without_crediting",
+        "wiring_test": "provider_charge_currency_mismatch_is_refused_without_crediting"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-BILLING-DUNNING-INVOICE-MONOTONIC",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "payment_failure_cannot_regress_a_paid_invoice_or_canceled_subscription"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-BILLING-DUNNING-INVOICE-MONOTONIC",
+        "unit_test": "payment_failure_cannot_regress_a_paid_invoice_or_canceled_subscription",
+        "wiring_test": "payment_failure_cannot_regress_a_paid_invoice_or_canceled_subscription"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-BILLING-DUNNING-SUBSCRIPTION-TERMINAL",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "payment_failure_cannot_regress_a_paid_invoice_or_canceled_subscription"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-BILLING-DUNNING-SUBSCRIPTION-TERMINAL",
+        "unit_test": "payment_failure_cannot_regress_a_paid_invoice_or_canceled_subscription",
+        "wiring_test": "payment_failure_cannot_regress_a_paid_invoice_or_canceled_subscription"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-BILLING-LEASE-CLAIM-LOOKUP",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "held_lease_for_claim_returns_only_the_indexed_match",
+        "held_lease_key_lookup_uses_the_idempotency_index"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-BILLING-LEASE-CLAIM-LOOKUP",
+        "unit_test": "held_lease_for_claim_returns_only_the_indexed_match",
+        "wiring_test": "held_lease_key_lookup_uses_the_idempotency_index"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-BILLING-PAYMENT-FAILURE-FENCE",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "failed_payment_webhook_fails_the_pending_payment_and_releases_the_fence"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-BILLING-PAYMENT-FAILURE-FENCE",
+        "unit_test": "failed_payment_webhook_fails_the_pending_payment_and_releases_the_fence",
+        "wiring_test": "failed_payment_webhook_fails_the_pending_payment_and_releases_the_fence"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-BILLING-REFUND-AMOUNT-TRUTH",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "provider_refund_amount_mismatch_is_refused_and_keeps_the_reservation"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-BILLING-REFUND-AMOUNT-TRUTH",
+        "unit_test": "provider_refund_amount_mismatch_is_refused_and_keeps_the_reservation",
+        "wiring_test": "provider_refund_amount_mismatch_is_refused_and_keeps_the_reservation"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-BILLING-REFUND-COMMITTED",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "pending_refund_commitment_blocks_a_second_refund_after_a_released_fence"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-BILLING-REFUND-COMMITTED",
+        "unit_test": "pending_refund_commitment_blocks_a_second_refund_after_a_released_fence",
+        "wiring_test": "pending_refund_commitment_blocks_a_second_refund_after_a_released_fence"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-BILLING-REFUND-CURRENCY-TRUTH",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "provider_refund_currency_mismatch_is_refused_and_keeps_the_reservation"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-BILLING-REFUND-CURRENCY-TRUTH",
+        "unit_test": "provider_refund_currency_mismatch_is_refused_and_keeps_the_reservation",
+        "wiring_test": "provider_refund_currency_mismatch_is_refused_and_keeps_the_reservation"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-BILLING-REFUND-WEBHOOK-TRUTH",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "refund_webhook_truth_mismatch_is_refused_before_settlement"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-BILLING-REFUND-WEBHOOK-TRUTH",
+        "unit_test": "refund_webhook_truth_mismatch_is_refused_before_settlement",
+        "wiring_test": "refund_webhook_truth_mismatch_is_refused_before_settlement"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-BILLING-TICK-FENCE",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "lifecycle_tick_cannot_write_under_the_subscription_fence"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-BILLING-TICK-FENCE",
+        "unit_test": "lifecycle_tick_cannot_write_under_the_subscription_fence",
+        "wiring_test": "lifecycle_tick_cannot_write_under_the_subscription_fence"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-BILLING-WEBHOOK-PAYMENT-ID",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "webhook_for_a_second_payment_during_in_flight_charge_keeps_both_receipts"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-BILLING-WEBHOOK-PAYMENT-ID",
+        "unit_test": "webhook_for_a_second_payment_during_in_flight_charge_keeps_both_receipts",
+        "wiring_test": "webhook_for_a_second_payment_during_in_flight_charge_keeps_both_receipts"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-BILLING-WEBHOOK-PAYMENT-TRUTH",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "webhook_payment_truth_mismatch_for_a_recorded_payment_is_refused"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-BILLING-WEBHOOK-PAYMENT-TRUTH",
+        "unit_test": "webhook_payment_truth_mismatch_for_a_recorded_payment_is_refused",
+        "wiring_test": "webhook_payment_truth_mismatch_for_a_recorded_payment_is_refused"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-BILLING-WEBHOOK-SUBSCRIPTION-FENCE",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "payment_webhook_cannot_activate_a_subscription_under_its_mutation_fence"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-BILLING-WEBHOOK-SUBSCRIPTION-FENCE",
+        "unit_test": "payment_webhook_cannot_activate_a_subscription_under_its_mutation_fence",
+        "wiring_test": "payment_webhook_cannot_activate_a_subscription_under_its_mutation_fence"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
       "id": "invariant.INV-BROWSER-CAPTURE-CLEANUP",
       "kind": "invariant",
       "path": "tests/invariants.toml",
@@ -13420,6 +13418,68 @@
         "mutation": "node scripts/mutation-run.mjs INV-CHILD-HANDOFF-AUTHORITY",
         "unit_test": "",
         "wiring_test": ""
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-CHILD-HANDOFF-EXACTLY-ONCE",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "fault_probe_crash_before_parent_handoff_reattach_heals_exactly_once",
+        "parent_continuation_receives_structured_child_handoff_not_the_raw_transcript"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-CHILD-HANDOFF-EXACTLY-ONCE",
+        "unit_test": "fault_probe_crash_before_parent_handoff_reattach_heals_exactly_once",
+        "wiring_test": "parent_continuation_receives_structured_child_handoff_not_the_raw_transcript"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-CHILD-HANDOFF-UNAVAILABLE",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "child_handoff_unreadable_ledger_is_unavailable_never_absent",
+        "typed_child_handoff_is_bounded_and_never_inlines_the_child_transcript"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-CHILD-HANDOFF-UNAVAILABLE",
+        "unit_test": "child_handoff_unreadable_ledger_is_unavailable_never_absent",
+        "wiring_test": "typed_child_handoff_is_bounded_and_never_inlines_the_child_transcript"
       },
       "adversarial": [
         "planted-mutation",
@@ -13911,6 +13971,130 @@
       "evidence": null
     },
     {
+      "id": "invariant.INV-COMPACTION-CRITERIA-TRUTH",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "criteria_fact_survives_five_compacting_turns",
+        "task_rows_survive_five_compactions_byte_identical"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-COMPACTION-CRITERIA-TRUTH",
+        "unit_test": "criteria_fact_survives_five_compacting_turns",
+        "wiring_test": "task_rows_survive_five_compactions_byte_identical"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-COMPACTION-MANUAL-DIGEST",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "manual_compaction_evidence_ids_are_durable",
+        "manual_compaction_ignores_a_checkpoint_with_a_mismatched_digest"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-COMPACTION-MANUAL-DIGEST",
+        "unit_test": "manual_compaction_ignores_a_checkpoint_with_a_mismatched_digest",
+        "wiring_test": "manual_compaction_evidence_ids_are_durable"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-COMPACTION-MIN-REDUCTION",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "one_percent_summary_rejected_and_deterministic_fallback",
+        "zero_reduction_never_accepted_even_at_target"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-COMPACTION-MIN-REDUCTION",
+        "unit_test": "one_percent_summary_rejected_and_deterministic_fallback",
+        "wiring_test": "zero_reduction_never_accepted_even_at_target"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-COMPACTION-RESTART-DIGEST",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "checkpoint_reproduces_identical_context_digest_across_restart_and_skips_old_rows",
+        "context_checkpoint_digest_must_describe_the_payload"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-COMPACTION-RESTART-DIGEST",
+        "unit_test": "context_checkpoint_digest_must_describe_the_payload",
+        "wiring_test": "checkpoint_reproduces_identical_context_digest_across_restart_and_skips_old_rows"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
       "id": "invariant.INV-COMPACTION-SUMMARY-CAP",
       "kind": "invariant",
       "path": "tests/invariants.toml",
@@ -13934,6 +14118,37 @@
         "mutation": "node scripts/mutation-run.mjs INV-COMPACTION-SUMMARY-CAP",
         "unit_test": "compaction_summary_one_over_the_cap_is_refused",
         "wiring_test": "try_compact_consumes_durable_projection_not_the_transcript"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-COMPACTION-TOOL-EXCERPT",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "manual_compaction_evidence_ids_are_durable",
+        "manual_compaction_ignores_a_checkpoint_with_a_mismatched_digest"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-COMPACTION-TOOL-EXCERPT",
+        "unit_test": "manual_compaction_evidence_ids_are_durable",
+        "wiring_test": "manual_compaction_ignores_a_checkpoint_with_a_mismatched_digest"
       },
       "adversarial": [
         "planted-mutation",
@@ -14180,6 +14395,96 @@
         "mutation": "node scripts/mutation-run.mjs INV-DURABLE-JSON-NO-EMPTY-DEFAULT",
         "unit_test": "durable_serialization_never_silently_defaults_to_empty",
         "wiring_test": "durable_serialization_never_silently_defaults_to_empty"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-EDITION8-ORG-SCOPED-COMMERCIAL-READS",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "script.INV-EDITION8-ORG-SCOPED-COMMERCIAL-READS"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-EDITION8-ORG-SCOPED-COMMERCIAL-READS",
+        "unit_test": "",
+        "wiring_test": ""
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-EDITION8-READONLY-COMMERCIAL-PROVENANCE",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "script.INV-EDITION8-READONLY-COMMERCIAL-PROVENANCE"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-EDITION8-READONLY-COMMERCIAL-PROVENANCE",
+        "unit_test": "",
+        "wiring_test": ""
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-EDITION8-S55-CONNECT-PRIMARY",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "script.INV-EDITION8-S55-CONNECT-PRIMARY"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-EDITION8-S55-CONNECT-PRIMARY",
+        "unit_test": "",
+        "wiring_test": ""
       },
       "adversarial": [
         "planted-mutation",
@@ -14465,6 +14770,68 @@
       "evidence": null
     },
     {
+      "id": "invariant.INV-HANDOFF-CANCELLED",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "cancelled_child_reports_an_explicit_cancelled_handoff",
+        "parent_continuation_receives_structured_child_handoff_not_the_raw_transcript"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-HANDOFF-CANCELLED",
+        "unit_test": "cancelled_child_reports_an_explicit_cancelled_handoff",
+        "wiring_test": "parent_continuation_receives_structured_child_handoff_not_the_raw_transcript"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-HANDOFF-RUN-QUALIFIED",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "parent_continuation_receives_structured_child_handoff_not_the_raw_transcript",
+        "two_runs_of_one_parent_keep_distinct_child_handoffs"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-HANDOFF-RUN-QUALIFIED",
+        "unit_test": "two_runs_of_one_parent_keep_distinct_child_handoffs",
+        "wiring_test": "parent_continuation_receives_structured_child_handoff_not_the_raw_transcript"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
       "id": "invariant.INV-HOOKS-SESSION-WORKSPACE-CWD",
       "kind": "invariant",
       "path": "tests/invariants.toml",
@@ -14577,6 +14944,37 @@
         "mutation": "node scripts/mutation-run.mjs INV-IDE-SSE-FRAME-BOUNDED",
         "unit_test": "",
         "wiring_test": ""
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-IMPACT-BOUNDED-QUERY",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "bounded_results_always_reserve_a_test_slot",
+        "crate_expansion_is_conservative_but_bounded"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-IMPACT-BOUNDED-QUERY",
+        "unit_test": "bounded_results_always_reserve_a_test_slot",
+        "wiring_test": "crate_expansion_is_conservative_but_bounded"
       },
       "adversarial": [
         "planted-mutation",
@@ -15313,6 +15711,161 @@
         "mutation": "node scripts/mutation-run.mjs INV-NETWORK-AUTHORITY-SINGULAR",
         "unit_test": "",
         "wiring_test": ""
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-PAYMENTS-INVOICE-TRUTH",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "matching_webhook_updates_faktor_invoice_and_observation_atomically",
+        "provider_amount_mismatch_is_a_typed_conflict_and_never_rewrites_totals"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-PAYMENTS-INVOICE-TRUTH",
+        "unit_test": "provider_amount_mismatch_is_a_typed_conflict_and_never_rewrites_totals",
+        "wiring_test": "matching_webhook_updates_faktor_invoice_and_observation_atomically"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-PAYMENTS-LEASE-FENCE",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "crash_after_fence_keeps_the_fence_and_reconciles_without_a_second_effect",
+        "fence_release_is_refused_until_terminal_or_no_effect"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-PAYMENTS-LEASE-FENCE",
+        "unit_test": "fence_release_is_refused_until_terminal_or_no_effect",
+        "wiring_test": "crash_after_fence_keeps_the_fence_and_reconciles_without_a_second_effect"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-PAYMENTS-REFUND-BOUND",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "refund_provider_error_releases_only_after_no_effect_proof",
+        "refunds_are_bounded_by_paid_and_credit_notes_number"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-PAYMENTS-REFUND-BOUND",
+        "unit_test": "refunds_are_bounded_by_paid_and_credit_notes_number",
+        "wiring_test": "refund_provider_error_releases_only_after_no_effect_proof"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-PAYMENTS-TENANT-SCOPE",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "refunds_payments_and_defaults_are_tenant_scoped",
+        "tenant_isolation_and_auth_before_disclosure_shapes_are_real"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-PAYMENTS-TENANT-SCOPE",
+        "unit_test": "tenant_isolation_and_auth_before_disclosure_shapes_are_real",
+        "wiring_test": "refunds_payments_and_defaults_are_tenant_scoped"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-PAYMENTS-WEBHOOK-WINDOW",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "webhook_timestamp_window_is_enforced",
+        "webhooks_are_atomic_ordered_and_monotonic"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-PAYMENTS-WEBHOOK-WINDOW",
+        "unit_test": "webhook_timestamp_window_is_enforced",
+        "wiring_test": "webhooks_are_atomic_ordered_and_monotonic"
       },
       "adversarial": [
         "planted-mutation",
@@ -16581,6 +17134,36 @@
       "evidence": null
     },
     {
+      "id": "invariant.INV-SITE-BILLING-DESTRUCTIVE-CONFIRM",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "script.INV-SITE-BILLING-DESTRUCTIVE-CONFIRM"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-SITE-BILLING-DESTRUCTIVE-CONFIRM",
+        "unit_test": "",
+        "wiring_test": ""
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
       "id": "invariant.INV-SNAPSHOT-IDENTITY-NO-SYNTHETIC",
       "kind": "invariant",
       "path": "tests/invariants.toml",
@@ -17647,7 +18230,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "rev8": false,
         "credential": true,
@@ -17664,18 +18247,7 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": {
-        "passed": true,
-        "cases": [
-          {
-            "name": "deletes locally and reports remoteRevoked=false",
-            "passed": true,
-            "observed": {
-              "status": 200
-            }
-          }
-        ]
-      }
+      "evidence": null
     },
     {
       "id": "native.delete.native.session.id",
@@ -17696,7 +18268,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -17713,25 +18285,7 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": {
-        "passed": true,
-        "cases": [
-          {
-            "name": "deletes with a tombstone",
-            "passed": true,
-            "observed": {
-              "status": 200
-            }
-          },
-          {
-            "name": "replay is idempotent",
-            "passed": true,
-            "observed": {
-              "status": 200
-            }
-          }
-        ]
-      }
+      "evidence": null
     },
     {
       "id": "native.delete.native.session.id.context.pins",
@@ -17857,7 +18411,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -17874,18 +18428,7 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": {
-        "passed": true,
-        "cases": [
-          {
-            "name": "deletes only the matching revision",
-            "passed": true,
-            "observed": {
-              "status": 200
-            }
-          }
-        ]
-      }
+      "evidence": null
     },
     {
       "id": "native.delete.native.session.id.worktrees.worktree-id",
@@ -19796,7 +20339,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -19813,18 +20356,7 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": {
-        "passed": true,
-        "cases": [
-          {
-            "name": "reports hasToken without the token",
-            "passed": true,
-            "observed": {
-              "status": 200
-            }
-          }
-        ]
-      }
+      "evidence": null
     },
     {
       "id": "native.get.native.mcp.servers.id.oauth.callback.flow-id",
@@ -20580,7 +21112,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -20597,26 +21129,7 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": {
-        "passed": true,
-        "cases": [
-          {
-            "name": "returns the ordered chain with served status",
-            "passed": true,
-            "observed": {
-              "write": 200,
-              "read": 200
-            }
-          },
-          {
-            "name": "unknown preset is typed 404",
-            "passed": true,
-            "observed": {
-              "status": 404
-            }
-          }
-        ]
-      }
+      "evidence": null
     },
     {
       "id": "native.get.native.presets.id.roles",
@@ -20637,7 +21150,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -20654,25 +21167,7 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": {
-        "passed": true,
-        "cases": [
-          {
-            "name": "reports served=true for the served binding",
-            "passed": true,
-            "observed": {
-              "status": 200
-            }
-          },
-          {
-            "name": "unknown preset is typed 404",
-            "passed": true,
-            "observed": {
-              "status": 404
-            }
-          }
-        ]
-      }
+      "evidence": null
     },
     {
       "id": "native.get.native.providers",
@@ -20798,7 +21293,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "rev8": false,
         "credential": true,
@@ -20815,19 +21310,7 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": {
-        "passed": true,
-        "cases": [
-          {
-            "name": "lists references only",
-            "passed": true,
-            "observed": {
-              "status": 200,
-              "count": 1
-            }
-          }
-        ]
-      }
+      "evidence": null
     },
     {
       "id": "native.get.native.ready",
@@ -21688,7 +22171,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -21705,25 +22188,7 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": {
-        "passed": true,
-        "cases": [
-          {
-            "name": "lists the created comment with change staleness",
-            "passed": true,
-            "observed": {
-              "status": 200
-            }
-          },
-          {
-            "name": "a foreign session is typed 404",
-            "passed": true,
-            "observed": {
-              "status": 404
-            }
-          }
-        ]
-      }
+      "evidence": null
     },
     {
       "id": "native.get.native.session.id.settings",
@@ -21744,7 +22209,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -21761,18 +22226,7 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": {
-        "passed": true,
-        "cases": [
-          {
-            "name": "reads the durable settings with apply timing",
-            "passed": true,
-            "observed": {
-              "status": 200
-            }
-          }
-        ]
-      }
+      "evidence": null
     },
     {
       "id": "native.get.native.session.id.task-runs",
@@ -22878,7 +23332,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -22895,25 +23349,7 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": {
-        "passed": true,
-        "cases": [
-          {
-            "name": "updates with expectedRevision",
-            "passed": true,
-            "observed": {
-              "status": 200
-            }
-          },
-          {
-            "name": "a stale revision is typed 409",
-            "passed": true,
-            "observed": {
-              "status": 409
-            }
-          }
-        ]
-      }
+      "evidence": null
     },
     {
       "id": "native.post.native.agents.child-id.budget",
@@ -23844,7 +24280,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -23861,27 +24297,7 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": {
-        "passed": true,
-        "cases": [
-          {
-            "name": "observes a dead endpoint as failed, never ready",
-            "passed": true,
-            "observed": {
-              "connection": 200,
-              "status": 200,
-              "state": "failed"
-            }
-          },
-          {
-            "name": "unknown connection is typed 404",
-            "passed": true,
-            "observed": {
-              "status": 404
-            }
-          }
-        ]
-      }
+      "evidence": null
     },
     {
       "id": "native.post.native.config.commit",
@@ -24812,7 +25228,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -24829,26 +25245,7 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": {
-        "passed": true,
-        "cases": [
-          {
-            "name": "connects without round-tripping the token",
-            "passed": true,
-            "observed": {
-              "mcp": 200,
-              "status": 200
-            }
-          },
-          {
-            "name": "double connect is idempotent and still discloses no token",
-            "passed": true,
-            "observed": {
-              "status": 200
-            }
-          }
-        ]
-      }
+      "evidence": null
     },
     {
       "id": "native.post.native.mcp.servers.id.connect",
@@ -25639,7 +26036,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -25656,18 +26053,7 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": {
-        "passed": true,
-        "cases": [
-          {
-            "name": "refuses a duplicate chain before persistence",
-            "passed": true,
-            "observed": {
-              "status": 400
-            }
-          }
-        ]
-      }
+      "evidence": null
     },
     {
       "id": "native.post.native.presets.id.roles",
@@ -25688,7 +26074,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -25705,26 +26091,7 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": {
-        "passed": true,
-        "cases": [
-          {
-            "name": "round-trips a served role map",
-            "passed": true,
-            "observed": {
-              "preset": 200,
-              "status": 200
-            }
-          },
-          {
-            "name": "refuses an unserved binding typed 409",
-            "passed": true,
-            "observed": {
-              "status": 409
-            }
-          }
-        ]
-      }
+      "evidence": null
     },
     {
       "id": "native.post.native.providers.connections",
@@ -25815,7 +26182,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "rev8": false,
         "credential": true,
@@ -25832,26 +26199,7 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": {
-        "passed": true,
-        "cases": [
-          {
-            "name": "stores without echoing the secret",
-            "passed": true,
-            "observed": {
-              "status": 200,
-              "handle": "vault://provider_key/8ea34f52a294e8c97c1af8ae1e551fa5"
-            }
-          },
-          {
-            "name": "malformed body is typed 400",
-            "passed": true,
-            "observed": {
-              "status": 400
-            }
-          }
-        ]
-      }
+      "evidence": null
     },
     {
       "id": "native.post.native.providers.credentials.rotate",
@@ -25872,7 +26220,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "rev8": false,
         "credential": true,
@@ -25889,19 +26237,7 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": {
-        "passed": true,
-        "cases": [
-          {
-            "name": "rotates a generation without disclosing either secret",
-            "passed": true,
-            "observed": {
-              "status": 200,
-              "generation": 2
-            }
-          }
-        ]
-      }
+      "evidence": null
     },
     {
       "id": "native.post.native.runtime.trust",
@@ -26202,7 +26538,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -26219,19 +26555,7 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": {
-        "passed": true,
-        "cases": [
-          {
-            "name": "without a staged shadow accepts nothing (typed 503/404)",
-            "passed": true,
-            "observed": {
-              "status": 404,
-              "code": "not_found"
-            }
-          }
-        ]
-      }
+      "evidence": null
     },
     {
       "id": "native.post.native.session.id.changes.accept-hunks",
@@ -26322,7 +26646,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -26339,19 +26663,7 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": {
-        "passed": true,
-        "cases": [
-          {
-            "name": "a missing checkpoint/authority is typed 503/404, never a fake plan",
-            "passed": true,
-            "observed": {
-              "status": 404,
-              "code": "not_found"
-            }
-          }
-        ]
-      }
+      "evidence": null
     },
     {
       "id": "native.post.native.session.id.context.compact",
@@ -26582,7 +26894,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -26599,26 +26911,7 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": {
-        "passed": true,
-        "cases": [
-          {
-            "name": "exports a bounded bundle with a digest",
-            "passed": true,
-            "observed": {
-              "status": 200
-            }
-          },
-          {
-            "name": "deleted content refuses export with the tombstone",
-            "passed": true,
-            "observed": {
-              "status": 409,
-              "code": "session_deleted"
-            }
-          }
-        ]
-      }
+      "evidence": null
     },
     {
       "id": "native.post.native.session.id.fork",
@@ -26814,7 +27107,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -26831,25 +27124,7 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": {
-        "passed": true,
-        "cases": [
-          {
-            "name": "creates a scoped, revisioned comment",
-            "passed": true,
-            "observed": {
-              "status": 200
-            }
-          },
-          {
-            "name": "path traversal is refused",
-            "passed": true,
-            "observed": {
-              "status": 400
-            }
-          }
-        ]
-      }
+      "evidence": null
     },
     {
       "id": "native.post.native.session.id.task-runs",
@@ -28130,7 +28405,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -28147,37 +28422,7 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": {
-        "passed": true,
-        "cases": [
-          {
-            "name": "applies a validated settings patch",
-            "passed": true,
-            "observed": {
-              "status": 200,
-              "applied": [
-                "compactionModel",
-                "maxTurns",
-                "maxConsecutiveFailures"
-              ]
-            }
-          },
-          {
-            "name": "out-of-range value is typed 400",
-            "passed": true,
-            "observed": {
-              "status": 400
-            }
-          },
-          {
-            "name": "unserved compaction model is typed 409",
-            "passed": true,
-            "observed": {
-              "status": 409
-            }
-          }
-        ]
-      }
+      "evidence": null
     },
     {
       "id": "provider.anthropic",

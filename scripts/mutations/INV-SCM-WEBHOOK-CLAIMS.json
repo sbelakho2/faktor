@@ -8,5 +8,7 @@
   "note": "Answering Fresh after a reopen loses the acknowledged webhook claim.",
   "capabilities": [
     "scm.webhook_claims"
-  ]
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

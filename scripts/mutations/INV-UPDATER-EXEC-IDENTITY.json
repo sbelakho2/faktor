@@ -13,8 +13,11 @@
     }
   ],
   "gate": "cargo test -p faktor-updater --lib a_binary_swapped_between_verification_and_exec_never_executes",
+  "expect": "FAILED",
   "capabilities": [
     "updater.authority"
   ],
-  "note": "Reopens the release by PATH after the digest check on the fd-exec platforms (the verified inode is no longer what executes) AND drops the Darwin /dev/fd fallback's pathname re-hash, so the fallback execs the swapped path unchecked: on every platform the swapped-in stand-in must never execute."
+  "note": "Reopens the release by PATH after the digest check on the fd-exec platforms (the verified inode is no longer what executes) AND drops the Darwin /dev/fd fallback's pathname re-hash, so the fallback execs the swapped path unchecked: on every platform the swapped-in stand-in must never execute.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

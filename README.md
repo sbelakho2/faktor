@@ -202,6 +202,12 @@ signed evidence objects for release gates (`docs/certification.md` §6); the
 `CERTIFY_*` booleans are inert self-test inputs and setting one without a
 verifying signed evidence file fails the run.
 
+The tester/SUT boundary is structural: test oracles own their expected
+values, state and process; the daemon/agent/UI never scores or attests its
+own tests. `node scripts/check-test-separation.mjs --check` enforces the five
+violation classes and requires every new test file to declare its oracle and
+isolation (see [`docs/testing-separation.md`](docs/testing-separation.md)).
+
 ## Branding
 
 All user-visible metadata in this repository uses Faktor branding; the

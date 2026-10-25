@@ -4,5 +4,8 @@
   "find": "                        let _ =\n                            insert_prepared_refs(&tx, session_id, &attachments, &mut not_found)?;\n                        tx.execute(",
   "replace": "                        let _ = (&attachments, &mut not_found);\n                        tx.execute(",
   "gate": "cargo test -p faktor-store --lib seed_task_attachments_txn_create_lands_references_and_the_row_together",
-  "note": "The create path commits the task row WITHOUT its reference set: the promised same-transaction seed is broken."
+  "expect": "FAILED",
+  "note": "The create path commits the task row WITHOUT its reference set: the promised same-transaction seed is broken.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

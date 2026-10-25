@@ -1,0 +1,15 @@
+{
+  "id": "INV-PAYMENTS-WEBHOOK-WINDOW",
+  "surface": "payments.billing",
+  "file": "crates/payments/src/webhook.rs",
+  "find": "    if now_ms < 0 || (now_ms - timestamp_ms).abs() > window_ms {",
+  "replace": "    if false {",
+  "gate": "cargo test -p faktor-payments --test lifecycle webhook_timestamp_window_is_enforced",
+  "expect": "FAILED",
+  "note": "Removing the timestamp-window check accepts a replayed/stale signed webhook; the staleness oracle must fail.",
+  "capabilities": [
+    "payments.webhook_window"
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+}

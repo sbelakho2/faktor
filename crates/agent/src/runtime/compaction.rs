@@ -440,7 +440,22 @@ impl AgentRuntime {
         compaction_output_slot: Arc<std::sync::Mutex<Option<ModelOutput>>>,
         compaction_usage_slot: Arc<std::sync::Mutex<Option<CanonicalUsage>>>,
     ) -> faktor_core::Result<BudgetedSummarizer> {
-        Ok(if let Some(model) = self.deps.compaction_model.as_deref() {
+        // The per-session compaction model (K-02, `/native/session/{id}/
+        // settings`) wins over the daemon config, exactly like the session
+        // context-window setting: the daemon mirrors the accepted
+        // `provider/model` into the session fact space because the agent
+        // runtime cannot read the foundation store. An empty/absent fact is
+        // `inherit` (the daemon config, then router passthrough).
+        let session_model = handle
+            .memory_fact_get("session_settings", "compactionModel")
+            .ok()
+            .flatten()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let configured_model = session_model
+            .as_deref()
+            .or(self.deps.compaction_model.as_deref());
+        Ok(if let Some(model) = configured_model {
             let built = match self.resolve_compaction_model(handle, model) {
                 Ok((provider, model_name)) => Some(StreamingSummarizer {
                     provider,
@@ -612,6 +627,21 @@ impl AgentRuntime {
             // them on the wire.
             None => Compactor::deterministic_only(),
         };
+        // Evidence extracted from huge historical tool output is archived
+        // through the daemon's DURABLE authority at the live session scope:
+        // the `evidence://<id>` rendered on the wire must still resolve after
+        // this compactor is dropped and the daemon restarts. A failed durable
+        // write keeps the raw output inline (never a dangling ref).
+        let workspace_id = handle.row()?.workspace_id.raw();
+        let task_id = handle
+            .task_id() // allowed-task-id-read: read-only evidence archive scope; compaction never writes a task row
+            .ok()
+            .map(|task| task.raw())
+            .filter(|task| *task > 0);
+        let compactor = compactor
+            .with_evidence_scope(handle.id().raw(), workspace_id, task_id)
+            .map_err(|error| Error::internal(format!("compaction evidence scope: {error}")))?
+            .with_durable_evidence(self.evidence_authority.clone());
         // Audit 70/71: compaction consumes a READ-ONLY projection built from
         // the durable rows — goal/criteria/plan/state from the typed Task
         // row, decisions + child progress from the typed session ledger,

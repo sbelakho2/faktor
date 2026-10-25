@@ -5,5 +5,7 @@
   "replace": "        let _ = path;\n        None",
   "gate": "cargo test -p faktor-fs --lib anchored_root_identity_detects_a_swapped_path",
   "expect": "FAILED",
-  "note": "Losing the path identity comparison disables the post-registration root-swap check for the watcher backend."
+  "note": "Losing the path identity comparison disables the post-registration root-swap check for the watcher backend.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

@@ -44,12 +44,23 @@ pub struct ChangeForm {
     pub csrf: String,
     pub plan_id: String,
     pub interval: String,
+    #[serde(default)]
+    pub confirm: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct CancelForm {
     pub csrf: String,
     pub at_period_end: String,
+    #[serde(default)]
+    pub confirm: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RemoveMethodForm {
+    pub csrf: String,
+    #[serde(default)]
+    pub confirm: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -342,6 +353,11 @@ pub async fn change_plan(
     state.verify_csrf(&headers, Some(&auth), &form.csrf)?;
     auth.require_role(auth::Role::Owner)?;
     auth.require_verified()?;
+    if form.confirm != "yes" {
+        return Err(SiteError::Unprocessable(
+            "Confirm the plan change before submitting it.",
+        ));
+    }
     let org = org_id(&auth)?;
     let overview = state.payments.overview(&org)?;
     let subscription = overview.subscription.as_ref().ok_or(SiteError::Conflict(
@@ -369,6 +385,11 @@ pub async fn cancel(
     state.verify_csrf(&headers, Some(&auth), &form.csrf)?;
     auth.require_role(auth::Role::Owner)?;
     auth.require_verified()?;
+    if form.confirm != "yes" {
+        return Err(SiteError::Unprocessable(
+            "Confirm the cancellation boundary before submitting it.",
+        ));
+    }
     let org = org_id(&auth)?;
     let overview = state.payments.overview(&org)?;
     let subscription = overview.subscription.as_ref().ok_or(SiteError::Conflict(
@@ -461,12 +482,17 @@ pub async fn remove_payment_method(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(method_id): Path<String>,
-    Form(form): Form<CsrfForm>,
+    Form(form): Form<RemoveMethodForm>,
 ) -> SiteResult<Response> {
     let auth = state.require_auth(&headers)?;
     state.verify_csrf(&headers, Some(&auth), &form.csrf)?;
     auth.require_role(auth::Role::Owner)?;
     auth.require_verified()?;
+    if form.confirm != "yes" {
+        return Err(SiteError::Unprocessable(
+            "Confirm removing the payment method before submitting it.",
+        ));
+    }
     let org = org_id(&auth)?;
     let _ = state.payments.remove_payment_method(
         &org,

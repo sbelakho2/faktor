@@ -1,0 +1,12 @@
+{
+  "id": "INV-EDITION8-S55-CONNECT-PRIMARY",
+  "file": "apps/vscode/src/edition8/html.ts",
+  "find": "  S55: { command: 'faktor.controlPlaneSignIn', label: 'Connect Account' },",
+  "replace": "  S55: { command: 'faktor.openChat', label: 'Connect Account' },",
+  "gate": "node --no-warnings apps/vscode/scripts/selftest.mjs",
+  "expect": "FAIL",
+  "timeout_ms": 180000,
+  "note": "S55's spec primary no longer reaches the control-plane sign-in command.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+}

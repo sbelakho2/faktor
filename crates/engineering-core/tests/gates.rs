@@ -481,7 +481,6 @@ fn a_receipt_signed_by_a_foreign_key_cannot_establish_execution() {
     assert!(response.require_ready(&verifier).is_err());
     let own = ReceiptSigner::from_seed([7u8; 32]);
     let own_verifier = engineering_core::ReceiptVerifier::trusting_key_id(&own.key_id()).unwrap();
-    assert!(response.is_verified(&own_verifier));
     assert!(response.require_ready(&own_verifier).is_ok());
 }
 

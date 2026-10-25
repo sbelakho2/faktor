@@ -1,0 +1,19 @@
+{
+  "id": "INV-BILLING-REFUND-WEBHOOK-TRUTH",
+  "surface": "payments.billing",
+  "file": "crates/payments/src/service/webhook_effects.rs",
+  "find": "        if provider_refund_id.is_some_and(|id| id != refund_ref.provider_refund_id.as_str()) {\n            return Err(PaymentError::Conflict(\n                \"refund webhook id does not match the recorded provider refund\".into(),\n            ));\n        }\n        let webhook_amount = object.and_then(|object| {\n            object\n                .get(\"amount_minor\")\n                .and_then(serde_json::Value::as_i64)\n                .or_else(|| object.get(\"amount\").and_then(serde_json::Value::as_i64))\n        });\n        if webhook_amount.is_some_and(|amount| amount != refund_ref.amount_minor) {\n            return Err(PaymentError::Conflict(\n                \"refund webhook amount does not match the recorded refund\".into(),\n            ));\n        }\n        let webhook_currency = object\n            .and_then(|object| object.get(\"currency\"))\n            .and_then(serde_json::Value::as_str);\n        if webhook_currency\n            .is_some_and(|currency| !currency.eq_ignore_ascii_case(&refund_ref.currency))\n        {\n            return Err(PaymentError::Conflict(\n                \"refund webhook currency does not match the recorded refund\".into(),\n            ));\n        }\n",
+  "replace": "        // mutated: refund webhook id/amount/currency truth is not checked\n",
+  "gate": "cargo test -p faktor-payments --test invoice_fencing refund_webhook_truth_mismatch_is_refused_before_settlement",
+  "expect": "FAILED",
+  "note": "Settling a refund from a webhook whose id/amount/currency contradicts the recorded refund leaks provider money and misstates the ledger; the webhook-truth oracle must fail.",
+  "capabilities": [
+    "payments.refund_bound"
+  ],
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

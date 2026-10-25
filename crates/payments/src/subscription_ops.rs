@@ -288,11 +288,7 @@ pub(crate) fn release_for_claim(
     organization_id: &str,
     idempotency_key: &str,
 ) -> Result<(), PaymentError> {
-    let Some(lease) = store
-        .leases_needing_reconciliation(organization_id)?
-        .into_iter()
-        .find(|lease| lease.idempotency_key == idempotency_key)
-    else {
+    let Some(lease) = store.held_lease_for_claim(organization_id, idempotency_key)? else {
         return Ok(());
     };
     settle(store, organization_id, &lease, idempotency_key)

@@ -5,5 +5,7 @@
   "replace": "            if seam_tripped {\n                // silently continue\n            }",
   "gate": "cargo test -p faktor-orchestrator --lib post_admission_read_failure",
   "expect": "FAILED",
-  "note": "Silencing the post-admission failure makes an undriven accepted run look successful."
+  "note": "Silencing the post-admission failure makes an undriven accepted run look successful.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

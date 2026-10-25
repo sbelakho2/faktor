@@ -8,5 +8,7 @@
   "note": "Capability truth is the NEGOTIATED subset (explicit config or the conservative default), never a blanket claim: an adapter that over-claims the whole operation vocabulary must fail the negotiation test before any request is framed.",
   "capabilities": [
     "kiwi.optional-provider"
-  ]
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

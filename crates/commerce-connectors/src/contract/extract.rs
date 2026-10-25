@@ -949,10 +949,6 @@ mod tests {
         let drift = SchemaDrift::new(expected, observed, vec!["data/price".to_string()]);
         assert_eq!(drift.to_source_error(), SourceError::ExtractionIncomplete);
         assert!(drift.render().contains("missing=data/price"));
-        assert_eq!(
-            Fingerprint::of_dom("<div class=\"x\"></div>"),
-            Fingerprint::of_dom("<div class=\"x\"></div>")
-        );
     }
 
     #[test]

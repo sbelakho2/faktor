@@ -2,6 +2,104 @@
  "schema": "faktor-invariant-coverage/v3",
  "entries": [
   {
+   "crate": "engineering-cad",
+   "class": "release-critical",
+   "reason": "CAD DTOs cross frozen wire boundaries",
+   "owners": [],
+   "capabilities": [
+    {
+     "id": "engineering-cad.delegated.inv-frozen-contracts",
+     "class": "delegated",
+     "delegate": "INV-FROZEN-CONTRACTS",
+     "reason": "engineering-cad delegates to INV-FROZEN-CONTRACTS: CAD DTOs cross frozen wire boundaries"
+    }
+   ]
+  },
+  {
+   "crate": "engineering-core",
+   "class": "release-critical",
+   "reason": "engineering core DTOs cross frozen wire boundaries",
+   "owners": [],
+   "capabilities": [
+    {
+     "id": "engineering-core.delegated.inv-frozen-contracts",
+     "class": "delegated",
+     "delegate": "INV-FROZEN-CONTRACTS",
+     "reason": "engineering-core delegates to INV-FROZEN-CONTRACTS: engineering core DTOs cross frozen wire boundaries"
+    }
+   ]
+  },
+  {
+   "crate": "engineering-eda",
+   "class": "release-critical",
+   "reason": "EDA DTOs cross frozen wire boundaries",
+   "owners": [],
+   "capabilities": [
+    {
+     "id": "engineering-eda.delegated.inv-frozen-contracts",
+     "class": "delegated",
+     "delegate": "INV-FROZEN-CONTRACTS",
+     "reason": "engineering-eda delegates to INV-FROZEN-CONTRACTS: EDA DTOs cross frozen wire boundaries"
+    }
+   ]
+  },
+  {
+   "crate": "engineering-knowledge",
+   "class": "release-critical",
+   "reason": "knowledge DTOs cross frozen wire boundaries",
+   "owners": [],
+   "capabilities": [
+    {
+     "id": "engineering-knowledge.delegated.inv-frozen-contracts",
+     "class": "delegated",
+     "delegate": "INV-FROZEN-CONTRACTS",
+     "reason": "engineering-knowledge delegates to INV-FROZEN-CONTRACTS: knowledge DTOs cross frozen wire boundaries"
+    }
+   ]
+  },
+  {
+   "crate": "engineering-models",
+   "class": "release-critical",
+   "reason": "model DTOs cross frozen wire boundaries",
+   "owners": [],
+   "capabilities": [
+    {
+     "id": "engineering-models.delegated.inv-frozen-contracts",
+     "class": "delegated",
+     "delegate": "INV-FROZEN-CONTRACTS",
+     "reason": "engineering-models delegates to INV-FROZEN-CONTRACTS: model DTOs cross frozen wire boundaries"
+    }
+   ]
+  },
+  {
+   "crate": "engineering-solvers",
+   "class": "release-critical",
+   "reason": "solver DTOs cross frozen wire boundaries",
+   "owners": [],
+   "capabilities": [
+    {
+     "id": "engineering-solvers.delegated.inv-frozen-contracts",
+     "class": "delegated",
+     "delegate": "INV-FROZEN-CONTRACTS",
+     "reason": "engineering-solvers delegates to INV-FROZEN-CONTRACTS: solver DTOs cross frozen wire boundaries"
+    }
+   ]
+  },
+  {
+   "crate": "engineering-units",
+   "class": "release-critical",
+   "reason": "unit conversion DTOs cross frozen wire boundaries",
+   "owners": [],
+   "capabilities": [
+    {
+     "id": "engineering-units.delegated.inv-frozen-contracts",
+     "class": "delegated",
+     "delegate": "INV-FROZEN-CONTRACTS",
+     "reason": "engineering-units delegates to INV-FROZEN-CONTRACTS: unit conversion DTOs cross frozen wire boundaries"
+    }
+   ]
+  },
+  {
    "crate": "faktor-acp",
    "class": "release-critical",
    "owners": [
@@ -190,6 +288,20 @@
      "class": "delegated",
      "delegate": "INV-DURABLE-CORRUPTION-LOUD",
      "reason": "faktor-cas delegates this capability to INV-DURABLE-CORRUPTION-LOUD: CAS writes/reads are the durable store transaction substrate"
+    }
+   ]
+  },
+  {
+   "crate": "faktor-ci-tools",
+   "class": "release-critical",
+   "reason": "it enforces the compiled capability/proof inventory",
+   "owners": [],
+   "capabilities": [
+    {
+     "id": "ci-tools.delegated.inv-capability-coverage",
+     "class": "delegated",
+     "delegate": "INV-CAPABILITY-COVERAGE",
+     "reason": "faktor-ci-tools delegates to INV-CAPABILITY-COVERAGE: it enforces the compiled capability/proof inventory"
     }
    ]
   },
@@ -433,6 +545,20 @@
      "class": "delegated",
      "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
      "reason": "the persistent permission policy routes are served by the production router and exercised over a socket by INV-NATIVE-ROUTE-BEHAVIOR"
+    }
+   ]
+  },
+  {
+   "crate": "faktor-freshness",
+   "class": "release-critical",
+   "reason": "its freshness decisions are canonical-cache authority",
+   "owners": [],
+   "capabilities": [
+    {
+     "id": "freshness.delegated.inv-verification-cache-freshness",
+     "class": "delegated",
+     "delegate": "INV-VERIFICATION-CACHE-FRESHNESS",
+     "reason": "faktor-freshness delegates to INV-VERIFICATION-CACHE-FRESHNESS: its freshness decisions are canonical-cache authority"
     }
    ]
   },
@@ -730,6 +856,45 @@
    ]
   },
   {
+   "crate": "faktor-payments",
+   "class": "release-critical",
+   "owners": [
+    "INV-PAYMENTS-TENANT-SCOPE",
+    "INV-PAYMENTS-REFUND-BOUND",
+    "INV-PAYMENTS-WEBHOOK-WINDOW",
+    "INV-PAYMENTS-LEASE-FENCE",
+    "INV-PAYMENTS-INVOICE-TRUTH"
+   ],
+   "authority": "mutation-killed payment invariants",
+   "capabilities": [
+    {
+     "id": "payments.tenant_scope",
+     "unit": "tenant_isolation_and_auth_before_disclosure_shapes_are_real",
+     "mutation": "INV-PAYMENTS-TENANT-SCOPE"
+    },
+    {
+     "id": "payments.refund_bound",
+     "unit": "refunds_are_bounded_by_paid_and_credit_notes_number",
+     "mutation": "INV-PAYMENTS-REFUND-BOUND"
+    },
+    {
+     "id": "payments.webhook_window",
+     "unit": "webhook_timestamp_window_is_enforced",
+     "mutation": "INV-PAYMENTS-WEBHOOK-WINDOW"
+    },
+    {
+     "id": "payments.lease_fence",
+     "unit": "fence_release_is_refused_until_terminal_or_no_effect",
+     "mutation": "INV-PAYMENTS-LEASE-FENCE"
+    },
+    {
+     "id": "payments.invoice_truth",
+     "unit": "provider_amount_mismatch_is_a_typed_conflict_and_never_rewrites_totals",
+     "mutation": "INV-PAYMENTS-INVOICE-TRUTH"
+    }
+   ]
+  },
+  {
    "crate": "faktor-protocol",
    "class": "release-critical",
    "owners": [
@@ -963,6 +1128,20 @@
    ]
   },
   {
+   "crate": "faktor-site",
+   "class": "release-critical",
+   "reason": "its published content is frozen-site contract input",
+   "owners": [],
+   "capabilities": [
+    {
+     "id": "site.delegated.inv-frozen-contracts",
+     "class": "delegated",
+     "delegate": "INV-FROZEN-CONTRACTS",
+     "reason": "faktor-site delegates to INV-FROZEN-CONTRACTS: its published content is frozen-site contract input"
+    }
+   ]
+  },
+  {
    "crate": "faktor-snapshot",
    "class": "release-critical",
    "reason": "snapshot checkpoints feed the shell attribution settlement path",
@@ -1010,6 +1189,132 @@
    ]
   },
   {
+   "crate": "faktor-supply-core",
+   "class": "release-critical",
+   "reason": "supply records cross frozen wire boundaries",
+   "owners": [],
+   "capabilities": [
+    {
+     "id": "supply-core.delegated.inv-frozen-contracts",
+     "class": "delegated",
+     "delegate": "INV-FROZEN-CONTRACTS",
+     "reason": "faktor-supply-core delegates to INV-FROZEN-CONTRACTS: supply records cross frozen wire boundaries"
+    }
+   ]
+  },
+  {
+   "crate": "faktor-supply-cost",
+   "class": "release-critical",
+   "reason": "supply cost records cross frozen wire boundaries",
+   "owners": [],
+   "capabilities": [
+    {
+     "id": "supply-cost.delegated.inv-frozen-contracts",
+     "class": "delegated",
+     "delegate": "INV-FROZEN-CONTRACTS",
+     "reason": "faktor-supply-cost delegates to INV-FROZEN-CONTRACTS: supply cost records cross frozen wire boundaries"
+    }
+   ]
+  },
+  {
+   "crate": "faktor-supply-engineering",
+   "class": "release-critical",
+   "reason": "supply engineering records cross frozen wire boundaries",
+   "owners": [],
+   "capabilities": [
+    {
+     "id": "supply-engineering.delegated.inv-frozen-contracts",
+     "class": "delegated",
+     "delegate": "INV-FROZEN-CONTRACTS",
+     "reason": "faktor-supply-engineering delegates to INV-FROZEN-CONTRACTS: supply engineering records cross frozen wire boundaries"
+    }
+   ]
+  },
+  {
+   "crate": "faktor-supply-engineering-traps",
+   "class": "release-critical",
+   "reason": "trap fixtures implement frozen protocol contracts",
+   "owners": [],
+   "capabilities": [
+    {
+     "id": "supply-engineering-traps.delegated.inv-frozen-contracts",
+     "class": "delegated",
+     "delegate": "INV-FROZEN-CONTRACTS",
+     "reason": "faktor-supply-engineering-traps delegates to INV-FROZEN-CONTRACTS: trap fixtures implement frozen protocol contracts"
+    }
+   ]
+  },
+  {
+   "crate": "faktor-supply-execution",
+   "class": "release-critical",
+   "reason": "execution records cross frozen wire boundaries",
+   "owners": [],
+   "capabilities": [
+    {
+     "id": "supply-execution.delegated.inv-frozen-contracts",
+     "class": "delegated",
+     "delegate": "INV-FROZEN-CONTRACTS",
+     "reason": "faktor-supply-execution delegates to INV-FROZEN-CONTRACTS: execution records cross frozen wire boundaries"
+    }
+   ]
+  },
+  {
+   "crate": "faktor-supply-logistics",
+   "class": "release-critical",
+   "reason": "logistics records cross frozen wire boundaries",
+   "owners": [],
+   "capabilities": [
+    {
+     "id": "supply-logistics.delegated.inv-frozen-contracts",
+     "class": "delegated",
+     "delegate": "INV-FROZEN-CONTRACTS",
+     "reason": "faktor-supply-logistics delegates to INV-FROZEN-CONTRACTS: logistics records cross frozen wire boundaries"
+    }
+   ]
+  },
+  {
+   "crate": "faktor-supply-planning",
+   "class": "release-critical",
+   "reason": "planning records cross frozen wire boundaries",
+   "owners": [],
+   "capabilities": [
+    {
+     "id": "supply-planning.delegated.inv-frozen-contracts",
+     "class": "delegated",
+     "delegate": "INV-FROZEN-CONTRACTS",
+     "reason": "faktor-supply-planning delegates to INV-FROZEN-CONTRACTS: planning records cross frozen wire boundaries"
+    }
+   ]
+  },
+  {
+   "crate": "faktor-supply-quality",
+   "class": "release-critical",
+   "reason": "supply quality records cross frozen wire boundaries",
+   "owners": [],
+   "capabilities": [
+    {
+     "id": "supply-quality.delegated.inv-frozen-contracts",
+     "class": "delegated",
+     "delegate": "INV-FROZEN-CONTRACTS",
+     "reason": "faktor-supply-quality delegates to INV-FROZEN-CONTRACTS: supply quality records cross frozen wire boundaries"
+    }
+   ]
+  },
+  {
+   "crate": "faktor-supply-supplier",
+   "class": "release-critical",
+   "reason": "supplier records cross frozen wire boundaries",
+   "owners": [],
+   "capabilities": [
+    {
+     "id": "supply-supplier.delegated.inv-frozen-contracts",
+     "class": "delegated",
+     "delegate": "INV-FROZEN-CONTRACTS",
+     "reason": "faktor-supply-supplier delegates to INV-FROZEN-CONTRACTS: supplier records cross frozen wire boundaries"
+    }
+   ]
+  },
+  {
    "crate": "faktor-terminal",
    "class": "release-critical",
    "owners": [
@@ -1022,6 +1327,20 @@
      "id": "terminal.authority",
      "unit": "deny_all_spawn_isolates_the_child_or_refuses_typed",
      "mutation": "INV-SANDBOX-PRIVILEGE-DROP"
+    }
+   ]
+  },
+  {
+   "crate": "faktor-test-mocks",
+   "class": "release-critical",
+   "reason": "its shared fakes implement frozen protocol contracts",
+   "owners": [],
+   "capabilities": [
+    {
+     "id": "test-mocks.delegated.inv-frozen-contracts",
+     "class": "delegated",
+     "delegate": "INV-FROZEN-CONTRACTS",
+     "reason": "faktor-test-mocks delegates to INV-FROZEN-CONTRACTS: its shared fakes implement frozen protocol contracts"
     }
    ]
   },

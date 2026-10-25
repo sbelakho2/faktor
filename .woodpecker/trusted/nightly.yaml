@@ -343,6 +343,10 @@ steps:
       # conventionally tagged and assigned to a lane wired in this workflow
       # (or documented as manual) — see scripts/check-ignored-tests.mjs.
       - node scripts/check-ignored-tests.mjs
+      # Tester/SUT separation is re-checked on the nightly checkout as well.
+      - node scripts/check-test-separation.mjs --selftest
+      - node scripts/check-test-separation.mjs --check
+      - node scripts/mutation-run.mjs --check-specs
       # Test-programme nightly gates: structural registry + full selection,
       # settlement ban, and the strict tree/history core-dump scan.
       - node scripts/programme/check-registry.mjs --check --no-probe

@@ -8,5 +8,7 @@
   "note": "Negating the timed-out flag skips the typed provider timeout.",
   "capabilities": [
     "semantic.watchdog"
-  ]
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

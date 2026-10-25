@@ -8,5 +8,7 @@
   "note": "Disabling ring trimming retains the 2 MiB stderr flood whole.",
   "capabilities": [
     "lsp.reader_bounds"
-  ]
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=mutation isolation=isolated-worktree,read-only-artifacts
 // Hermetic mutation-gate support artifacts (audit P2-9 + P1-11).
 //
 // The isolated mutation scratch copy needs two SUPPORT trees that must never

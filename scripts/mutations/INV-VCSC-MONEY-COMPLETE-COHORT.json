@@ -5,5 +5,7 @@
   "replace": "            if entry.settlement.money_state != MoneyState::Unavailable {\n                let model = entry.settlement.model_spend_micro.unwrap_or(0);\n",
   "gate": "cargo test -p faktor-tests-economy --test new_guard_fold_properties",
   "expect": "leaked into the eligible cohort",
-  "note": "Folding pending rows into the monetary cohort lets an incomplete settlement contaminate total spend and VCSC; the new exclusion property must catch it."
+  "note": "Folding pending rows into the monetary cohort lets an incomplete settlement contaminate total spend and VCSC; the new exclusion property must catch it.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

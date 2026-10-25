@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! Rev8 long-task acceptance probes: S08/S10/S11/S12/S62/S66/S69.
 //!
 //! These drive the REAL native routes (auth, DTOs, typed errors). They are
@@ -1098,4 +1099,165 @@ async fn acceptance_s11_s69_instructions_list_preview_and_edit() {
         .await;
     assert_eq!(status, 409, "{outside}");
     let _ = rig.handle.request_shutdown();
+}
+
+/// The manual compaction route shares the agent's restart invariant: a
+/// checkpoint whose recorded digest does not describe its payload is corrupt
+/// (or swapped) and must never be re-certified into a new checkpoint.
+#[tokio::test]
+async fn manual_compaction_ignores_a_checkpoint_with_a_mismatched_digest() {
+    let rig = Rig::new().await;
+    let handle = rig
+        .deps
+        .session
+        .get_session(faktor_core::id::SessionId::new(rig.session))
+        .unwrap()
+        .unwrap();
+    let payload_turns = vec![faktor_context::RecentTurn {
+        role: "user".into(),
+        text: "PAYLOAD CONTENT".into(),
+    }];
+    let digest = faktor_context::history_digest(&[faktor_context::RecentTurn {
+        role: "user".into(),
+        text: "SOMETHING ELSE".into(),
+    }]);
+    handle
+        .put_context_checkpoint(1, &digest, &serde_json::to_vec(&payload_turns).unwrap())
+        .unwrap();
+    assert!(
+        super::decode_checkpoint_turns(&handle).is_empty(),
+        "a mismatched digest must fall back to the durable transcript, never load"
+    );
+}
+
+/// CASE INV-COMPACTION-TOOL-EXCERPT: manual compaction renders
+/// `evidence://<id>` for huge historical tool output and PERSISTS the
+/// replacement context. Reading the durable `excerpt` field (not a legacy
+/// `output`/`text` guess) is what makes the tool storm visible at all; the id
+/// must resolve through the daemon's durable evidence authority after the
+/// request (and a restart).
+#[tokio::test]
+async fn manual_compaction_evidence_ids_are_durable() {
+    let rig = Rig::new().await;
+    let handle = rig.handle();
+    let marker = "tool-output-marker-42";
+    for turn in 0..13 {
+        let seq = handle
+            .force_append_event(
+                faktor_core::event::EventKind::ModelChunkReceived,
+                faktor_core::state::AgentState::ReadyForNextTurn,
+                None,
+                None,
+            )
+            .unwrap();
+        let text = if turn == 11 {
+            format!(
+                "{marker}\nerror: build failed at src/lib.rs:41\n{}",
+                "warning: unused variable x\n".repeat(8_000)
+            )
+        } else {
+            format!("TURN-{turn:03} {}", "h".repeat(2_000))
+        };
+        let role = if turn == 11 || turn % 2 == 1 {
+            "assistant"
+        } else {
+            "user"
+        };
+        let role = if turn == 12 { "user" } else { role };
+        let message = handle
+            .put_message(seq.raw() as i64, role, json!({"parts": []}))
+            .unwrap();
+        if turn == 11 {
+            handle
+                .put_tool_result_part(
+                    message,
+                    "call-1",
+                    &faktor_protocol::native::ToolResultBody {
+                        excerpt: text,
+                        exit_code: Some(1),
+                        artifact: None,
+                        slice_hint: None,
+                    },
+                )
+                .unwrap();
+        } else {
+            handle.put_text_part(message, &text).unwrap();
+        }
+    }
+    rig.capture_usage(4_000, 4_000).await;
+    let path = format!("/native/session/{}/context/compaction", rig.session);
+    let (status, started) = rig
+        .send(
+            reqwest::Method::POST,
+            &path,
+            Some(json!({
+                "operationId": "op-durable-evidence",
+                "targetTokens": 20_000,
+                "minReductionRatio": 0.25
+            })),
+        )
+        .await;
+    assert_eq!(status, 200, "{started}");
+    assert_eq!(started["state"], "applied", "{started}");
+    let checkpoint = handle
+        .context_checkpoint()
+        .unwrap()
+        .expect("the manual compaction persisted a replacement");
+    let turns: Vec<faktor_context::RecentTurn> =
+        serde_json::from_slice(&checkpoint.payload).unwrap();
+    let ref_text = turns
+        .iter()
+        .find(|turn| turn.text.contains("evidence://"))
+        .expect("the huge tool output rides as an evidence ref");
+    let raw_id = ref_text
+        .text
+        .split("evidence://")
+        .nth(1)
+        .unwrap()
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .unwrap();
+    let evidence_id = faktor_evidence::types::EvidenceId(raw_id.parse().unwrap());
+    let workspace = handle.row().unwrap().workspace_id;
+    let task_id = handle
+        .task_id()
+        .ok()
+        .map(|task| task.raw())
+        .filter(|task| *task > 0);
+    let ctx =
+        faktor_evidence::store::EvidenceAccessContext::new(rig.session, workspace.raw(), task_id);
+    let stored = rig
+        .deps
+        .agent
+        .evidence_authority()
+        .get_scoped(evidence_id, &ctx)
+        .expect("the checkpoint's evidence id resolves durably");
+    let backing = stored.backing.expect("backing retained");
+    assert!(String::from_utf8_lossy(&backing).contains(marker));
+}
+
+/// CASE MC-MANUAL-COMPACTION-RESTART-DIGEST / MC-COMPACTION-TOOL-EXCERPT
+/// (mutation witnesses): the manual route must verify the checkpoint digest
+/// before loading it and must read the durable tool-result `excerpt` field.
+fn manual_compaction_guards_present(source: &str) -> bool {
+    source.contains("if checkpoint.digest != actual {") && source.contains(".get(\"excerpt\")")
+}
+
+#[test]
+fn manual_compaction_restart_and_tool_excerpt_guards_are_pinned() {
+    const SOURCE: &str = include_str!("longtask.rs");
+    assert!(
+        manual_compaction_guards_present(SOURCE),
+        "manual compaction lost its restart-digest or tool-excerpt guard"
+    );
+    let no_digest = SOURCE.replace("if checkpoint.digest != actual {", "if false {");
+    assert!(
+        !manual_compaction_guards_present(&no_digest),
+        "the witness must detect a dropped manual digest comparison"
+    );
+    let no_excerpt = SOURCE.replace(".get(\"excerpt\")", ".get(\"output\")");
+    assert!(
+        !manual_compaction_guards_present(&no_excerpt),
+        "the witness must detect a regression to the erased tool-result key"
+    );
 }

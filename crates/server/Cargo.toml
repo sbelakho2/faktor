@@ -6,8 +6,9 @@ license.workspace = true
 rust-version.workspace = true
 
 [features]
-# Manual loopback streaming-delivery harness (ignored by default). Enabling
-# it installs a counting global allocator for the lib-test binary only.
+# Manual loopback streaming-delivery harness. The harness lives in
+# tests/streaming_harness.rs and compiles only when this feature is enabled,
+# so no harness code is part of the server library.
 streaming-harness = []
 
 [dependencies]

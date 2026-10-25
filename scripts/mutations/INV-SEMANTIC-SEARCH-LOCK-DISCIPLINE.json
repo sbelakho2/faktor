@@ -8,5 +8,7 @@
   "note": "The path-probe guard is held across the query embed: a blocked provider now owns the index mutex, so lexical/symbol search and index updates stall behind it (the audit P1 lock-discipline bug).",
   "capabilities": [
     "search.authority"
-  ]
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

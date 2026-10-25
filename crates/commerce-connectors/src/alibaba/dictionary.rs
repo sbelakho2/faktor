@@ -130,7 +130,6 @@ mod tests {
             expand_query("usb cable"),
             "usb cable usb charger cable type-c cable"
         );
-        assert_eq!(expand_query("usb cable"), expand_query("usb cable"));
         assert!(is_inquiry_text("Contact Supplier"));
         assert!(is_inquiry_text("Get Latest Price"));
         assert!(!is_inquiry_text("US $36.00"));

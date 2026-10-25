@@ -160,22 +160,26 @@ impl PaymentService {
             observed_ms: now,
             source: ProviderObservationSource::Webhook,
         });
-        let subscription = invoice
-            .subscription_id
-            .as_deref()
-            .and_then(|id| subscription_by_id_tx(tx, org, id).ok().flatten())
-            .filter(|subscription| {
-                subscription
-                    .state
-                    .can_transition_to(SubscriptionState::Active)
-            })
-            .map(|mut subscription| {
-                subscription.state = SubscriptionState::Active;
-                subscription.dunning_attempts = 0;
-                subscription.grace_end_ms = None;
-                subscription.updated_ms = now;
-                subscription
-            });
+        let subscription = match invoice.subscription_id.as_deref() {
+            Some(id) if !Self::subscription_mutation_fence_active(tx, org, id)? => {
+                subscription_by_id_tx(tx, org, id)
+                    .ok()
+                    .flatten()
+                    .filter(|subscription| {
+                        subscription
+                            .state
+                            .can_transition_to(SubscriptionState::Active)
+                    })
+                    .map(|mut subscription| {
+                        subscription.state = SubscriptionState::Active;
+                        subscription.dunning_attempts = 0;
+                        subscription.grace_end_ms = None;
+                        subscription.updated_ms = now;
+                        subscription
+                    })
+            }
+            _ => None,
+        };
         Ok(WebhookEffects {
             subscription,
             invoice: Some(invoice),

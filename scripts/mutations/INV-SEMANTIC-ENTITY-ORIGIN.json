@@ -5,5 +5,7 @@
   "replace": "            origin: SemanticEntityOrigin::Provider,",
   "gate": "cargo test -p faktor-semantic --lib heuristic_origin_marked_and_provider_responses_refuse_it",
   "expect": "FAILED",
-  "note": "Marking path-derived ids as provider-origin lets Faktor-invented identities masquerade as Tangerine compiler identities."
+  "note": "Marking path-derived ids as provider-origin lets Faktor-invented identities masquerade as Tangerine compiler identities.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

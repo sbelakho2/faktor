@@ -186,9 +186,9 @@ const ALLOWLIST = [
   {
     file: 'crates/agent/src/runtime/compaction.rs',
     line_contains: '.ok()',
-    count: 1,
+    count: 2,
     reason:
-      'workspace-root resolve inside the consult: the failure flows into the explicit revision-unavailable branch that degrades to Unknown with a warn — never a fabricated snapshot identity.',
+      'workspace-root resolve inside the consult, plus the optional per-session compaction-model fact and the task-scope hint for the evidence archive: a failed resolve degrades to the explicit revision-unavailable branch (Unknown with a warn), an absent model fact means inherit, and a missing task id scopes the archive to the session/workspace — none fabricates a snapshot identity, model or task.',
     owner: 'agent semantic consult authority',
   },
   {
@@ -1025,14 +1025,6 @@ const ALLOWLIST = [
   },
   {
     file: 'crates/server/src/native/longtask.rs',
-    line_contains: 'Ok(Some(checkpoint)) => serde_json::from_slice(&checkpoint.payload).unwrap_or_else(|e| {',
-    count: 1,
-    reason:
-      'malformed checkpoint payload logs a typed error and falls back to the durable transcript (documented manual-compaction fallback), never fabricated turns.',
-    owner: 'server compaction surface',
-  },
-  {
-    file: 'crates/server/src/native/longtask.rs',
     line_contains: 'let mut newest_seq = base_seq.unwrap_or(0);',
     count: 1,
     reason:
@@ -1050,9 +1042,9 @@ const ALLOWLIST = [
   {
     file: 'crates/server/src/native/longtask.rs',
     line_contains: '.ok()',
-    count: 2,
+    count: 3,
     reason:
-      'Two optional compaction projections: the manual-compaction baseline ledger and the latest context manifest both render absent when unreadable, and the durable transcript/manifest reads remain the authority.',
+      'Three optional compaction projections/settings: the manual-compaction baseline ledger, the latest context manifest, and the session compaction model / configured reduction floor. An unreadable optional value falls back to the documented request/durable default, and the durable transcript/manifest reads remain the authority.',
     owner: 'server compaction surface',
   },
   {

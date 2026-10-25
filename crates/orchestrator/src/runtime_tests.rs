@@ -4057,6 +4057,14 @@ async fn bound_child_refuses_live_fallback_when_binding_or_rows_are_gone_or_tamp
         "the live V2 file is never served instead: {err:?}"
     );
 }
+fn oracle_estimate_tokens(text: &str) -> usize {
+    let chars = text.chars().count();
+    if chars == 0 {
+        return 0;
+    }
+    (chars / 3 + 1).max(chars.saturating_mul(10).div_ceil(34))
+}
+
 /// Typed child handoff (audit): the parent-facing handoff of a finished
 /// child is built from durable rows only — facts/findings/decisions/changed
 /// files plus scoped refs — bounded to the configured budget. A child whose
@@ -4122,10 +4130,14 @@ async fn typed_child_handoff_is_bounded_and_never_inlines_the_child_transcript()
         .orchestrator
         .child_handoff("child-7", child_id, 512)
         .unwrap();
+    let rendered = handoff
+        .render_bounded(512)
+        .expect("the handoff fits its budget");
+    // Independent reference estimator, not the SUT's approx_tokens metric.
+    let tokens = oracle_estimate_tokens(&rendered);
     assert!(
-        handoff.approx_tokens() <= 512,
-        "the handoff must fit the configured budget: {} tokens",
-        handoff.approx_tokens()
+        tokens <= 512,
+        "the handoff must fit the configured budget: {tokens} tokens"
     );
     // The structured acquisition envelope is reachable by the parent: every
     // component was read, so every one is Available (never silently absent).
@@ -4137,9 +4149,6 @@ async fn typed_child_handoff_is_bounded_and_never_inlines_the_child_transcript()
     assert_eq!(handoff.findings.as_available().map(Vec::len), Some(1));
     assert_eq!(handoff.changed_files.as_available().map(Vec::len), Some(1));
     assert_eq!(handoff.decisions.as_available().map(Vec::len), Some(1));
-    let rendered = handoff
-        .render_bounded(512)
-        .expect("the handoff fits its budget");
     for needle in [
         "audit the parser",
         "bounded handoff",
@@ -4235,7 +4244,7 @@ async fn parent_continuation_receives_structured_child_handoff_not_the_raw_trans
     // internal-context section as a durable pending fact on the PARENT
     // session — the parent continuation's next logical turn consumes it.
     let parent = env.manager.get_session(env.parent).unwrap().unwrap();
-    let key = format!("child-handoff/{}", child.child_id);
+    let key = format!("child-handoff/run-handoff/{}", child.child_id);
     let pending = parent
         .memory_facts()
         .unwrap()

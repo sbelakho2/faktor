@@ -758,12 +758,95 @@ fn oversized_context_checkpoint_payload_is_a_typed_refusal() {
         text: "hello".into(),
     }])
     .unwrap();
+    let turns: Vec<RecentTurn> = serde_json::from_slice(&valid).unwrap();
     let checkpoint = faktor_session::ContextCheckpoint {
         through_seq: 1,
-        digest: String::new(),
+        digest: faktor_context::history_digest(&turns),
         payload: valid,
     };
     assert_eq!(decode_checkpoint_turns(&checkpoint).unwrap().len(), 1);
+}
+
+/// CASE INV-COMPACTION-RESTART-DIGEST: a checkpoint whose payload still matches its
+/// chunk hash but whose recorded digest names a DIFFERENT context (a swapped
+/// or tampered head, a copied digest row) must refuse at the restart
+/// boundary. Accepting it would silently replace the conversation with
+/// content no compaction ever certified.
+#[test]
+fn context_checkpoint_digest_must_describe_the_payload() {
+    let turns = vec![RecentTurn {
+        role: "user".into(),
+        text: "the exact compacted context".into(),
+    }];
+    let payload = serde_json::to_vec(&turns).unwrap();
+    let other = faktor_context::history_digest(&[RecentTurn {
+        role: "user".into(),
+        text: "a different context".into(),
+    }]);
+    let mismatched = faktor_session::ContextCheckpoint {
+        through_seq: 9,
+        digest: other,
+        payload: payload.clone(),
+    };
+    let error = decode_checkpoint_turns(&mismatched).unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Malformed);
+    assert!(
+        error.message.contains("digest mismatch"),
+        "the refusal names the mismatch: {error}"
+    );
+
+    let empty_digest = faktor_session::ContextCheckpoint {
+        through_seq: 9,
+        digest: String::new(),
+        payload: payload.clone(),
+    };
+    assert_eq!(
+        decode_checkpoint_turns(&empty_digest).unwrap_err().kind,
+        ErrorKind::Malformed,
+        "an absent digest is never accepted as verified"
+    );
+
+    let truncated = faktor_session::ContextCheckpoint {
+        through_seq: 9,
+        digest: "ab".repeat(31),
+        payload,
+    };
+    assert_eq!(
+        decode_checkpoint_turns(&truncated).unwrap_err().kind,
+        ErrorKind::Malformed,
+        "a non-canonical digest length is refused"
+    );
+}
+
+/// CASE MC-COMPACTION-RESTART-DIGEST (mutation witness): the decode path must
+/// compare the canonical history digest with the durable head. The witness
+/// detects a source that drops or neuters the comparison.
+fn checkpoint_digest_guard_present(source: &str) -> bool {
+    source.contains("let actual = faktor_context::history_digest(&turns);")
+        && source.contains("if actual != checkpoint.digest {")
+        && source.contains("context checkpoint digest mismatch")
+}
+
+#[test]
+fn checkpoint_digest_guard_is_pinned_against_mutation() {
+    const SOURCE: &str = include_str!("request.rs");
+    assert!(
+        checkpoint_digest_guard_present(SOURCE),
+        "the restart digest guard changed: a checkpoint must be verified, never trusted"
+    );
+    let dropped = SOURCE.replace("if actual != checkpoint.digest {", "if false {");
+    assert!(
+        !checkpoint_digest_guard_present(&dropped),
+        "the witness must detect a dropped digest comparison"
+    );
+    let accepted = SOURCE.replace(
+        "let actual = faktor_context::history_digest(&turns);",
+        "let actual: String = checkpoint.digest.clone();",
+    );
+    assert!(
+        !checkpoint_digest_guard_present(&accepted),
+        "the witness must detect a comparison that trusts the head digest"
+    );
 }
 
 #[test]

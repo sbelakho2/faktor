@@ -8,5 +8,7 @@
   "note": "Downgrading the stalled-attempt timeout to an Api error breaks the typed Transport contract.",
   "capabilities": [
     "scm.token_bounds"
-  ]
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

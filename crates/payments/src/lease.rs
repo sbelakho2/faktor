@@ -574,6 +574,30 @@ impl SqlitePaymentStore {
         read_lease_by_id_conn(&conn, organization_id, lease_id)
     }
 
+    /// The one held lease bound to an operation claim key. This is an
+    /// indexed single-row lookup used on the reconciliation hot path; it must
+    /// never scan every held lease per claim.
+    pub fn held_lease_for_claim(
+        &self,
+        organization_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<FinancialMutationLease>, PaymentError> {
+        let conn = self.lock()?;
+        let raw = conn
+            .query_row(
+                &format!(
+                    "SELECT {LEASE_COLUMNS} FROM financial_mutation_lease \
+                     WHERE organization_id = ?1 AND idempotency_key = ?2 AND state = 'held' \
+                     ORDER BY acquired_ms, id LIMIT 1"
+                ),
+                params![organization_id, idempotency_key],
+                decode_raw_lease,
+            )
+            .optional()
+            .map_err(store_err)?;
+        raw.map(RawLease::into_lease).transpose()
+    }
+
     /// Every held lease for an organization. Held means the terminal outcome
     /// is not proved yet, so each row is a reconciliation obligation.
     pub fn leases_needing_reconciliation(
@@ -739,6 +763,27 @@ fn read_lease_by_id_conn(
         .optional()
         .map_err(store_err)?;
     raw.map(RawLease::into_lease).transpose()
+}
+
+/// Read the active fence for one domain inside an already-open transaction.
+/// State-only writers (lifecycle ticks, dunning) use this to prove the
+/// resource is not owned by an in-flight provider mutation.
+pub(crate) fn active_lease_conn(
+    conn: &Connection,
+    organization_id: &str,
+    domain: &ConflictDomain,
+) -> Result<Option<FinancialMutationLease>, PaymentError> {
+    if domain.logical_resource_id().is_empty() {
+        return Err(PaymentError::Malformed(
+            "a conflict domain carries an empty resource id".into(),
+        ));
+    }
+    read_active_lease_conn(
+        conn,
+        organization_id,
+        domain.as_str(),
+        &domain.logical_resource_id(),
+    )
 }
 
 fn read_active_lease_conn(

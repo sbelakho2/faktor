@@ -8,5 +8,7 @@
   "note": "A one-byte-too-large declared length breaks the byte-exact round trip.",
   "capabilities": [
     "semantic.process_client"
-  ]
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

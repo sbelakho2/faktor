@@ -38,7 +38,8 @@ use crate::ledger::TaskContextProjection;
 use faktor_evidence::compress::compress;
 use faktor_evidence::normalize::ProcessLogSummary;
 use faktor_evidence::store::{
-    EvidenceAccessContext, EvidenceStore, MemoryEvidenceStore, StoredEvidence,
+    DurableEvidenceAuthority, EvidenceAccessContext, EvidenceStore, MemoryEvidenceStore,
+    StoredEvidence,
 };
 use faktor_evidence::types::{
     BackingCompleteness, CompactRepresentation, CompressionRecord, EvidenceEnvelope, EvidenceError,
@@ -433,6 +434,12 @@ pub struct EvidenceArchive {
     session_id: faktor_core::SessionId,
     workspace_id: faktor_core::WorkspaceId,
     task_id: Option<u64>,
+    /// When set, archived evidence is written to the DAEMON'S durable
+    /// authority (CAS-backed, restart-stable) instead of this instance's
+    /// in-memory store. Production compaction MUST set it: an ephemeral id
+    /// rendered on the wire (`evidence://<id>`) would be dangling the moment
+    /// the compactor is dropped.
+    durable: Option<Arc<DurableEvidenceAuthority>>,
 }
 
 impl Default for EvidenceArchive {
@@ -443,6 +450,7 @@ impl Default for EvidenceArchive {
             session_id: faktor_core::SessionId::new(1),
             workspace_id: faktor_core::WorkspaceId::new(1),
             task_id: None,
+            durable: None,
         }
     }
 }
@@ -488,7 +496,18 @@ impl EvidenceArchive {
             session_id,
             workspace_id,
             task_id,
+            durable: None,
         })
+    }
+
+    /// Route every archive write through the daemon's durable evidence
+    /// authority (the SAME store the native evidence routes and producer
+    /// evidence use). A configured authority whose write fails makes
+    /// [`Self::archive`] fail, so the caller keeps the raw output inline —
+    /// a dangling `evidence://<id>` is never rendered.
+    pub fn with_durable_authority(mut self, authority: Arc<DurableEvidenceAuthority>) -> Self {
+        self.durable = Some(authority);
+        self
     }
 
     pub fn len(&self) -> usize {
@@ -517,6 +536,33 @@ impl EvidenceArchive {
             .as_ref()
             .map(|n| n.important_lines.len())
             .unwrap_or(0);
+        if let Some(authority) = &self.durable {
+            // Durable path: the envelope id is allocated by the store of
+            // record and its backing lives in the CAS, so the rendered ref
+            // remains retrievable after this compactor (and the daemon)
+            // restarts. No fallback to the ephemeral store: a failed durable
+            // write keeps the raw bytes inline.
+            let envelope = authority.archive_text(
+                self.session_id,
+                self.workspace_id,
+                self.task_id,
+                kind,
+                None,
+                ProvenanceSource::Tool,
+                raw,
+                EVIDENCE_COMPACT_BODY_MAX_BYTES,
+            )?;
+            return Ok(EvidenceRef {
+                id: envelope.id,
+                kind: envelope.kind,
+                original_bytes: envelope.compression.original_bytes as usize,
+                compact_bytes: envelope.compression.compact_bytes as usize,
+                backing_hash: hash,
+                compact_body: envelope.compact.body.clone(),
+                normalized_exit,
+                normalized_important_lines,
+            });
+        }
 
         let mut id_raw = u64::from_be_bytes(hash[..8].try_into().expect("8 bytes"));
         loop {
@@ -587,6 +633,9 @@ impl EvidenceArchive {
     /// Scope-checked retrieval of one archived envelope (backing included
     /// when the store retained it).
     pub fn retrieve(&self, id: EvidenceId) -> Result<StoredEvidence, EvidenceError> {
+        if let Some(authority) = &self.durable {
+            return authority.get_scoped(id, &self.access());
+        }
         self.store.get_scoped(id, &self.access())
     }
 }
@@ -794,6 +843,15 @@ impl Compactor {
     /// The per-instance evidence archive (bounded backing, scope checks).
     pub fn evidence(&self) -> MutexGuard<'_, EvidenceArchive> {
         self.lock_evidence()
+    }
+
+    /// Archive extraction output through the daemon's DURABLE evidence
+    /// authority (CAS-backed; ids survive this compactor and a restart).
+    /// Production compaction always sets it; a harness that does not keeps
+    /// the in-memory archive and never claims durable retrievability.
+    pub fn with_durable_evidence(self, authority: Arc<DurableEvidenceAuthority>) -> Self {
+        self.lock_evidence().durable = Some(authority);
+        self
     }
 
     /// (a)+(b)+(c) Deterministic preparation, run BEFORE any summarization:

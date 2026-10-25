@@ -701,6 +701,7 @@ pub struct PaymentsOverview {
     pub open_invoice_count: u64,
     pub outstanding_minor: i64,
     pub paid_minor: i64,
+    pub refunded_minor: i64,
     /// Counts of the Faktor invoices' provider-reconciliation states. Never
     /// derived from provider totals.
     pub reconciliation: ReconciliationSummary,

@@ -4,5 +4,8 @@
   "find": "        tiers.reverse();",
   "replace": "        // planted mutation: the descending tier order is dropped",
   "gate": "cargo test -p faktor-agent --lib maximum_quality_prefers_higher_measured_quality_over_equal_descriptor_priors",
-  "note": "Drops highest-floor-first probing: MaximumQuality then takes the lowest servable tier, so the higher MEASURED quality loses."
+  "expect": "FAILED",
+  "note": "Drops highest-floor-first probing: MaximumQuality then takes the lowest servable tier, so the higher MEASURED quality loses.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

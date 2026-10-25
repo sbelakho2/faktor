@@ -8,5 +8,7 @@
   "note": "Human-required/unavailable connector states must stay unusable no matter how much time passes.",
   "capabilities": [
     "acquire.health"
-  ]
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

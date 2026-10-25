@@ -8,5 +8,7 @@
   "note": "Negating the claim check classifies a claimed frame as a clean timeout.",
   "capabilities": [
     "mcp.spawn_lifecycle"
-  ]
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

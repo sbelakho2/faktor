@@ -8,5 +8,7 @@
   "note": "Flipping the declared-size guard turns in-bound frames fatal and the oversize row incomplete.",
   "capabilities": [
     "acp.content_length_corpus"
-  ]
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

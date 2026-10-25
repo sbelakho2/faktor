@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir,separate-process
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -465,7 +466,10 @@ async fn webhook_forgery_replay_and_out_of_order_are_typed() {
         .unwrap()
         .invoice;
     let provider_invoice = invoice.provider_invoice_id.clone().unwrap();
-    let expected_total = invoice.total_minor;
+    // Fixture-owned expectation: 100.00 plan + 1 x 25.00 seat + 3 x 5.00
+    // usage - 2.00 credits + 8.25% exclusive tax. Never read it back from the
+    // SUT invoice.
+    let expected_total = 14_939;
 
     let now_secs = START / 1000;
     let body = serde_json::to_vec(&serde_json::json!({

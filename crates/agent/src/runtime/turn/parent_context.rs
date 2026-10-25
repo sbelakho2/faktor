@@ -9,7 +9,7 @@
 //! bounded typed [`ChildHandoff`] through the ONE section renderer and
 //! records the section as a pending memory fact on the PARENT session
 //! (kind [`PENDING_INTERNAL_CONTEXT_KIND`], key
-//! `child-handoff/<child id>`).
+//! `child-handoff/<run id>/<child id>`).
 //!
 //! The parent's NEXT logical turn — whenever the daemon drives it — consumes
 //! every pending section exactly once at drive start and folds it into the
@@ -37,11 +37,13 @@
 pub const PENDING_INTERNAL_CONTEXT_KIND: &str = "internal_context";
 
 /// Key prefix of one child-handoff delivery inside that kind. The key is
-/// `child-handoff/<child id>`; re-recording the same child overwrites.
+/// `child-handoff/<run id>/<child id>` (child ids are per run, so the run
+/// qualifier prevents two runs of one parent from overwriting each other);
+/// re-recording the same run/child overwrites.
 pub const PENDING_INTERNAL_CONTEXT_KEY_PREFIX: &str = "child-handoff/";
 
 /// Companion WATERMARK of the last delivered child state inside that kind:
-/// `child-handoff-delivered/<child id>` = the child registry row's
+/// `child-handoff-delivered/<run id>/<child id>` = the child registry row's
 /// `updated_ms`. It is written atomically WITH the section and survives the
 /// parent's ack, so re-attach can distinguish "this exact terminal state was
 /// delivered (pending or consumed)" from "a NEWER retry state was never

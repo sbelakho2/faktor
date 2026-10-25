@@ -1,0 +1,19 @@
+{
+  "id": "INV-BILLING-WEBHOOK-PAYMENT-ID",
+  "surface": "payments.billing",
+  "file": "crates/payments/src/service/webhook_effects.rs",
+  "find": "                id: format!(\"pay_{}\", uuid::Uuid::new_v4()),",
+  "replace": "                id: {\n                    let key: Option<String> = match tx.query_row(\n                        \"SELECT idempotency_key FROM financial_mutation_lease \\\n                         WHERE organization_id = ?1 AND conflict_domain = 'invoice_payment' \\\n                         AND logical_resource_id = ?2 AND state = 'held' \\\n                         ORDER BY acquired_ms DESC, id DESC LIMIT 1\",\n                        rusqlite::params![org, &invoice_ref.id],\n                        |row| row.get(0),\n                    ) {\n                        Ok(key) => Some(key),\n                        Err(rusqlite::Error::QueryReturnedNoRows) => None,\n                        Err(error) => {\n                            return Err(PaymentError::Store(format!(\n                                \"read invoice payment fence: {error}\"\n                            )))\n                        }\n                    };\n                    match key {\n                        Some(key) => {\n                            operation_resource_id(\"pay\", org, \"pay_invoice\", &key)\n                        }\n                        None => format!(\"pay_{}\", uuid::Uuid::new_v4()),\n                    }\n                },",
+  "gate": "cargo test -p faktor-payments --test invoice_fencing webhook_for_a_second_payment_during_in_flight_charge_keeps_both_receipts",
+  "expect": "FAILED",
+  "note": "Reusing an in-flight invoice-payment lease's local payment id for a DIFFERENT provider payment makes pay_invoice overwrite the checkout receipt (one row, lost refundable money). The receipt-identity oracle must fail.",
+  "capabilities": [
+    "payments.invoice_truth"
+  ],
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

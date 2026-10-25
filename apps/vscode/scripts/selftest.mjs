@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// TEST-SEPARATION: oracle=external-fixture isolation=read-only-artifacts
 // Faktor VS Code extension selftest. Plain `node scripts/selftest.mjs`, no
 // npm install, no test framework. It imports the real TypeScript modules
 // (Node >= 23.6 strips types natively) and drives them with a fake fetch /
@@ -39,6 +40,8 @@ import * as e5commands from '../src/edition5/commands.ts';
 import * as e8approval from '../src/edition8/approval.ts';
 import * as oc from '../src/outcomes.ts';
 import { renderEdition8Html, scriptJson } from '../src/edition8/html.ts';
+import { loadEdition8Snapshot } from '../src/edition8/source.ts';
+import { edition8Snapshot } from './fixtures/edition8.mjs';
 import composerPolicy from '../media/composer-state.js';
 import boardPolicy from '../media/board-state.js';
 import historyPolicy from '../media/history-state.js';
@@ -55,13 +58,14 @@ import {
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 // `--packaged <extension-dir>` additionally asserts the extracted VSIX layout
 // (out/ + media/, the Faktor-owned panel) without a daemon.
 const packagedIndex = process.argv.indexOf('--packaged');
 const packagedDir = packagedIndex !== -1 ? process.argv[packagedIndex + 1] : null;
+const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 
 // ------------------------------------------------------------- test harness
 
@@ -12386,6 +12390,43 @@ async function usagePanelTests() {
   const member = nc.validateIdentity(clone(memberIdentityJson)).identity;
   const entitlements = nc.validateEntitlements(clone(entitlementsJson)).entitlements;
   const usage = nc.validateBillingUsage(clone(billingUsageJson));
+  const billing = {
+    organization_id: 'org-local',
+    account: null,
+    plan_id: 'pro',
+    plan_found: true,
+    subscription: null,
+    subscription_active: true,
+    trial: { state: 'none', ends_ms: null },
+    payment: { state: 'available', cause: null },
+    invoices: { state: 'available', cause: null },
+    seats: { state: 'available', cause: null },
+    tax: { state: 'available', cause: null },
+    currency: { state: 'available', cause: null },
+    usage_export: { state: 'available', cause: null },
+    usage_export_formats: ['csv', 'json'],
+    payments: {
+      invoice_count: 3,
+      open_invoice_count: 1,
+      outstanding_minor: 1900,
+      paid_minor: 3800,
+      refunded_minor: 500,
+      payment_method_count: 1,
+      seats: 2,
+      currency: 'EUR',
+      currency_exponent: 2,
+      tax: { state: 'available', cause: null, default_jurisdiction: 'NL' },
+      reconciliation: {
+        unreconciled: 0,
+        matched: 3,
+        amount_mismatch: 0,
+        currency_mismatch: 0,
+        provider_invoice_missing: 0,
+      },
+      provider: { provider: 'mollie', state: 'available', cause: null },
+    },
+    now_ms: 1_760_000_000_000,
+  };
   const panelInput = (overrides) => ({
     identity: admin,
     entitlements,
@@ -12393,6 +12434,7 @@ async function usagePanelTests() {
     refusal: null,
     cursor: null,
     hasPrev: false,
+    billing,
     ...overrides,
   });
 
@@ -12444,6 +12486,18 @@ async function usagePanelTests() {
     );
     assert(lines.some((line) => line.includes('subscription active')), JSON.stringify(lines));
     assert(lines.some((line) => line.includes('credits balance')), JSON.stringify(lines));
+    assert(
+      lines.some((line) => line.includes('invoices 3 recorded') && line.includes('refunded €5.00')),
+      JSON.stringify(lines),
+    );
+    assert(
+      lines.some((line) => line.includes('seats 2') && line.includes('tax NL')),
+      JSON.stringify(lines),
+    );
+    assert(
+      lines.some((line) => line.includes('reconciliation 0 unreconciled')),
+      JSON.stringify(lines),
+    );
     const section = cp.usagePanelSections(panel)[0];
     assertEqual(section.key, 'usage');
     assertEqual(section.title, 'Usage / Credits');
@@ -12466,6 +12520,27 @@ async function usagePanelTests() {
       panel.manageDisabledReason.includes('billing_write') &&
         panel.manageDisabledReason.includes('owner'),
       panel.manageDisabledReason,
+    );
+  });
+
+  await test('usage export is disabled when the served capability is unavailable', () => {
+    const panel = cp.buildUsagePanel(
+      panelInput({
+        billing: {
+          ...billing,
+          usage_export: { state: 'unavailable', cause: 'usage_export_not_configured' },
+        },
+      }),
+    );
+    const action = cp
+      .usagePanelSections(panel)[0]
+      .actions.find((entry) => entry.key === 'usage-export');
+    assertEqual(action.enabled, false);
+    assert(
+      cp.usagePanelLines(panel).some((line) =>
+        line.includes('usage export unavailable — usage_export_not_configured'),
+      ),
+      JSON.stringify(cp.usagePanelLines(panel)),
     );
   });
 
@@ -16103,6 +16178,86 @@ async function capabilityMatrixTests() {
 }
 
 async function edition8HtmlSafetyTests() {
+  await test('edition8: commercial reads use the served organization and keep S55 sign-in reachable', async () => {
+    const paths = [];
+    const fake = {
+      edition5Json: async (_method, path) => {
+        paths.push(path);
+        if (path === '/native/identity') return { identity: { organization: 'org_1' } };
+        if (path.startsWith('/native/usage')) {
+          return {
+            ok: true,
+            organization: 'org_1',
+            fold: {
+              organization_id: 'org_1',
+              totals: {},
+              per_task: [],
+              next_cursor: null,
+            },
+            credits: {},
+            items: [],
+            nextCursor: null,
+          };
+        }
+        if (path.startsWith('/native/outcomes')) {
+          return { metrics: { runs: 0, verifiedChanges: 0 }, runs: [], nextCursor: null };
+        }
+        return {};
+      },
+      legacyCatalogJson: async (_method, path) => (path === '/models' ? [] : {}),
+    };
+    const snapshot = await loadEdition8Snapshot(fake, {
+      session: null,
+      workspace: null,
+      worktree: null,
+      daemon: null,
+      generation: 1,
+      now: 1,
+    });
+    assert(paths.includes('/native/usage?org=org_1&limit=1'), JSON.stringify(paths));
+    assert(paths.includes('/native/outcomes?org=org_1&limit=1'), JSON.stringify(paths));
+    assertEqual(snapshot.identity.organization, 'org_1');
+    const html = renderEdition8Html({
+      nonce: 'testnonce',
+      cspSource: 'vscode-resource:',
+      scriptUri: 'media/edition8.js',
+      styleUri: 'media/edition8.css',
+      state: { snapshot: edition8Snapshot(), loading: false, error: null, focusControl: null },
+      initialScreen: 'S55',
+      host: 'vscode',
+    });
+    assert(html.includes('data-host-command="faktor.controlPlaneSignIn"'), 'S55 has no reachable sign-in');
+    assert(html.includes('Connect Account'), 'S55 primary label drifted');
+  });
+
+  await test('site billing cancellation requires the explicit confirmation field', () => {
+    const source = readFileSync(join(ROOT, 'crates/site/src/routes/billing.rs'), 'utf8');
+    assert(source.includes('Confirm the cancellation boundary before submitting it.'), 'cancel confirmation guard is absent');
+    assert(source.includes('let _ = &form.at_period_end;') === false, 'a bare cancellation path survived');
+  });
+
+  await test('edition8: read-only commercial screens lead with served state and collapse provenance', () => {
+    const html = renderEdition8Html({
+      nonce: 'testnonce',
+      cspSource: 'vscode-resource:',
+      scriptUri: 'media/edition8.js',
+      styleUri: 'media/edition8.css',
+      state: { snapshot: edition8Snapshot(), loading: false, error: null, focusControl: null },
+      initialScreen: 'S53',
+      host: 'vscode',
+    });
+    const start = html.indexOf('id="e8-screen-S53"');
+    const end = html.indexOf('<section class="e8-screen"', start + 1);
+    const section = html.slice(start, end === -1 ? undefined : end);
+    assert(section.includes('Served S53 state'), 'S53 served state is absent');
+    assert(section.includes('Control provenance (read-only)'), 'read-only provenance is not disclosed');
+    assert(
+      section.indexOf('Served S53 state') < section.indexOf('Control provenance (read-only)'),
+      'read-only controls precede the served cohort',
+    );
+    assert(!section.slice(0, section.indexOf('Control provenance')).includes('e8-control-grid'), 'controls are not collapsed');
+  });
+
   await test('edition8: inline state serialization cannot terminate the script element', () => {
     const hostile = '</script><img src=x onerror=alert(1)>';
     const encoded = scriptJson({ error: hostile, nested: { text: '\u2028&<>' } });

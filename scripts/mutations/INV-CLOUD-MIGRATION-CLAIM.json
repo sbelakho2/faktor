@@ -8,5 +8,7 @@
   "note": "Inverting the version-claim guard drops the pre-migration refusal.",
   "capabilities": [
     "cloud.migration_claim"
-  ]
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

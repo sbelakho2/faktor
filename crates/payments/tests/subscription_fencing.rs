@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir,separate-process
 //! Different-idempotency-key fences for subscription creation, plan/seat
 //! changes, cancellation and period invoices.
 //!

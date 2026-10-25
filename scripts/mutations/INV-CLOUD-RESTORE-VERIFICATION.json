@@ -8,5 +8,7 @@
   "note": "Short-circuiting restore verification accepts a corrupted backup.",
   "capabilities": [
     "cloud.restore_verification"
-  ]
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

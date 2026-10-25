@@ -5,5 +5,7 @@
   "replace": "            let (task_caps, budget_error) =\n                (faktor_core::CapabilitySet::ALL, None::<String>);",
   "gate": "cargo test -p faktor-agent --lib task_capability_budget_denies_a_tool_class_before_execution",
   "expect": "FAILED",
-  "note": "Restoring the ALL placeholder makes the task-policy leg meaningless: a budgeted child could run any tool class."
+  "note": "Restoring the ALL placeholder makes the task-policy leg meaningless: a budgeted child could run any tool class.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
 }

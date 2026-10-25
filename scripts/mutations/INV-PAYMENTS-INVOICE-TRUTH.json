@@ -1,0 +1,15 @@
+{
+  "id": "INV-PAYMENTS-INVOICE-TRUTH",
+  "surface": "payments.billing",
+  "file": "crates/payments/src/service/webhooks.rs",
+  "find": "        } else if provider_total != invoice.total_minor {",
+  "replace": "        } else if false {",
+  "gate": "cargo test -p faktor-payments --test invoice_authority provider_amount_mismatch_is_a_typed_conflict_and_never_rewrites_totals",
+  "expect": "FAILED",
+  "note": "Collapsing a provider amount mismatch into Matched rewrites invoice truth from provider bytes; the mismatch-conflict oracle must fail while the authored total stays unchanged.",
+  "capabilities": [
+    "payments.invoice_truth"
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+}

@@ -1,0 +1,15 @@
+{
+  "id": "INV-BILLING-TICK-FENCE",
+  "surface": "payments.billing",
+  "file": "crates/payments/src/service.rs",
+  "find": "            if crate::lease::active_lease_conn(\n                tx,\n                org,\n                &ConflictDomain::SubscriptionMutation {\n                    subscription_id: subscription.id.clone(),\n                },\n            )?\n            .is_some()\n                || crate::lease::active_lease_conn(\n                    tx,\n                    org,\n                    &ConflictDomain::Subscription {\n                        organization_id: org.to_string(),\n                    },\n                )?\n                .is_some()\n            {\n                return Ok((subscription, false));\n            }",
+  "replace": "            if false {\n                return Ok((subscription, false));\n            }",
+  "gate": "cargo test -p faktor-payments --test invoice_fencing lifecycle_tick_cannot_write_under_the_subscription_fence",
+  "expect": "FAILED",
+  "note": "A lifecycle tick that ignores the subscription fence writes a stale period/cancelation over an in-flight plan/seat/cancel result; the fenced-tick oracle must fail.",
+  "capabilities": [
+    "payments.lease_fence"
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+}
