@@ -1,8 +1,8 @@
 {
   "schema": "faktor-test-programme-registry/v1",
-  "generated_at": "2026-10-25T16:29:43.920Z",
-  "commit": "799ea0d3d099be9758ec1cf6f495039b2595563f",
-  "tree": "be808d7f15d7ef26c5a05a5b4c0f4c5a3695a19d",
+  "generated_at": "2026-10-25T19:24:25.882Z",
+  "commit": "b7a97d1dbfb2f99c316d689bffc79d6f1e7d37f4",
+  "tree": "436bdadf11324095f90f036eaa5abeb94f6266ee",
   "layers": [
     "structural",
     "unit",
@@ -19,7 +19,7 @@
     "release"
   ],
   "counts": {
-    "rows": 1017,
+    "rows": 1019,
     "by_kind": {
       "acceptance-scenario": 40,
       "act-now": 8,
@@ -28,7 +28,7 @@
       "cli-command": 49,
       "config-key": 53,
       "control": 200,
-      "invariant": 195,
+      "invariant": 197,
       "jetbrains-contribution": 1,
       "native-route": 299,
       "provider-adapter": 6,
@@ -38,22 +38,22 @@
       "workflow": 16
     },
     "by_status": {
-      "deferred": 944,
-      "proven": 5,
+      "deferred": 875,
+      "proven": 76,
       "stub": 68
     },
     "by_lane": {
-      "nightly": 549,
-      "pull": 686,
-      "trusted": 1016,
+      "nightly": 551,
+      "pull": 688,
+      "trusted": 1018,
       "weekly-live": 342
     },
     "by_layer": {
       "agent-evals": 1,
       "contracts": 436,
       "ide-screen-readers": 385,
-      "state-model-crash": 293,
-      "unit-property": 278
+      "state-model-crash": 295,
+      "unit-property": 280
     }
   },
   "rows": [
@@ -1240,7 +1240,7 @@
       ],
       "evidence_kind": "state-model",
       "oracle": "Overflow/negative/malformed cursors and duplicate concurrent streams are typed and bounded; no 5xx, no panic, no event duplication across one session.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "report_row": "widen-ordering"
       },
@@ -1249,7 +1249,58 @@
         "replay",
         "corruption"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "cases": [
+          {
+            "name": "cursor-18446744073709551616",
+            "passed": true,
+            "observed": {
+              "status": 400,
+              "aborted": false
+            }
+          },
+          {
+            "name": "cursor--1",
+            "passed": true,
+            "observed": {
+              "status": 400,
+              "aborted": false
+            }
+          },
+          {
+            "name": "cursor-abc",
+            "passed": true,
+            "observed": {
+              "status": 400,
+              "aborted": false
+            }
+          },
+          {
+            "name": "cursor-1&after=2",
+            "passed": true,
+            "observed": {
+              "status": 400,
+              "aborted": false
+            }
+          },
+          {
+            "name": "two-concurrent-streams",
+            "passed": true,
+            "observed": {
+              "first": "bounded",
+              "second": "bounded"
+            }
+          },
+          {
+            "name": "stream-auth-before-data",
+            "passed": true,
+            "observed": {
+              "status": 401
+            }
+          }
+        ]
+      }
     },
     {
       "id": "act-now.hostile-generators",
@@ -1734,7 +1785,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "acp"
       },
@@ -1745,7 +1796,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "acp",
+          "help_bytes": 260,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.approval",
@@ -1764,7 +1822,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "approval"
       },
@@ -1775,7 +1833,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "approval",
+          "help_bytes": 796,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.billing",
@@ -1794,7 +1859,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "billing"
       },
@@ -1805,7 +1870,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "billing",
+          "help_bytes": 1584,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.bootstrap",
@@ -1824,7 +1896,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "bootstrap"
       },
@@ -1835,7 +1907,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "bootstrap",
+          "help_bytes": 670,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.build",
@@ -1854,7 +1933,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "build"
       },
@@ -1865,7 +1944,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "build",
+          "help_bytes": 324,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.commerce",
@@ -1884,7 +1970,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "commerce"
       },
@@ -1895,7 +1981,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "commerce",
+          "help_bytes": 967,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.commerce.clear-cache",
@@ -1914,7 +2007,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "commerce.clear-cache"
       },
@@ -1925,7 +2018,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "commerce.clear-cache",
+          "help_bytes": 255,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.commerce.doctor",
@@ -1944,7 +2044,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "commerce.doctor"
       },
@@ -1955,7 +2055,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "commerce.doctor",
+          "help_bytes": 316,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.commerce.login",
@@ -1974,7 +2081,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "commerce.login"
       },
@@ -1985,7 +2092,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "commerce.login",
+          "help_bytes": 366,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.commerce.logout",
@@ -2004,7 +2118,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "commerce.logout"
       },
@@ -2015,7 +2129,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "commerce.logout",
+          "help_bytes": 334,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.commerce.status",
@@ -2034,7 +2155,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "commerce.status"
       },
@@ -2045,7 +2166,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "commerce.status",
+          "help_bytes": 244,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.doctor",
@@ -2064,7 +2192,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "doctor"
       },
@@ -2075,7 +2203,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "doctor",
+          "help_bytes": 838,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.engineering",
@@ -2094,7 +2229,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "engineering"
       },
@@ -2105,7 +2240,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "engineering",
+          "help_bytes": 689,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.enterprise",
@@ -2124,7 +2266,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "enterprise"
       },
@@ -2135,7 +2277,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "enterprise",
+          "help_bytes": 1098,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.enterprise.artifact",
@@ -2154,7 +2303,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "enterprise.artifact"
       },
@@ -2165,7 +2314,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "enterprise.artifact",
+          "help_bytes": 489,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.enterprise.artifact.eligible",
@@ -2184,7 +2340,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "enterprise.artifact.eligible"
       },
@@ -2195,7 +2351,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "enterprise.artifact.eligible",
+          "help_bytes": 321,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.enterprise.artifact.list",
@@ -2214,7 +2377,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "enterprise.artifact.list"
       },
@@ -2225,7 +2388,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "enterprise.artifact.list",
+          "help_bytes": 333,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.enterprise.artifact.register",
@@ -2244,7 +2414,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "enterprise.artifact.register"
       },
@@ -2255,7 +2425,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "enterprise.artifact.register",
+          "help_bytes": 669,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.enterprise.audit",
@@ -2274,7 +2451,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "enterprise.audit"
       },
@@ -2285,7 +2462,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "enterprise.audit",
+          "help_bytes": 378,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.enterprise.config",
@@ -2304,7 +2488,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "enterprise.config"
       },
@@ -2315,7 +2499,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "enterprise.config",
+          "help_bytes": 298,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.enterprise.deletion",
@@ -2334,7 +2525,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "enterprise.deletion"
       },
@@ -2345,7 +2536,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "enterprise.deletion",
+          "help_bytes": 495,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.enterprise.deletion.advance",
@@ -2364,7 +2562,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "enterprise.deletion.advance"
       },
@@ -2375,7 +2573,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "enterprise.deletion.advance",
+          "help_bytes": 313,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.enterprise.deletion.show",
@@ -2394,7 +2599,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "enterprise.deletion.show"
       },
@@ -2405,7 +2610,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "enterprise.deletion.show",
+          "help_bytes": 288,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.enterprise.deletion.start",
@@ -2424,7 +2636,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "enterprise.deletion.start"
       },
@@ -2435,7 +2647,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "enterprise.deletion.start",
+          "help_bytes": 371,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.enterprise.gc",
@@ -2454,7 +2673,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "enterprise.gc"
       },
@@ -2465,7 +2684,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "enterprise.gc",
+          "help_bytes": 379,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.enterprise.settings",
@@ -2484,7 +2710,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "enterprise.settings"
       },
@@ -2495,7 +2721,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "enterprise.settings",
+          "help_bytes": 260,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.enterprise.status",
@@ -2514,7 +2747,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "enterprise.status"
       },
@@ -2525,7 +2758,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "enterprise.status",
+          "help_bytes": 278,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.impact",
@@ -2544,7 +2784,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "impact"
       },
@@ -2555,7 +2795,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "impact",
+          "help_bytes": 576,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.mcp",
@@ -2574,7 +2821,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "mcp"
       },
@@ -2585,7 +2832,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "mcp",
+          "help_bytes": 458,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.run",
@@ -2604,7 +2858,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "run"
       },
@@ -2615,7 +2869,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "run",
+          "help_bytes": 548,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.sandbox",
@@ -2634,7 +2895,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "sandbox"
       },
@@ -2645,7 +2906,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "sandbox",
+          "help_bytes": 807,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.sandbox.choose",
@@ -2664,7 +2932,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "sandbox.choose"
       },
@@ -2675,7 +2943,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "sandbox.choose",
+          "help_bytes": 593,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.sandbox.status",
@@ -2694,7 +2969,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "sandbox.status"
       },
@@ -2705,7 +2980,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "sandbox.status",
+          "help_bytes": 328,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.serve",
@@ -2724,7 +3006,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "serve"
       },
@@ -2735,7 +3017,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "serve",
+          "help_bytes": 266,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.sessions",
@@ -2754,7 +3043,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "sessions"
       },
@@ -2765,7 +3054,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "sessions",
+          "help_bytes": 152,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.supply",
@@ -2784,7 +3080,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "supply"
       },
@@ -2795,7 +3091,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "supply",
+          "help_bytes": 1707,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.updater",
@@ -2814,7 +3117,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "updater"
       },
@@ -2825,7 +3128,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "updater",
+          "help_bytes": 2322,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.updater.abort",
@@ -2844,7 +3154,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "updater.abort"
       },
@@ -2855,7 +3165,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "updater.abort",
+          "help_bytes": 415,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.updater.activate",
@@ -2874,7 +3191,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "updater.activate"
       },
@@ -2885,7 +3202,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "updater.activate",
+          "help_bytes": 555,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.updater.apply",
@@ -2904,7 +3228,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "updater.apply"
       },
@@ -2915,7 +3239,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "updater.apply",
+          "help_bytes": 353,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.updater.check",
@@ -2934,7 +3265,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "updater.check"
       },
@@ -2945,7 +3276,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "updater.check",
+          "help_bytes": 570,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.updater.downgrade",
@@ -2964,7 +3302,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "updater.downgrade"
       },
@@ -2975,7 +3313,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "updater.downgrade",
+          "help_bytes": 875,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.updater.finalize",
@@ -2994,7 +3339,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "updater.finalize"
       },
@@ -3005,7 +3350,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "updater.finalize",
+          "help_bytes": 623,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.updater.recover",
@@ -3024,7 +3376,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "updater.recover"
       },
@@ -3035,7 +3387,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "updater.recover",
+          "help_bytes": 281,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.updater.rollback",
@@ -3054,7 +3413,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "updater.rollback"
       },
@@ -3065,7 +3424,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "updater.rollback",
+          "help_bytes": 318,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.updater.stage",
@@ -3084,7 +3450,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "updater.stage"
       },
@@ -3095,7 +3461,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "updater.stage",
+          "help_bytes": 771,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.updater.status",
@@ -3114,7 +3487,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "updater.status"
       },
@@ -3125,7 +3498,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "updater.status",
+          "help_bytes": 299,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.worker",
@@ -3144,7 +3524,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "worker"
       },
@@ -3155,7 +3535,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "worker",
+          "help_bytes": 656,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "cli.worker.run",
@@ -3174,7 +3561,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "command": "worker.run"
       },
@@ -3185,7 +3572,14 @@
         "redaction",
         "idempotence"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "worker.run",
+          "help_bytes": 478,
+          "unknown_flag_exit": 2
+        }
+      }
     },
     {
       "id": "config.faktor.agent.maxConsecutiveFailures",
@@ -14403,6 +14797,68 @@
       "evidence": null
     },
     {
+      "id": "invariant.INV-DESIGN-FOCUS-ECONOMIC",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "economic_gate_boundaries_at_one_eighth_and_two_kib",
+        "mutation_witness_economic_gate_rejects_each_boundary_crossing"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-DESIGN-FOCUS-ECONOMIC",
+        "unit_test": "economic_gate_boundaries_at_one_eighth_and_two_kib",
+        "wiring_test": "mutation_witness_economic_gate_rejects_each_boundary_crossing"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-DESIGN-READINESS-PROMOTION",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "mutation_witness_promotion_rule_would_escalate_without_the_clamp",
+        "promotion_rule_clamps_new_findings_on_a_calm_contract"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-DESIGN-READINESS-PROMOTION",
+        "unit_test": "promotion_rule_clamps_new_findings_on_a_calm_contract",
+        "wiring_test": "mutation_witness_promotion_rule_would_escalate_without_the_clamp"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
       "id": "invariant.INV-DUAL-PRODUCER-FACTS-DURABLE",
       "kind": "invariant",
       "path": "tests/invariants.toml",
@@ -18352,7 +18808,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "rev8": false,
         "credential": true,
@@ -18369,7 +18825,18 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "cases": [
+          {
+            "name": "deletes locally and reports remoteRevoked=false",
+            "passed": true,
+            "observed": {
+              "status": 200
+            }
+          }
+        ]
+      }
     },
     {
       "id": "native.delete.native.session.id",
@@ -18390,7 +18857,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -18407,7 +18874,25 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "cases": [
+          {
+            "name": "deletes with a tombstone",
+            "passed": true,
+            "observed": {
+              "status": 200
+            }
+          },
+          {
+            "name": "replay is idempotent",
+            "passed": true,
+            "observed": {
+              "status": 200
+            }
+          }
+        ]
+      }
     },
     {
       "id": "native.delete.native.session.id.context.pins",
@@ -18533,7 +19018,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -18550,7 +19035,18 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "cases": [
+          {
+            "name": "deletes only the matching revision",
+            "passed": true,
+            "observed": {
+              "status": 200
+            }
+          }
+        ]
+      }
     },
     {
       "id": "native.delete.native.session.id.worktrees.worktree-id",
@@ -20461,7 +20957,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -20478,7 +20974,18 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "cases": [
+          {
+            "name": "reports hasToken without the token",
+            "passed": true,
+            "observed": {
+              "status": 200
+            }
+          }
+        ]
+      }
     },
     {
       "id": "native.get.native.mcp.servers.id.oauth.callback.flow-id",
@@ -21234,7 +21741,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -21251,7 +21758,26 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "cases": [
+          {
+            "name": "returns the ordered chain with served status",
+            "passed": true,
+            "observed": {
+              "write": 200,
+              "read": 200
+            }
+          },
+          {
+            "name": "unknown preset is typed 404",
+            "passed": true,
+            "observed": {
+              "status": 404
+            }
+          }
+        ]
+      }
     },
     {
       "id": "native.get.native.presets.id.roles",
@@ -21272,7 +21798,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -21289,7 +21815,25 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "cases": [
+          {
+            "name": "reports served=true for the served binding",
+            "passed": true,
+            "observed": {
+              "status": 200
+            }
+          },
+          {
+            "name": "unknown preset is typed 404",
+            "passed": true,
+            "observed": {
+              "status": 404
+            }
+          }
+        ]
+      }
     },
     {
       "id": "native.get.native.providers",
@@ -21415,7 +21959,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "rev8": false,
         "credential": true,
@@ -21432,7 +21976,19 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "cases": [
+          {
+            "name": "lists references only",
+            "passed": true,
+            "observed": {
+              "status": 200,
+              "count": 1
+            }
+          }
+        ]
+      }
     },
     {
       "id": "native.get.native.ready",
@@ -22293,7 +22849,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -22310,7 +22866,25 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "cases": [
+          {
+            "name": "lists the created comment with change staleness",
+            "passed": true,
+            "observed": {
+              "status": 200
+            }
+          },
+          {
+            "name": "a foreign session is typed 404",
+            "passed": true,
+            "observed": {
+              "status": 404
+            }
+          }
+        ]
+      }
     },
     {
       "id": "native.get.native.session.id.settings",
@@ -22331,7 +22905,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -22348,7 +22922,18 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "cases": [
+          {
+            "name": "reads the durable settings with apply timing",
+            "passed": true,
+            "observed": {
+              "status": 200
+            }
+          }
+        ]
+      }
     },
     {
       "id": "native.get.native.session.id.task-runs",
@@ -23454,7 +24039,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -23471,7 +24056,25 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "cases": [
+          {
+            "name": "updates with expectedRevision",
+            "passed": true,
+            "observed": {
+              "status": 200
+            }
+          },
+          {
+            "name": "a stale revision is typed 409",
+            "passed": true,
+            "observed": {
+              "status": 409
+            }
+          }
+        ]
+      }
     },
     {
       "id": "native.post.native.agents.child-id.budget",
@@ -24402,7 +25005,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -24419,7 +25022,27 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "cases": [
+          {
+            "name": "observes a dead endpoint as failed, never ready",
+            "passed": true,
+            "observed": {
+              "connection": 200,
+              "status": 200,
+              "state": "failed"
+            }
+          },
+          {
+            "name": "unknown connection is typed 404",
+            "passed": true,
+            "observed": {
+              "status": 404
+            }
+          }
+        ]
+      }
     },
     {
       "id": "native.post.native.config.commit",
@@ -25350,7 +25973,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -25367,7 +25990,26 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "cases": [
+          {
+            "name": "connects without round-tripping the token",
+            "passed": true,
+            "observed": {
+              "mcp": 200,
+              "status": 200
+            }
+          },
+          {
+            "name": "double connect is idempotent and still discloses no token",
+            "passed": true,
+            "observed": {
+              "status": 200
+            }
+          }
+        ]
+      }
     },
     {
       "id": "native.post.native.mcp.servers.id.connect",
@@ -26158,7 +26800,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -26175,7 +26817,18 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "cases": [
+          {
+            "name": "refuses a duplicate chain before persistence",
+            "passed": true,
+            "observed": {
+              "status": 400
+            }
+          }
+        ]
+      }
     },
     {
       "id": "native.post.native.presets.id.roles",
@@ -26196,7 +26849,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -26213,7 +26866,26 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "cases": [
+          {
+            "name": "round-trips a served role map",
+            "passed": true,
+            "observed": {
+              "preset": 200,
+              "status": 200
+            }
+          },
+          {
+            "name": "refuses an unserved binding typed 409",
+            "passed": true,
+            "observed": {
+              "status": 409
+            }
+          }
+        ]
+      }
     },
     {
       "id": "native.post.native.providers.connections",
@@ -26304,7 +26976,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "rev8": false,
         "credential": true,
@@ -26321,7 +26993,26 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "cases": [
+          {
+            "name": "stores without echoing the secret",
+            "passed": true,
+            "observed": {
+              "status": 200,
+              "handle": "vault://provider_key/75d64226ad9a0c6b6926e5440d126795"
+            }
+          },
+          {
+            "name": "malformed body is typed 400",
+            "passed": true,
+            "observed": {
+              "status": 400
+            }
+          }
+        ]
+      }
     },
     {
       "id": "native.post.native.providers.credentials.rotate",
@@ -26342,7 +27033,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "rev8": false,
         "credential": true,
@@ -26359,7 +27050,19 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "cases": [
+          {
+            "name": "rotates a generation without disclosing either secret",
+            "passed": true,
+            "observed": {
+              "status": 200,
+              "generation": 2
+            }
+          }
+        ]
+      }
     },
     {
       "id": "native.post.native.runtime.trust",
@@ -26660,7 +27363,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -26677,7 +27380,19 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "cases": [
+          {
+            "name": "without a staged shadow accepts nothing (typed 503/404)",
+            "passed": true,
+            "observed": {
+              "status": 404,
+              "code": "not_found"
+            }
+          }
+        ]
+      }
     },
     {
       "id": "native.post.native.session.id.changes.accept-hunks",
@@ -26768,7 +27483,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -26785,7 +27500,19 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "cases": [
+          {
+            "name": "a missing checkpoint/authority is typed 503/404, never a fake plan",
+            "passed": true,
+            "observed": {
+              "status": 404,
+              "code": "not_found"
+            }
+          }
+        ]
+      }
     },
     {
       "id": "native.post.native.session.id.context.compact",
@@ -27016,7 +27743,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -27033,7 +27760,26 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "cases": [
+          {
+            "name": "exports a bounded bundle with a digest",
+            "passed": true,
+            "observed": {
+              "status": 200
+            }
+          },
+          {
+            "name": "deleted content refuses export with the tombstone",
+            "passed": true,
+            "observed": {
+              "status": 409,
+              "code": "session_deleted"
+            }
+          }
+        ]
+      }
     },
     {
       "id": "native.post.native.session.id.fork",
@@ -27229,7 +27975,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -27246,7 +27992,25 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "cases": [
+          {
+            "name": "creates a scoped, revisioned comment",
+            "passed": true,
+            "observed": {
+              "status": 200
+            }
+          },
+          {
+            "name": "path traversal is refused",
+            "passed": true,
+            "observed": {
+              "status": 400
+            }
+          }
+        ]
+      }
     },
     {
       "id": "native.post.native.session.id.task-runs",
@@ -28527,7 +29291,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "deferred",
+      "status": "proven",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -28544,7 +29308,37 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": null
+      "evidence": {
+        "passed": true,
+        "cases": [
+          {
+            "name": "applies a validated settings patch",
+            "passed": true,
+            "observed": {
+              "status": 200,
+              "applied": [
+                "compactionModel",
+                "maxTurns",
+                "maxConsecutiveFailures"
+              ]
+            }
+          },
+          {
+            "name": "out-of-range value is typed 400",
+            "passed": true,
+            "observed": {
+              "status": 400
+            }
+          },
+          {
+            "name": "unserved compaction model is typed 409",
+            "passed": true,
+            "observed": {
+              "status": 409
+            }
+          }
+        ]
+      }
     },
     {
       "id": "provider.anthropic",

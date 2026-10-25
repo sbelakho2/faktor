@@ -549,6 +549,8 @@ const SUITE_PATHS = Object.freeze([
   ['docs/specs/edition8/', 'edition8'],
   ['tests/programme/', 'programme'],
   ['tests/lanes.toml', 'programme'],
+  ['tests/invariants.toml', 'invariants'],
+  ['tests/mutation-surfaces.json', 'invariants'],
   ['scripts/programme/', 'programme'],
   ['apps/vscode/', 'vscode'],
   ['apps/jetbrains/', 'jetbrains'],
@@ -1246,6 +1248,16 @@ export function selftest() {
   check(
     'the lane manifest maps to the programme suite (never an unmapped authority)',
     lanes.suites.includes('programme') && lanes.refused === false,
+  );
+  const invariantRegistry = select(['tests/invariants.toml']);
+  check(
+    'the invariant registry maps to the invariants suite (never an unmapped authority)',
+    invariantRegistry.suites.includes('invariants') && invariantRegistry.refused === false,
+  );
+  const mutationSurfaces = select(['tests/mutation-surfaces.json']);
+  check(
+    'the mutation surface registry maps to the invariants suite (never an unmapped authority)',
+    mutationSurfaces.suites.includes('invariants') && mutationSurfaces.refused === false,
   );
   const report = select(['Report.pdf']);
   check('a root review artifact maps to docs', report.suites.includes('docs') && report.refused === false);
