@@ -656,14 +656,48 @@ function mutationSurfaceGate(root) {
   }
 }
 
+/**
+ * One representative planted mutation per declared surface. A bounded
+ * per-surface campaign proves that every critical product surface has a
+ * mutation that its own gate detects; the static manifest still enumerates
+ * every spec, and the full campaign (`--scope full`) remains the nightly
+ * all-spec run. Surfaces with `all_invariants` are covered by the invariant
+ * registry itself, not by one representative spec.
+ */
+function selectPerSurface(entries, root) {
+  const manifest = JSON.parse(readFileSync(join(root, 'tests/mutation-surfaces.json'), 'utf8'));
+  const byId = new Map(entries.map((entry) => [entry.id, entry]));
+  const selected = new Map();
+  const uncovered = [];
+  for (const surface of manifest.surfaces ?? []) {
+    if (surface.all_invariants === true) continue;
+    let pick = null;
+    for (const id of surface.specs ?? []) {
+      const entry = byId.get(id);
+      if (entry === undefined) continue;
+      const command = typeof entry.mutation_command === 'string' ? entry.mutation_command.trim() : '';
+      if (command === '') continue;
+      pick = entry;
+      break;
+    }
+    if (pick === null) {
+      uncovered.push(surface.id);
+      continue;
+    }
+    selected.set(pick.id, pick);
+  }
+  return { entries: [...selected.values()], uncovered };
+}
+
 /** One machine-readable campaign document consumed by the static gate. */
-function writeCampaignEvidence(root, entries, results, support) {
+function writeCampaignEvidence(root, entries, results, support, scope = 'full') {
   const out = join(root, 'target', 'certification', 'mutation-campaign.json');
   const survivors = results.filter((result) => result.outcome === 'undetected').length;
   const environmentFailures = results.filter((result) => result.outcome === 'environment').length;
   const notRun = results.filter((result) => result.outcome === 'not_run').length;
   const document = {
     schema: 'faktor-mutation-campaign/v1',
+    scope,
     generated_at: new Date().toISOString(),
     root,
     support,
@@ -684,13 +718,18 @@ function main() {
   const args = process.argv.slice(2);
   if (args.includes('-h') || args.includes('--help')) {
     console.log(
-      'usage: node scripts/check-invariants.mjs [--root DIR] [--registry FILE] [--expect-fail CODE] [--mutations]',
+      'usage: node scripts/check-invariants.mjs [--root DIR] [--registry FILE] [--expect-fail CODE] [--mutations [--scope full|per-surface]]',
     );
     return 2;
   }
   const root = resolve(argValue(args, '--root', SCRIPT_ROOT));
   const registryPath = resolve(argValue(args, '--registry', join(root, 'tests/invariants.toml')));
   const mutations = args.includes('--mutations');
+  const scope = argValue(args, '--scope', 'full');
+  if (scope !== 'full' && scope !== 'per-surface') {
+    console.error(`check-invariants: unknown --scope ${JSON.stringify(scope)} (expected full or per-surface)`);
+    return 2;
+  }
   const { problems, warnings, counts, entries } = runCheck({ root, registryPath });
   for (const warning of warnings) console.warn(`invariants-warning: ${warning}`);
   const expectFail = argValue(args, '--expect-fail');
@@ -725,6 +764,20 @@ function main() {
     return 1;
   }
   if (mutations) {
+    let selectedEntries = entries;
+    if (scope === 'per-surface') {
+      const selection = selectPerSurface(entries, root);
+      if (selection.uncovered.length > 0) {
+        for (const id of selection.uncovered) {
+          console.error(`mutation-campaign: campaign-surface-uncovered: ${id} has no runnable representative spec`);
+        }
+        console.error(
+          `check-invariants --mutations: FAIL (${selection.uncovered.length} surface(s) without a runnable mutation)`,
+        );
+        return 1;
+      }
+      selectedEntries = selection.entries;
+    }
     // Mutation mode: a witness is only credible when a PLANTED violation
     // makes its gate fail. An invariant either ships a `mutation_command`
     // that plants the violation (and must exit non-zero), or carries an
@@ -807,7 +860,7 @@ function main() {
     let campaignResults = [];
     let proven = 0;
     try {
-      for (const entry of entries) {
+      for (const entry of selectedEntries) {
         const command = typeof entry.mutation_command === 'string' ? entry.mutation_command.trim() : '';
         if (command === '') {
           if (typeof entry.mutation_debt !== 'string' || entry.mutation_debt.trim() === '') {
@@ -915,7 +968,7 @@ function main() {
     }
     // The campaign document is published only after the isolation/barrier
     // checks pass: evidence from an uncertified run is never consumable.
-    const campaign = writeCampaignEvidence(root, entries, campaignResults, support);
+    const campaign = writeCampaignEvidence(root, selectedEntries, campaignResults, support, scope);
     const world = loadWorld(root);
     const campaignIssues = campaignProblems(world, campaign.out);
     if (campaignIssues.length > 0) {
