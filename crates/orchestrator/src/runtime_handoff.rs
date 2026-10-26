@@ -429,3 +429,62 @@ impl OrchestratorRuntime {
         }
     }
 }
+
+/// True when the most recent logical turn ended through the bounded
+/// abort/Stop path. `SessionHandle::abort` journals `TurnCompleted` with
+/// `{"aborted": true}` (an ordinary completion journals no payload), so
+/// this durable marker lets re-attach preserve cancellation truth even
+/// though `ReadyForNextTurn` is the same post-state for both outcomes.
+///
+/// The read is BOUNDED (the journal tail only) and matches the active
+/// turn's own op id, so an older aborted turn can never poison a newer
+/// completed one. A journal read failure is typed/retriable: reconciliation
+/// must never guess an outcome from an unreadable authority.
+pub(super) fn last_turn_completed_was_aborted(
+    session: &faktor_session::SessionHandle,
+) -> Result<bool, ExecError> {
+    const TAIL_EVENTS: u64 = 64;
+    let active = session
+        .active_turn_record()
+        .map_err(|e| ExecError::retriable("child turn record read", e))?;
+    // Only an ACTIVE record needs the journal marker (its status is still
+    // "active" because the executor died before closing it). A closed
+    // record's status is the authoritative turn outcome; an unknown
+    // status is corrupt storage and must fail typed, never become Done.
+    let Some(record) = active else {
+        let latest = session
+            .latest_turn_record()
+            .map_err(|e| ExecError::retriable("child turn record read", e))?;
+        return match latest {
+            None => Ok(false),
+            Some(row) if row.status == "cancelled" => Ok(true),
+            Some(row) if matches!(row.status.as_str(), "completed" | "failed") => Ok(false),
+            Some(row) => Err(ExecError::InvalidState(format!(
+                "child turn record {} carries unknown status {:?}; refusing to guess an outcome",
+                row.id, row.status
+            ))),
+        };
+    };
+    let Some(last) = session
+        .last_event_seq()
+        .map_err(|e| ExecError::retriable("child journal tail read", e))?
+    else {
+        return Ok(false);
+    };
+    let from = last.raw().saturating_sub(TAIL_EVENTS - 1).max(1);
+    let events = session
+        .events_range(from, Some(TAIL_EVENTS))
+        .map_err(|e| ExecError::retriable("child journal tail read", e))?;
+    Ok(events.iter().rev().find_map(|event| {
+        (event.kind == EventKind::TurnCompleted && event.op_id == Some(record.turn_op_id)).then(
+            || {
+                event
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.get("aborted"))
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            },
+        )
+    }) == Some(true))
+}

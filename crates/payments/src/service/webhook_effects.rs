@@ -85,6 +85,11 @@ impl PaymentService {
         if invoice_ref.organization_id != org {
             return Ok(WebhookEffects::default());
         }
+        if Self::settlement_fenced_by_subscription_mutation(tx, org, invoice_ref)? {
+            return Err(PaymentError::Conflict(
+                "a subscription mutation is in flight; retry the webhook".into(),
+            ));
+        }
         let amount = object.and_then(|object| {
             object
                 .get("amount_minor")
@@ -331,6 +336,15 @@ impl PaymentService {
             }
         };
         let Some(refund_ref) = refund.as_mut() else {
+            // The provider already produced a refund object while our local
+            // reservation is still between dispatch and its durable row.
+            // Acknowledge nothing: recording this event would make the later
+            // status transition a duplicate and strand the refund pending.
+            if provider_refund_id.is_some() && Self::refund_mutation_in_flight(tx, org)? {
+                return Err(PaymentError::Conflict(
+                    "a refund mutation is in flight; retry the webhook".into(),
+                ));
+            }
             return Ok(WebhookEffects::default());
         };
         if refund_ref.organization_id != org || refund_ref.credit_note_id.is_some() {

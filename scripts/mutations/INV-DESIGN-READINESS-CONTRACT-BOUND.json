@@ -1,0 +1,12 @@
+{
+  "id": "INV-DESIGN-READINESS-CONTRACT-BOUND",
+  "file": "crates/core/src/design_readiness.rs",
+  "find": "        if contract.risks.len() >= MAX_DESIGN_SOURCES {",
+  "replace": "        if contract.risks.len() >= usize::MAX {",
+  "gate": "cargo test -p faktor-core --lib apply_never_exceeds_the_contract_entry_bound",
+  "expect": "FAIL",
+  "timeout_ms": 600000,
+  "note": "Appending past the durable MAX_TASK_CONTRACT_ENTRIES bound makes the merged task contract unpersistable.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+}

@@ -37,7 +37,11 @@ pub fn billing(
     } else {
         String::new()
     };
-    let subscription = data.overview.subscription.as_ref();
+    let subscription = data
+        .overview
+        .subscription
+        .as_ref()
+        .filter(|subscription| subscription.is_live());
     let current = if let Some(subscription) = subscription {
         current_subscription(
             auth,
@@ -84,7 +88,12 @@ pub fn billing(
         plan_cards(auth, csrf, data, subscription.is_some())
     );
     let invoices = invoice_rows(auth, csrf, data.invoices);
-    let methods = payment_methods(auth, csrf, data.methods, &data.overview.provider.provider);
+    let methods = payment_methods(
+        csrf,
+        data.methods,
+        &data.overview.provider.provider,
+        data.overview.provider.state,
+    );
     let content = format!(
         "{}{}<div class=\"app-grid\">{}{}{}</div><div class=\"app-grid mt-22\">{}</div><section class=\"page-section no-rule\"><div class=\"section-head\"><div><p class=\"kicker\">Plans</p><h2 class=\"h2\">Choose the record you need.</h2></div><p class=\"lead\">Annual prices are stored independently. Switching plans records a proration on the next invoice; cancellation takes effect at the chosen boundary.</p></div>{}</section><div class=\"app-grid mt-22\">{}</div>",
         notice,
@@ -174,7 +183,7 @@ fn plan_cards(
     has_subscription: bool,
 ) -> String {
     let _ = auth;
-    let disabled = has_subscription || data.overview.provider.state == "unconfigured";
+    let disabled = has_subscription || data.overview.provider.state != "available";
     PLANS
         .iter()
         .map(|plan| {
@@ -251,13 +260,12 @@ fn invoice_rows(auth: &AuthSession, csrf: &str, invoices: &[Invoice]) -> String 
     )
 }
 
-fn payment_methods(
-    auth: &AuthSession,
+pub(crate) fn payment_methods(
     csrf: &str,
     methods: &[PaymentMethodView],
     provider: &str,
+    provider_state: &str,
 ) -> String {
-    let _ = auth;
     let list = if methods.is_empty() {
         "<div class=\"empty\"><strong>No stored payment method.</strong>Attach an opaque provider token below. Do not enter a card number or security code.</div>".to_string()
     } else {
@@ -283,7 +291,7 @@ fn payment_methods(
             })
             .collect::<String>()
     };
-    let disabled = if provider == "unconfigured" {
+    let disabled = if provider_state != "available" {
         " disabled"
     } else {
         ""
@@ -295,7 +303,7 @@ fn payment_methods(
     );
     format!(
         "<article class=\"panel span-12\"><div class=\"panel-head\"><div><h2>Payment methods</h2><p class=\"panel-sub\">Provider tokens only. Faktor never accepts a PAN, CVV or magnetic-stripe data.</p></div>{}</div><div class=\"table-wrap\">{}</div>{}<p class=\"notice mt-18\">Provider: {}. Stored token material is sealed by the billing vault; only brand and last four are rendered.</p></article>",
-        status_badge("active"),
+        status_badge(provider_state),
         list,
         form,
         html_escape(provider)

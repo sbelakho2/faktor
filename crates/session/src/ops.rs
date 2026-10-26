@@ -418,6 +418,14 @@ impl SessionHandle {
             .map_err(|e| crate::map_store_err(e).into())
     }
 
+    /// The newest logical-turn record of the session (bounded point read).
+    pub fn latest_turn_record(&self) -> faktor_core::Result<Option<faktor_store::TurnRecordRow>> {
+        self.manager
+            .store()
+            .latest_turn_record(self.id)
+            .map_err(|e| crate::map_store_err(e).into())
+    }
+
     /// Record a provider wire call (never cancels the session; provider calls
     /// are sub-operations of a turn).
     #[allow(clippy::too_many_arguments)]

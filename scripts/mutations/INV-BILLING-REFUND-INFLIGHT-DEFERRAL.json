@@ -1,0 +1,19 @@
+{
+  "id": "INV-BILLING-REFUND-INFLIGHT-DEFERRAL",
+  "surface": "payments.billing",
+  "file": "crates/payments/src/service/webhook_effects.rs",
+  "find": "            if provider_refund_id.is_some() && Self::refund_mutation_in_flight(tx, org)? {\n                return Err(PaymentError::Conflict(\n                    \"a refund mutation is in flight; retry the webhook\".into(),\n                ));\n            }",
+  "replace": "            // mutated: the in-flight refund window is acknowledged as ignored",
+  "gate": "cargo test -p faktor-payments --test invoice_fencing refund_webhook_during_in_flight_refund_is_deferred_not_lost",
+  "expect": "FAILED",
+  "note": "Acknowledging a provider refund webhook that arrives before its local binding records it as ignored/duplicate, so the terminal succeeded truth can never settle the reservation; the deferral oracle must fail.",
+  "capabilities": [
+    "payments.refund_bound"
+  ],
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

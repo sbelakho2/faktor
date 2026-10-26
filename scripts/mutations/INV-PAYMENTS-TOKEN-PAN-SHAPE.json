@@ -1,0 +1,19 @@
+{
+  "id": "INV-PAYMENTS-TOKEN-PAN-SHAPE",
+  "surface": "payments.billing",
+  "file": "crates/payments/src/service/tokens.rs",
+  "find": "    if (12..=19).contains(&digits.len()) && (luhn_valid(&digits) || pan_shaped_body(token)) {",
+  "replace": "    if (12..=19).contains(&digits.len()) && (luhn_valid(&digits) || false) {",
+  "gate": "cargo test -p faktor-payments --test tokens strict_token_shape_rejects_pan_at_any_offset_and_oversize",
+  "expect": "FAILED",
+  "note": "Dropping the separator-shaped PAN check stores a mistyped/forged 4-digit-group card number that has no contiguous run and fails Luhn as an opaque provider token; the PAN-shape oracle must fail.",
+  "capabilities": [
+    "payments.refund_bound"
+  ],
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

@@ -175,7 +175,11 @@ async fn begin_subscription(
     let interval = crate::config::parse_interval(&form.interval).ok_or(
         SiteError::Unprocessable("Choose monthly or annual billing."),
     )?;
-    if let Some(subscription) = overview.subscription.as_ref() {
+    if let Some(subscription) = overview
+        .subscription
+        .as_ref()
+        .filter(|subscription| subscription.is_live())
+    {
         if subscription.plan_id != form.plan_id || subscription.interval != interval {
             return Err(SiteError::Conflict(
                 "A live subscription exists. Use the plan-change form instead of starting a second subscription.",
@@ -450,9 +454,13 @@ pub async fn change_plan(
     }
     let org = org_id(&auth)?;
     let overview = state.payments.overview(&org)?;
-    let subscription = overview.subscription.as_ref().ok_or(SiteError::Conflict(
-        "There is no live subscription to change.",
-    ))?;
+    let subscription = overview
+        .subscription
+        .as_ref()
+        .filter(|subscription| subscription.is_live())
+        .ok_or(SiteError::Conflict(
+            "There is no live subscription to change.",
+        ))?;
     let interval = crate::config::parse_interval(&form.interval).ok_or(
         SiteError::Unprocessable("Choose monthly or annual billing."),
     )?;
@@ -482,9 +490,13 @@ pub async fn cancel(
     }
     let org = org_id(&auth)?;
     let overview = state.payments.overview(&org)?;
-    let subscription = overview.subscription.as_ref().ok_or(SiteError::Conflict(
-        "There is no live subscription to cancel.",
-    ))?;
+    let subscription = overview
+        .subscription
+        .as_ref()
+        .filter(|subscription| subscription.is_live())
+        .ok_or(SiteError::Conflict(
+            "There is no live subscription to cancel.",
+        ))?;
     let at_period_end = match form.at_period_end.as_str() {
         "1" => true,
         "0" => false,

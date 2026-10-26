@@ -1,0 +1,12 @@
+{
+  "id": "INV-SITE-BILLING-TERMINAL-RESUBSCRIBE",
+  "file": "crates/site/src/web/billing_pages.rs",
+  "find": "    let subscription = data\n        .overview\n        .subscription\n        .as_ref()\n        .filter(|subscription| subscription.is_live());",
+  "replace": "    let subscription = data.overview.subscription.as_ref();",
+  "gate": "cargo test -p faktor-site cancelled_subscription_unblocks_the_plan_cards_and_a_new_checkout",
+  "expect": "FAIL",
+  "timeout_ms": 600000,
+  "note": "Treating a terminal subscription as live disables the plan cards and hides the only resubscribe path.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+}

@@ -2215,35 +2215,47 @@ export function buildCockpit(input: CockpitInput): CockpitView | null {
   });
 
   // Plan / DAG steps: explicit plan steps when served, else the milestone
-  // lists; children link by item id.
-  const planSteps = task?.plan ?? [];
+  // lists; children link by item id. Both the step list and the child index
+  // are bounded/linear so a hostile fan-out cannot become an O(n*m) render.
+  const childIdsByItem = new Map<string, string[]>();
+  for (const child of children) {
+    if (child.itemId === null) continue;
+    const ids = childIdsByItem.get(child.itemId);
+    if (ids === undefined) {
+      childIdsByItem.set(child.itemId, [child.agentId]);
+    } else {
+      ids.push(child.agentId);
+    }
+  }
+  const childIdsFor = (itemId: string): string[] => childIdsByItem.get(itemId) ?? [];
+  const planSteps = (task?.plan ?? []).slice(0, MAX_LINES);
   const steps: CockpitStepView[] = planSteps.map((step) => ({
     id: step.id,
     summary: step.summary,
     status: step.state,
     dependsOn: step.dependsOn,
-    childIds: children.filter((child) => child.itemId === step.id).map((child) => child.agentId),
+    childIds: childIdsFor(step.id),
   }));
   const plannedIds = new Set(steps.map((step) => step.id));
-  for (const completed of task?.completed ?? []) {
+  for (const completed of (task?.completed ?? []).slice(0, MAX_LINES)) {
     if (!plannedIds.has(completed)) {
       steps.push({
         id: completed,
         summary: completed,
         status: 'done',
         dependsOn: [],
-        childIds: children.filter((child) => child.itemId === completed).map((child) => child.agentId),
+        childIds: childIdsFor(completed),
       });
     }
   }
-  for (const open of task?.open ?? []) {
+  for (const open of (task?.open ?? []).slice(0, MAX_LINES)) {
     if (!plannedIds.has(open)) {
       steps.push({
         id: open,
         summary: open,
         status: 'open',
         dependsOn: [],
-        childIds: children.filter((child) => child.itemId === open).map((child) => child.agentId),
+        childIds: childIdsFor(open),
       });
     }
   }

@@ -2554,7 +2554,7 @@ platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
 id = "INV-BILLING-WEBHOOK-SUBSCRIPTION-FENCE"
-statement = "A payment/invoice webhook observes the subscription mutation fence inside its transaction and never activates or dunns a subscription owned by an in-flight plan, seat or cancel operation."
+statement = "A payment/invoice webhook observes the subscription mutation fence inside its transaction; a settlement would write subscription state owned by an in-flight plan, seat or cancel operation, so the whole event is refused unrecorded and applies exactly once on retry, never activating or dunning under the fence."
 owner = "crates/payments webhook settlement"
 authority = "crates/payments/src/service.rs subscription_mutation_fence_active"
 unit_test = "payment_webhook_cannot_activate_a_subscription_under_its_mutation_fence"
@@ -2590,6 +2590,62 @@ production_wiring = "payment_failed_dunning_defers_under_subscription_mutation_f
 fault = ""
 mutation_witness = "payment_failed_dunning_defers_under_subscription_mutation_fence"
 mutation_command = "node scripts/mutation-run.mjs INV-BILLING-PAYMENT-FAILED-DUNNING-FENCE"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-BILLING-CHECKOUT-PROVIDER-TRUTH"
+statement = "A hosted checkout becomes durable only when the provider object's amount and currency equal the fenced invoice balance; a mismatch keeps the operation claim unknown, activates nothing, and is never re-dispatched as a second object."
+owner = "crates/payments hosted checkout"
+authority = "crates/payments/src/service.rs create_checkout provider amount/currency truth"
+unit_test = "checkout_provider_truth_mismatch_is_refused_without_activating"
+production_wiring = "checkout_provider_truth_mismatch_is_refused_without_activating"
+fault = ""
+mutation_witness = "checkout_provider_truth_mismatch_is_refused_without_activating"
+mutation_command = "node scripts/mutation-run.mjs INV-BILLING-CHECKOUT-PROVIDER-TRUTH"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-BILLING-INVOICE-RECEIPT-IDENTITY"
+statement = "An invoice-paid event and a payment-succeeded event that name the same provider payment converge on exactly one local receipt; the invoice event never mints a second refundable payment for money already observed."
+owner = "crates/payments invoice authority"
+authority = "crates/payments/src/service/webhooks.rs invoice.paid provider payment identity binding"
+unit_test = "invoice_and_payment_events_describe_one_receipt"
+production_wiring = "invoice_and_payment_events_describe_one_receipt"
+fault = ""
+mutation_witness = "invoice_and_payment_events_describe_one_receipt"
+mutation_command = "node scripts/mutation-run.mjs INV-BILLING-INVOICE-RECEIPT-IDENTITY"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-BILLING-REFUND-INFLIGHT-DEFERRAL"
+statement = "A refund webhook that arrives after the provider refund exists but before its local reservation row is durable is refused unrecorded while a refund mutation is in flight, so the same event retries and settles the reservation exactly once."
+owner = "crates/payments webhook settlement"
+authority = "crates/payments/src/service/webhook_effects.rs refund mutation in-flight deferral"
+unit_test = "refund_webhook_during_in_flight_refund_is_deferred_not_lost"
+production_wiring = "refund_webhook_during_in_flight_refund_is_deferred_not_lost"
+fault = ""
+mutation_witness = "refund_webhook_during_in_flight_refund_is_deferred_not_lost"
+mutation_command = "node scripts/mutation-run.mjs INV-BILLING-REFUND-INFLIGHT-DEFERRAL"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-PAYMENTS-TOKEN-PAN-SHAPE"
+statement = "Provider-token ingestion refuses any 12..=19 digit card-shaped payload, including a PAN split into digit groups that has no contiguous run and fails Luhn."
+owner = "crates/payments token ingestion"
+authority = "crates/payments/src/service/tokens.rs validate_payment_token pan_shaped_body"
+unit_test = "strict_token_shape_rejects_pan_at_any_offset_and_oversize"
+production_wiring = "strict_token_shape_rejects_pan_at_any_offset_and_oversize"
+fault = ""
+mutation_witness = "strict_token_shape_rejects_pan_at_any_offset_and_oversize"
+mutation_command = "node scripts/mutation-run.mjs INV-PAYMENTS-TOKEN-PAN-SHAPE"
 mutation_debt = ""
 release_critical = true
 platforms = ["linux", "macos", "windows"]
@@ -2825,6 +2881,108 @@ production_wiring = "mutation_witness_economic_gate_rejects_each_boundary_crossi
 fault = ""
 mutation_witness = "mutation_witness_economic_gate_rejects_each_boundary_crossing"
 mutation_command = "node scripts/mutation-run.mjs INV-DESIGN-FOCUS-ECONOMIC"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-DESIGN-FOCUS-SANITIZATION"
+statement = "Every focus-projection term is a bounded lowercase ASCII alphanumeric/underscore run, unique and sorted, so hostile contract text can never inject prompt-section structure through the projection."
+owner = "crates/core design readiness"
+authority = "crates/core/src/design_readiness.rs scan_tokens, collect_source_terms and design_focus_terms"
+script_check = ""
+unit_test = "focus_terms_are_sanitized_bounded_unique_sorted_and_deterministic"
+production_wiring = "mutation_witness_focus_sanitization_strips_prompt_section_syntax"
+fault = ""
+mutation_witness = "mutation_witness_focus_sanitization_strips_prompt_section_syntax"
+mutation_command = "node scripts/mutation-run.mjs INV-DESIGN-FOCUS-SANITIZATION"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-SITE-PROXY-TRUST-CHAIN"
+statement = "Forwarded client identity is trusted only from a socket peer inside the explicitly configured proxy CIDRs: with no configured CIDR the peer alone is used, an untrusted peer's Forwarded/X-Forwarded-For/X-Real-IP headers can never spoof the rate-limit identity, the chain is walked from the socket peer toward the origin so the first untrusted hop wins, and malformed, chained, or oversized forwarding headers fail closed to the peer."
+owner = "crates/site proxy trust and client identity"
+authority = "crates/site/src/security.rs client_ip/derived_client; crates/site/src/config.rs parse_trusted_proxy_cidrs"
+script_check = ""
+unit_test = "untrusted_peer_cannot_spoof_forwarding_headers"
+production_wiring = "spoofed_forwarded_headers_from_an_untrusted_peer_do_not_evade_ip_limits"
+fault = ""
+mutation_witness = "mixed_chain_uses_the_rightmost_untrusted_address"
+mutation_command = "node scripts/mutation-run.mjs INV-SITE-PROXY-TRUST-CHAIN"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-MEMORY-CAS-GROUP-ATOMIC"
+statement = "A group of memory facts replaces only when the named compare-and-swap fact still equals the caller's observed value (or is absent), with the comparison and every write in one transaction: two writers that observed the same prior value cannot both land, a stale expected value writes nothing, and a winner writes the section and its delivery watermark together."
+owner = "crates/store grouped memory CAS + crates/orchestrator child handoff"
+authority = "crates/store/src/ledger.rs upsert_memory_facts_if_unchanged; crates/orchestrator/src/runtime_handoff.rs deliver_child_handoff"
+script_check = ""
+unit_test = "memory_facts_cas_group_has_one_winner_and_rejects_stale_expected"
+production_wiring = "fault_probe_crash_before_parent_handoff_reattach_heals_exactly_once"
+fault = ""
+mutation_witness = "memory_facts_cas_group_has_one_winner_and_rejects_stale_expected"
+mutation_command = "node scripts/mutation-run.mjs INV-MEMORY-CAS-GROUP-ATOMIC"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-VSCODE-COCKPIT-RENDER-BOUND"
+statement = "Cockpit plan, completed and open lists are capped at the render line bound and child links are built with one linear index, so a hostile task/agent fan-out cannot create an unbounded view or O(n*m) render work; retained steps keep their exact child links."
+owner = "apps/vscode cockpit render"
+authority = "apps/vscode/src/cockpit.ts buildCockpit childIdsByItem and MAX_LINES slices"
+script_check = "cockpit bounds a hostile plan and child fan-out without quadratic linking"
+mutation_witness = "cockpit bounds a hostile plan and child fan-out without quadratic linking"
+mutation_command = "node scripts/mutation-run.mjs INV-VSCODE-COCKPIT-RENDER-BOUND"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-SITE-BILLING-TERMINAL-RESUBSCRIBE"
+statement = "A terminal (canceled) subscription is never presented as live: the billing page shows the plan cards again, hides change/cancel-only controls, and a checkout can start a replacement subscription; change/cancel on a terminal row are a typed conflict instead of a provider call."
+owner = "crates/site billing UI and routes"
+authority = "crates/site/src/web/billing_pages.rs billing/plan_cards; crates/site/src/routes/billing.rs begin_subscription/change_plan/cancel"
+script_check = ""
+unit_test = "cancelled_subscription_unblocks_the_plan_cards_and_a_new_checkout"
+production_wiring = "cancelled_subscription_unblocks_the_plan_cards_and_a_new_checkout"
+fault = ""
+mutation_witness = "cancelled_subscription_unblocks_the_plan_cards_and_a_new_checkout"
+mutation_command = "node scripts/mutation-run.mjs INV-SITE-BILLING-TERMINAL-RESUBSCRIBE"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-DESIGN-READINESS-CONTRACT-BOUND"
+statement = "Applying design-readiness findings never pushes the risk list past the durable MAX_TASK_CONTRACT_ENTRIES bound, so a full contract keeps its compiled additions instead of becoming unpersistable; repeated application at the bound is a no-op."
+owner = "crates/core design readiness + crates/agent contract compiler"
+authority = "crates/core/src/design_readiness.rs apply_design_readiness risk append bound"
+script_check = ""
+unit_test = "apply_never_exceeds_the_contract_entry_bound"
+production_wiring = "compile_path_applies_readiness_once_without_side_effects"
+fault = ""
+mutation_witness = "apply_never_exceeds_the_contract_entry_bound"
+mutation_command = "node scripts/mutation-run.mjs INV-DESIGN-READINESS-CONTRACT-BOUND"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-SITE-BILLING-PROVIDER-AVAILABILITY"
+statement = "Commercial controls are exposed only when the served provider state is exactly available: provider-token attach and plan checkout are disabled for every other state, and the panel badge serves the real state instead of a fabricated active provider."
+owner = "crates/site billing UI"
+authority = "crates/site/src/web/billing_pages.rs payment_methods disabled/provider_state and plan_cards disabled"
+script_check = ""
+unit_test = "payment_method_attach_follows_the_provider_readiness_state"
+production_wiring = "cancelled_subscription_unblocks_the_plan_cards_and_a_new_checkout"
+fault = ""
+mutation_witness = "payment_method_attach_follows_the_provider_readiness_state"
+mutation_command = "node scripts/mutation-run.mjs INV-SITE-BILLING-PROVIDER-AVAILABILITY"
 mutation_debt = ""
 release_critical = true
 platforms = ["linux", "macos", "windows"]

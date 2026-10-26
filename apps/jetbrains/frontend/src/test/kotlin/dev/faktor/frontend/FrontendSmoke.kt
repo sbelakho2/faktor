@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=separate-process, read-only-artifacts
 // Frontend smoke: the new model parsing (blocker, tournament,
 // provider/reasoning, attachments) against canned native JSON, a real
 // daemon where feasible (task-run with `files`, permissions reply route,

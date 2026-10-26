@@ -1,0 +1,12 @@
+{
+  "id": "INV-DESIGN-FOCUS-SANITIZATION",
+  "file": "crates/core/src/design_readiness.rs",
+  "find": "        if ch.is_ascii_alphanumeric() || ch == '_' {",
+  "replace": "        if !ch.is_whitespace() {",
+  "gate": "cargo test -p faktor-core --lib mutation_witness_focus_sanitization_strips_prompt_section_syntax",
+  "expect": "FAILED",
+  "note": "Accepting every non-whitespace character lets hostile markup, control bytes and prompt-section syntax survive into a focus term.",
+  "capabilities": [],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+}

@@ -1061,21 +1061,25 @@ impl AgentRuntime {
         }
         // Zero-artifact Elephant memory: derive a tiny focus projection from
         // the authoritative durable contract in memory. It may REPLACE only
-        // this work item's duplicated retrieval-key material, never add to it,
-        // and only behind the tokenizer-free economic gate (>=12.5% AND >=2 KiB
-        // smaller). Precise owned/recent path needs below remain unchanged.
+        // this work item's DUPLICATED material: the path list is a copy of
+        // `changed_files`, which still feeds the owned/recent path needs below,
+        // so those precise path needs survive unchanged. The step title is
+        // unique retrieval/evidence material (it can carry `evidence://`
+        // refs), so it is always preserved. Replacement happens only behind
+        // the tokenizer-free economic gate (>=12.5% AND >=2 KiB smaller) and
+        // is measured against the material actually removed, never the title.
         // No prompt section, memory fact, CAS object or second design document.
         let design_focus = task
             .map(|task| faktor_core::design_focus_terms(&task.contract))
             .unwrap_or_default();
         let active_work_item = ledger.open_steps.first().map(|step| {
-            let baseline_bytes = ledger.changed_files.iter().fold(step.len(), |total, path| {
+            let duplicated_bytes = ledger.changed_files.iter().fold(0usize, |total, path| {
                 total.saturating_add(path.len()).saturating_add(1)
             });
-            if faktor_core::design_focus_is_economic(baseline_bytes, &design_focus) {
+            if faktor_core::design_focus_is_economic(duplicated_bytes, &design_focus) {
                 WorkItem {
                     id: "step:0".to_string(),
-                    title: String::new(),
+                    title: step.clone(),
                     state: "open".to_string(),
                     paths: Vec::new(),
                     criteria: design_focus,

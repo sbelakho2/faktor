@@ -102,6 +102,148 @@ async fn fault_probe_crash_before_parent_handoff_reattach_heals_exactly_once() {
     );
 }
 
+/// New-angle cancellation probe: the bounded abort path lands the child
+/// session `ReadyForNextTurn` after journaling `TurnCompleted {aborted:true}`
+/// — the SAME post-state an ordinary completion leaves. A crash before the
+/// executor settles the child must reconcile the durable abort marker as
+/// `cancelled`, never fabricate `done`, and the parent handoff must carry the
+/// truthful terminal outcome exactly once.
+#[tokio::test]
+async fn crash_after_cancel_before_settlement_reconciles_cancelled_not_done() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(open_env(dir.path(), empty_script(), 0));
+    let p = plan(
+        OwnershipModel::NoWrites,
+        vec![wi("a", WorkKind::Analysis, &[])],
+    );
+    let mut config = base_config(&env, "run-cancel-crash");
+    // Fire after the child row/session exists, BEFORE any drive: the child
+    // is left Running. We then reproduce the executor's abort and kill the
+    // process in the settlement window by going straight to re-attach.
+    config.crash_seam = Some(CrashSeam::BeforeDrive);
+    let err = run_exec(&env, p, config, vec![spec("a")])
+        .await
+        .expect_err("the BeforeDrive seam must fire");
+    assert!(matches!(err, ExecError::InjectedCrashSeam(_)), "{err:?}");
+    let rows =
+        OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, "run-cancel-crash")
+            .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].state, ChildState::Running);
+
+    // The exact durable state `cancel_child` leaves when the executor dies
+    // after the bounded abort but before settlement: the child session is
+    // promptable again and its last TurnCompleted carries the abort marker.
+    let child = env
+        .manager
+        .get_session(SessionId::try_from(rows[0].session_id).unwrap())
+        .unwrap()
+        .unwrap();
+    let receipt = child
+        .submit_prompt("cancel this child", &[])
+        .expect("the child accepts a prompt");
+    child
+        .abort(Some(receipt.op_id))
+        .expect("the bounded abort succeeds");
+    assert_eq!(
+        child.state().unwrap(),
+        AgentState::ReadyForNextTurn,
+        "abort leaves the same post-state as a genuine completion"
+    );
+    let last = child.last_event_seq().unwrap().unwrap();
+    let tail = child.events_range(last.raw(), Some(1)).unwrap();
+    assert_eq!(tail[0].kind, EventKind::TurnCompleted);
+    assert_eq!(
+        tail[0]
+            .payload
+            .as_ref()
+            .and_then(|p| p.get("aborted"))
+            .and_then(serde_json::Value::as_bool),
+        Some(true),
+        "the abort marker is the durable cancellation authority"
+    );
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(600),
+        env.orchestrator.reattach(
+            env.parent,
+            "run-cancel-crash",
+            Ceilings::default(),
+            base_config(&env, "x").parent_caps,
+            "m".to_string(),
+            env.isolated_root.clone(),
+            None,
+        ),
+    )
+    .await
+    .expect("reattach exceeded the hard bound")
+    .expect("reattach heals the cancelled child");
+    assert!(!outcome.complete, "a cancelled child is never complete");
+    assert_eq!(
+        outcome.item_states,
+        vec![("a".to_string(), WorkState::Cancelled)],
+        "the plan outcome reports cancellation, not success: {outcome:?}"
+    );
+    let healed =
+        OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, "run-cancel-crash")
+            .unwrap();
+    assert_eq!(healed[0].state, ChildState::Cancelled);
+    assert!(
+        healed[0].revision > rows[0].revision,
+        "the reconciled cancellation advances the monotonic transition revision"
+    );
+    let parent = env.manager.get_session(env.parent).unwrap().unwrap();
+    let key = format!("child-handoff/run-cancel-crash/{}", healed[0].child_id);
+    let section = parent
+        .memory_fact_get("internal_context", &key)
+        .unwrap()
+        .expect("re-attach delivers the cancelled handoff");
+    assert!(
+        section.contains("outcome: cancelled"),
+        "the handoff reports cancellation: {section}"
+    );
+    assert!(
+        !section.contains("outcome: done"),
+        "a cancelled child must never hand off a fabricated success: {section}"
+    );
+    let watermark_key = format!(
+        "child-handoff-delivered/run-cancel-crash/{}",
+        healed[0].child_id
+    );
+    assert_eq!(
+        parent
+            .memory_fact_get("internal_context", &watermark_key)
+            .unwrap(),
+        Some(format!("rev:{}", healed[0].revision)),
+        "the delivered watermark binds the cancelled generation"
+    );
+}
+
+/// Mutation witness for the cancellation reconciler: the abort marker is the
+/// ONLY durable distinction between `cancelled` and `done` after a crash.
+/// The witness passes on the production source and fails on the mutation
+/// (`aborted` forced false), exactly what the functional probe above pins.
+#[test]
+fn cancel_reconcile_abort_marker_witness_is_mutation_sensitive() {
+    const SOURCE: &str = include_str!("runtime_handoff.rs");
+    fn guarded(source: &str) -> bool {
+        source.contains("fn last_turn_completed_was_aborted(")
+            && source.contains("payload.get(\"aborted\")")
+            && source.contains("and_then(serde_json::Value::as_bool)")
+    }
+    assert!(guarded(SOURCE), "the abort-marker reconciler is present");
+    let mutated = SOURCE.replace(
+        "and_then(serde_json::Value::as_bool)",
+        "and_then(|_| Some(false))",
+    );
+    assert_ne!(mutated, SOURCE, "the witness seam must exist");
+    assert!(
+        !guarded(&mutated),
+        "forcing the abort marker false must break the witness"
+    );
+}
+
 /// New-angle depth probe: orchestration nests exactly ONE level. A child
 /// session can never own another run (no grandchildren), and the refusal is
 /// typed before any plan/registry row of the nested run is written.

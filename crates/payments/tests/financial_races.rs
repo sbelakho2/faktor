@@ -1710,11 +1710,11 @@ async fn payment_webhooks_never_bypass_a_subscription_mutation_fence() {
                     mutation.label()
                 );
             } else {
-                let outcome = delivered.unwrap();
-                assert_eq!(
-                    outcome.disposition,
-                    WebhookDisposition::Applied,
-                    "{} payment.succeeded was not applied",
+                let deferred = delivered
+                    .expect_err("a held subscription mutation must defer the settlement webhook");
+                assert!(
+                    matches!(deferred, PaymentError::Conflict(_)),
+                    "{} payment.succeeded bypassed a held mutation fence: {deferred:?}",
                     mutation.label()
                 );
                 assert_eq!(
@@ -1725,8 +1725,13 @@ async fn payment_webhooks_never_bypass_a_subscription_mutation_fence() {
                 );
                 assert_eq!(
                     fx.invoice(&invoice.id).status,
-                    InvoiceStatus::Paid,
-                    "{} payment.succeeded did not settle its invoice",
+                    InvoiceStatus::Open,
+                    "{} deferred payment.succeeded recorded an invoice effect",
+                    mutation.label()
+                );
+                assert!(
+                    fx.payments().is_empty(),
+                    "{} deferred payment.succeeded recorded a payment",
                     mutation.label()
                 );
             }
@@ -1740,8 +1745,6 @@ async fn payment_webhooks_never_bypass_a_subscription_mutation_fence() {
             task.await.unwrap().unwrap();
             assert_eq!(fx.ledger.committed(kind).len(), 1);
 
-            let final_invoice = fx.invoice(&invoice.id);
-            let final_subscription = fx.store.subscription(ORG).unwrap().unwrap();
             if failed_webhook {
                 let retried = fx
                     .service
@@ -1778,32 +1781,54 @@ async fn payment_webhooks_never_bypass_a_subscription_mutation_fence() {
                 }
                 assert_eq!(after.grace_end_ms, past_due.grace_end_ms);
             } else {
+                let retried = fx
+                    .service
+                    .handle_webhook(&headers, &body, fx.clock.now_ms())
+                    .await
+                    .unwrap();
                 assert_eq!(
-                    final_invoice.status,
-                    InvoiceStatus::Paid,
-                    "{} payment.succeeded did not remain settled",
+                    retried.disposition,
+                    WebhookDisposition::Applied,
+                    "{} deferred payment.succeeded was not applied exactly once on retry",
                     mutation.label()
                 );
+                assert_eq!(
+                    fx.invoice(&invoice.id).status,
+                    InvoiceStatus::Paid,
+                    "{} retried payment.succeeded did not settle its invoice",
+                    mutation.label()
+                );
+                let after = fx.store.subscription(ORG).unwrap().unwrap();
                 match mutation {
                     FenceMutation::ChangePlan => {
-                        assert_eq!(final_subscription.plan_id, "team");
-                        assert_eq!(final_subscription.state, SubscriptionState::PastDue);
+                        assert_eq!(after.plan_id, "team");
+                        assert_eq!(after.state, SubscriptionState::Active);
                     }
                     FenceMutation::ChangeSeats => {
-                        assert_eq!(final_subscription.quantity, 2);
-                        assert_eq!(final_subscription.state, SubscriptionState::PastDue);
+                        assert_eq!(after.quantity, 2);
+                        assert_eq!(after.state, SubscriptionState::Active);
                     }
                     FenceMutation::Cancel => {
-                        assert_eq!(final_subscription.state, SubscriptionState::Canceled);
+                        assert_eq!(after.state, SubscriptionState::Canceled);
                     }
                 }
-                assert_eq!(
-                    final_subscription.dunning_attempts,
-                    past_due.dunning_attempts,
-                    "{} payment.succeeded reset dunning across the fence",
-                    mutation.label()
-                );
-                assert_eq!(final_subscription.grace_end_ms, past_due.grace_end_ms);
+                if matches!(mutation, FenceMutation::Cancel) {
+                    assert_eq!(
+                        after.dunning_attempts,
+                        past_due.dunning_attempts,
+                        "{} a canceled subscription keeps its terminal dunning record",
+                        mutation.label()
+                    );
+                    assert_eq!(after.grace_end_ms, past_due.grace_end_ms);
+                } else {
+                    assert_eq!(
+                        after.dunning_attempts,
+                        0,
+                        "{} the retried settlement did not reset dunning",
+                        mutation.label()
+                    );
+                    assert!(after.grace_end_ms.is_none());
+                }
             }
             let domain = ConflictDomain::SubscriptionMutation {
                 subscription_id: subscription.id.clone(),

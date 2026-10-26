@@ -386,6 +386,28 @@ impl AgentRuntime {
         ))
     }
 
+    /// The effective configured compaction model: the session setting wins,
+    /// then the daemon config. Empty AND the literal `inherit` mean "not
+    /// configured": both fall through to routing/deterministic pruning.
+    ///
+    /// `inherit` is not a model. A durable/legacy row carrying it must never
+    /// become a bogus provider call (which also wastes the one compaction
+    /// slot); the daemon's own settings route clears the fact, but recovery
+    /// deletes nothing and older writers may have mirrored the literal.
+    pub(crate) fn configured_compaction_model<'a>(
+        session: Option<&'a str>,
+        daemon: Option<&'a str>,
+    ) -> Option<&'a str> {
+        session
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && *value != "inherit")
+            .or_else(|| {
+                daemon
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty() && *value != "inherit")
+            })
+    }
+
     /// Resolve the configured compaction model ("model" uses the session's
     /// provider; "provider/model" names another registered provider).
     pub(crate) fn resolve_compaction_model(
@@ -452,9 +474,14 @@ impl AgentRuntime {
             .flatten()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
-        let configured_model = session_model
-            .as_deref()
-            .or(self.deps.compaction_model.as_deref());
+        // `inherit` is the ABSENCE of a model, never a model id: a stored
+        // literal (legacy/hostile row) must fall through to the daemon
+        // config exactly like an empty/absent fact, not consume a provider
+        // call with a guaranteed-unroutable name.
+        let configured_model = Self::configured_compaction_model(
+            session_model.as_deref(),
+            self.deps.compaction_model.as_deref(),
+        );
         Ok(if let Some(model) = configured_model {
             let built = match self.resolve_compaction_model(handle, model) {
                 Ok((provider, model_name)) => Some(StreamingSummarizer {

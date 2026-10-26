@@ -1,0 +1,16 @@
+{
+  "id": "INV-SITE-PROXY-TRUST-CHAIN",
+  "surface": "security",
+  "file": "crates/site/src/security.rs",
+  "find": "    if !config.trusts_proxy(peer) {\n        return peer.to_string();\n    }",
+  "replace": "    if false {\n        return peer.to_string();\n    }",
+  "gate": "cargo test -p faktor-site --lib untrusted_peer_cannot_spoof_forwarding_headers",
+  "expect": "FAILED",
+  "note": "Trusting forwarding headers from every socket peer lets an untrusted client spoof its rate-limit identity; the spoof oracle must fail.",
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

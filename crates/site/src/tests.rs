@@ -807,9 +807,21 @@ async fn mollie_handoff_and_id_only_webhook_fetch_settle_the_invoice() {
     mock.route(
         "POST",
         "/v2/payments",
-        MockAction::Respond {
+        MockAction::RespondFn {
             status: 201,
-            body: include_str!("../../payments/tests/fixtures/mollie/payment_open.json").into(),
+            respond: Arc::new(|request| {
+                let mut value: serde_json::Value = serde_json::from_str(include_str!(
+                    "../../payments/tests/fixtures/mollie/payment_open.json"
+                ))
+                .expect("payment fixture");
+                if let Some(amount) = request.get("amount") {
+                    value["amount"] = amount.clone();
+                }
+                if let Some(metadata) = request.get("metadata") {
+                    value["metadata"] = metadata.clone();
+                }
+                value.to_string()
+            }),
         },
     );
     let base = mock.base_url().await;
@@ -897,6 +909,67 @@ async fn mollie_handoff_and_id_only_webhook_fetch_settle_the_invoice() {
         )
         .await;
     assert_eq!(foreign.status, StatusCode::UNAUTHORIZED, "{}", foreign.body);
+}
+
+#[tokio::test]
+async fn cancelled_subscription_unblocks_the_plan_cards_and_a_new_checkout() {
+    let app = TestApp::build();
+    let mut client = signup_verified(&app, "resubscribe@example.com").await;
+    let location = start_local_checkout(&mut client).await;
+    let _ = pay_local(&mut client, &location).await;
+    let org = app.org_for_email("resubscribe@example.com");
+    let org_id = faktor_cloud::OrganizationId::try_new(org.clone()).unwrap();
+    let page = client.get("/account/billing/").await;
+    let csrf = client.form_csrf(&page.body);
+    let cancelled = client
+        .post(
+            "/account/billing/cancel/",
+            &[
+                ("csrf", csrf.as_str()),
+                ("at_period_end", "0"),
+                ("confirm", "yes"),
+            ],
+        )
+        .await;
+    assert_eq!(
+        cancelled.status,
+        StatusCode::SEE_OTHER,
+        "{}",
+        cancelled.body
+    );
+    let overview = app.payments().overview(&org_id).unwrap();
+    assert!(
+        !overview.subscription.unwrap().is_live(),
+        "an immediate cancellation is terminal"
+    );
+
+    let page = client.get("/account/billing/").await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(
+        !page.body.contains("A live subscription exists"),
+        "a terminal subscription must not claim to be live"
+    );
+    assert!(
+        page.body.contains("No live subscription"),
+        "the page must offer the plan cards again"
+    );
+    let form = billing_form(&mut client).await;
+    let checkout = client
+        .post(
+            "/account/billing/checkout/",
+            &[
+                ("csrf", form.csrf.as_str()),
+                ("plan_id", "team"),
+                ("interval", "monthly"),
+                ("request_id", form.request_id.as_str()),
+            ],
+        )
+        .await;
+    assert_eq!(checkout.status, StatusCode::SEE_OTHER, "{}", checkout.body);
+    let overview = app.payments().overview(&org_id).unwrap();
+    let subscription = overview.subscription.unwrap();
+    assert_eq!(subscription.plan_id, "team");
+    assert!(subscription.is_live());
 }
 
 #[tokio::test]
@@ -1599,5 +1672,26 @@ async fn public_auth_pages_keep_chrome_free_of_added_auth_links() {
                 "{route} adds the auth chrome link {absent}"
             );
         }
+    }
+}
+
+#[test]
+fn payment_method_attach_follows_the_provider_readiness_state() {
+    let available = crate::web::billing_pages::payment_methods("csrf", &[], "local", "available");
+    assert!(available.contains("type=\"submit\">Attach token"));
+    for state in ["unconfigured", "disabled", "unavailable"] {
+        let unavailable = crate::web::billing_pages::payment_methods("csrf", &[], "local", state);
+        assert!(
+            unavailable.contains("type=\"submit\" disabled>Attach token"),
+            "{state}: the attach control must be disabled"
+        );
+        assert!(
+            unavailable.contains(&format!("badge neutral\">{state}</span>")),
+            "{state}: the panel must serve the real provider state"
+        );
+        assert!(
+            !unavailable.contains("badge ok\">active</span>"),
+            "{state}: the panel must not claim a fake active provider"
+        );
     }
 }

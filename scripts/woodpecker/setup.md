@@ -522,68 +522,27 @@ On hosted `woodpecker-ci.org` the server cap is fixed and cannot be raised by
 a user; run the nightly cron on a self-hosted instance (or accept that long
 campaign lanes are cut off at the cap) until that changes.
 
-## 7. Branch protection / required status checks
+## 7. Branch protection (OFF) and main-only pipeline
 
-**Current operator state (verified 2026-10-19):** `main` requires only
-`ci/woodpecker/pr/pr` with `strict: true`; `enforce_admins` is **false**, so
-the repository-admin bypass is open. This is the truthful state while the
-single-project server runs the untrusted PR shape and therefore cannot
-publish `ci/woodpecker/push/trusted`. Close the bypass after the first
-exact-SHA `ci/woodpecker/pr/pr` green run:
+**Current operator state (verified 2026-10-25):** `main` is **not protected**;
+`gh api repos/sbelakho2/faktor/branches/main/protection` returns
+`404 Branch not protected`. Direct pushes to `main` are expected for this
+single-maintainer repository.
 
-```sh
-gh api --method POST repos/sbelakho2/faktor/branches/main/protection/enforce_admins
-gh api repos/sbelakho2/faktor/branches/main/protection/enforce_admins --jq .enabled
-```
+The live project (id 2) loads `.woodpecker/main.yaml` with `allow_pr: false`
+and `trusted.volumes: false`. Only `push` events on `main` run the
+change-scoped lane. The PR workflow is optional and must not gate `main`:
 
-Do not add the push context to branch protection until the trusted shape
-actually publishes for `main`; a required context with no publisher blocks
-every merge.
+- do **not** require `ci/woodpecker/pr/pr`;
+- do **not** require any other PR context;
+- do **not** add a required pull request review.
 
-For a full two-project or hosted instance, Woodpecker reports one commit
-status per workflow, so branch protection must require BOTH the PR context
-and the main-push context:
-
-- the PR check `ci/woodpecker/pr/pr` (untrusted project), and
-- the main-push check `ci/woodpecker/push/trusted` (trusted project).
-
-Requiring the push context is what makes a main push fail closed: every
-push creates the trusted workflow because its top-level `when` includes the
-`push` event (enforced by `bash scripts/certify.sh --check-gate-parity`,
-which fails when the push event is filtered out), and the workflow's
-`certificate` step runs on `success` **and** `failure` status. A pipeline
-that **fails to start** (for example a config-parse error) never becomes a
-successful status: GitHub keeps the required `ci/woodpecker/push/trusted`
-check pending/non-success, so the commit cannot be treated as green by any
-consumer that checks the required context. The same applies to the tag
-context `ci/woodpecker/tag/trusted`; darwin/windows certificates run inside
-the trusted workflow, so their failure also fails
-`ci/woodpecker/push/trusted`.
-
-- GitHub UI: Settings → Branches → Add branch protection rule for `main` →
-  *Require status checks to pass* → search for and add
-  `ci/woodpecker/pr/pr` and `ci/woodpecker/push/trusted`.
-- API:
-
-  ```sh
-  gh api --method PUT repos/<owner>/<repo>/branches/main/protection --input - <<'JSON'
-  {
-    "required_status_checks": {
-      "strict": true,
-      "contexts": ["ci/woodpecker/pr/pr", "ci/woodpecker/push/trusted"]
-    },
-    "enforce_admins": false,
-    "required_pull_request_reviews": null,
-    "restrictions": null
-  }
-  JSON
-  ```
-
-`activate.sh` prints the same instructions after activation. Server
-overrides of `WOODPECKER_STATUS_CONTEXT(_FORMAT)` rename every context; use
-the resulting strings in branch protection. The default status context is
-derived from the workflow file, so a workflow that fails to load can never
-switch the required context to something else.
+`activate.sh` is a two-project helper for servers that implement the
+`?project=` selector; this instance does not (upstream 3.18/3.19 limitation).
+Do not run its trusted step here: it would overwrite the main-only shape.
+For an optional PR lane, use a separate project or instance with
+`config_file=.woodpecker/untrusted/` and `allow_pr=true`; keep
+`trusted.volumes=false`.
 
 ## 8. Linux agent
 

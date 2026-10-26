@@ -1123,6 +1123,27 @@ async fn manual_compaction_ignores_a_checkpoint_with_a_mismatched_digest() {
         .get_session(faktor_core::id::SessionId::new(rig.session))
         .unwrap()
         .unwrap();
+    // The real transcript the fallback MUST preserve. If a refused
+    // checkpoint still contributed its `through_seq`, every one of these
+    // rows would be skipped while the loader claimed to fall back.
+    let mut newest = 0u64;
+    for turn in 0..3 {
+        let seq = handle
+            .force_append_event(
+                faktor_core::event::EventKind::ModelChunkReceived,
+                faktor_core::state::AgentState::ReadyForNextTurn,
+                None,
+                None,
+            )
+            .unwrap();
+        newest = seq.raw() as u64;
+        let message = handle
+            .put_message(seq.raw() as i64, "user", json!({"parts": []}))
+            .unwrap();
+        handle
+            .put_text_part(message, &format!("ROW-{turn:03} durable transcript"))
+            .unwrap();
+    }
     let payload_turns = vec![faktor_context::RecentTurn {
         role: "user".into(),
         text: "PAYLOAD CONTENT".into(),
@@ -1132,11 +1153,35 @@ async fn manual_compaction_ignores_a_checkpoint_with_a_mismatched_digest() {
         text: "SOMETHING ELSE".into(),
     }]);
     handle
-        .put_context_checkpoint(1, &digest, &serde_json::to_vec(&payload_turns).unwrap())
+        .put_context_checkpoint(
+            newest,
+            &digest,
+            &serde_json::to_vec(&payload_turns).unwrap(),
+        )
         .unwrap();
     assert!(
-        super::decode_checkpoint_turns(&handle).is_empty(),
+        super::decode_checkpoint_with_seq(&handle).0.is_empty(),
         "a mismatched digest must fall back to the durable transcript, never load"
+    );
+    let (turns, loaded_newest) = super::load_turns(&rig.deps, &handle, 100).unwrap();
+    assert!(
+        turns
+            .iter()
+            .any(|turn| turn.text.contains("ROW-000 durable transcript"))
+            && turns
+                .iter()
+                .any(|turn| turn.text.contains("ROW-002 durable transcript")),
+        "a refused checkpoint contributes NEITHER turns NOR its high-water mark: {turns:?}"
+    );
+    assert!(
+        !turns
+            .iter()
+            .any(|turn| turn.text.contains("PAYLOAD CONTENT")),
+        "the swapped payload is never re-certified: {turns:?}"
+    );
+    assert_eq!(
+        loaded_newest, newest,
+        "the replacement bound comes from the loaded rows, not the refused head"
     );
 }
 

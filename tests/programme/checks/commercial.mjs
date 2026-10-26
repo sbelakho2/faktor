@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// TEST-SEPARATION: oracle=independent-reference isolation=isolated-data-dir
 // Commercial capability matrix: prove every commercial action reaches a real
 // server handler AND a real service seam, and that every IDE client consumes
 // the same route. This is the commercial-specific complement to the generic

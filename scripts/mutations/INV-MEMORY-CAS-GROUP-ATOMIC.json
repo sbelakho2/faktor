@@ -1,0 +1,16 @@
+{
+  "id": "INV-MEMORY-CAS-GROUP-ATOMIC",
+  "surface": "core.runtime",
+  "file": "crates/store/src/ledger.rs",
+  "find": "                let unchanged = match (&expected, &current) {\n                    (None, None) => true,\n                    (Some(expected), Some(current)) => expected == current,\n                    _ => false,\n                };",
+  "replace": "                let unchanged = true;",
+  "gate": "cargo test -p faktor-store --lib memory_facts_cas_group_has_one_winner_and_rejects_stale_expected",
+  "expect": "FAILED",
+  "note": "Dropping the compare-and-swap lets a stale expected watermark overwrite the delivered generation (and two concurrent claims both land), so the one-winner oracle must fail.",
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

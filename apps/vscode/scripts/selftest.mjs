@@ -6568,6 +6568,54 @@ async function cockpitTests() {
     );
   });
 
+  await test('cockpit bounds a hostile plan and child fan-out without quadratic linking', () => {
+    const plan = Array.from({ length: 4_000 }, (_, index) => ({
+      id: `step-${index}`,
+      summary: `step ${index}`,
+      state: 'open',
+      dependsOn: [],
+    }));
+    const agents = st.summarizeAgents(
+      Array.from({ length: 4_000 }, (_, index) => ({
+        ...clone(agentsJson[1]),
+        agent_id: `child-${index}`,
+        item_id: `step-${index}`,
+      })),
+    );
+    const task = {
+      goal: 'bounded cockpit',
+      state: 'running',
+      completed: [],
+      open: [],
+      testsRun: [],
+      testsFailed: [],
+      changedFiles: [],
+      budget: null,
+      acceptanceCriteria: [],
+      plan,
+      blockers: [],
+      evidenceRefs: [],
+      phase: null,
+      progress: null,
+      completion: null,
+    };
+    const view = cp.buildCockpit({
+      task,
+      agents,
+      verification: null,
+      usage: null,
+      taskVerification: null,
+    });
+    assert(view, 'a task alone builds a cockpit');
+    assertEqual(view.steps.length, 64, 'the rendered plan is bounded');
+    assertDeepEqual(view.steps[0].childIds, ['child-0'], 'the bounded step keeps its child link');
+    assertEqual(
+      view.steps.some((step) => step.id === 'step-4000'),
+      false,
+      'the unbounded tail never enters the view',
+    );
+  });
+
   await test('cockpit tournament block is state-gated: decide waits, abort is open-only', () => {
     const candidate = (childId, state) => ({
       childId,

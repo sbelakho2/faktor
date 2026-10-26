@@ -3135,6 +3135,23 @@ impl Store {
         Ok(out)
     }
 
+    /// The NEWEST logical-turn record of one session (bounded LIMIT 1). The
+    /// previous caller-side `turn_records_of(..).last()` materialized every
+    /// turn of a long-lived child; recovery only needs the latest outcome.
+    pub fn latest_turn_record(&self, session_id: SessionId) -> StoreResult<Option<TurnRecordRow>> {
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, turn_op_id, queue_seq, prompt_message_id, effective_provider, effective_model, variant, tool_mode, started_at, status, updated_ms
+             FROM turn_record WHERE session_id = ?1
+             ORDER BY started_at DESC, id DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![session_id.raw() as i64])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(turn_record_map(row)?)),
+            None => Ok(None),
+        }
+    }
+
     // ---------------------------------------------------------------- provider calls
 
     /// EVERY unfinished (still `running`) tool run across ALL sessions —

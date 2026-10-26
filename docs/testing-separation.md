@@ -121,6 +121,25 @@ replace self-derived expectations with fixture/reference oracles:
 
 ## CI
 
-The checker runs in the PR programme-selection step and the trusted
-certification step, after its selftest. The static-authority suite remains the
-production-source authority; this checker is the test-tree authority.
+The scoped main lane (`.woodpecker/main.yaml`) runs the checker through
+`scripts/programme/ci-scope.mjs` whenever the push diff touches
+`tests/test-separation/**`, `scripts/check-test-separation.mjs`, the mutation
+registries/specs or the programme trees: `--selftest` then `--check`, plus
+`node scripts/mutation-run.mjs --check-specs`. The invariant/mutation suite
+also runs the checker so a new spec's isolation declaration cannot drift from
+its runner. The optional PR workflow and the trusted certification lane run
+the same two commands; none of them is a merge gate for `main` (branch
+protection is off, direct pushes are expected).
+
+Newest guards are not exempt from mutation proof. The current additions are
+`INV-SITE-PROXY-TRUST-CHAIN` (untrusted peers cannot spoof forwarded client
+identity; the rightmost untrusted hop wins) and
+`INV-MEMORY-CAS-GROUP-ATOMIC` (grouped memory facts compare-and-swap in one
+transaction), both wired to their own specs in `scripts/mutations/` and to the
+`security` / `core.runtime` mutation surfaces. The bounded per-surface
+campaign (`node scripts/check-invariants.mjs --mutations --scope per-surface`)
+runs from a clean committed checkout and fails on any survivor, environment
+failure or unrun representative.
+
+The static-authority suite remains the production-source authority; this
+checker is the test-tree authority.

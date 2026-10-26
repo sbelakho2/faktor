@@ -107,12 +107,15 @@ readiness layer cannot by itself raise Faktor's routing quality floor.
 The durable `EngineeringContract` remains the single design authority. A tiny
 in-memory focus projection may be derived from its proof bindings, risks and
 invariants and used only to **replace** the active work item's duplicated
-retrieval-key material when a zero-call byte gate proves a meaningful dividend:
-at least 12.5% smaller and at least 2 KiB removed. It is never appended to the
-baseline search material, is not rendered as a new prompt section and is not
-persisted. Small/local tasks and tasks that fail the dividend gate keep the
-baseline path byte-for-byte, while long tasks can sharpen evidence selection
-without another context artifact.
+path material when a zero-call byte gate proves a meaningful dividend: at
+least 12.5% smaller and at least 2 KiB removed. The work item's unique title
+(which may carry explicit evidence references) is preserved, and the task's
+owned/recent path needs still carry every precise path, so the replacement
+can never make a required path unreachable. The projection is never appended
+to the baseline search material, is not rendered as a new prompt section and
+is not persisted. Small/local tasks and tasks that fail the dividend gate
+keep the baseline path byte-for-byte, while long tasks can sharpen evidence
+selection without another context artifact.
 
 Role separation is strict:
 

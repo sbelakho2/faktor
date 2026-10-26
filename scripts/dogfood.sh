@@ -193,6 +193,7 @@ run_cmd "$NODE_BIN" scripts/programme/build-registry.mjs --check
 run_cmd "$NODE_BIN" scripts/programme/check-registry.mjs --check
 run_cmd "$NODE_BIN" scripts/programme/check-registry.mjs --selftest
 run_cmd "$NODE_BIN" scripts/programme/select-tests.mjs selftest
+run_cmd "$NODE_BIN" scripts/programme/ci-scope.mjs --selftest
 run_cmd "$NODE_BIN" scripts/programme/build-impact-graph.mjs --selftest
 run_cmd "$NODE_BIN" scripts/programme/select-tests.mjs --mode trusted --out target/certification/programme/selection-dogfood.json
 run_cmd "$NODE_BIN" scripts/certification/select-tests.mjs --changed-file crates/store/src/ledger.rs --lane pull --out target/certification/programme/selection-dogfood-alias.json

@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! `runtime::contract_compiler_tests`: adversarial covers of the drive-start
 //! baseline contract compilation (audit item 5) — the bounded scanner, the
 //! production merge through the durable task row, the idempotent replay and
@@ -291,6 +292,83 @@ async fn drive_start_compiles_persists_and_replays_the_baseline_contract() {
     handle.merge_task_contract(task_id, &task.contract).unwrap();
 }
 
+#[test]
+fn readiness_seam_only_appends_bounded_medium_risks_to_the_compiled_contract() {
+    let contract = faktor_core::EngineeringContract {
+        proof_obligations: vec![faktor_core::EngineeringContract::obligation_bound(
+            "the legacy category claim holds",
+            faktor_core::ProofEvidenceKind::TestExecution,
+            faktor_core::ContractOrigin::User,
+            faktor_core::Requirement::Required,
+            faktor_core::EvidenceBinding::Category,
+            faktor_core::AcceptedStrength::for_requirement(faktor_core::Requirement::Required),
+        )],
+        ..Default::default()
+    };
+    let mut compiled = faktor_core::CompiledContract {
+        contract,
+        provenance: Vec::new(),
+        uncertainties: Vec::new(),
+        intent_tokens: vec!["legacy".into()],
+        build_systems: vec!["cargo".into()],
+        touched_files: vec!["src/lib.rs".into()],
+        touched_symbols: Vec::new(),
+        repository_digest: "repo:readiness-test".into(),
+        repository_acquisition: faktor_core::RepositoryAcquisition::Complete,
+        enrichments: Vec::new(),
+    };
+    let before = compiled.clone();
+    let audit = faktor_core::audit_compiled_design(&compiled);
+    let applied = faktor_core::apply_design_readiness(&mut compiled, &audit);
+
+    assert!(applied >= 1, "the unbound required proof is a real gap");
+    assert!(
+        applied <= faktor_core::MAX_DESIGN_READINESS_FINDINGS,
+        "application stays bounded"
+    );
+    assert_eq!(
+        compiled.contract.proof_obligations, before.contract.proof_obligations,
+        "readiness never creates, rewrites or discharges a proof obligation"
+    );
+    assert_eq!(
+        compiled.contract.verification_depth(),
+        before.contract.verification_depth(),
+        "a calm compiled contract is never newly promoted to Deep verification"
+    );
+    assert_eq!(
+        compiled.contract.verification_depth(),
+        faktor_core::VerificationDepth::Standard
+    );
+    for risk in &compiled.contract.risks[before.contract.risks.len()..] {
+        assert_eq!(risk.severity, faktor_core::RiskSeverity::Medium);
+        assert_eq!(risk.origin, faktor_core::ContractOrigin::Heuristic);
+        assert!(risk.id.starts_with("dr1:"));
+        assert!(risk.id.len() <= 96);
+        assert!(!risk.description.is_empty());
+        assert!(risk.description.len() <= 320);
+    }
+    assert_eq!(compiled.provenance, before.provenance);
+    assert_eq!(compiled.uncertainties, before.uncertainties);
+    assert_eq!(compiled.intent_tokens, before.intent_tokens);
+    assert_eq!(compiled.build_systems, before.build_systems);
+    assert_eq!(compiled.touched_files, before.touched_files);
+    assert_eq!(compiled.touched_symbols, before.touched_symbols);
+    assert_eq!(compiled.repository_digest, before.repository_digest);
+    assert_eq!(
+        compiled.repository_acquisition,
+        before.repository_acquisition
+    );
+    assert_eq!(compiled.enrichments, before.enrichments);
+    assert!(audit.focus_terms.len() <= faktor_core::MAX_DESIGN_FOCUS_TERMS);
+    assert!(audit.focus_terms.iter().all(|term| {
+        !term.is_empty()
+            && term.len() <= faktor_core::MAX_DESIGN_FOCUS_TERM_BYTES
+            && term
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    }));
+}
+
 #[tokio::test]
 async fn drive_start_records_uncertainty_when_nothing_is_derivable() {
     let dir = tempdir().unwrap();
@@ -543,8 +621,14 @@ async fn installed_provider_answers_the_bounded_questions_into_the_durable_contr
     let task_id = handle.task_id().unwrap();
     let task = handle.get_task(task_id).unwrap().unwrap();
 
-    // The runtime actually ASKED the provider the bounded questions.
-    assert!(spy.consults.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+    // The runtime actually ASKED the provider the bounded questions EXACTLY
+    // once: readiness is a pure seam over the single neutral consult, never a
+    // second paid model call.
+    assert_eq!(
+        spy.consults.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one compile must consult the system-intelligence provider exactly once"
+    );
     let asked: Vec<&str> = spy
         .questions
         .lock()
@@ -655,6 +739,91 @@ async fn refusing_provider_leaves_the_native_contract_and_never_fails_the_drive(
         task.contract,
         native_contract_for(&repo, &ledger.goal),
         "a refusing provider never alters the native contract"
+    );
+}
+
+/// Design-readiness INTEGRATION (not just the pure seam): the real compile
+/// path applies the audit exactly once over the single provider consult,
+/// appends bounded heuristic risks, creates NO proof obligation and NO
+/// second artifact, and a replayed drive neither re-consults nor mutates the
+/// durable revision.
+#[tokio::test]
+async fn compile_path_applies_readiness_once_without_side_effects() {
+    let dir = tempdir().unwrap();
+    let repo = dir.path().join("empty-repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let manager =
+        SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+    let (deps, _keep) =
+        deps_sharing_session(manager.clone(), Arc::new(scripted_provider(vec![])), vec![]);
+    let runtime = AgentRuntime::new(deps).unwrap();
+    let spy = Arc::new(AnsweringIntel::default());
+    runtime.set_system_intelligence_provider(spy.clone());
+    runtime.set_value_gate(granting_gate());
+    let ws = manager.create_workspace(repo.to_str().unwrap()).unwrap();
+    let handle = manager.create_session(ws, "t", "fake", "m").unwrap();
+    let mut ledger = TaskLedger {
+        goal: "Fix the refresh-token race".to_string(),
+        ..Default::default()
+    };
+    runtime
+        .restore_task_rows(&handle, &mut ledger)
+        .await
+        .unwrap();
+    let task_id = handle.task_id().unwrap();
+    let task = handle.get_task(task_id).unwrap().unwrap();
+    let native = native_contract_for(&repo, &ledger.goal);
+    assert_eq!(
+        spy.consults.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the compile path consults the provider exactly once"
+    );
+    assert_eq!(
+        task.contract.proof_obligations, native.proof_obligations,
+        "readiness and enrichment create/rewrite NO proof obligation"
+    );
+    let mut seen = std::collections::HashSet::new();
+    let readiness: Vec<_> = task
+        .contract
+        .risks
+        .iter()
+        .filter(|risk| risk.id.starts_with("dr1:"))
+        .collect();
+    assert!(
+        !readiness.is_empty(),
+        "the compile path applied the readiness audit (native gap: {native:?})"
+    );
+    assert!(
+        readiness.len() <= faktor_core::MAX_DESIGN_READINESS_FINDINGS,
+        "readiness stays bounded"
+    );
+    for risk in readiness {
+        assert_eq!(risk.origin, faktor_core::ContractOrigin::Heuristic);
+        assert!(
+            seen.insert(risk.id.clone()),
+            "a finding is appended exactly once, never duplicated: {risk:?}"
+        );
+    }
+    assert_eq!(
+        external_count(&task.contract),
+        5,
+        "readiness creates no extra artifact/statement"
+    );
+    let revision = handle.task_revision(task_id).unwrap();
+    let contract = task.contract.clone();
+    runtime
+        .restore_task_rows(&handle, &mut ledger)
+        .await
+        .unwrap();
+    assert_eq!(
+        spy.consults.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a replayed compile is a no-op, never a second model call"
+    );
+    assert_eq!(handle.task_revision(task_id).unwrap(), revision);
+    assert_eq!(
+        handle.get_task(task_id).unwrap().unwrap().contract,
+        contract
     );
 }
 

@@ -1,0 +1,19 @@
+{
+  "id": "INV-BILLING-CHECKOUT-PROVIDER-TRUTH",
+  "surface": "payments.billing",
+  "file": "crates/payments/src/service.rs",
+  "find": "        if checkout.amount_minor != request.amount_minor || checkout.currency != request.currency {",
+  "replace": "        if false {",
+  "gate": "cargo test -p faktor-payments --test invoice_fencing checkout_provider_truth_mismatch_is_refused_without_activating",
+  "expect": "FAILED",
+  "note": "Accepting a provider checkout whose amount/currency contradicts the fenced invoice balance would let Faktor store and redirect to an object that charges a different amount; the provider-truth oracle must fail.",
+  "capabilities": [
+    "payments.invoice_truth"
+  ],
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

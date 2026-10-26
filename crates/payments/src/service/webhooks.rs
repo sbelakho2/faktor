@@ -22,6 +22,23 @@ impl PaymentService {
                 .and_then(|object| object.pointer("/metadata/local_invoice_id"))
                 .and_then(serde_json::Value::as_str)
         };
+        // A provider invoice names the payment that settled it. Binding that
+        // identity here makes invoice.paid and payment_intent.succeeded
+        // converge on ONE local receipt instead of minting a second
+        // refundable payment for the same money.
+        let provider_payment_id = object
+            .and_then(|object| {
+                object
+                    .get("payment_intent")
+                    .or_else(|| object.get("charge"))
+            })
+            .and_then(|value| {
+                value
+                    .as_str()
+                    .or_else(|| value.get("id").and_then(serde_json::Value::as_str))
+            })
+            .filter(|id| !id.is_empty() && id.len() <= MAX_TEXT_BYTES)
+            .map(str::to_string);
         let provider_invoice_id = object_id().map(str::to_string);
         let local_id = local_invoice_id();
         let invoice = if let Some(local_id) = local_id {
@@ -36,6 +53,11 @@ impl PaymentService {
         };
         if invoice.organization_id != org {
             return Ok(WebhookEffects::default());
+        }
+        if Self::settlement_fenced_by_subscription_mutation(tx, org, &invoice)? {
+            return Err(PaymentError::Conflict(
+                "a subscription mutation is in flight; retry the webhook".into(),
+            ));
         }
         let provider_invoice_id =
             provider_invoice_id.or_else(|| invoice.provider_invoice_id.clone());
@@ -127,19 +149,44 @@ impl PaymentService {
             let paid = provider_paid.max(0).min(invoice.balance_minor());
             if paid > 0 {
                 invoice.amount_paid_minor = checked_add(invoice.amount_paid_minor, paid)?;
-                payment = Some(Payment {
-                    id: format!("pay_{}", uuid::Uuid::new_v4()),
-                    organization_id: org.to_string(),
-                    invoice_id: invoice.id.clone(),
-                    provider: self.provider.name().to_string(),
-                    provider_payment_id: format!("{}:payment", event.id),
-                    payment_method_id: None,
-                    amount_minor: paid,
-                    refunded_minor: 0,
-                    currency: invoice.currency.clone(),
-                    status: PaymentStatus::Succeeded,
-                    created_ms: now,
-                });
+                payment = match provider_payment_id.as_deref() {
+                    Some(provider_payment_id) => {
+                        match payment_by_provider_id_tx(tx, org, provider_payment_id)? {
+                            Some(mut existing) => {
+                                if existing.status.can_transition_to(PaymentStatus::Succeeded) {
+                                    existing.status = PaymentStatus::Succeeded;
+                                }
+                                Some(existing)
+                            }
+                            None => Some(Payment {
+                                id: format!("pay_{}", uuid::Uuid::new_v4()),
+                                organization_id: org.to_string(),
+                                invoice_id: invoice.id.clone(),
+                                provider: self.provider.name().to_string(),
+                                provider_payment_id: provider_payment_id.to_string(),
+                                payment_method_id: None,
+                                amount_minor: paid,
+                                refunded_minor: 0,
+                                currency: invoice.currency.clone(),
+                                status: PaymentStatus::Succeeded,
+                                created_ms: now,
+                            }),
+                        }
+                    }
+                    None => Some(Payment {
+                        id: format!("pay_{}", uuid::Uuid::new_v4()),
+                        organization_id: org.to_string(),
+                        invoice_id: invoice.id.clone(),
+                        provider: self.provider.name().to_string(),
+                        provider_payment_id: format!("{}:payment", event.id),
+                        payment_method_id: None,
+                        amount_minor: paid,
+                        refunded_minor: 0,
+                        currency: invoice.currency.clone(),
+                        status: PaymentStatus::Succeeded,
+                        created_ms: now,
+                    }),
+                };
             }
             if invoice.amount_paid_minor >= invoice.total_minor {
                 invoice.status = InvoiceStatus::Paid;

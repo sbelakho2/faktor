@@ -1934,13 +1934,25 @@ impl PaymentService {
         let idempotency_key = request.idempotency_key.clone();
         self.store
             .mark_claim_dispatched(org, &idempotency_key, now)?;
-        let checkout = match self.provider.create_checkout(request).await {
+        let checkout = match self.provider.create_checkout(request.clone()).await {
             Ok(checkout) => checkout,
             Err(error) => {
                 self.fail_dispatch(org, &idempotency_key, &error)?;
                 return Err(error);
             }
         };
+        // A hosted checkout is provider truth only after its amount and
+        // currency agree with the fenced invoice balance. Recording an
+        // object that charges a different amount would make the checkout
+        // fence lie, so the claim stays `unknown` and is never re-dispatched.
+        if checkout.amount_minor != request.amount_minor || checkout.currency != request.currency {
+            self.store
+                .mark_claim_unknown(org, &idempotency_key, self.now_ms())?;
+            return Err(PaymentError::Provider(format!(
+                "provider checkout {} {} does not match the requested {} {}",
+                checkout.amount_minor, checkout.currency, request.amount_minor, request.currency
+            )));
+        }
         let response = serde_json::to_value(&checkout)
             .map_err(|e| PaymentError::Store(format!("checkout encoding: {e}")))?;
         let write = self.write(
@@ -3272,6 +3284,40 @@ impl PaymentService {
             },
         )?
         .is_some())
+    }
+
+    /// True when a settlement event would write subscription state owned by
+    /// an in-flight plan/seat/cancel provider call. The whole event is
+    /// deferred (unrecorded) so its single retry can apply the settlement and
+    /// the activation in the correct order instead of dropping the activation.
+    fn settlement_fenced_by_subscription_mutation(
+        tx: &rusqlite::Connection,
+        org: &str,
+        invoice: &Invoice,
+    ) -> Result<bool, PaymentError> {
+        let Some(subscription_id) = invoice.subscription_id.as_deref() else {
+            return Ok(false);
+        };
+        Self::subscription_mutation_fence_active(tx, org, subscription_id)
+    }
+
+    /// True while any refund mutation in this organization is between its
+    /// durable reservation and its local record. A provider refund webhook
+    /// that arrives in that window has no local binding yet; refusing it
+    /// unrecorded keeps the event retryable instead of acknowledging a truth
+    /// that can never be replayed under the same event id.
+    fn refund_mutation_in_flight(
+        tx: &rusqlite::Connection,
+        org: &str,
+    ) -> Result<bool, PaymentError> {
+        tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM financial_mutation_lease \
+             WHERE organization_id = ?1 AND conflict_domain = 'payment_refund' \
+             AND state = 'held')",
+            rusqlite::params![org],
+            |row| row.get(0),
+        )
+        .map_err(|error| PaymentError::Store(format!("read held refund leases: {error}")))
     }
 }
 

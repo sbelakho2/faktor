@@ -1,10 +1,14 @@
 # Faktor main-branch CI — CHANGE-SCOPED ONLY (single-maintainer policy).
 #
-# Direct pushes to main are expected. This lane never runs the whole test suite
-# for a partial change: it compiles the workspace (cheap relative to tests) and
-# runs fmt/clippy/tests only for the crates whose files changed, plus app/site
-# checks only when those trees changed. Pull-request gating is not required and
-# branch protection must remain off for this single-person repository.
+# Direct pushes to main are expected. This lane never runs the whole test
+# suite for a partial change: `scripts/programme/ci-scope.mjs` maps the push
+# diff to the EXACT workspace package names (read from each member's
+# Cargo.toml), selects bounded docs/apps/site/programme/mutation/separation
+# checks, and writes one script per toolchain. The mapping is selftested here
+# with planted docs/apps/site/programme, deleted/renamed, base-fallback and
+# unmappable-path cases. An unmappable path is a typed failure (exit 3), not
+# an empty selection. Pull-request gating is not required and branch
+# protection must remain off for this single-person repository.
 when:
   - event: push
     branch: main
@@ -13,55 +17,47 @@ labels:
   platform: linux/amd64
 
 steps:
-  - name: changed-scope
+  - name: scope
+    image: node:24-trixie@sha256:016f604a11c4c725f0a4c62e29ff11adab153d297bf97046c9bf2ddb9f1011d3 # node:24-trixie @ 2026-10-24
+    environment:
+      RUST_BACKTRACE: "1"
+    commands:
+      - node scripts/programme/ci-scope.mjs --selftest
+      - |
+        set -eu
+        base="${CI_COMMIT_BEFORE_SHA:-}"
+        node scripts/programme/ci-scope.mjs --plan --base "$base"
+      - cat target/certification/ci/plan.json
+
+  # Rust half: one workspace type-check (cross-crate effects) plus fmt,
+  # clippy and tests only for crates whose own files changed. A manifest-only
+  # change compiles the workspace and runs no whole-workspace test command.
+  - name: rust-scope
+    depends_on: [scope]
     image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24
     environment:
       RUST_BACKTRACE: "1"
     commands:
       - rustup component add rustfmt clippy
-      - |
-        set -eu
-        base="${CI_COMMIT_BEFORE_SHA:-}"
-        case "$base" in ""|0000000000000000000000000000000000000000) base="HEAD~1" ;; esac
-        git fetch --no-tags --depth=2 origin "$base" 2>/dev/null || true
-        changed="$(git diff --name-only "$base" HEAD 2>/dev/null || git diff --name-only HEAD~1 HEAD)"
-        echo "changed files:"; echo "$changed"
-        crates="$(printf '%s\n' "$changed" | sed -n 's#^crates/\([^/]*\)/.*#faktor-\1#p' | sort -u)"
-        echo "changed crates: ${crates:-<none>}"
-        if [ -n "$crates" ]; then
-          # Compile the whole workspace once (type-checks cross-crate effects)
-          cargo check --workspace --all-targets
-          for p in $crates; do
-            cargo fmt --check -p "$p"
-            cargo clippy -p "$p" --all-targets -- -D warnings
-            cargo test -p "$p"
-          done
-        fi
-      - |
-        set -eu
-        base="${CI_COMMIT_BEFORE_SHA:-HEAD~1}"
-        changed="$(git diff --name-only "$base" HEAD 2>/dev/null || git diff --name-only HEAD~1 HEAD)"
-        if printf '%s\n' "$changed" | grep -qE '^(tests/programme|scripts/programme|scripts/mutations|tests/static-authority)'; then
-          node scripts/programme/check-registry.mjs --check
-          node scripts/programme/select-tests.mjs selftest
-          node scripts/programme/check-core-dumps.mjs --check
-        fi
-        if printf '%s\n' "$changed" | grep -qE '^(docs/|AGENTS\.md|README\.md)'; then
-          ./scripts/check-docs-sync.sh
-        fi
-      - |
-        set -eu
-        base="${CI_COMMIT_BEFORE_SHA:-HEAD~1}"
-        changed="$(git diff --name-only "$base" HEAD 2>/dev/null || git diff --name-only HEAD~1 HEAD)"
-        if printf '%s\n' "$changed" | grep -q '^crates/site/'; then
-          cargo fmt --check -p faktor-site
-          cargo check -p faktor-site
-          cargo clippy -p faktor-site --all-targets -- -D warnings
-          cargo test -p faktor-site
-        fi
-        if printf '%s\n' "$changed" | grep -q '^apps/vscode/'; then
-          (cd apps/vscode && npm ci && npm run build && node scripts/selftest.mjs)
-        fi
-        if printf '%s\n' "$changed" | grep -q '^apps/jetbrains/'; then
-          bash apps/jetbrains/compile-and-smoke.sh
-        fi
+      - sh target/certification/ci/scope-rust.sh
+
+  # Node half: docs, programme registry/selector, mutation/separation static
+  # gates and the zero-JavaScript website scan. The script is a no-op when
+  # the diff selected none of these scopes.
+  - name: node-scope
+    depends_on: [scope]
+    image: node:24-trixie@sha256:016f604a11c4c725f0a4c62e29ff11adab153d297bf97046c9bf2ddb9f1011d3 # node:24-trixie @ 2026-10-24
+    commands:
+      - sh target/certification/ci/scope-node.sh
+
+  - name: vscode-scope
+    depends_on: [scope]
+    image: node:24-trixie@sha256:016f604a11c4c725f0a4c62e29ff11adab153d297bf97046c9bf2ddb9f1011d3 # node:24-trixie @ 2026-10-24
+    commands:
+      - sh target/certification/ci/scope-vscode.sh
+
+  - name: jetbrains-scope
+    depends_on: [scope]
+    image: ghcr.io/sbelakho2/faktor-ci@sha256:bf7739456df1fc9aad818f4dc08990092f89d4c36785abedc14751441b143166 # faktor-ci (linux/amd64) built from docker/faktor-ci/Dockerfile; digest recorded in docker/faktor-ci/image-digest.txt
+    commands:
+      - sh target/certification/ci/scope-jetbrains.sh

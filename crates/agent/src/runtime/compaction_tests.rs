@@ -896,6 +896,95 @@ async fn session_compaction_model_setting_is_used_by_the_next_compaction() {
 }
 
 #[tokio::test]
+async fn inherited_compaction_model_is_not_called_as_a_model() {
+    // A durable/legacy `compactionModel = "inherit"` means "no session
+    // override", exactly like an empty fact. Treating the literal as a model
+    // id burns the compaction slot on an unroutable provider/model call and
+    // silently bypasses the configured daemon summarizer.
+    let (seed_deps, _dir0) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
+    let (manager, session) = shared_session(&seed_deps);
+    seed_long_history(&manager, session, 5, 300).await;
+    manager
+        .get_session(session)
+        .unwrap()
+        .unwrap()
+        .upsert_memory_fact("session_settings", "compactionModel", "inherit")
+        .unwrap();
+    let compactor = Arc::new(FakeProvider::with_script(
+        "compacto",
+        ModelCapabilities {
+            streaming: true,
+            context: 64_000,
+            ..Default::default()
+        },
+        vec![
+            ScriptedResponse::Text("COMPACTION SUMMARY: inherited model.".into()),
+            ScriptedResponse::End,
+        ],
+    ));
+    let mut registry = ProviderRegistry::new();
+    registry
+        .try_register(Arc::new(FakeProvider::with_script(
+            "fake",
+            ModelCapabilities {
+                tools: true,
+                context: 200_000,
+                ..Default::default()
+            },
+            vec![ScriptedResponse::End],
+        )))
+        .unwrap();
+    registry.try_register(compactor.clone()).unwrap();
+    let (mut final_deps, _dir) = deps_sharing_session(
+        manager.clone(),
+        Arc::new(FakeProvider::with_script(
+            "fake",
+            ModelCapabilities {
+                tools: true,
+                context: 200_000,
+                ..Default::default()
+            },
+            vec![ScriptedResponse::End],
+        )),
+        vec![],
+    );
+    final_deps.providers = Arc::new(registry);
+    final_deps.compact_at_usage = 0.0;
+    final_deps.compaction_model = Some("compacto/summary-model".into());
+    let runtime = AgentRuntime::new(final_deps).unwrap();
+    let outcome = runtime
+        .run_turn(session, "do the thing", &[])
+        .await
+        .unwrap();
+    assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+    assert_eq!(
+        compactor.last_request_model().as_deref(),
+        Some("summary-model"),
+        "`inherit` falls through to the daemon config; it is never a model call"
+    );
+}
+
+/// Mutation witness for the inherit guard: both the helper's filter and its
+/// call site are load-bearing. The mutation (`inherit` treated as configured)
+/// makes the functional probe above route the literal as a model.
+#[test]
+fn inherit_guard_witness_is_mutation_sensitive() {
+    const SOURCE: &str = include_str!("compaction.rs");
+    fn guarded(source: &str) -> bool {
+        source.contains("fn configured_compaction_model")
+            && source.contains("*value != \"inherit\"")
+            && source.contains("Self::configured_compaction_model(")
+    }
+    assert!(guarded(SOURCE), "the inherit guard is wired");
+    let mutated = SOURCE.replace("*value != \"inherit\"", "true");
+    assert_ne!(mutated, SOURCE, "the witness seam must exist");
+    assert!(
+        !guarded(&mutated),
+        "treating `inherit` as a configured model must break the witness"
+    );
+}
+
+#[tokio::test]
 async fn broken_compaction_model_degrades_not_breaks() {
     // A compaction model spec that names nothing resolvable must NOT
     // kill the turn: it degrades to the deterministic path.

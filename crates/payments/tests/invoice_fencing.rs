@@ -159,6 +159,7 @@ struct GateProvider {
     inner: faktor_payments::LocalPaymentProvider,
     charge_calls: AtomicUsize,
     refund_calls: AtomicUsize,
+    checkout_calls: AtomicUsize,
     charge_entered: Semaphore,
     charge_release: Semaphore,
     refund_entered: Semaphore,
@@ -174,6 +175,8 @@ struct GateProvider {
     charge_currency: Mutex<Option<String>>,
     refund_amount: Mutex<Option<i64>>,
     refund_currency: Mutex<Option<String>>,
+    checkout_amount: Mutex<Option<i64>>,
+    checkout_currency: Mutex<Option<String>>,
     last_charge: Mutex<Option<ProviderCharge>>,
     last_refund: Mutex<Option<ProviderRefund>>,
 }
@@ -188,6 +191,7 @@ impl GateProvider {
             ),
             charge_calls: AtomicUsize::new(0),
             refund_calls: AtomicUsize::new(0),
+            checkout_calls: AtomicUsize::new(0),
             charge_entered: Semaphore::new(0),
             charge_release: Semaphore::new(0),
             refund_entered: Semaphore::new(0),
@@ -203,6 +207,8 @@ impl GateProvider {
             charge_currency: Mutex::new(None),
             refund_amount: Mutex::new(None),
             refund_currency: Mutex::new(None),
+            checkout_amount: Mutex::new(None),
+            checkout_currency: Mutex::new(None),
             last_charge: Mutex::new(None),
             last_refund: Mutex::new(None),
         }
@@ -252,6 +258,14 @@ impl GateProvider {
         *self.refund_currency.lock().unwrap() = Some(currency.to_string());
     }
 
+    fn set_checkout_amount(&self, amount_minor: i64) {
+        *self.checkout_amount.lock().unwrap() = Some(amount_minor);
+    }
+
+    fn set_checkout_currency(&self, currency: &str) {
+        *self.checkout_currency.lock().unwrap() = Some(currency.to_string());
+    }
+
     async fn wait_charge(&self) {
         self.charge_entered.acquire().await.unwrap().forget();
     }
@@ -284,6 +298,20 @@ impl GateProvider {
 
     fn refund_calls(&self) -> usize {
         self.refund_calls.load(Ordering::SeqCst)
+    }
+
+    fn checkout_calls(&self) -> usize {
+        self.checkout_calls.load(Ordering::SeqCst)
+    }
+
+    fn last_refund_id(&self) -> String {
+        self.last_refund
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("a committed refund exists")
+            .id
+            .clone()
     }
 }
 
@@ -329,7 +357,17 @@ impl PaymentProvider for GateProvider {
         &self,
         request: ProviderCheckoutRequest,
     ) -> Result<ProviderCheckout, PaymentError> {
-        self.inner.create_checkout(request).await
+        self.checkout_calls.fetch_add(1, Ordering::SeqCst);
+        let mut result = self.inner.create_checkout(request).await;
+        if let Ok(checkout) = result.as_mut() {
+            if let Some(amount) = *self.checkout_amount.lock().unwrap() {
+                checkout.amount_minor = amount;
+            }
+            if let Some(currency) = self.checkout_currency.lock().unwrap().clone() {
+                checkout.currency = currency;
+            }
+        }
+        result
     }
 
     async fn create_invoice(
@@ -1607,6 +1645,161 @@ async fn pending_refund_commitment_blocks_a_second_refund_after_a_released_fence
     );
 }
 
+fn request_with_key(invoice: &Invoice, key: &str) -> ProviderCheckoutRequest {
+    ProviderCheckoutRequest {
+        organization_id: ORG.into(),
+        idempotency_key: key.into(),
+        customer_id: "cus_checkout".into(),
+        description: "Pro plan".into(),
+        amount_minor: invoice.balance_minor(),
+        currency: invoice.currency.clone(),
+        success_url: "https://example.invalid/ok".into(),
+        cancel_url: "https://example.invalid/cancel".into(),
+        webhook_url: Some("https://example.invalid/webhooks/payments".into()),
+        local_invoice_id: Some(invoice.id.clone()),
+    }
+}
+
+#[tokio::test]
+async fn checkout_provider_truth_mismatch_is_refused_without_activating() {
+    let fx = fixture();
+    let subscription = subscribe(&fx.service, "fence-sub").await;
+    let invoice = issue(&fx.service, &subscription.id).await;
+    let overview = fx.service.overview(&org()).unwrap();
+    let customer = overview.customer.expect("payment customer exists");
+    let request = ProviderCheckoutRequest {
+        organization_id: ORG.into(),
+        idempotency_key: "checkout-truth".into(),
+        customer_id: customer.provider_customer_id,
+        description: "Pro plan".into(),
+        amount_minor: invoice.balance_minor(),
+        currency: invoice.currency.clone(),
+        success_url: "https://example.invalid/ok".into(),
+        cancel_url: "https://example.invalid/cancel".into(),
+        webhook_url: Some("https://example.invalid/webhooks/payments".into()),
+        local_invoice_id: Some(invoice.id.clone()),
+    };
+    fx.provider.set_checkout_amount(request.amount_minor + 1);
+    let refused = fx
+        .service
+        .create_checkout(&org(), request.clone())
+        .await
+        .expect_err("a checkout for a different amount is not provider truth");
+    assert!(matches!(refused, PaymentError::Provider(_)), "{refused:?}");
+    assert_eq!(fx.provider.checkout_calls(), 1);
+    let retry = fx
+        .service
+        .create_checkout(&org(), request)
+        .await
+        .expect_err("an ambiguous checkout is never re-dispatched");
+    assert!(matches!(retry, PaymentError::Conflict(_)), "{retry:?}");
+    assert_eq!(
+        fx.provider.checkout_calls(),
+        1,
+        "the mismatched provider object must stay unreconciled, never duplicated"
+    );
+    let stored = fx.service.invoice(&org(), &invoice.id).unwrap();
+    assert_eq!(stored.status, faktor_payments::InvoiceStatus::Open);
+    assert_eq!(stored.amount_paid_minor, 0);
+    assert!(fx.service.payments(&org(), 10).unwrap().is_empty());
+
+    let currency_request = request_with_key(&invoice, "checkout-currency");
+    fx.provider
+        .set_checkout_amount(currency_request.amount_minor);
+    fx.provider.set_checkout_currency("EUR");
+    let refused = fx
+        .service
+        .create_checkout(&org(), currency_request.clone())
+        .await
+        .expect_err("a checkout in a different currency is not provider truth");
+    assert!(matches!(refused, PaymentError::Provider(_)), "{refused:?}");
+    assert_eq!(fx.provider.checkout_calls(), 2);
+    let retry = fx
+        .service
+        .create_checkout(&org(), currency_request)
+        .await
+        .expect_err("the ambiguous currency checkout is never re-dispatched");
+    assert!(matches!(retry, PaymentError::Conflict(_)), "{retry:?}");
+    assert_eq!(fx.provider.checkout_calls(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refund_webhook_during_in_flight_refund_is_deferred_not_lost() {
+    let fx = fixture();
+    let (invoice, payment) = paid_payment(&fx).await;
+    fx.provider.set_refund_status("pending");
+    fx.provider.block_refund();
+    let service = fx.service.clone();
+    let payment_id = payment.id.clone();
+    let task = tokio::spawn(async move {
+        service
+            .refund(
+                &org(),
+                refund_request(&payment_id, 4_000, "refund-in-flight"),
+            )
+            .await
+    });
+    fx.provider.wait_refund().await;
+    let provider_refund_id = fx.provider.last_refund_id();
+    let (headers, body) = refund_webhook(&provider_refund_id, "succeeded");
+    let deferred = fx
+        .service
+        .handle_webhook(&headers, &body, NOW)
+        .await
+        .expect_err("a refund webhook before its local binding must be retryable");
+    assert!(
+        matches!(deferred, PaymentError::Conflict(_)),
+        "{deferred:?}"
+    );
+    let event_id = format!("evt_refund_{provider_refund_id}");
+    assert!(
+        fx.store
+            .webhook_seen(fx.provider.name(), &event_id)
+            .unwrap()
+            .is_none(),
+        "a deferred refund event is never recorded as ignored/duplicate"
+    );
+    assert!(fx
+        .store
+        .refunds_for_payment(ORG, &payment.id)
+        .unwrap()
+        .is_empty());
+
+    fx.provider.release_refund();
+    let pending = task.await.unwrap().unwrap();
+    assert_eq!(pending.refund.status, RefundStatus::Pending);
+    assert_eq!(
+        pending.refund.provider_refund_id, provider_refund_id,
+        "the deferred webhook still names the locally recorded refund"
+    );
+
+    let applied = fx
+        .service
+        .handle_webhook(&headers, &body, NOW)
+        .await
+        .unwrap();
+    assert_eq!(
+        applied.disposition,
+        WebhookDisposition::Applied,
+        "provider succeeded truth is applied on the retry, not lost as stale"
+    );
+    let refunds = fx.store.refunds_for_payment(ORG, &payment.id).unwrap();
+    assert_eq!(refunds.len(), 1);
+    assert_eq!(refunds[0].status, RefundStatus::Succeeded);
+    assert!(refunds[0].credit_note_id.is_some());
+    let settled = fx.service.payments(&org(), 10).unwrap();
+    assert_eq!(settled[0].refunded_minor, 4_000);
+    assert_eq!(settled[0].status, PaymentStatus::PartiallyRefunded);
+    assert_eq!(
+        fx.service
+            .invoice(&org(), &invoice.id)
+            .unwrap()
+            .amount_refunded_minor,
+        4_000
+    );
+    assert_eq!(fx.provider.refund_calls(), 1);
+}
+
 #[tokio::test]
 async fn payment_webhook_cannot_activate_a_subscription_under_its_mutation_fence() {
     let fx = fixture();
@@ -1614,36 +1807,90 @@ async fn payment_webhook_cannot_activate_a_subscription_under_its_mutation_fence
     let invoice = issue(&fx.service, &subscription.id).await;
     let mut past_due = fx.store.subscription(ORG).unwrap().unwrap();
     past_due.state = SubscriptionState::PastDue;
+    past_due.dunning_attempts = 1;
     past_due.grace_end_ms = Some(NOW + 60_000);
     fx.store.put_subscription(&past_due).unwrap();
+    let key = "webhook-holder";
+    let draft = OperationClaimDraft {
+        organization_id: ORG.into(),
+        idempotency_key: key.into(),
+        operation: "change_plan".into(),
+        resource_type: FinancialResourceType::Subscription,
+        resource_id: subscription.id.clone(),
+        request_digest: "webhook-digest".into(),
+        provider_idempotency_key: format!("{key}:change-plan"),
+        context: "{}".into(),
+        created_ms: NOW,
+    };
+    assert!(matches!(
+        fx.store.claim_operation(&draft).unwrap(),
+        ClaimAcquisition::Acquired
+    ));
     let domain = ConflictDomain::SubscriptionMutation {
         subscription_id: subscription.id.clone(),
     };
-    let holder = LeaseClaim::new("webhook-holder", "webhook-holder", "digest");
-    assert!(matches!(
-        fx.store
-            .try_acquire(ORG, &domain, &subscription.id, &holder, None)
-            .unwrap(),
-        LeaseAcquisition::Held(_)
-    ));
+    let lease = match fx
+        .store
+        .try_acquire(
+            ORG,
+            &domain,
+            &subscription.id,
+            &LeaseClaim::new(key, key, "webhook-digest"),
+            None,
+        )
+        .unwrap()
+    {
+        LeaseAcquisition::Held(lease) => lease,
+        other => panic!("expected a held subscription mutation fence, got {other:?}"),
+    };
 
     let (headers, body) = webhook("tr_settle_fenced", FULL, &invoice.id);
+    let deferred = fx
+        .service
+        .handle_webhook(&headers, &body, NOW)
+        .await
+        .expect_err("a held subscription mutation must defer the settlement webhook");
+    assert!(matches!(deferred, PaymentError::Conflict(_)));
+    assert_eq!(
+        fx.service.invoice(&org(), &invoice.id).unwrap().status,
+        faktor_payments::InvoiceStatus::Open,
+        "a deferred settlement writes no invoice effect"
+    );
+    assert_eq!(fx.service.payments(&org(), 10).unwrap().len(), 0);
+    let settled = fx.store.subscription(ORG).unwrap().unwrap();
+    assert_eq!(
+        settled.state,
+        SubscriptionState::PastDue,
+        "the webhook must not write over the fenced subscription mutation"
+    );
+    assert_eq!(settled.dunning_attempts, 1);
+    assert_eq!(settled.grace_end_ms, Some(NOW + 60_000));
+    assert_eq!(fx.provider.charge_calls(), 0);
+
+    fx.store
+        .fail_claim(ORG, key, "conflict", "test fence release", NOW)
+        .unwrap();
+    fx.store.release_no_effect(ORG, &lease.id).unwrap();
+
     let applied = fx
         .service
         .handle_webhook(&headers, &body, NOW)
         .await
         .unwrap();
-    assert_eq!(applied.disposition, WebhookDisposition::Applied);
+    assert_eq!(
+        applied.disposition,
+        WebhookDisposition::Applied,
+        "the unrecorded settlement applies exactly once on retry"
+    );
     assert_eq!(
         fx.service.invoice(&org(), &invoice.id).unwrap().status,
         faktor_payments::InvoiceStatus::Paid
     );
     assert_eq!(fx.service.payments(&org(), 10).unwrap().len(), 1);
-    assert_eq!(
-        fx.store.subscription(ORG).unwrap().unwrap().state,
-        SubscriptionState::PastDue,
-        "the webhook must not write over the fenced subscription mutation"
-    );
+    let activated = fx.store.subscription(ORG).unwrap().unwrap();
+    assert_eq!(activated.state, SubscriptionState::Active);
+    assert_eq!(activated.dunning_attempts, 0);
+    assert!(activated.grace_end_ms.is_none());
     assert_eq!(fx.provider.charge_calls(), 0);
 }
 

@@ -609,7 +609,15 @@ pub(crate) async fn native_compaction_cancel(
     }
 }
 
-fn decode_checkpoint_turns(handle: &faktor_session::SessionHandle) -> Vec<RecentTurn> {
+/// Decode the durable checkpoint into the replacement turns AND the
+/// high-water sequence they replace. The two travel together on purpose: a
+/// corrupt or swapped checkpoint is an ABSENT replacement for BOTH, so its
+/// `through_seq` can never keep bounding the reloaded transcript after the
+/// payload was refused (that silently dropped every pre-checkpoint row while
+/// claiming to fall back).
+fn decode_checkpoint_with_seq(
+    handle: &faktor_session::SessionHandle,
+) -> (Vec<RecentTurn>, Option<u64>) {
     match handle.context_checkpoint() {
         Ok(Some(checkpoint)) => {
             let turns: Vec<RecentTurn> = match serde_json::from_slice(&checkpoint.payload) {
@@ -620,7 +628,7 @@ fn decode_checkpoint_turns(handle: &faktor_session::SessionHandle) -> Vec<Recent
                         error = %e,
                         "context checkpoint turns are malformed; manual compaction falls back to the durable transcript"
                     );
-                    return Vec::new();
+                    return (Vec::new(), None);
                 }
             };
             // The head digest is the canonical identity of the replacement
@@ -635,47 +643,40 @@ fn decode_checkpoint_turns(handle: &faktor_session::SessionHandle) -> Vec<Recent
                     actual = %actual,
                     "context checkpoint digest mismatch; manual compaction falls back to the durable transcript"
                 );
-                return Vec::new();
+                return (Vec::new(), None);
             }
-            turns
+            (turns, Some(checkpoint.through_seq))
         }
-        Ok(None) => Vec::new(),
+        Ok(None) => (Vec::new(), None),
         Err(e) => {
             tracing::error!(
                 session = %handle.id(),
                 error = %e,
                 "context checkpoint is unreadable; manual compaction falls back to the durable transcript"
             );
-            Vec::new()
+            (Vec::new(), None)
         }
     }
-}
-
-fn checkpoint_through_seq(handle: &faktor_session::SessionHandle) -> Option<u64> {
-    handle
-        .context_checkpoint()
-        .ok()
-        .flatten()
-        .map(|c| c.through_seq)
 }
 
 /// Load the LOGICAL history (checkpoint replacement + strictly newer rows)
 /// bounded by messages and bytes. Parts are loaded in one batch, never N+1.
 fn load_turns(
-    state: &AppState,
+    deps: &ServerDeps,
     handle: &faktor_session::SessionHandle,
     max_messages: u64,
 ) -> faktor_core::Result<(Vec<RecentTurn>, u64)> {
-    let base_seq = checkpoint_through_seq(handle);
-    let mut turns = decode_checkpoint_turns(handle);
+    // A refused checkpoint contributes NEITHER turns nor a high-water mark:
+    // the fallback is the real durable transcript, not the rows after a
+    // tampered head.
+    let (mut turns, base_seq) = decode_checkpoint_with_seq(handle);
     // The window is read from the STORE ordered newest-first and bounded by
     // the checkpoint high-water mark, so a compacted session never replays
     // rows the checkpoint already replaced. Reverse it to the wire's
     // oldest-first order before appending to the checkpoint turns: keeping
     // DESC order here would put older rows after newer ones and make the
     // compactor's newest-suffix rule keep the WRONG end of the history.
-    let rows = state
-        .deps
+    let rows = deps
         .session
         .store()
         .messages_window_with_parts(handle.id(), None, base_seq, max_messages, MAX_TURN_BYTES)
@@ -801,7 +802,7 @@ async fn execute_compaction(
         "loading-history",
         100_000,
     )?;
-    let (turns, newest_seq) = match load_turns(state, handle, max_messages) {
+    let (turns, newest_seq) = match load_turns(&state.deps, handle, max_messages) {
         Ok(turns) => turns,
         Err(e) => return finish_failed(handle, operation_id, &e),
     };
@@ -930,7 +931,13 @@ async fn execute_compaction(
         )
         .map_err(|e| api_err(&e));
     }
-    let through_seq = checkpoint_through_seq(handle).unwrap_or(0).max(newest_seq);
+    // The replacement context is bound to the window THIS operation loaded,
+    // never to a re-read of the checkpoint: a corrupt head's high-water mark
+    // was already refused by `load_turns` (base_seq = None), and a concurrent
+    // compaction advancing it must not silently skip rows our plan never
+    // contained. `newest_seq` starts at the VALIDATED checkpoint seq and
+    // covers every row the plan actually saw.
+    let through_seq = newest_seq;
     let digest = faktor_context::history_digest(&plan.kept_recent);
     let payload = match serde_json::to_vec(&plan.kept_recent) {
         Ok(payload) => payload,

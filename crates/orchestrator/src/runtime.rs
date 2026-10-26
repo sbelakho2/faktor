@@ -38,6 +38,7 @@ use std::sync::{Arc, Mutex};
 use faktor_agent::{AgentRuntime, TurnOutcome};
 use faktor_core::attachment::AttachmentId;
 use faktor_core::cancellation::CancellationToken;
+use faktor_core::event::EventKind;
 use faktor_core::id::{OpId, SessionId, TaskId, WorkspaceId, WorktreeId};
 use faktor_core::op::{OpMeta, RecoveryStrategy};
 use faktor_core::retry::RetryPolicy;
@@ -2482,14 +2483,32 @@ impl OrchestratorRuntime {
         match session.state()? {
             AgentState::Completed => Ok((ChildState::Done, None)),
             AgentState::ReadyForNextTurn => {
+                // Stop/abort lands the child session ReadyForNextTurn after
+                // journaling `TurnCompleted {aborted:true}` (the ordinary
+                // completion carries no payload). The session state alone
+                // cannot distinguish "the child finished" from "the child was
+                // cancelled" in the crash window before settlement, and
+                // mapping both to Done fabricates a successful parent
+                // handoff for a cancelled child. The durable journal marker
+                // is the authority: a cancelled generation stays Cancelled
+                // through every re-attach and never resurrects Done.
+                let aborted = runtime_handoff::last_turn_completed_was_aborted(&session)?;
                 // A genuine end happened; close a turn record left active by
-                // a crash between TurnCompleted and finish_turn_record.
+                // a crash between TurnCompleted and finish_turn_record —
+                // with the HONEST status (cancelled vs completed).
                 if let Ok(Some(record)) = session.active_turn_record() {
                     session
-                        .finish_turn_record(record.turn_op_id, "completed")
+                        .finish_turn_record(
+                            record.turn_op_id,
+                            if aborted { "cancelled" } else { "completed" },
+                        )
                         .map_err(|e| ExecError::retriable("turn record close", e))?;
                 }
-                Ok((ChildState::Done, None))
+                if aborted {
+                    Ok((ChildState::Cancelled, None))
+                } else {
+                    Ok((ChildState::Done, None))
+                }
             }
             AgentState::Cancelled => Ok((ChildState::Cancelled, None)),
             AgentState::FailedRecoverable | AgentState::FailedPermanent => {

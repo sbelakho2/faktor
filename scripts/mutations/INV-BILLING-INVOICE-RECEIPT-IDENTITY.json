@@ -1,0 +1,19 @@
+{
+  "id": "INV-BILLING-INVOICE-RECEIPT-IDENTITY",
+  "surface": "payments.billing",
+  "file": "crates/payments/src/service/webhooks.rs",
+  "find": "        let provider_payment_id = object\n            .and_then(|object| {\n                object\n                    .get(\"payment_intent\")\n                    .or_else(|| object.get(\"charge\"))\n            })\n            .and_then(|value| {\n                value\n                    .as_str()\n                    .or_else(|| value.get(\"id\").and_then(serde_json::Value::as_str))\n            })\n            .filter(|id| !id.is_empty() && id.len() <= MAX_TEXT_BYTES)\n            .map(str::to_string);",
+  "replace": "        let provider_payment_id: Option<String> = None;",
+  "gate": "cargo test -p faktor-payments --test invoice_authority invoice_and_payment_events_describe_one_receipt",
+  "expect": "FAILED",
+  "note": "Ignoring the provider payment identity on invoice.paid mints a synthetic second receipt when payment_intent.succeeded later describes the same money, inflating refundable payments; the one-receipt oracle must fail.",
+  "capabilities": [
+    "payments.invoice_truth"
+  ],
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

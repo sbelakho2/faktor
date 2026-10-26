@@ -1,0 +1,12 @@
+{
+  "id": "INV-VSCODE-COCKPIT-RENDER-BOUND",
+  "file": "apps/vscode/src/cockpit.ts",
+  "find": "  const planSteps = (task?.plan ?? []).slice(0, MAX_LINES);",
+  "replace": "  const planSteps = task?.plan ?? [];",
+  "gate": "node --no-warnings --experimental-loader ./scripts/mutations/vscode-ts-loader.mjs apps/vscode/scripts/selftest.mjs",
+  "expect": "FAIL",
+  "timeout_ms": 180000,
+  "note": "Removing the plan cap lets a hostile task plan fan-out enter the cockpit view unbounded.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+}

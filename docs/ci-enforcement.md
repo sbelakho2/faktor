@@ -1,11 +1,13 @@
 # CI enforcement runbook
 
 Status of the release/toolchain enforcement surfaces for
-`sbelakho2/faktor` (GitHub remote `origin`), as of 2026-10-19 (operator
+`sbelakho2/faktor` (GitHub remote `origin`), as of 2026-10-25 (operator
 state verified against the local Woodpecker 3.18.1 instance and the GitHub
-API at 2026-10-19T23:57Z). "Applied" means the action was executed from this
-checkout via `gh`/the local Woodpecker API; "Operator" means it needs
-credentials or a server this checkout does not have.
+API). "Applied" means the action was executed from this checkout via
+`gh`/the local Woodpecker API; "Operator" means it needs credentials or a
+server this checkout does not have. Single-maintainer governance: direct
+pushes to `main` are expected, branch protection is **off**, and no pull
+request is a merge gate.
 
 | Surface | State | Where |
 | --- | --- | --- |
@@ -19,59 +21,81 @@ credentials or a server this checkout does not have.
 | Lane-bound marker auth: per-lane HMAC `auth` over the canonical unsigned marker, one shared generator, `unattested` (not silent pass) without a token | Applied | `scripts/certification/lane-marker.{sh,mjs}`, `scripts/certification/evidence.mjs`, `.woodpecker/trusted/trusted.yaml`, `.woodpecker/trusted/nightly.yaml` |
 | Invariant criticality + planted-mutation proof: every entry is release-critical by default (its `authority` names the production gate) and must ship a planted `mutation_command`; non-empty `mutation_debt` fails both checker modes, downgrades require `criticality_reason` | Applied | `tests/invariants.toml`, `scripts/check-invariants.mjs`, `scripts/mutation-run.mjs`, `scripts/mutations/*.json`, `.woodpecker/trusted/trusted.yaml`, `.woodpecker/untrusted/pr.yaml` |
 | `@vscode/vsce` pinned exactly in the VS Code lockfile and run as the locked binary | Applied | `apps/vscode/package.json`, `apps/vscode/package-lock.json`, `.woodpecker/**`, `scripts/package-artifacts.sh` |
-| Branch protection on `main` requires `ci/woodpecker/pr/pr` (strict); the admin bypass is currently **open** (`enforce_admins: false`) | Applied (exact state below) | GitHub API |
-| Woodpecker webhook for this repo | Applied (local tunnel) | hook `685914438`, events push/PR/review/deployment, latest ping `200` at 2026-10-19T23:57Z |
-| `ci/woodpecker/pr/pr` publication | Applied via single-project switch (upstream 3.18/3.19 has no two-projects-per-repo selector) | Woodpecker server, project id 2 |
+| Branch protection on `main` | **OFF** (verified 2026-10-25: `gh api repos/sbelakho2/faktor/branches/main/protection` returns `404 Branch not protected`) | GitHub API |
+| Scoped main lane | Applied: project id 2 loads `.woodpecker/main.yaml` (`allow_pr=false`, `trusted.volumes=false`); only `push` to `main` runs | Woodpecker server, project id 2 |
+| Woodpecker webhook for this repo | Applied (local tunnel) | hook `685914438`, events push/PR/review/deployment |
+| `ci/woodpecker/pr/pr` publication | **Optional / not gating**: the live project is main-only; a PR workflow can be attached to a separate project or instance but `main` never waits for it | `.woodpecker/untrusted/pr.yaml` |
 | Commit signature shows `verified:true` on GitHub | Applied (repo-local account noreply identity; HEAD `56d415e0`) | GitHub account + SSH signing key |
 | Release-signing role `faktor-release-signing` | Provisioned; secret `faktor_release_signing_key` (events push/tag) public half equals the allowlist entry; fingerprint `SHA256:jp4xtwnKtRAq7PEzI4wGYxHoSTgLJKFQRYZOiC0yYA4` | Woodpecker secret + `scripts/certification/attestation-keys.json` |
 
-## 1. Branch protection (applied; verified 2026-10-19)
+## 1. Branch protection (OFF; verified 2026-10-25)
 
-`main` currently has (verified with
-`gh api repos/sbelakho2/faktor/branches/main/protection`):
+`main` has **no branch protection**. The GitHub API returns
+`404 Branch not protected` for
+`gh api repos/sbelakho2/faktor/branches/main/protection`, and the repository
+is a single-maintainer repository that accepts direct pushes to `main`.
+There is no required status check and no required pull request. Do not
+re-create a protection rule that requires `ci/woodpecker/pr/pr` or any other
+PR context: PR gating is not part of this repository's release policy.
 
-- required status checks: `["ci/woodpecker/pr/pr"]`, `strict: true`
-  (branch must be up to date before merge);
-- a pull request is required before merging (`required_approving_review_count: 0`);
-- force pushes and branch deletion disabled;
-- `enforce_admins: false`: the repository-admin bypass is **open**. This is
-  deliberate while the single-project Woodpecker instance is in the
-  untrusted PR shape and can publish only `ci/woodpecker/pr/pr`; the trusted
-  `ci/woodpecker/push/trusted` context is not currently a required check
-  (requiring it with no publisher would block every main push). Close the
-  bypass after the first exact-SHA `ci/woodpecker/pr/pr` green run:
-
-  ```sh
-  gh api repos/sbelakho2/faktor/branches/main/protection/enforce_admins --jq .enabled
-  gh api --method POST repos/sbelakho2/faktor/branches/main/protection/enforce_admins
-  gh api repos/sbelakho2/faktor/branches/main/protection/enforce_admins --jq .enabled
-  ```
-
-  Add `ci/woodpecker/push/trusted` only in the same change that makes the
-  trusted push shape actually publish for `main` (setup.md §2/§7).
-
-To re-apply the exact current configuration (idempotent PUT):
+Verify the off state (must stay `404`):
 
 ```sh
-cat > /tmp/protection.json <<'JSON'
-{
-  "required_status_checks": { "strict": true, "contexts": ["ci/woodpecker/pr/pr"] },
-  "enforce_admins": false,
-  "required_pull_request_reviews": {
-    "dismiss_stale_reviews": false,
-    "require_code_owner_reviews": false,
-    "required_approving_review_count": 0
-  },
-  "restrictions": null,
-  "allow_force_pushes": false,
-  "allow_deletions": false
-}
-JSON
-gh api --method PUT repos/sbelakho2/faktor/branches/main/protection --input /tmp/protection.json
+gh api repos/sbelakho2/faktor/branches/main/protection
 ```
 
-To remove it entirely (only if the Woodpecker project is abandoned):
-`gh api --method DELETE repos/sbelakho2/faktor/branches/main/protection`.
+If a protection rule is ever created accidentally, remove it with:
+
+```sh
+gh api --method DELETE repos/sbelakho2/faktor/branches/main/protection
+```
+
+## 1.1 Scoped main lane (applied; verified 2026-10-25)
+
+The live Woodpecker project (id 2, `sbelakho2/faktor`) loads a single
+pipeline file, `.woodpecker/main.yaml`, with `allow_pr: false` and
+`trusted.volumes: false`. Only `push` events on `main` reach it. The PR
+workflow remains in the tree as an optional, non-gating workflow; it is not
+attached to the live project and `main` never waits for it.
+
+`main.yaml` runs `scripts/programme/ci-scope.mjs` as its mapping authority:
+
+- changed files come from `CI_COMMIT_BEFORE_SHA` (empty/all-zero => `HEAD~1`)
+  with `git diff --name-only --no-renames --diff-filter=ACMRD -z`. A rename
+  is therefore a delete + add and both paths select; a deleted file still
+  selects its crate. An unfetched base is fetched once, then falls back to
+  `HEAD~1`; a root commit with no parent is a typed refusal.
+- `crates/<dir>/**` and `tests/<dir>/**` map to the **exact** package name
+  read from that member's `Cargo.toml`. Directory names are never
+  transliterated (`crates/engineering-core` is package `engineering-core`,
+  not `faktor-engineering-core`).
+- `docs/**` (and the root docs files) select only
+  `scripts/check-docs-sync.sh`; no Rust test runs.
+- `apps/vscode/**` selects `npm ci`, `npm run build` and the VS Code
+  selftest; `apps/jetbrains/**` selects the Gradle integrity gate and the
+  JetBrains compile/smoke; `site/**` selects the zero-JavaScript website
+  scan; programme, mutation/separation, CI and Edition trees select their
+  bounded checks.
+- an unknown path (including a `crates/` path whose directory is not a
+  current workspace member without a workspace manifest change) is a typed
+  refusal (`exit 3`), never an empty selection or a silent pass.
+- a workspace manifest/toolchain change (`Cargo.toml`, `Cargo.lock`,
+  `rust-toolchain.toml`) runs one `cargo check --workspace --all-targets`
+  and still tests any crate whose source also changed. It never emits a
+  whole-workspace test command.
+
+The planner is selftested on every main run with planted cases for exact
+package names, docs-only, apps/site/programme, deleted/renamed files, base
+fallback, root-commit refusal and unmappable paths:
+
+```sh
+node scripts/programme/ci-scope.mjs --selftest
+```
+
+The lane writes one script per toolchain
+(`target/certification/ci/scope-{rust,node,vscode,jetbrains}.sh`) and runs
+each in a toolchain-matched step. A scope with no work is an explicit no-op,
+not a skipped step.
 
 ## 2. Woodpecker webhook and PR publication (local, applied)
 
@@ -108,7 +132,7 @@ Current project shape (Woodpecker project id 2, verified via
 `GET /api/repos/2`):
 
 ```json
-{"config_file":".woodpecker/untrusted/","allow_pr":true,
+{"config_file":".woodpecker/main.yaml","allow_pr":false,
  "trusted":{"volumes":false},"timeout":1560,"active":true}
 ```
 
@@ -126,8 +150,8 @@ If the webhook/App cannot be created or repaired with the available
 credentials, the exact operator runbook is: obtain a repository-admin token
 (`gh auth refresh -h github.com -s repo,admin:repo_hook`), re-run the hook
 PATCH with the tunnel origin above, POST a ping, and require a `200` before
-touching branch protection. If no `200` is observed, stop fail-closed: do not
-weaken or remove the required context and do not substitute a parent/merge
+relying on the main lane. If no `200` is observed, stop fail-closed: do not
+add a required context to compensate and do not substitute a parent/merge
 SHA. The typed stop condition is `webhook-delivery-not-200`; certify.sh
 `--verify-ci-evidence` only accepts an observed pipeline for the exact SHA.
 
@@ -139,21 +163,21 @@ it and the lookup returns the same project id. Do not run the script's
 trusted step against an instance that behaves this way — it would overwrite
 the PR configuration.
 
-The applied fail-closed sequence for one project (repo id 2) is:
+The applied single-maintainer sequence for one project (repo id 2) is:
 
-1. Before pushing the candidate branch, PATCH the project to the untrusted
-   shape: `config_file=.woodpecker/untrusted/`, `allow_pr=true`,
-   `trusted.volumes=false`. This is the only shape that can run
-   `pull_request` events; it can never mount the trusted volumes.
-2. Push the branch and open the PR. Woodpecker publishes
-   `ci/woodpecker/pr/pr` for the PR head SHA.
-3. Only after the PR is green, PATCH the project back to the trusted shape:
-   `config_file=.woodpecker/trusted/`, `allow_pr=false`,
-   `trusted.volumes=true`.
-4. Fast-forward the exact PR head onto `main`. The push event runs the full
-   trusted matrix (linux + darwin + windows) at that same SHA; the aggregate
-   `status-publish` runs only on `main`.
-5. Re-assert branch protection and close the admin bypass.
+1. Keep the project in the main-only shape:
+   `config_file=.woodpecker/main.yaml`, `allow_pr=false`,
+   `trusted.volumes=false`. It loads only the push/main workflow and can
+   never mount trusted volumes.
+2. Commit directly to `main` (or merge locally first). The push event runs
+   the change-scoped lane at that exact SHA.
+3. Do **not** add a required status check or a required pull request. PR
+   gating is optional and must not block `main`.
+
+An optional PR lane may be attached to a separate project or instance with
+`config_file=.woodpecker/untrusted/`; it never gates `main`. The same
+single-project server cannot host both pipeline paths at once (upstream
+3.18/3.19 limitation above).
 
 Never leave `allow_pr=true` on a project that has `trusted.volumes=true`,
 and never point the trusted project at `.woodpecker/untrusted/`.

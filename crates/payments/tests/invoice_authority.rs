@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir,separate-process
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -350,6 +351,73 @@ async fn duplicate_and_replayed_paid_events_never_double_credit() {
             .len(),
         1
     );
+}
+
+#[tokio::test]
+async fn invoice_and_payment_events_describe_one_receipt() {
+    let fixture = fixture().await;
+    let provider_payment = "pi_authority_shared";
+    let invoice_event = serde_json::to_vec(&serde_json::json!({
+        "id": "evt_invoice_first",
+        "type": "invoice.paid",
+        "created": START / 1000,
+        "data": {"object": {
+            "id": fixture.provider_invoice.clone(),
+            "status": "paid",
+            "amount": fixture.total,
+            "amount_paid": fixture.total,
+            "amount_refunded": 0,
+            "currency": "usd",
+            "payment_intent": provider_payment,
+            "metadata": {"organization_id": "org-authority"}
+        }}
+    }))
+    .unwrap();
+    let first = fixture
+        .service
+        .handle_webhook(&signed(&invoice_event), &invoice_event, START)
+        .await
+        .unwrap();
+    assert_eq!(first.disposition, WebhookDisposition::Applied);
+
+    let payment_event = serde_json::to_vec(&serde_json::json!({
+        "id": "evt_payment_after",
+        "type": "payment_intent.succeeded",
+        "created": START / 1000 + 1,
+        "data": {"object": {
+            "id": provider_payment,
+            "status": "succeeded",
+            "amount": fixture.total,
+            "currency": "USD",
+            "metadata": {
+                "organization_id": "org-authority",
+                "local_invoice_id": fixture.invoice_id.clone(),
+            }
+        }}
+    }))
+    .unwrap();
+    let second = fixture
+        .service
+        .handle_webhook(&signed(&payment_event), &payment_event, START + 1_000)
+        .await
+        .unwrap();
+    assert_eq!(second.disposition, WebhookDisposition::Applied);
+
+    let payments = fixture.service.payments(&fixture.organization, 10).unwrap();
+    assert_eq!(
+        payments.len(),
+        1,
+        "two provider descriptions of one payment must not mint two refundable receipts"
+    );
+    assert_eq!(payments[0].provider_payment_id, provider_payment);
+    assert_eq!(payments[0].amount_minor, fixture.total);
+    let invoice = fixture
+        .service
+        .invoice(&fixture.organization, &fixture.invoice_id)
+        .unwrap();
+    assert_eq!(invoice.status, InvoiceStatus::Paid);
+    assert_eq!(invoice.amount_paid_minor, fixture.total);
+    assert_eq!(invoice.total_minor, fixture.total);
 }
 
 #[tokio::test]

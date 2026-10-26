@@ -1,9 +1,11 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! `runtime::retrieval_tests`: out-of-line tests.
 
 use super::*;
 use crate::runtime::fixtures_tests::*;
 use crate::runtime::tests::*;
 use crate::*;
+use faktor_context::compiler::{NeedSet, NeedSource};
 
 /// The durable activation flag round-trips: a signal activates and is
 /// persisted, an ordinary follow-up keeps it, `/source off` deactivates
@@ -2166,4 +2168,218 @@ fn corrupt_durable_activation_fact_is_a_typed_read_failure() {
     );
     assert!(load.set.is_empty());
     assert!(!load.found());
+}
+
+fn design_focus_contract() -> faktor_core::EngineeringContract {
+    faktor_core::EngineeringContract {
+        risks: vec![faktor_core::RiskHypothesis {
+            id: "r1:design-focus".into(),
+            description: "alpha bravo charlie delta echo foxtrot golf hotel india juliet zulu \
+                          lima mike november oscar papa"
+                .into(),
+            severity: faktor_core::RiskSeverity::Low,
+            origin: faktor_core::ContractOrigin::Heuristic,
+        }],
+        ..Default::default()
+    }
+}
+
+fn task_facts_with_contract(
+    contract: faktor_core::EngineeringContract,
+    ledger: &TaskLedger,
+) -> TaskFacts {
+    let (deps, _dir) = deps(scripted_provider(vec![]), vec![]);
+    let runtime = AgentRuntime::new(deps).unwrap();
+    let session = new_session(runtime.deps());
+    let handle = runtime
+        .deps()
+        .session
+        .get_session(session)
+        .unwrap()
+        .unwrap();
+    let task_id = handle.task_id().unwrap();
+    let now = handle.now_ms();
+    handle
+        .create_task(Task {
+            task_id,
+            session_id: session,
+            goal: ledger.goal.clone(),
+            acceptance_criteria: Vec::new(),
+            plan: Vec::new(),
+            attachments: Vec::new(),
+            contract,
+            budget: faktor_session::TaskBudget::default(),
+            state: faktor_core::state::TaskState::Pending,
+            created_ms: now,
+            updated_ms: now,
+        })
+        .unwrap();
+    runtime
+        .task_facts_for(&handle, ledger, task_id)
+        .expect("the durable task identity and row are readable")
+}
+
+/// Retrieval contract: a small or calm task keeps the baseline work item
+/// byte-for-byte, including its unique title, its path list and the
+/// `evidence://` reference embedded in the step text.
+#[test]
+fn small_and_calm_tasks_keep_the_baseline_work_item_byte_identical() {
+    let step = "implement the parser fix evidence://42";
+    let changed = vec!["src/parser.rs".to_string()];
+    let ledger = TaskLedger {
+        goal: "fix the parser".into(),
+        open_steps: vec![step.into()],
+        changed_files: changed.clone(),
+        ..Default::default()
+    };
+    let baseline = WorkItem {
+        id: "step:0".into(),
+        title: step.into(),
+        state: "open".into(),
+        paths: changed.clone(),
+        criteria: Vec::new(),
+    };
+    let contract = design_focus_contract();
+    let focus = faktor_core::design_focus_terms(&contract);
+    let duplicated_bytes = changed.iter().map(|path| path.len() + 1).sum::<usize>();
+    assert!(
+        !faktor_core::design_focus_is_economic(duplicated_bytes, &focus),
+        "the small baseline must fail the economic gate"
+    );
+
+    let facts = task_facts_with_contract(contract, &ledger);
+    assert_eq!(facts.active_work_item, Some(baseline.clone()));
+    assert_eq!(facts.owned_paths, changed);
+    assert_eq!(facts.changed_files, changed);
+    let refs = faktor_context::compiler::referenced_evidence_ids(
+        &faktor_context::compiler::CompilerInput::new(facts.clone(), 4_096),
+    );
+    assert!(
+        refs.contains(&faktor_context::compiler::EvidenceId(42)),
+        "the baseline step evidence reference must stay reachable: {refs:?}"
+    );
+
+    let calm = task_facts_with_contract(faktor_core::EngineeringContract::default(), &ledger);
+    assert_eq!(
+        calm.active_work_item,
+        Some(baseline),
+        "a calm contract with no focus terms leaves the work item untouched"
+    );
+}
+
+/// Retrieval contract: when the gate proves a dividend, only the work item's
+/// DUPLICATED path list is replaced. The unique step title, every precise
+/// owned/recent path need and all required needs are unchanged, and no second
+/// work-item need or prompt section is appended.
+#[test]
+fn economic_focus_replaces_only_duplicated_paths_and_preserves_path_needs() {
+    let step = "implement the parser fix evidence://42";
+    let changed: Vec<String> = (0..12)
+        .map(|index| format!("src/module_{index:02}_{}.rs", "x".repeat(240)))
+        .collect();
+    let ledger = TaskLedger {
+        goal: "fix the parser".into(),
+        open_steps: vec![step.into()],
+        changed_files: changed.clone(),
+        ..Default::default()
+    };
+    let contract = design_focus_contract();
+    let focus = faktor_core::design_focus_terms(&contract);
+    let duplicated_bytes = changed.iter().map(|path| path.len() + 1).sum::<usize>();
+    assert!(
+        faktor_core::design_focus_is_economic(duplicated_bytes, &focus),
+        "the duplicated path material must clear the economic gate"
+    );
+
+    let facts = task_facts_with_contract(contract, &ledger);
+    let work = facts
+        .active_work_item
+        .as_ref()
+        .expect("the open step yields a work item");
+    assert_eq!(
+        work.title, step,
+        "the unique title and its evidence ref are never removed"
+    );
+    assert!(
+        work.paths.is_empty(),
+        "only the duplicated path list is replaced"
+    );
+    assert_eq!(work.criteria, focus);
+    assert_eq!(facts.owned_paths, changed);
+    assert_eq!(facts.changed_files, changed);
+
+    let mut baseline_facts = facts.clone();
+    baseline_facts.active_work_item = Some(WorkItem {
+        id: "step:0".into(),
+        title: step.into(),
+        state: "open".into(),
+        paths: changed.clone(),
+        criteria: Vec::new(),
+    });
+    let baseline_needs = NeedSet::from_facts(&baseline_facts);
+    let focus_needs = NeedSet::from_facts(&facts);
+    let path_needs = |needs: &NeedSet| -> Vec<_> {
+        needs
+            .entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.source,
+                    NeedSource::OwnedPath | NeedSource::RecentChange
+                )
+            })
+            .cloned()
+            .collect()
+    };
+    assert_eq!(
+        path_needs(&baseline_needs),
+        path_needs(&focus_needs),
+        "removing the duplicated work-item paths must not drop a precise path need"
+    );
+    let required = |needs: &NeedSet| -> Vec<_> {
+        needs
+            .entries
+            .iter()
+            .filter(|entry| entry.need.required)
+            .cloned()
+            .collect()
+    };
+    assert_eq!(
+        required(&baseline_needs),
+        required(&focus_needs),
+        "required needs are unchanged"
+    );
+    assert_eq!(
+        focus_needs
+            .entries
+            .iter()
+            .filter(|entry| entry.source == NeedSource::WorkItem)
+            .count(),
+        1,
+        "the replacement never appends a second work-item need"
+    );
+    let work_need = focus_needs
+        .entries
+        .iter()
+        .find(|entry| entry.source == NeedSource::WorkItem)
+        .unwrap();
+    assert!(
+        work_need.keywords.iter().any(|keyword| keyword == "alpha"),
+        "the focus projection grounds the work-item need: {:?}",
+        work_need.keywords
+    );
+    assert!(
+        work_need
+            .keywords
+            .iter()
+            .any(|keyword| keyword == "implement"),
+        "the preserved title keeps its own retrieval keys"
+    );
+    let refs = faktor_context::compiler::referenced_evidence_ids(
+        &faktor_context::compiler::CompilerInput::new(facts, 4_096),
+    );
+    assert!(
+        refs.contains(&faktor_context::compiler::EvidenceId(42)),
+        "the preserved title keeps the explicit evidence reference: {refs:?}"
+    );
 }

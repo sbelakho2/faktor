@@ -1,0 +1,12 @@
+{
+  "id": "INV-SITE-BILLING-PROVIDER-AVAILABILITY",
+  "file": "crates/site/src/web/billing_pages.rs",
+  "find": "    let disabled = if provider_state != \"available\" {",
+  "replace": "    let disabled = if provider_state == \"unconfigured\" {",
+  "gate": "cargo test -p faktor-site payment_method_attach_follows_the_provider_readiness_state",
+  "expect": "FAIL",
+  "timeout_ms": 600000,
+  "note": "Only the exact available state may expose provider-token entry; any other served state is unavailable, not just unconfigured.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+}

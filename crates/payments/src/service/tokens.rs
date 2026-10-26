@@ -314,7 +314,7 @@ pub fn validate_payment_token(token: &str) -> Result<(), PaymentError> {
         ));
     }
     let digits: Vec<u8> = token.bytes().filter(u8::is_ascii_digit).collect();
-    if (12..=19).contains(&digits.len()) && luhn_valid(&digits) {
+    if (12..=19).contains(&digits.len()) && (luhn_valid(&digits) || pan_shaped_body(token)) {
         return Err(PaymentError::Malformed(
             "raw card numbers are never accepted; use a provider token".into(),
         ));
@@ -330,6 +330,18 @@ pub fn validate_payment_token(token: &str) -> Result<(), PaymentError> {
         ));
     }
     Ok(())
+}
+
+/// True when the token payload (after an optional provider prefix such as
+/// `pm_`) is nothing but digits and card separators. This catches a
+/// mistyped/forged PAN split into 4-digit groups, which has no contiguous
+/// 12-digit run and may fail Luhn while still being card data.
+fn pan_shaped_body(token: &str) -> bool {
+    let body = token.split_once('_').map_or(token, |(_, body)| body);
+    !body.is_empty()
+        && body.bytes().all(|byte| {
+            byte.is_ascii_digit() || matches!(byte, b' ' | b'-' | b'.' | b'/' | b':' | b'_')
+        })
 }
 
 fn luhn_valid(digits: &[u8]) -> bool {
