@@ -1,0 +1,12 @@
+{
+  "id": "INV-STORAGE-ARCHIVE-LOSS-MARKER",
+  "file": "crates/storage/src/governor.rs",
+  "find": "                if object.class.requires_loss_marker() {",
+  "replace": "                if false && object.class.requires_loss_marker() {",
+  "gate": "cargo test -p faktor-storage --lib archive_eviction_writes_a_durable_loss_marker",
+  "expect": "FAILED",
+  "note": "Suppresses the durable archive loss marker on eviction: the archive oracle must fail.",
+  "capabilities": ["storage.governor"],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+}

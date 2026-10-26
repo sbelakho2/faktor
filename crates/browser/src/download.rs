@@ -216,6 +216,9 @@ pub struct DownloadManager {
     order: Mutex<VecDeque<String>>,
     last_error: Mutex<Option<BrowserError>>,
     stats: Mutex<DownloadStats>,
+    /// Always-on storage governor (browser-storage class). Admission is
+    /// reserved before the temp file is created; a refusal starts no stream.
+    governor: Mutex<Option<Arc<faktor_storage::StorageGovernor>>>,
 }
 
 impl std::fmt::Debug for DownloadManager {
@@ -247,6 +250,7 @@ impl DownloadManager {
             .validate()?
             .unwrap_or_else(|| PathBuf::from("downloads"));
         let dir_rel = base.join(&subdir);
+        let discovered = faktor_storage::StorageGovernor::discover(root.root());
         let manager = Arc::new(Self {
             policy,
             root,
@@ -256,6 +260,7 @@ impl DownloadManager {
             order: Mutex::new(VecDeque::new()),
             last_error: Mutex::new(None),
             stats: Mutex::new(DownloadStats::default()),
+            governor: Mutex::new(discovered.map(Arc::new)),
         });
         if manager.policy.enabled {
             manager.prepare()?;
@@ -279,6 +284,16 @@ impl DownloadManager {
             .map_err(|e| BrowserError::profile(format!("cannot restrict download dir: {e}")))?;
         self.ready.store(true, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// Attach the daemon's always-on storage governor (browser storage
+    /// class). Idempotent; the manager may exist before the governor.
+    pub fn attach_governor(&self, governor: Arc<faktor_storage::StorageGovernor>) {
+        *faktor_core::lock::recover(&self.governor) = Some(governor);
+    }
+
+    fn governor(&self) -> Option<Arc<faktor_storage::StorageGovernor>> {
+        faktor_core::lock::recover(&self.governor).clone()
     }
 
     /// The policy this manager enforces.
@@ -526,6 +541,26 @@ impl DownloadManager {
         }
         let filename = download_filename(disposition.as_deref(), &url, &request_id);
         let dest_rel = self.dir_rel.join(&filename);
+        // Reserve browser-storage admission BEFORE the temp file exists: a
+        // refused reservation starts no stream and leaves no partial file.
+        let reservation = match self.governor() {
+            Some(governor) => match governor.reserve(
+                faktor_storage::StorageClass::BrowserStorage,
+                &dest_rel.to_string_lossy().replace('\\', "/"),
+                self.policy.max_bytes,
+            ) {
+                Ok(reservation) => Some(reservation),
+                Err(error) => {
+                    let detail = format!("storage admission refused: {error}");
+                    self.reject(&request_id, &url, &detail, false);
+                    let _ = self
+                        .deny(client, session, &request_id, deadline, cancel)
+                        .await;
+                    return Err(BrowserError::StorageRefused { detail });
+                }
+            },
+            None => None,
+        };
         let tmp_rel = self.dir_rel.join(format!(
             "{TEMP_PREFIX}{}.tmp",
             uuid::Uuid::new_v4().simple()
@@ -699,6 +734,13 @@ impl DownloadManager {
             )));
         }
         let _ = self.root.sync_dir(&self.dir_rel);
+        if let Some(reservation) = reservation {
+            reservation
+                .commit(written, None)
+                .map_err(|error| BrowserError::StorageRefused {
+                    detail: format!("download storage commit failed: {error}"),
+                })?;
+        }
         self.record(DownloadRecord {
             guid: request_id.clone(),
             url: url.clone(),

@@ -143,6 +143,10 @@ pub enum StoreError {
     Oversized(String),
     #[error("malformed value rejected: {0}")]
     Malformed(String),
+    /// The always-on storage governor refused growth BEFORE the append:
+    /// the SQLite/WAL class quota or the aggregate budget cannot hold it.
+    #[error("storage growth refused: {0}")]
+    StorageRefused(String),
     /// Typed backpressure: the bounded writer queue was full for longer than
     /// the configured enqueue wait, so the prepared command was refused
     /// before touching the database.

@@ -328,6 +328,76 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn browser_storage_class_is_bounded_and_active_profile_evidence_survives() {
+        use faktor_cas::faktor_storage::{
+            DirectoryBackend, StorageClass, StorageGovernor, StorageGovernorConfig,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("commerce").join("profiles");
+        let store = ProfileStore::open(root.clone()).unwrap();
+        let active = store.profile_dir("active").unwrap();
+        std::fs::write(active.join("Cookies"), vec![1u8; 3_000]).unwrap();
+        let config = StorageGovernorConfig {
+            total_budget_bytes: 100_000,
+            watermark_permille: 900,
+            reservation_lease_ms: 60_000,
+            quotas: StorageClass::ALL
+                .into_iter()
+                .map(|class| {
+                    (
+                        class,
+                        if class == StorageClass::BrowserStorage {
+                            20_000
+                        } else {
+                            50_000
+                        },
+                    )
+                })
+                .collect(),
+        }
+        .validated()
+        .unwrap();
+        let governor = StorageGovernor::open(tmp.path(), config).unwrap();
+        governor
+            .register_backend(std::sync::Arc::new(DirectoryBackend::new(
+                StorageClass::BrowserStorage,
+                root.clone(),
+            )))
+            .unwrap();
+        governor
+            .pin(
+                StorageClass::BrowserStorage,
+                "active/Cookies",
+                "active_profile",
+            )
+            .unwrap();
+        governor
+            .register_object(StorageClass::BrowserStorage, "active/Cookies", 3_000, None)
+            .unwrap();
+        for index in 0..20 {
+            let key = format!("scratch/profile-{index}/Cache/data");
+            match governor.reserve(StorageClass::BrowserStorage, &key, 2_000) {
+                Ok(reservation) => {
+                    let path = root.join(&key);
+                    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    std::fs::write(&path, vec![2u8; 2_000]).unwrap();
+                    reservation.commit(2_000, None).unwrap();
+                }
+                Err(_) => break,
+            }
+        }
+        assert_eq!(
+            std::fs::read(active.join("Cookies")).unwrap(),
+            vec![1u8; 3_000],
+            "an active profile file must never be evicted"
+        );
+        let metrics = governor.metrics().unwrap();
+        assert!(metrics.per_class["browser_storage"].bytes <= 20_000);
+        assert!(metrics.evictions > 0);
+    }
+
+    #[test]
     fn symlink_swapped_profile_entries_are_refused_and_targets_untouched() {
         use std::os::unix::fs::symlink;
         let tmp = tempfile::tempdir().unwrap();

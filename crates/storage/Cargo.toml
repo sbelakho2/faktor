@@ -1,0 +1,22 @@
+[package]
+name = "faktor-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Always-on storage governor: one hard aggregate budget, per-class quotas, reserve-before-publish admission, eviction and typed degraded health."
+
+[dependencies]
+faktor-core.workspace = true
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

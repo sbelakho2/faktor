@@ -335,6 +335,14 @@
     "INV-WORKER-REGISTRATION-ATOMIC-REPAIR",
     "INV-WORKER-TOKEN-SINGLE-BINDING"
    ]
+  },
+  {
+   "id": "storage.governor",
+   "title": "Always-on storage governor: aggregate budget, quotas, eviction, loss markers",
+   "specs": [
+    "INV-STORAGE-AGGREGATE-BUDGET",
+    "INV-STORAGE-ARCHIVE-LOSS-MARKER"
+   ]
   }
  ]
 }

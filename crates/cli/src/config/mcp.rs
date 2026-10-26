@@ -51,6 +51,7 @@ impl Default for Config {
             enterprise: EnterpriseCfg::default(),
             worker_node: WorkerNodeCfg::default(),
             commerce: CommerceCfg::default(),
+            storage: StorageCfg::default(),
         }
     }
 }

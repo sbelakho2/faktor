@@ -1722,6 +1722,7 @@ pub(crate) fn doctor_run_with_config(
 ) -> DoctorReport {
     let mut lines: Vec<String> = Vec::new();
     let mut issues = 0usize;
+    doctor_storage_governor_line(data_dir, &mut lines, &mut issues);
     doctor_worker_plane_line(config_path, &mut lines, &mut issues);
     // The additive value-centric entitlement section: the [billing] plan
     // table's paid VALUE features (inference-independent; offline default
@@ -1797,6 +1798,75 @@ pub(crate) fn doctor_run_with_config(
     DoctorReport { lines, issues }
 }
 
+/// The always-on storage governor section: totals, every per-class quota and
+/// usage, evictions, refusals, pending reservations and the watermark.
+/// Degraded health is an ISSUE (the budget cannot be met). Doctor never
+/// reconciles or evicts: it reports the durable ledger as-is.
+pub(crate) fn doctor_storage_governor_line(
+    data_dir: &std::path::Path,
+    lines: &mut Vec<String>,
+    issues: &mut usize,
+) {
+    let Some(governor) = crate::config::StorageCfg::existing_governor(data_dir) else {
+        lines.push("storage-governor: not initialized (next daemon start creates it)".into());
+        return;
+    };
+    match governor.metrics() {
+        Ok(metrics) => {
+            let classes = metrics
+                .per_class
+                .values()
+                .map(|usage| {
+                    format!(
+                        "{}={}/{}",
+                        usage.class.as_str(),
+                        usage.bytes,
+                        usage.quota_bytes
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            lines.push(format!(
+                "storage-governor: total={}/{} bytes ({} permille) objects={} evictions={} refusals={} pending={} loss-markers={} watermark={} permille above-watermark={} last-maintenance-ms={} classes=[{}]",
+                metrics.total_bytes,
+                metrics.total_budget_bytes,
+                metrics.used_permille_of_budget,
+                metrics.total_objects,
+                metrics.evictions,
+                metrics.refusals,
+                metrics.pending_reservations,
+                metrics.loss_markers,
+                metrics.watermark_permille,
+                metrics.above_watermark,
+                metrics
+                    .last_maintenance_ms
+                    .map(|ms| ms.to_string())
+                    .unwrap_or_else(|| "never".to_string()),
+                classes
+            ));
+            if let Some(degraded) = metrics.degraded {
+                lines.push(format!(
+                    "storage-governor: DEGRADED {} — {} (total={} budget={} required={} class={})",
+                    degraded.code,
+                    degraded.detail,
+                    degraded.total_bytes,
+                    degraded.total_budget_bytes,
+                    degraded.required_bytes,
+                    degraded
+                        .class
+                        .map(|class| class.as_str())
+                        .unwrap_or("aggregate")
+                ));
+                *issues += 1;
+            }
+        }
+        Err(error) => {
+            lines.push(format!("storage-governor: metrics FAILED ({error})"));
+            *issues += 1;
+        }
+    }
+}
+
 /// The `cloud-db` doctor section: every `*.db` under the data dir — top-level
 /// AND nested (bounded depth, deterministic order, symlinks/hidden backup
 /// trees skipped) — is probed READ-ONLY for pragma state, the
@@ -1826,7 +1896,7 @@ pub(crate) fn commercial_db_doctor(
     /// Directory names holding snapshots/blobs, never live authorities:
     /// probing every copy would consume the bounded probe budget and could
     /// hide a live database behind its own backups.
-    const SKIP_DB_DIRS: &[&str] = &["backups", "commercial-backups", "cas"];
+    const SKIP_DB_DIRS: &[&str] = &["backups", "commercial-backups", "cas", "storage-governor"];
     /// Databases whose authority is the commercial control plane: a missing
     /// durability policy marker here is an issue, not information.
     const CLOUD_FAMILY: &[&str] = &[

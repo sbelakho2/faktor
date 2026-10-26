@@ -238,4 +238,53 @@ mod tests {
         );
         assert!(r.summary.starts_with("line1"));
     }
+
+    #[test]
+    fn artifact_writer_reserves_before_publishing_and_refuses_over_budget() {
+        use faktor_cas::faktor_storage::{StorageClass, StorageGovernor, StorageGovernorConfig};
+        let dir = tempdir().unwrap();
+        let config = StorageGovernorConfig {
+            total_budget_bytes: 100_000,
+            watermark_permille: 900,
+            reservation_lease_ms: 60_000,
+            quotas: StorageClass::ALL
+                .into_iter()
+                .map(|class| {
+                    (
+                        class,
+                        if class == StorageClass::MainCas {
+                            1_000
+                        } else {
+                            20_000
+                        },
+                    )
+                })
+                .collect(),
+        }
+        .validated()
+        .unwrap();
+        let governor = Arc::new(StorageGovernor::open(dir.path(), config).unwrap());
+        let mut cas = Cas::open_in_class(dir.path().join("cas"), StorageClass::MainCas).unwrap();
+        cas.attach_governor(governor.clone(), StorageClass::MainCas);
+        let cas = Arc::new(cas);
+        let writer = ArtifactWriter::new(cas.clone(), SessionId::new(1));
+        let mut noise_state = 0x9E37_79B9_7F4A_7C15u64;
+        let noise: Vec<u8> = (0..2_000)
+            .map(|_| {
+                noise_state ^= noise_state << 13;
+                noise_state ^= noise_state >> 7;
+                noise_state ^= noise_state << 17;
+                noise_state as u8
+            })
+            .collect();
+        let error = writer
+            .store("log", &noise, 0)
+            .expect_err("over-budget artifact must be refused");
+        assert_eq!(error.kind, ErrorKind::Store);
+        assert_eq!(cas.blob_count(), 0);
+        assert_eq!(governor.counters().unwrap().refusals, 1);
+        let stored = writer.store("log", b"small artifact", 0).unwrap();
+        assert!(stored.artifact.is_some());
+        assert_eq!(cas.blob_count(), 1);
+    }
 }

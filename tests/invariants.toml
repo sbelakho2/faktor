@@ -3046,3 +3046,32 @@ mutation_command = "node scripts/mutation-run.mjs INV-DESIGN-FOCUS-DIVIDEND"
 mutation_debt = ""
 release_critical = true
 platforms = ["linux", "macos", "windows"]
+
+
+[[invariant]]
+id = "INV-STORAGE-AGGREGATE-BUDGET"
+statement = "One hard aggregate budget plus per-class quotas refuse an over-budget object before any bytes or reservation are published; the refusal is durable and typed."
+owner = "crates/storage"
+authority = "crates/storage/src/governor.rs StorageGovernor::reserve/try_reserve"
+unit_test = "budget_refusal_is_enforced_before_publish"
+production_wiring = "cas_put_refuses_before_publishing_over_budget"
+fault = ""
+mutation_witness = "budget_refusal_guard_is_pinned_against_mutation"
+mutation_command = "node scripts/mutation-run.mjs INV-STORAGE-AGGREGATE-BUDGET"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-STORAGE-ARCHIVE-LOSS-MARKER"
+statement = "Compaction archive eviction leaves a durable loss marker and a verified eviction-index row; a CAS blob is integrity-verified before it is deleted."
+owner = "crates/storage + crates/cas"
+authority = "crates/storage/src/governor.rs StorageGovernor::evict_row; crates/cas/src/governed.rs CasStorageBackend::evict"
+unit_test = "archive_eviction_writes_a_durable_loss_marker"
+production_wiring = "archive_cas_eviction_records_a_durable_loss_marker_with_verified_integrity"
+fault = ""
+mutation_witness = "archive_loss_marker_guard_is_pinned_against_mutation"
+mutation_command = "node scripts/mutation-run.mjs INV-STORAGE-ARCHIVE-LOSS-MARKER"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]

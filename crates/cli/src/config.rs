@@ -52,6 +52,8 @@ mod provider;
 pub use provider::*;
 mod commerce;
 pub use commerce::*;
+mod storage;
+pub use storage::*;
 
 #[cfg(test)]
 #[path = "config/first_run_tests.rs"]

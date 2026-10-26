@@ -77,6 +77,11 @@ pub const SLOW_TRANSACTION_THRESHOLD: Duration = Duration::from_millis(250);
 /// A job whose queue wait exceeds this is instrumented as slow.
 pub const SLOW_QUEUE_WAIT_THRESHOLD: Duration = Duration::from_millis(250);
 
+/// Fixed per-statement growth estimate used for admission. The exact sizes
+/// are reconciled by WAL maintenance on the same path; this bound refuses a
+/// write BEFORE it touches the database when the budget cannot hold it.
+pub const STORAGE_APPEND_ESTIMATE_BYTES: u64 = 4_096;
+
 /// Default finite bound for [`WriterService::shutdown`]: how long a clean
 /// stop may spend draining queued jobs before the owner is interrupted.
 pub const DEFAULT_WRITER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -240,6 +245,10 @@ struct WriterInner {
     /// Owner thread stopped (set once, just before the thread returns).
     stopped: Mutex<bool>,
     stopped_cv: Condvar,
+    /// Always-on storage governor. Every mutation (hot batches AND typed
+    /// single writes) is admitted here BEFORE it is enqueued, so no write
+    /// path can grow SQLite/WAL past the hard budget.
+    storage_governor: Mutex<Option<Arc<faktor_storage::StorageGovernor>>>,
 }
 
 impl std::fmt::Debug for WriterInner {
@@ -320,6 +329,7 @@ impl WriterService {
             interrupt,
             stopped: Mutex::new(false),
             stopped_cv: Condvar::new(),
+            storage_governor: Mutex::new(None),
         });
         {
             let progress_inner = Arc::clone(&inner);
@@ -365,6 +375,12 @@ impl WriterService {
     /// shutdown was requested or a command panicked).
     pub(crate) fn is_available(&self) -> bool {
         self.inner.available.load(Ordering::Acquire) && !self.inner.is_shutdown_requested()
+    }
+
+    /// Attach the always-on storage governor (every write is admitted
+    /// against the SQLite/WAL class quota and aggregate budget).
+    pub(crate) fn attach_storage_governor(&self, governor: Arc<faktor_storage::StorageGovernor>) {
+        self.inner.attach_storage_governor(governor);
     }
 
     /// Typed one-line reason the writer stopped, when it did.
@@ -454,6 +470,7 @@ impl WriterService {
         F: FnOnce(&mut Connection) -> crate::StoreResult<R> + Send + 'static,
     {
         self.inner.check_available(label)?;
+        self.inner.admit_storage(label)?;
         let (result_tx, result_rx) = mpsc::sync_channel::<crate::StoreResult<R>>(1);
         let job_inner = Arc::clone(&self.inner);
         let job = Job {
@@ -586,6 +603,32 @@ impl WriterInner {
         } else {
             Err(StoreError::WriterUnavailable(self.reason_or_dead()))
         }
+    }
+
+    /// Attach the always-on storage governor (production daemon wiring).
+    pub(crate) fn attach_storage_governor(&self, governor: Arc<faktor_storage::StorageGovernor>) {
+        *self
+            .storage_governor
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(governor);
+    }
+
+    /// Refuse one mutation BEFORE it is enqueued when the SQLite/WAL class
+    /// quota or aggregate budget cannot hold it. The estimate is a fixed
+    /// per-statement bound; the exact usage is reconciled by WAL maintenance
+    /// on the same hot path.
+    fn admit_storage(&self, label: &'static str) -> crate::StoreResult<()> {
+        let governor = self
+            .storage_governor
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let Some(governor) = governor else {
+            return Ok(());
+        };
+        governor
+            .admit_sqlite_growth(STORAGE_APPEND_ESTIMATE_BYTES)
+            .map_err(|error| StoreError::StorageRefused(format!("`{label}`: {error}")))
     }
 
     fn is_shutdown_requested(&self) -> bool {

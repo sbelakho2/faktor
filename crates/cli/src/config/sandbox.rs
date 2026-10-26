@@ -136,6 +136,8 @@ impl<'de> serde::Deserialize<'de> for Config {
             worker_node: WorkerNodeCfg,
             #[serde(default)]
             commerce: CommerceCfg,
+            #[serde(default)]
+            storage: StorageCfg,
         }
         let file = File::deserialize(de)?;
         if file.config_version != 1 {
@@ -167,6 +169,7 @@ impl<'de> serde::Deserialize<'de> for Config {
             enterprise: file.enterprise,
             worker_node: file.worker_node,
             commerce: file.commerce,
+            storage: file.storage,
         })
     }
 }

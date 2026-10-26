@@ -2608,15 +2608,12 @@ mod tests {
             evidence_tokens: 32_768,
             ..VolatileClaims::default()
         };
-        let baseline_input =
-            CompilerInput::new(baseline_facts, 32_768).with_volatile(volatile);
+        let baseline_input = CompilerInput::new(baseline_facts, 32_768).with_volatile(volatile);
         let focused_input = CompilerInput::new(focused_facts, 32_768).with_volatile(volatile);
         // Control: ONE ordinary compile's acquisition cost on this store. The
         // pair must pay that same cost, never twice (two independent compiles).
         let control_input = baseline_input.clone();
-        compiler
-            .compile(&control_input)
-            .expect("control compile");
+        compiler.compile(&control_input).expect("control compile");
         let one_acquisition = source.newest_lists.load(Ordering::SeqCst);
         source.newest_lists.store(0, Ordering::SeqCst);
         let (baseline, focused) = compiler

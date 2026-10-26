@@ -193,6 +193,26 @@ pub(crate) fn build_daemon_with_seams_and_planner(
     // store directory, database or CAS behind.
     preflight_daemon_config(&config)?;
     std::fs::create_dir_all(data_dir).map_err(|e| e.to_string())?;
+    // The always-on storage governor exists BEFORE the store/CAS open so
+    // both discover it through the `<data>/storage-governor` marker.
+    let _storage_governor = config.storage.open_governor(data_dir)?;
+    if let Some(install_root) = config
+        .updater
+        .install_root_path(data_dir)
+        .map_err(|e| format!("updater install root: {e}"))?
+    {
+        let staging = install_root.join("staging");
+        _storage_governor
+            .register_backend(std::sync::Arc::new(
+                faktor_storage::DirectoryBackend::new(
+                    faktor_storage::StorageClass::UpdateRemnant,
+                    &staging,
+                )
+                .with_min_age(config.storage.update_remnant_stale_ms),
+            ))
+            .map_err(|e| format!("storage governor updater remnants: {e}"))?;
+        let _ = _storage_governor.cleanup_update_remnants(config.storage.update_remnant_stale_ms);
+    }
     // 1-2: the durable store + CAS (full integrity scan on this entry);
     // 3: ONE daemon supervisor, exactly as [`build_daemon`].
     let session = SessionManager::open(data_dir.join("store"), data_dir.join("cas"), true)
@@ -305,6 +325,27 @@ pub(crate) async fn build_daemon_with_mcp_inner(
     preflight_daemon_config(&config)?;
     let entries = config.mcp_servers()?;
     std::fs::create_dir_all(data_dir).map_err(|e| e.to_string())?;
+    // Productive entries (serve/run/acp): create the always-on governor
+    // before the store/CAS so both attach automatically, and remove stale
+    // updater staging remnants once at startup.
+    let _storage_governor = config.storage.open_governor(data_dir)?;
+    if let Some(install_root) = config
+        .updater
+        .install_root_path(data_dir)
+        .map_err(|e| format!("updater install root: {e}"))?
+    {
+        let staging = install_root.join("staging");
+        _storage_governor
+            .register_backend(std::sync::Arc::new(
+                faktor_storage::DirectoryBackend::new(
+                    faktor_storage::StorageClass::UpdateRemnant,
+                    &staging,
+                )
+                .with_min_age(config.storage.update_remnant_stale_ms),
+            ))
+            .map_err(|e| format!("storage governor updater remnants: {e}"))?;
+        let _ = _storage_governor.cleanup_update_remnants(config.storage.update_remnant_stale_ms);
+    }
     let session = if fast_open {
         SessionManager::open_quick(data_dir.join("store"), data_dir.join("cas"))
     } else {

@@ -2396,7 +2396,10 @@ fn lazy_focus_does_zero_work_without_an_active_step_or_under_two_kib() {
         ..Default::default()
     };
     let variants = task_facts_variants_with_contract(contract.clone(), &no_step);
-    assert!(!variants.focus.evaluated, "no active step => zero focus work");
+    assert!(
+        !variants.focus.evaluated,
+        "no active step => zero focus work"
+    );
     assert!(variants.focus.terms.is_empty());
     assert!(variants.focused.is_none());
 
@@ -2429,22 +2432,24 @@ fn lazy_focus_does_zero_work_without_an_active_step_or_under_two_kib() {
 #[test]
 fn runtime_focus_policy_preserves_priority_ranked_terms() {
     let mut contract = faktor_core::EngineeringContract::default();
-    contract.proof_obligations.push(faktor_core::ProofObligation {
-        id: "p1:focus".into(),
-        claim: "parse_token must reject replay".into(),
-        requirement: faktor_core::Requirement::Required,
-        evidence: faktor_core::ProofEvidenceKind::ContractCheck,
-        evidence_binding: faktor_core::EvidenceBinding::TestSelector(
-            "auth::refresh::replay_is_rejected".into(),
-        ),
-        accepted_strength: faktor_core::AcceptedStrength::Supported,
-        state: faktor_core::ClaimState::Unknown,
-        origin: faktor_core::ContractOrigin::User,
-        confidence_bps: None,
-        evidence_refs: Vec::new(),
-        proofs: Vec::new(),
-        binding_updates: Vec::new(),
-    });
+    contract
+        .proof_obligations
+        .push(faktor_core::ProofObligation {
+            id: "p1:focus".into(),
+            claim: "parse_token must reject replay".into(),
+            requirement: faktor_core::Requirement::Required,
+            evidence: faktor_core::ProofEvidenceKind::ContractCheck,
+            evidence_binding: faktor_core::EvidenceBinding::TestSelector(
+                "auth::refresh::replay_is_rejected".into(),
+            ),
+            accepted_strength: faktor_core::AcceptedStrength::Supported,
+            state: faktor_core::ClaimState::Unknown,
+            origin: faktor_core::ContractOrigin::User,
+            confidence_bps: None,
+            evidence_refs: Vec::new(),
+            proofs: Vec::new(),
+            binding_updates: Vec::new(),
+        });
     contract.invariants.push(faktor_core::Invariant {
         id: "i1:focus".into(),
         statement: "migration stays atomic".into(),
@@ -2484,7 +2489,10 @@ fn runtime_focus_policy_preserves_priority_ranked_terms() {
     assert!(position("migration") < position("cache"));
     assert!(position("cache") < position("generic"));
     assert_eq!(
-        terms.iter().filter(|term| term.as_str() == "refresh").count(),
+        terms
+            .iter()
+            .filter(|term| term.as_str() == "refresh")
+            .count(),
         1
     );
     assert_eq!(

@@ -355,7 +355,11 @@ impl CheckpointStore {
         content: &[u8],
     ) -> Result<FileHash, Error> {
         self.cas
-            .put(content)
+            .put_in_class(
+                faktor_cas::CasStorageClass::Checkpoint,
+                "checkpoint",
+                content,
+            )
             .map_err(|e| Error::new(ErrorKind::Store, format!("cas: {e}")))
     }
 
@@ -418,7 +422,7 @@ impl CheckpointStore {
         if let Some(bytes) = before_content {
             let actual = self
                 .cas
-                .put(bytes)
+                .put_in_class(faktor_cas::CasStorageClass::Checkpoint, "checkpoint", bytes)
                 .map_err(|e| Error::new(ErrorKind::Store, format!("cas: {e}")))?;
             if Some(actual) != before.hash {
                 return Err(Error::internal(format!(
@@ -444,7 +448,7 @@ impl CheckpointStore {
             Some(bytes) => {
                 let actual = self
                     .cas
-                    .put(bytes)
+                    .put_in_class(faktor_cas::CasStorageClass::Checkpoint, "checkpoint", bytes)
                     .map_err(|e| Error::new(ErrorKind::Store, format!("cas: {e}")))?;
                 if Some(actual) != after.hash {
                     return Err(Error::internal(format!(
@@ -1022,6 +1026,69 @@ mod tests {
         assert_eq!(blob, content);
         // blob_count counts the shard files: one blob + ... assert via has().
         assert!(cps.cas.has(before_hashes[0]));
+    }
+
+    #[test]
+    fn checkpoint_blobs_are_admitted_before_publish_and_classified() {
+        use faktor_cas::faktor_storage::{StorageClass, StorageGovernor, StorageGovernorConfig};
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("ws");
+        fs::create_dir_all(&root).unwrap();
+        let service = faktor_fs::WorkspaceFileService::new();
+        let handle = service.open(WorkspaceId::new(1), root).unwrap();
+        let identity =
+            WorkspaceIdentity::new(WorkspaceId::new(1), WorktreeId::new(1), TaskId::new(1));
+        let config = StorageGovernorConfig {
+            total_budget_bytes: 1_000_000,
+            watermark_permille: 900,
+            reservation_lease_ms: 60_000,
+            quotas: StorageClass::ALL
+                .into_iter()
+                .map(|class| {
+                    (
+                        class,
+                        if class == StorageClass::Checkpoint {
+                            100
+                        } else {
+                            100_000
+                        },
+                    )
+                })
+                .collect(),
+        }
+        .validated()
+        .unwrap();
+        let governor = Arc::new(StorageGovernor::open(dir.path(), config).unwrap());
+        let mut cas = Cas::open_in_class(dir.path().join("cas"), StorageClass::Checkpoint).unwrap();
+        cas.attach_governor(governor.clone(), StorageClass::Checkpoint);
+        let cas = Arc::new(cas);
+        let store = Arc::new(Store::open(dir.path().join("store"), true).unwrap());
+        let ws = store.create_workspace("/w").unwrap();
+        let row = store.create_session(ws, "t", "p", "m").unwrap();
+        let cps = CheckpointStore::new(cas.clone(), store);
+        let mut noise_state = 0x9E37_79B9_7F4A_7C15u64;
+        let noise: Vec<u8> = (0..200)
+            .map(|_| {
+                noise_state ^= noise_state << 13;
+                noise_state ^= noise_state >> 7;
+                noise_state ^= noise_state << 17;
+                noise_state as u8
+            })
+            .collect();
+        let error = cps.before_write(row.id, "too-big.rs", &noise).unwrap_err();
+        assert!(
+            error.to_string().contains("storage admission refused"),
+            "{error}"
+        );
+        assert_eq!(cas.blob_count(), 0);
+        assert!(governor.counters().unwrap().refusals >= 1);
+        let hash = cps.before_write(row.id, "small.rs", b"ok").unwrap();
+        assert_eq!(
+            governor.object_class_of_digest(&hash.to_hex()).unwrap(),
+            Some(StorageClass::Checkpoint)
+        );
+        let _ = (&handle, identity);
     }
 
     #[test]

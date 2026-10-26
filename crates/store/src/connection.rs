@@ -513,6 +513,9 @@ pub struct Store {
     /// rows + settlement events). Read-side metric folds cache by this
     /// value; it advances only when a writer commits a row/event.
     pub(crate) outcome_revision: AtomicU64,
+    /// Always-on storage governor (discovered beside the data dir), used for
+    /// WAL maintenance and growth refusal. `None` in bare test stores.
+    storage_governor: std::sync::Mutex<Option<Arc<faktor_storage::StorageGovernor>>>,
 }
 
 impl Drop for Store {
@@ -1417,6 +1420,112 @@ mod writer_service_tests {
         assert!(telemetry.jobs >= 1, "{telemetry:?}");
     }
 
+    /// Always-on SQLite governance: the WAL is checkpoint-truncated and a
+    /// growth that cannot fit the class quota/aggregate budget is refused
+    /// BEFORE the append (typed StoreError::StorageRefused).
+    #[test]
+    fn storage_governor_bounds_wal_growth_and_refuses_over_budget() {
+        use faktor_storage::{StorageClass, StorageGovernor, StorageGovernorConfig};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("store"), true).unwrap();
+        store
+            .sql_execute("CREATE TABLE storage_probe(body BLOB NOT NULL)")
+            .unwrap();
+        for _ in 0..4 {
+            store
+                .sql_execute("INSERT INTO storage_probe(body) VALUES (randomblob(200000))")
+                .unwrap();
+        }
+        let db = dir.path().join("store").join("faktor-plus.db");
+        let wal = dir.path().join("store").join("faktor-plus.db-wal");
+        let db_size = std::fs::metadata(&db).unwrap().len();
+        let before = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        assert!(before > 0, "the probe must leave a WAL");
+        let quota = db_size + before / 2;
+        let config = StorageGovernorConfig {
+            total_budget_bytes: quota + 1_000_000,
+            watermark_permille: 900,
+            reservation_lease_ms: 60_000,
+            quotas: StorageClass::ALL
+                .into_iter()
+                .map(|class| {
+                    (
+                        class,
+                        if class == StorageClass::SqliteWal {
+                            quota
+                        } else {
+                            1_000_000
+                        },
+                    )
+                })
+                .collect(),
+        }
+        .validated()
+        .unwrap();
+        let governor = Arc::new(StorageGovernor::open(dir.path(), config).unwrap());
+        store.attach_storage_governor(governor.clone());
+        let reclaimed = store.storage_maintenance().unwrap();
+        let after = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        assert!(
+            after < before || reclaimed > 0,
+            "WAL must be truncated by maintenance (before {before}, after {after})"
+        );
+        let error = store.admit_storage_growth(quota).unwrap_err();
+        assert!(
+            matches!(error, StoreError::StorageRefused(_)),
+            "over-budget SQLite growth must be refused typed: {error}"
+        );
+        assert!(governor.counters().unwrap().refusals >= 1);
+        assert!(governor
+            .health()
+            .unwrap()
+            .is_some_and(|health| health.class == Some(StorageClass::SqliteWal)));
+    }
+
+    /// Every typed store mutation (not only the hot batch) is admitted
+    /// against the SQLite/WAL class quota: when the budget cannot hold the
+    /// append the write is refused BEFORE the writer queue or SQLite sees it.
+    #[test]
+    fn every_typed_write_path_is_refused_before_sqlite_growth() {
+        use faktor_storage::{StorageClass, StorageGovernor, StorageGovernorConfig};
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageGovernorConfig {
+            total_budget_bytes: 2_000_000,
+            watermark_permille: 900,
+            reservation_lease_ms: 60_000,
+            quotas: StorageClass::ALL
+                .into_iter()
+                .map(|class| {
+                    (
+                        class,
+                        if class == StorageClass::SqliteWal {
+                            1
+                        } else {
+                            1_000_000
+                        },
+                    )
+                })
+                .collect(),
+        }
+        .validated()
+        .unwrap();
+        let governor = Arc::new(StorageGovernor::open(dir.path(), config).unwrap());
+        let store = Store::open(dir.path().join("store"), true).unwrap();
+        store.attach_storage_governor(governor.clone());
+        let error = store.create_workspace("/refused").unwrap_err();
+        assert!(
+            matches!(error, StoreError::StorageRefused(_)),
+            "a typed single write must be refused typed: {error}"
+        );
+        assert!(governor.counters().unwrap().refusals >= 1);
+        assert!(governor
+            .health()
+            .unwrap()
+            .is_some_and(|health| health.class == Some(StorageClass::SqliteWal)));
+    }
+
     /// The writer thread never blocks reads even when the queue is saturated
     /// with slow commands (bounded pending depth is observable).
     #[test]
@@ -2066,6 +2175,10 @@ impl Store {
         fact_seq: AtomicU64,
     ) -> Self {
         let pool = Arc::new(ReaderPool::new());
+        let storage_governor = faktor_storage::StorageGovernor::discover(&root).map(Arc::new);
+        if let Some(governor) = &storage_governor {
+            writer.attach_storage_governor(governor.clone());
+        }
         Self {
             root,
             writer,
@@ -2076,6 +2189,7 @@ impl Store {
             corruption_epoch: AtomicU64::new(0),
             outcome_revision: AtomicU64::new(0),
             maintenance: Arc::new(MaintenanceRegistry::new()),
+            storage_governor: std::sync::Mutex::new(storage_governor),
         }
     }
 
@@ -2083,6 +2197,39 @@ impl Store {
     /// Session-open verification caches key on this value.
     pub fn corruption_epoch(&self) -> u64 {
         self.corruption_epoch.load(Ordering::Acquire)
+    }
+
+    /// Attach the always-on governor explicitly (embedded hosts/tests).
+    pub fn attach_storage_governor(&self, governor: Arc<faktor_storage::StorageGovernor>) {
+        self.writer.attach_storage_governor(governor.clone());
+        *self.storage_governor.lock().unwrap() = Some(governor);
+    }
+
+    pub fn storage_governor(&self) -> Option<Arc<faktor_storage::StorageGovernor>> {
+        self.storage_governor.lock().unwrap().clone()
+    }
+
+    /// Refuse an append that would breach the SQLite/WAL class quota or the
+    /// aggregate budget. WAL maintenance (checkpoint/truncate) runs first;
+    /// the caller must not execute the write on `Err`.
+    pub fn admit_storage_growth(&self, incoming_bytes: u64) -> StoreResult<()> {
+        if let Some(governor) = self.storage_governor() {
+            governor
+                .admit_sqlite_growth(incoming_bytes)
+                .map_err(|e| StoreError::StorageRefused(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Checkpoint/truncate every discovered WAL and enforce the SQLite class
+    /// quota. Returns the bytes reclaimed.
+    pub fn storage_maintenance(&self) -> StoreResult<u64> {
+        match self.storage_governor() {
+            Some(governor) => governor
+                .sqlite_maintenance()
+                .map_err(|e| StoreError::StorageRefused(e.to_string())),
+            None => Ok(0),
+        }
     }
 
     /// Monotonic revision of the Engineering Outcome Ledger (engineering
@@ -2442,6 +2589,9 @@ impl Store {
         if writes.is_empty() {
             return Ok((Vec::new(), BatchTiming::default()));
         }
+        // Admission happens BEFORE any writer enqueue/transaction: a batch
+        // that cannot fit the SQLite/WAL budget is refused whole.
+        self.admit_storage_growth((writes.len() as u64).saturating_mul(4_096))?;
         let seam = Arc::clone(&self.seam);
         // Preparation BEFORE enqueueing: every JSON body of the batch is
         // serialized here (caller's thread); the writer owner executes
@@ -2520,6 +2670,9 @@ impl Store {
     /// [`StoreError`] surface as every other call: a failure is the caller's
     /// to log, never a corruption by itself.
     pub fn wal_checkpoint_passive(&self) -> StoreResult<()> {
+        // The always-on governor owns WAL bounds: truncate when the class is
+        // over quota, then fall through to the ordinary passive fold.
+        let _ = self.storage_maintenance();
         // Instrumentation: the checkpoint's duration is measured on the
         // writer owner (the only place it runs) and recorded even when the
         // pragma itself fails.

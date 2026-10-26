@@ -23,10 +23,16 @@ use std::sync::Mutex;
 use std::time::{Instant, SystemTime};
 
 use faktor_core::hash::FileHash;
+use faktor_storage::{Reservation, StorageClass, StorageGovernor};
 
+/// Governor backends for the CAS roots (integrity-verified eviction).
+pub mod governed;
 /// Referential-protection deletion primitives (the retention plane's last
 /// line of defense at the storage layer).
 pub mod retention;
+
+pub use faktor_storage;
+pub use faktor_storage::StorageClass as CasStorageClass;
 
 /// Default ceiling for a single blob payload, in bytes (512 MiB). Structural:
 /// the store refuses to compress unbounded data; use `put_bounded` or
@@ -73,6 +79,8 @@ pub enum CasError {
     Malformed(String),
     #[error("internal invariant violated: {0}")]
     Internal(String),
+    #[error("storage admission refused: {0}")]
+    Governor(String),
 }
 
 pub type CasResult<T> = Result<T, CasError>;
@@ -318,6 +326,11 @@ impl CrashSeam {
 #[derive(Debug)]
 pub struct Cas {
     root: PathBuf,
+    /// Always-on storage governor (production). `None` in bare test stores.
+    governor: Option<std::sync::Arc<StorageGovernor>>,
+    /// Default logical class of this root's blobs (MainCas for the main CAS,
+    /// EvidenceCas for the evidence backing store).
+    governor_class: StorageClass,
     /// Number of actual disk writes (fresh blob or repair). Healthy dedup
     /// hits that verify cleanly never increment; tests use this to prove
     /// that dedup does not rewrite.
@@ -350,6 +363,8 @@ impl Clone for Cas {
     fn clone(&self) -> Self {
         Self {
             root: self.root.clone(),
+            governor: self.governor.clone(),
+            governor_class: self.governor_class,
             writes: AtomicU64::new(self.writes.load(Ordering::Relaxed)),
             // The advisory cache never crosses a clone boundary.
             verified: Mutex::new(VecDeque::new()),
@@ -372,6 +387,8 @@ impl Cas {
     pub fn new(root: PathBuf) -> Self {
         Self {
             root,
+            governor: None,
+            governor_class: StorageClass::MainCas,
             writes: AtomicU64::new(0),
             verified: Mutex::new(VecDeque::new()),
             #[cfg(unix)]
@@ -385,9 +402,95 @@ impl Cas {
     }
 
     pub fn open(root: PathBuf) -> CasResult<Self> {
-        let cas = Self::new(root);
+        Self::open_in_class(root, StorageClass::MainCas)
+    }
+
+    /// Open a CAS root whose unclassified blobs belong to `class` (the
+    /// evidence CAS uses `EvidenceCas`). A governor discovered at any
+    /// ancestor (`<data>/storage-governor/governor.db`) attaches
+    /// automatically; its backends are installed for this root.
+    pub fn open_in_class(root: PathBuf, class: StorageClass) -> CasResult<Self> {
+        let mut cas = Self::new(root);
+        cas.governor_class = class;
         fs::create_dir_all(cas.root.join("tmp"))?;
+        if let Some(governor) = StorageGovernor::discover(&cas.root) {
+            cas.governor = Some(std::sync::Arc::new(governor));
+            cas.install_governor_backends();
+            if let Some(governor) = &cas.governor {
+                let _ = governor.reconcile();
+            }
+        }
         Ok(cas)
+    }
+
+    /// Explicit wiring for embedded hosts and tests.
+    pub fn attach_governor(
+        &mut self,
+        governor: std::sync::Arc<StorageGovernor>,
+        class: StorageClass,
+    ) {
+        self.governor = Some(governor);
+        self.governor_class = class;
+        self.install_governor_backends();
+        if let Some(governor) = &self.governor {
+            let _ = governor.reconcile();
+        }
+    }
+
+    pub fn governor(&self) -> Option<&std::sync::Arc<StorageGovernor>> {
+        self.governor.as_ref()
+    }
+
+    pub const fn storage_class(&self) -> StorageClass {
+        self.governor_class
+    }
+
+    fn install_governor_backends(&self) {
+        let Some(governor) = &self.governor else {
+            return;
+        };
+        let classes: &[StorageClass] = match self.governor_class {
+            StorageClass::EvidenceCas => &[StorageClass::EvidenceCas],
+            _ => &[
+                StorageClass::MainCas,
+                StorageClass::CompactionArchive,
+                StorageClass::TerminalCapture,
+                StorageClass::Checkpoint,
+            ],
+        };
+        for class in classes {
+            let backend = std::sync::Arc::new(governed::CasStorageBackend::new(
+                self.clone(),
+                *class,
+                self.governor_class,
+            ));
+            let _ = governor.register_backend(backend);
+        }
+    }
+
+    fn reserve_governed(
+        &self,
+        class: StorageClass,
+        key: &str,
+        bytes: u64,
+    ) -> CasResult<Option<Reservation>> {
+        match &self.governor {
+            Some(governor) => governor
+                .reserve(class, key, bytes)
+                .map(Some)
+                .map_err(|e| CasError::Governor(e.to_string())),
+            None => Ok(None),
+        }
+    }
+
+    fn commit_governed(&self, reservation: Option<Reservation>, hash: FileHash) -> CasResult<()> {
+        let Some(reservation) = reservation else {
+            return Ok(());
+        };
+        let stored = self.stored_size(hash)?;
+        reservation
+            .commit(stored, Some(&hash.to_hex()))
+            .map_err(|e| CasError::Governor(e.to_string()))
     }
 
     /// Root directory (public for tests and tooling).
@@ -424,10 +527,33 @@ impl Cas {
         self.put_bounded(bytes, DEFAULT_MAX_PUT_BYTES)
     }
 
+    /// Store bytes under an explicit logical class (compaction archive,
+    /// terminal capture, checkpoint, ...). The default class of a plain CAS
+    /// root is `MainCas`; evidence roots pass `EvidenceCas`.
+    pub fn put_in_class(
+        &self,
+        class: StorageClass,
+        key: &str,
+        bytes: &[u8],
+    ) -> CasResult<FileHash> {
+        self.put_bounded_in_class(class, key, bytes, DEFAULT_MAX_PUT_BYTES)
+    }
+
     /// Bounded put: rejects payloads larger than `max_bytes` *before* hashing
     /// with an explicit `CasError::Oversized` rather than compressing
-    /// unbounded data. The default ceiling is `DEFAULT_MAX_PUT_BYTES`.
+    /// unbounded data. Admission is reserved BEFORE the payload is written
+    /// when a governor is attached; a refusal publishes nothing.
     pub fn put_bounded(&self, bytes: &[u8], max_bytes: usize) -> CasResult<FileHash> {
+        self.put_bounded_in_class(self.governor_class, "cas", bytes, max_bytes)
+    }
+
+    pub fn put_bounded_in_class(
+        &self,
+        class: StorageClass,
+        key: &str,
+        bytes: &[u8],
+        max_bytes: usize,
+    ) -> CasResult<FileHash> {
         if bytes.len() > max_bytes {
             return Err(CasError::Oversized {
                 max: max_bytes,
@@ -437,14 +563,29 @@ impl Cas {
         let hash = FileHash::from(blake3::hash(bytes).into());
         let path = self.blob_path(hash);
         if self.blob_is_valid(hash, &path) {
-            // Dedup hit on a verified-healthy blob: never rewrite.
+            // Dedup hit on a verified-healthy blob: never rewrite, never
+            // spend admission on bytes that do not grow the store.
             return Ok(hash);
         }
         // Compress to memory first so the temp-file write is one syscall
         // batch; `put_reader` is the streaming path for payloads that must
-        // not be materialized in RAM (identically bounded).
+        // not be materialized in RAM (identically bounded). Admission is
+        // reserved for the EXACT stored (compressed) bytes, still before the
+        // publish rename.
         let compressed = zstd::encode_all(bytes, 3).map_err(|e| CasError::Zstd(e.to_string()))?;
-        self.write_compressed(&path, hash, &compressed)
+        let reservation = self.reserve_governed(class, key, compressed.len() as u64)?;
+        match self.write_compressed(&path, hash, &compressed) {
+            Ok(hash) => {
+                self.commit_governed(reservation, hash)?;
+                Ok(hash)
+            }
+            Err(error) => {
+                if let Some(reservation) = reservation {
+                    reservation.abort();
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Streaming put: zstd-compresses incrementally from `reader` into a temp
@@ -457,16 +598,76 @@ impl Cas {
     /// Streaming put with an explicit byte bound, enforced mid-stream: a
     /// reader that yields more than `max_bytes` aborts with `Oversized` and
     /// the temp file is removed (never left behind).
-    pub fn put_reader_bounded<R: Read>(
+    pub fn put_reader_bounded<R: Read>(&self, reader: R, max_bytes: usize) -> CasResult<FileHash> {
+        self.put_reader_bounded_in_class(self.governor_class, "cas-stream", reader, max_bytes)
+    }
+
+    /// Streaming put under an explicit logical class. The reservation is the
+    /// caller's byte bound (an upper bound on the published object); the
+    /// actual compressed size is committed after the rename.
+    pub fn put_reader_bounded_in_class<R: Read>(
         &self,
+        class: StorageClass,
+        key: &str,
         mut reader: R,
         max_bytes: usize,
     ) -> CasResult<FileHash> {
         let tmp = self.tmp_path("stream");
+        let hash = match self.write_stream_temp(&mut reader, max_bytes, &tmp) {
+            Ok(hash) => hash,
+            Err(error) => {
+                let _ = fs::remove_file(&tmp);
+                return Err(error);
+            }
+        };
+        let path = self.blob_path(hash);
+        if self.blob_is_valid(hash, &path) {
+            let _ = fs::remove_file(&tmp);
+            return Ok(hash);
+        }
+        // The temp file is fully written but NOT published: admission is
+        // reserved for its exact stored size before the atomic rename.
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let stored = fs::metadata(&tmp).map(|meta| meta.len()).unwrap_or(0);
+        let reservation = match self.reserve_governed(class, key, stored) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                let _ = fs::remove_file(&tmp);
+                return Err(error);
+            }
+        };
+        // Durability boundary of the streaming put: crash after the temp
+        // blob is fsynced, before the atomic rename (no blob at the
+        // address; the temp must never be served).
+        self.seam.trip("cas_stream_tmp");
+        if let Err(error) = self.finish_rename(&tmp, &path) {
+            if let Some(reservation) = reservation {
+                reservation.abort();
+            }
+            let _ = fs::remove_file(&tmp);
+            return Err(error);
+        }
+        self.writes.fetch_add(1, Ordering::Relaxed);
+        // Crash right after the rename: the blob is fully in place.
+        self.seam.trip("cas_stream_renamed");
+        self.commit_governed(reservation, hash)?;
+        Ok(hash)
+    }
+
+    /// Compress the stream into `tmp` and return the content digest. The
+    /// file is fsynced but NOT renamed; the caller admits and publishes it.
+    fn write_stream_temp<R: Read>(
+        &self,
+        reader: &mut R,
+        max_bytes: usize,
+        tmp: &Path,
+    ) -> CasResult<FileHash> {
         let mut hasher = blake3::Hasher::new();
         let mut total = 0usize;
         {
-            let file = fs::File::create(&tmp)?;
+            let file = fs::File::create(tmp)?;
             let mut enc = zstd::stream::write::Encoder::new(file, 3)
                 .map_err(|e| CasError::Zstd(e.to_string()))?;
             let mut buf = [0u8; 64 * 1024];
@@ -478,7 +679,6 @@ impl Cas {
                 total += n;
                 if total > max_bytes {
                     drop(enc);
-                    let _ = fs::remove_file(&tmp);
                     return Err(CasError::Oversized {
                         max: max_bytes,
                         actual: total,
@@ -490,15 +690,6 @@ impl Cas {
             }
             enc.finish().map_err(|e| CasError::Zstd(e.to_string()))?;
         }
-        let hash = FileHash::from(hasher.finalize().into());
-        let path = self.blob_path(hash);
-        if self.blob_is_valid(hash, &path) {
-            let _ = fs::remove_file(&tmp);
-            return Ok(hash);
-        }
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
         {
             // Reopen read+WRITE: Windows FlushFileBuffers requires write
             // access, so a read-only reopen made `sync_all` fail with
@@ -506,19 +697,31 @@ impl Cas {
             // Windows; the fault campaign exposed it). The handle grants no
             // mutation rights beyond the flush the durability contract
             // needs.
-            let f = fs::OpenOptions::new().read(true).write(true).open(&tmp)?;
+            let f = fs::OpenOptions::new().read(true).write(true).open(tmp)?;
             f.sync_all()?;
         }
-        // Durability boundary of the streaming put: crash after the temp
-        // blob is fsynced, before the atomic rename (no blob at the
-        // address; the temp must never be served).
-        self.seam.trip("cas_stream_tmp");
-        if self.finish_rename(&tmp, &path)? {
-            self.writes.fetch_add(1, Ordering::Relaxed);
+        Ok(FileHash::from(hasher.finalize().into()))
+    }
+
+    /// Strictly verify then delete one blob (the governor's CAS eviction
+    /// primitive). A corrupt or unreadable blob is a loud error and stays on
+    /// disk: eviction never destroys bytes it could not verify.
+    pub fn evict_verified(&self, hash: FileHash) -> CasResult<(u64, bool)> {
+        self.verify_now(&hash.to_hex())?;
+        let size = self.stored_size(hash)?;
+        match self.delete_blob(hash)? {
+            retention::BlobDeleteOutcome::Deleted { .. } => Ok((size, true)),
+            retention::BlobDeleteOutcome::Absent => Ok((0, true)),
+            retention::BlobDeleteOutcome::Refused { .. } => Err(CasError::Internal(
+                "unguarded CAS eviction was refused by a retention guard".into(),
+            )),
         }
-        // Crash right after the rename: the blob is fully in place.
-        self.seam.trip("cas_stream_renamed");
-        Ok(hash)
+    }
+
+    /// True when the CAS is attached to an always-on governor (production
+    /// daemon); bare test stores run ungoverned.
+    pub fn governor_attached(&self) -> bool {
+        self.governor.is_some()
     }
 
     /// True iff the blob at `path` decompresses and rehashes to `hash`. Any
@@ -1127,6 +1330,9 @@ fn decode_stream<W: Write>(
     }
     Ok(Some(size))
 }
+
+#[cfg(test)]
+mod governed_tests;
 
 #[cfg(test)]
 mod tests {

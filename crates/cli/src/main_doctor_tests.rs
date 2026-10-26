@@ -2165,3 +2165,47 @@ fn doctor_surfaces_the_explicit_real_home_grant() {
         "{lines:?}"
     );
 }
+
+#[test]
+fn doctor_reports_storage_governor_totals_quotas_refusals_and_degraded_health() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = crate::config::StorageCfg {
+        total_budget_bytes: 1_000_000,
+        main_cas_bytes: Some(1_000),
+        evidence_cas_bytes: Some(100_000),
+        compaction_archive_bytes: Some(100_000),
+        terminal_capture_bytes: Some(100_000),
+        browser_storage_bytes: Some(50_000),
+        checkpoint_bytes: Some(100_000),
+        sqlite_wal_bytes: Some(100_000),
+        update_remnant_bytes: Some(20_000),
+        rebuildable_cache_bytes: Some(30_000),
+        ..Default::default()
+    };
+    let governor = cfg.open_governor(dir.path()).unwrap();
+    let refused = governor.reserve(
+        faktor_storage::StorageClass::MainCas,
+        "doctor-oversized",
+        2_000,
+    );
+    assert!(refused.is_err(), "the test must create a typed refusal");
+    let report = doctor_run(dir.path(), false);
+    let line = report
+        .lines
+        .iter()
+        .find(|line| line.starts_with("storage-governor: total="))
+        .unwrap_or_else(|| panic!("no storage-governor line: {:?}", report.lines));
+    assert!(line.contains("refusals=1"), "{line}");
+    assert!(line.contains("main_cas=0/1000"), "{line}");
+    assert!(line.contains("watermark=900"), "{line}");
+    assert!(line.contains("last-maintenance-ms="), "{line}");
+    assert!(
+        report
+            .lines
+            .iter()
+            .any(|line| line.contains("storage-governor: DEGRADED")),
+        "{:?}",
+        report.lines
+    );
+    assert!(report.issues >= 1, "{:?}", report.lines);
+}

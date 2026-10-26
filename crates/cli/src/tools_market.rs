@@ -1592,6 +1592,7 @@ fn browser_source_error(error: faktor_browser::BrowserError) -> SourceError {
         Browser::ResponseTooLarge { .. } | Browser::Bound { .. } => SourceError::ResponseTooLarge,
         Browser::EventStreamLagged { .. } => SourceError::BrowserCrashed,
         Browser::DownloadBlocked { .. } => SourceError::InvalidRequest,
+        Browser::StorageRefused { .. } => SourceError::InvalidRequest,
         // Added to unblock the shared workspace while the browser
         // download/retire work lands; the owning sibling may adjust.
         Browser::DownloadRejected { .. } => SourceError::InvalidRequest,

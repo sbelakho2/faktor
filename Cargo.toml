@@ -31,6 +31,7 @@ members = [
     "crates/protocol",
     "crates/cas",
     "crates/store",
+    "crates/storage",
     "crates/session",
     "crates/context",
     "crates/memory",
@@ -125,6 +126,7 @@ faktor-freshness = { path = "crates/freshness" }
 faktor-protocol = { path = "crates/protocol" }
 faktor-cas = { path = "crates/cas" }
 faktor-store = { path = "crates/store" }
+faktor-storage = { path = "crates/storage" }
 faktor-session = { path = "crates/session" }
 faktor-context = { path = "crates/context" }
 faktor-evidence = { path = "crates/evidence" }

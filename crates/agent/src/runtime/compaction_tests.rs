@@ -6,6 +6,63 @@ use crate::runtime::fixtures_tests::*;
 use crate::runtime::tests::*;
 use crate::*;
 
+#[test]
+fn compaction_archive_store_is_classified_evictable_and_leaves_a_loss_marker() {
+    use faktor_cas::faktor_storage::{StorageClass, StorageGovernor, StorageGovernorConfig};
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = StorageGovernorConfig {
+        total_budget_bytes: 10_000_000,
+        watermark_permille: 900,
+        reservation_lease_ms: 60_000,
+        quotas: StorageClass::ALL
+            .into_iter()
+            .map(|class| {
+                (
+                    class,
+                    if class == StorageClass::CompactionArchive {
+                        10_000_000
+                    } else {
+                        100_000
+                    },
+                )
+            })
+            .collect(),
+    }
+    .validated()
+    .unwrap();
+    let governor = Arc::new(StorageGovernor::open(dir.path(), config).unwrap());
+    let mut cas =
+        faktor_cas::Cas::open_in_class(dir.path().join("cas"), StorageClass::MainCas).unwrap();
+    cas.attach_governor(governor.clone(), StorageClass::MainCas);
+    let chunks = vec!["old turn text".to_string(), "newer turn text".to_string()];
+    let manifest = store_compaction_archive(&cas, &chunks).expect("archive stored");
+    assert_eq!(
+        governor.object_class_of_digest(&manifest.to_hex()).unwrap(),
+        Some(StorageClass::CompactionArchive)
+    );
+    let archive_objects = governor
+        .backend(StorageClass::CompactionArchive)
+        .unwrap()
+        .scan(&governor)
+        .unwrap();
+    assert_eq!(
+        archive_objects.len(),
+        3,
+        "two chunks + one manifest are indexed as archive objects"
+    );
+    let freed = governor
+        .evict_object(StorageClass::CompactionArchive, &manifest.to_hex())
+        .unwrap();
+    assert!(freed > 0);
+    assert!(!cas.has(manifest));
+    assert!(governor
+        .loss_markers(Some(StorageClass::CompactionArchive))
+        .unwrap()
+        .iter()
+        .any(|(key, _, reason)| key == &manifest.to_hex() && reason == "archive_evicted"));
+}
+
 #[tokio::test]
 async fn compaction_trigger_records_and_recovers() {
     let (mut deps, _dir) = deps(

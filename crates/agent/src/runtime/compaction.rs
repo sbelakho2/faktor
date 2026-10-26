@@ -364,6 +364,52 @@ pub(crate) fn collect_tool_summary(
     }
 }
 
+/// Store the eviction archive (ordered chunks + JSON manifest) in the main
+/// CAS under the `CompactionArchive` class. Returns the manifest digest, or
+/// `None` when nothing could be published (best-effort: the turn continues
+/// with the inline digest exactly as before).
+pub(crate) fn store_compaction_archive(
+    cas: &faktor_cas::Cas,
+    chunks: &[String],
+) -> Option<faktor_core::hash::FileHash> {
+    let mut chunk_entries: Vec<serde_json::Value> = Vec::new();
+    let mut total_bytes = 0usize;
+    for (index, chunk) in chunks.iter().enumerate() {
+        // Each chunk is stored whole (chunks are already bounded by the
+        // compactor; a pathological single-turn chunk may exceed the bound
+        // and still stores — never truncated).
+        let Ok(hash) = cas.put_bounded_in_class(
+            faktor_cas::CasStorageClass::CompactionArchive,
+            "compaction-archive-chunk",
+            chunk.as_bytes(),
+            chunk.len(),
+        ) else {
+            return None;
+        };
+        total_bytes = total_bytes.saturating_add(chunk.len());
+        chunk_entries.push(serde_json::json!({
+            "index": index,
+            "size": chunk.len(),
+            "hash": hash.to_string(),
+        }));
+    }
+    if chunk_entries.is_empty() {
+        return None;
+    }
+    let manifest = serde_json::json!({
+        "version": 1,
+        "chunks": chunk_entries,
+        "total_bytes": total_bytes,
+    });
+    let bytes = serde_json::to_vec(&manifest).ok()?;
+    cas.put_in_class(
+        faktor_cas::CasStorageClass::CompactionArchive,
+        "compaction-archive-manifest",
+        &bytes,
+    )
+    .ok()
+}
+
 impl AgentRuntime {
     /// The production context compiler: `Some` only when the
     /// `semantic_context` (information-gain) flag is on. `None` keeps the
@@ -907,36 +953,10 @@ impl AgentRuntime {
         // or a restart would reproduce a different context digest.
         if !plan.archive_chunks.is_empty() {
             if let Some(cas) = &self.deps.cas {
-                let mut chunk_entries: Vec<serde_json::Value> = Vec::new();
-                let mut total_bytes = 0usize;
-                for (index, chunk) in plan.archive_chunks.iter().enumerate() {
-                    // Each chunk is stored whole (chunks are already bounded
-                    // by the compactor; a pathological single-turn chunk may
-                    // exceed the bound and still stores — never truncated).
-                    let Ok(hash) = cas.put_bounded(chunk.as_bytes(), chunk.len()) else {
-                        chunk_entries.clear();
-                        break;
-                    };
-                    total_bytes = total_bytes.saturating_add(chunk.len());
-                    chunk_entries.push(serde_json::json!({
-                        "index": index,
-                        "size": chunk.len(),
-                        "hash": hash.to_string(),
-                    }));
-                }
-                let manifest = serde_json::json!({
-                    "version": 1,
-                    "chunks": chunk_entries,
-                    "total_bytes": total_bytes,
-                });
-                if !chunk_entries.is_empty() {
-                    if let Ok(bytes) = serde_json::to_vec(&manifest) {
-                        if let Ok(hash) = cas.put(&bytes) {
-                            let marker = format!("artifact://{hash}");
-                            if let Some(first) = plan.kept_recent.first_mut() {
-                                first.text = first.text.replace("<artifact://hash>", &marker);
-                            }
-                        }
+                if let Some(hash) = store_compaction_archive(cas, &plan.archive_chunks) {
+                    let marker = format!("artifact://{hash}");
+                    if let Some(first) = plan.kept_recent.first_mut() {
+                        first.text = first.text.replace("<artifact://hash>", &marker);
                     }
                 }
             }

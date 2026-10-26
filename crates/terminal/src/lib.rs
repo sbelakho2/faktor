@@ -1429,9 +1429,16 @@ impl SharedCapture {
                 Some(filter) if filter.max_match_len() > 0 => {
                     self.store_scrubbed_artifact(&path, filter)
                 }
-                _ => std::fs::File::open(&path)
-                    .ok()
-                    .and_then(|f| self.cas.put_reader_bounded(f, self.artifact_max).ok()),
+                _ => std::fs::File::open(&path).ok().and_then(|f| {
+                    self.cas
+                        .put_reader_bounded_in_class(
+                            faktor_cas::CasStorageClass::TerminalCapture,
+                            "terminal-capture",
+                            f,
+                            self.artifact_max,
+                        )
+                        .ok()
+                }),
             };
             if let Some(hash) = hash {
                 self.artifact = Some(format!("artifact://{}", hash.to_hex()));
@@ -1458,7 +1465,15 @@ impl SharedCapture {
         };
         if ranges.is_empty() {
             let f = std::fs::File::open(path).ok()?;
-            return self.cas.put_reader_bounded(f, self.artifact_max).ok();
+            return self
+                .cas
+                .put_reader_bounded_in_class(
+                    faktor_cas::CasStorageClass::TerminalCapture,
+                    "terminal-capture",
+                    f,
+                    self.artifact_max,
+                )
+                .ok();
         }
         let scrubbed = path.with_extension("scrubbed");
         if let Err(err) = write_redacted_copy(path, &ranges, &filter.replacement(), &scrubbed) {
@@ -1469,9 +1484,16 @@ impl SharedCapture {
             let _ = std::fs::remove_file(&scrubbed);
             return None;
         }
-        let hash = std::fs::File::open(&scrubbed)
-            .ok()
-            .and_then(|f| self.cas.put_reader_bounded(f, self.artifact_max).ok());
+        let hash = std::fs::File::open(&scrubbed).ok().and_then(|f| {
+            self.cas
+                .put_reader_bounded_in_class(
+                    faktor_cas::CasStorageClass::TerminalCapture,
+                    "terminal-capture",
+                    f,
+                    self.artifact_max,
+                )
+                .ok()
+        });
         let _ = std::fs::remove_file(&scrubbed);
         hash
     }

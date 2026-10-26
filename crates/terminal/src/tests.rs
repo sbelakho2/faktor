@@ -1612,6 +1612,53 @@ async fn artifact_roundtrip_via_cas() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_capture_is_refused_before_publish_when_its_class_budget_is_full() {
+    use faktor_cas::faktor_storage::{StorageClass, StorageGovernor, StorageGovernorConfig};
+
+    let dir = tempdir().unwrap();
+    let config = StorageGovernorConfig {
+        total_budget_bytes: 1_000_000,
+        watermark_permille: 900,
+        reservation_lease_ms: 60_000,
+        quotas: StorageClass::ALL
+            .into_iter()
+            .map(|class| {
+                (
+                    class,
+                    if class == StorageClass::TerminalCapture {
+                        10
+                    } else {
+                        100_000
+                    },
+                )
+            })
+            .collect(),
+    }
+    .validated()
+    .unwrap();
+    let governor = Arc::new(StorageGovernor::open(dir.path(), config).unwrap());
+    let mut cas =
+        faktor_cas::Cas::open_in_class(dir.path().join("cas"), StorageClass::TerminalCapture)
+            .unwrap();
+    cas.attach_governor(governor.clone(), StorageClass::TerminalCapture);
+    let sup = ProcessSupervisor::new(Arc::new(cas));
+    let mut cfg =
+        sh("yes 'terminal-capture-over-budget-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' | head -c 200000");
+    cfg.artifact_max = 100_000;
+    let out = sup
+        .run(cfg, Duration::from_secs(60), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(out.exit_code, Some(0));
+    assert!(
+        out.artifact.is_none(),
+        "a refused capture must not publish an artifact reference"
+    );
+    assert!(governor.counters().unwrap().refusals >= 1);
+    assert_eq!(governor.metrics().unwrap().total_bytes, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn artifact_cap_enforced_and_truncation_reported() {
     // Audit round 10: `artifact_max = 1MB` must actually cap the spool.
     // 5MB of output over a 1MB cap ⇒ artifact holds exactly the first

@@ -90,6 +90,11 @@ pub struct Config {
     /// byte-identical requests. Credentials are referenced by environment
     /// variable NAME only — the section never carries a value.
     pub commerce: CommerceCfg,
+    /// The always-on `[storage]` section: one hard aggregate budget plus
+    /// per-class quotas for every durable class (CAS, evidence, compaction
+    /// archives, terminal capture, browser storage, checkpoints,
+    /// SQLite/WAL, updater remnants, rebuildable caches).
+    pub storage: StorageCfg,
 }
 
 pub(crate) fn default_config_version() -> u32 {
@@ -291,6 +296,7 @@ impl Config {
         self.enterprise.validate()?;
         self.worker_node.validate()?;
         self.commerce.validate()?;
+        self.storage.validate()?;
         // The billing routes derive their tenant from the control-plane
         // principal, so an enabled billing section without the cloud section
         // could never authorize an organization-scoped read. The pair is

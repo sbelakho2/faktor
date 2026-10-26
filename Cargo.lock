@@ -975,6 +975,7 @@ dependencies = [
  "faktor-context",
  "faktor-core",
  "faktor-edit",
+ "faktor-evidence",
  "faktor-fs",
  "faktor-git",
  "faktor-hooks",
@@ -1045,6 +1046,7 @@ dependencies = [
  "faktor-core",
  "faktor-fs",
  "faktor-security",
+ "faktor-storage",
  "faktor-terminal",
  "futures-util",
  "serde",
@@ -1064,6 +1066,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "faktor-core",
+ "faktor-storage",
  "serde",
  "tempfile",
  "thiserror",
@@ -1139,6 +1142,7 @@ dependencies = [
  "faktor-server",
  "faktor-session",
  "faktor-snapshot",
+ "faktor-storage",
  "faktor-store",
  "faktor-supply-core",
  "faktor-supply-cost",
@@ -1327,6 +1331,7 @@ dependencies = [
  "blake3",
  "faktor-cas",
  "faktor-core",
+ "faktor-storage",
  "faktor-store",
  "serde",
  "serde_json",
@@ -1949,11 +1954,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "faktor-storage"
+version = "0.1.0"
+dependencies = [
+ "faktor-core",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "faktor-store"
 version = "0.1.0"
 dependencies = [
  "blake3",
  "faktor-core",
+ "faktor-storage",
  "rusqlite",
  "serde",
  "serde_json",

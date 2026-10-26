@@ -34,6 +34,7 @@ faktor-impact = { workspace = true, features = ["runtime"] }
 faktor-search.workspace = true
 faktor-sandbox.workspace = true
 faktor-store.workspace = true
+faktor-storage.workspace = true
 faktor-cas.workspace = true
 faktor-acp.workspace = true
 faktor-verify.workspace = true

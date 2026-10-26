@@ -116,6 +116,9 @@ pub enum BrowserError {
     EventStreamLagged { skipped: u64 },
     /// A configured bound (pages, browsers, records) was reached.
     Bound { detail: String },
+    /// The always-on storage governor refused the write BEFORE any bytes
+    /// were published (class quota / aggregate budget).
+    StorageRefused { detail: String },
     /// Anything else, with context.
     Internal { detail: String },
 }
@@ -183,6 +186,7 @@ impl BrowserError {
             BrowserError::Profile { .. } => "profile",
             BrowserError::EventStreamLagged { .. } => "event_stream_lagged",
             BrowserError::Bound { .. } => "bound",
+            BrowserError::StorageRefused { .. } => "storage_refused",
             BrowserError::Internal { .. } => "internal",
         }
     }
@@ -260,6 +264,9 @@ impl fmt::Display for BrowserError {
                 write!(f, "cdp event stream lagged: {skipped} events lost")
             }
             BrowserError::Bound { detail } => write!(f, "browser bound reached: {detail}"),
+            BrowserError::StorageRefused { detail } => {
+                write!(f, "browser storage refused: {detail}")
+            }
             BrowserError::Internal { detail } => write!(f, "internal browser failure: {detail}"),
         }
     }

@@ -12,6 +12,7 @@ fault-injection = []
 
 [dependencies]
 faktor-core.workspace = true
+faktor-storage.workspace = true
 blake3.workspace = true
 zstd.workspace = true
 serde.workspace = true

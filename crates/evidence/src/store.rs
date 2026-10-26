@@ -919,6 +919,21 @@ impl<'a> DurableEvidenceStore<'a> {
             let recorded = envelope.backing_hash.unwrap_or(digest);
             return Ok((Some(hex(&recorded)), Some(recorded)));
         }
+        // Required evidence backing is pinned BEFORE the CAS publishes it:
+        // the digest is known from the bytes, so an eviction pass can never
+        // observe the committed blob unpinned. The pin also marks the row
+        // required when the reservation commits.
+        if let Some(governor) = self.cas.governor() {
+            governor
+                .pin(
+                    faktor_storage::StorageClass::EvidenceCas,
+                    &hex(&digest),
+                    "evidence_backing",
+                )
+                .map_err(|e| {
+                    EvidenceError::Malformed(format!("evidence backing pin failed: {e}"))
+                })?;
+        }
         let hash = self
             .cas
             .put(bytes)
@@ -1098,7 +1113,8 @@ impl DurableEvidenceAuthority {
     /// Deterministic, so a restart finds the SAME blobs without extra state.
     pub fn for_store(store: std::sync::Arc<faktor_store::Store>, backing_cap: usize) -> Self {
         let root = store.root().join("evidence-cas");
-        let cas = Cas::open(root.clone()).unwrap_or_else(|_| Cas::new(root));
+        let cas = Cas::open_in_class(root.clone(), faktor_storage::StorageClass::EvidenceCas)
+            .unwrap_or_else(|_| Cas::new(root));
         Self::new(store, std::sync::Arc::new(cas), backing_cap)
     }
 
@@ -1843,6 +1859,88 @@ mod tests {
             );
             assert_eq!(durable.backing_cap(), 1024);
         }
+    }
+
+    #[test]
+    fn evidence_backing_is_admitted_and_pinned_before_the_row_commits() {
+        use faktor_storage::{StorageClass, StorageGovernor, StorageGovernorConfig};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(faktor_store::Store::open(dir.path().join("db"), true).unwrap());
+        let config = StorageGovernorConfig {
+            total_budget_bytes: 1_000_000,
+            watermark_permille: 900,
+            reservation_lease_ms: 60_000,
+            quotas: StorageClass::ALL
+                .into_iter()
+                .map(|class| {
+                    (
+                        class,
+                        if class == StorageClass::EvidenceCas {
+                            1_000
+                        } else {
+                            100_000
+                        },
+                    )
+                })
+                .collect(),
+        }
+        .validated()
+        .unwrap();
+        let governor = Arc::new(StorageGovernor::open(dir.path(), config).unwrap());
+        let mut cas =
+            Cas::open_in_class(dir.path().join("evidence-cas"), StorageClass::EvidenceCas).unwrap();
+        cas.attach_governor(governor.clone(), StorageClass::EvidenceCas);
+        let durable = DurableEvidenceAuthority::new(store.clone(), Arc::new(cas), 4096);
+        let (sid, ws) = scoped_session(&store, "/w");
+
+        let stored = durable
+            .insert_new(
+                &durable_envelope(
+                    sid,
+                    ws,
+                    "pinned",
+                    Compressibility::Aggressive,
+                    BackingCompleteness::Complete,
+                ),
+                Some(b"pinned-evidence"),
+            )
+            .unwrap();
+        let digest = stored.backing_hash.expect("backing digest");
+        assert!(governor
+            .is_pinned(StorageClass::EvidenceCas, &hex(&digest))
+            .unwrap());
+        let water = store.evidence_high_water().unwrap();
+
+        // A second backing that would exceed the small evidence class quota
+        // is refused BEFORE a row or blob is published.
+        let mut noise_state = 0x9E37_79B9_7F4A_7C15u64;
+        let noise: Vec<u8> = (0..2_000)
+            .map(|_| {
+                noise_state ^= noise_state << 13;
+                noise_state ^= noise_state >> 7;
+                noise_state ^= noise_state << 17;
+                noise_state as u8
+            })
+            .collect();
+        let refused = durable.insert_new(
+            &durable_envelope(
+                sid,
+                ws,
+                "too-large",
+                Compressibility::Aggressive,
+                BackingCompleteness::Complete,
+            ),
+            Some(&noise),
+        );
+        assert!(refused.is_err(), "over-quota backing must be refused");
+        assert_eq!(store.evidence_high_water().unwrap(), water);
+        assert!(governor.counters().unwrap().refusals >= 1);
+
+        // Eviction can never remove the pinned, row-referenced backing.
+        let _ = governor.enforce();
+        let read = durable.get(stored.id).unwrap().unwrap();
+        assert_eq!(read.backing.as_deref(), Some(&b"pinned-evidence"[..]));
     }
 
     #[test]

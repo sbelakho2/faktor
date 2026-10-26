@@ -16,6 +16,7 @@ fault-injection = ["faktor-cas/fault-injection"]
 faktor-core = { path = "../core" }
 faktor-store = { path = "../store" }
 faktor-cas = { path = "../cas" }
+faktor-storage.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 blake3 = "1"
