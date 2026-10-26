@@ -743,12 +743,12 @@ async fn refusing_provider_leaves_the_native_contract_and_never_fails_the_drive(
 }
 
 /// Design-readiness INTEGRATION (not just the pure seam): the real compile
-/// path applies the audit exactly once over the single provider consult,
-/// appends bounded heuristic risks, creates NO proof obligation and NO
-/// second artifact, and a replayed drive neither re-consults nor mutates the
-/// durable revision.
+/// path audits exactly once over the single provider consult and keeps the
+/// findings EPHEMERAL — no durable risk row, no proof obligation, no
+/// evidence/artifact, no second model/Tangerine call — and a replayed drive
+/// neither re-consults nor mutates the durable revision.
 #[tokio::test]
-async fn compile_path_applies_readiness_once_without_side_effects() {
+async fn compile_path_audits_readiness_ephemerally_without_side_effects() {
     let dir = tempdir().unwrap();
     let repo = dir.path().join("empty-repo");
     std::fs::create_dir_all(&repo).unwrap();
@@ -778,37 +778,40 @@ async fn compile_path_applies_readiness_once_without_side_effects() {
         1,
         "the compile path consults the provider exactly once"
     );
+    assert!(
+        !faktor_core::audit_compiled_design(&native).is_empty(),
+        "the fixture must carry a real readiness gap: {native:?}"
+    );
     assert_eq!(
         task.contract.proof_obligations, native.proof_obligations,
-        "readiness and enrichment create/rewrite NO proof obligation"
-    );
-    let mut seen = std::collections::HashSet::new();
-    let readiness: Vec<_> = task
-        .contract
-        .risks
-        .iter()
-        .filter(|risk| risk.id.starts_with("dr1:"))
-        .collect();
-    assert!(
-        !readiness.is_empty(),
-        "the compile path applied the readiness audit (native gap: {native:?})"
+        "ephemeral readiness creates/rewrites NO proof obligation"
     );
     assert!(
-        readiness.len() <= faktor_core::MAX_DESIGN_READINESS_FINDINGS,
-        "readiness stays bounded"
+        !task.contract.risks.iter().any(|risk| {
+            faktor_core::is_design_readiness_id(&risk.id)
+                || risk
+                    .description
+                    .starts_with(faktor_core::DESIGN_READINESS_DESCRIPTION_PREFIX)
+        }),
+        "readiness findings must never become durable contract rows: {:?}",
+        task.contract.risks
     );
-    for risk in readiness {
-        assert_eq!(risk.origin, faktor_core::ContractOrigin::Heuristic);
-        assert!(
-            seen.insert(risk.id.clone()),
-            "a finding is appended exactly once, never duplicated: {risk:?}"
-        );
-    }
     assert_eq!(
         external_count(&task.contract),
         5,
-        "readiness creates no extra artifact/statement"
+        "readiness creates no extra statement"
     );
+    // No evidence/artifact row is created by the readiness audit either.
+    let workspace = handle.identity().unwrap().workspace_id;
+    let ctx = faktor_context::compiler::EvidenceAccessContext::new(
+        handle.id().raw(),
+        workspace.raw(),
+        Some(task_id.raw()),
+    );
+    let evidence_before = runtime
+        .evidence_authority()
+        .list_scoped_envelopes(&ctx, 64)
+        .unwrap();
     let revision = handle.task_revision(task_id).unwrap();
     let contract = task.contract.clone();
     runtime
@@ -818,12 +821,20 @@ async fn compile_path_applies_readiness_once_without_side_effects() {
     assert_eq!(
         spy.consults.load(std::sync::atomic::Ordering::SeqCst),
         1,
-        "a replayed compile is a no-op, never a second model call"
+        "a replayed compile is a no-op, never a second model/Tangerine call"
     );
     assert_eq!(handle.task_revision(task_id).unwrap(), revision);
     assert_eq!(
         handle.get_task(task_id).unwrap().unwrap().contract,
         contract
+    );
+    assert_eq!(
+        runtime
+            .evidence_authority()
+            .list_scoped_envelopes(&ctx, 64)
+            .unwrap(),
+        evidence_before,
+        "readiness and a replayed compile create no evidence/artifact row"
     );
 }
 

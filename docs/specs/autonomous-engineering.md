@@ -94,28 +94,31 @@ reviews only the compiled `EngineeringContract` and its bounded compiler
 facts. It never sees the implementation conversation or hidden architect
 reasoning.
 
-The pass may only add bounded **risk hypotheses** for structural gaps such as
-high/unknown risk without claim-bound proof, unbound required proof, or a
+The pass may only report bounded **risk hypotheses** for structural gaps such
+as high/unknown risk without claim-bound proof, unbound required proof, or a
 concurrency/migration/compatibility concern without corresponding proof
-coverage. It **must not** create or discharge proof obligations, certify
-completion, call tools, call a model, call Tangerine again, or write a design
-capsule/reviewer transcript/artifact. The pass also must not newly promote a
-calm contract to the High/Unknown risk tier: a newly discovered gap is Medium
-unless the pre-audit contract already carried an elevated risk. Therefore the
-readiness layer cannot by itself raise Faktor's routing quality floor.
+coverage. The findings are **advisory and ephemeral**: they are never applied
+to the durable contract, so they create no risk row, artifact, evidence or
+second source of truth. The pass **must not** create or discharge proof
+obligations, certify completion, call tools, call a model, call Tangerine
+again, or write a design capsule/reviewer transcript/artifact. Because the
+findings are not persisted, they cannot newly promote a calm contract to the
+High/Unknown risk tier or raise Faktor's routing quality floor.
 
 The durable `EngineeringContract` remains the single design authority. A tiny
 in-memory focus projection may be derived from its proof bindings, risks and
-invariants and used only to **replace** the active work item's duplicated
-path material when a zero-call byte gate proves a meaningful dividend: at
-least 12.5% smaller and at least 2 KiB removed. The work item's unique title
+invariants. A lazy gate skips all projection work unless the active work item
+duplicates more than 2 KiB of path material; the work item's unique title
 (which may carry explicit evidence references) is preserved, and the task's
 owned/recent path needs still carry every precise path, so the replacement
 can never make a required path unreachable. The projection is never appended
 to the baseline search material, is not rendered as a new prompt section and
-is not persisted. Small/local tasks and tasks that fail the dividend gate
-keep the baseline path byte-for-byte, while long tasks can sharpen evidence
-selection without another context artifact.
+is not persisted. Both final wire plans are rendered with the real tokenizer;
+the focused plan is adopted only when it saves at least 512 tokens AND at
+least 12.5% of the baseline. Otherwise the baseline plan and evidence stay
+byte-identical. Small/local tasks and tasks that fail the gate keep the
+baseline path byte-for-byte, while long tasks can sharpen evidence selection
+without another context artifact.
 
 Role separation is strict:
 
@@ -136,9 +139,12 @@ Native intelligence + optional Tangerine enrichment
 
 Tangerine therefore gives the contract richer eyes through the existing
 neutral intelligence seam; the readiness audit challenges that contract
-without sharing implementation context; Kiwi independently adjudicates
-formal claims after implementation. No stage creates a competing system
-model or a second source of truth.
+without sharing implementation context or persisting its hypotheses; Kiwi
+independently adjudicates the neutral claim batch after implementation. Kiwi
+submissions carry no contract constraints/invariants/risks and no readiness
+text, so local advisory state can never become an independent-verification
+premise. No stage creates a competing system model or a second source of
+truth.
 
 ## Required task representation
 

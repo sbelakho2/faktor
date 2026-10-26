@@ -666,9 +666,20 @@ impl AgentRuntime {
         // neutral/empty compile or a typed retrieval/overflow error
         // keeps the producers byte-for-byte (never a silent drop, and
         // required content is never destroyed by a fallback).
-        match self.compile_turn_evidence(st.handle, st.task_id, &st.ledger, &st.budget, volatile) {
-            Ok(Some(selected)) => evidence = selected,
-            Ok(None) => {}
+        //
+        // The SAME acquired candidate set yields the baseline selection and
+        // (behind the lazy focus gate) the focused selection. Both final wire
+        // plans are measured below; only a REAL token dividend adopts focus.
+        let mut focused_evidence: Option<Vec<Evidence>> = None;
+        match self
+            .compile_turn_evidence_variants(st.handle, st.task_id, &st.ledger, &st.budget, volatile)
+        {
+            Ok(variants) => {
+                if let Some(selected) = variants.baseline {
+                    evidence = selected;
+                    focused_evidence = variants.focused;
+                }
+            }
             Err(err) => tracing::warn!(
                 session = %st.handle.id(),
                 "context compiler kept producer evidence: {err}"
@@ -761,7 +772,7 @@ impl AgentRuntime {
         // The prior runs inline on this thread and its panics are NOT
         // caught (a prior must be total); hostile VALUES are clamped by
         // the planner's `prior_adjusted_gain`.
-        let wire_plan = plan_wire_turn_with_prior(
+        let baseline_plan = plan_wire_turn_with_prior(
             &self.deps.instructions,
             &st.system_extra,
             &tool_bundle.tools,
@@ -775,6 +786,32 @@ impl AgentRuntime {
             &self.token_cache,
             self.turn_context_prior(),
         )?;
+        // Real wire-token dividend: the focused variant was selected from the
+        // SAME acquired candidates, and its FINAL tokenizer-counted plan must
+        // beat the baseline by max(512, 12.5%). Any failure to prove that
+        // leaves the baseline plan/evidence byte-identical.
+        let focused = match focused_evidence {
+            Some(focused) if focused != evidence => {
+                let focused_plan = plan_wire_turn_with_prior(
+                    &self.deps.instructions,
+                    &st.system_extra,
+                    &tool_bundle.tools,
+                    &project_rules,
+                    &st.ledger,
+                    &repo_map,
+                    &history,
+                    &focused,
+                    &st.budget,
+                    &st.model,
+                    &self.token_cache,
+                    self.turn_context_prior(),
+                )?;
+                Some((focused_plan, focused))
+            }
+            _ => None,
+        };
+        let (wire_plan, evidence) =
+            crate::wire_plan::choose_design_focus_plan(baseline_plan, evidence, focused);
         st.recent = recent;
         st.recent_head_seq = recent_head_seq;
         st.evidence = evidence;

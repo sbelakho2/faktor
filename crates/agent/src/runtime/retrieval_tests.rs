@@ -2170,7 +2170,7 @@ fn corrupt_durable_activation_fact_is_a_typed_read_failure() {
     assert!(!load.found());
 }
 
-fn design_focus_contract() -> faktor_core::EngineeringContract {
+pub(crate) fn design_focus_contract() -> faktor_core::EngineeringContract {
     faktor_core::EngineeringContract {
         risks: vec![faktor_core::RiskHypothesis {
             id: "r1:design-focus".into(),
@@ -2184,10 +2184,10 @@ fn design_focus_contract() -> faktor_core::EngineeringContract {
     }
 }
 
-fn task_facts_with_contract(
+pub(crate) fn task_facts_variants_with_contract(
     contract: faktor_core::EngineeringContract,
     ledger: &TaskLedger,
-) -> TaskFacts {
+) -> TaskFactsVariants {
     let (deps, _dir) = deps(scripted_provider(vec![]), vec![]);
     let runtime = AgentRuntime::new(deps).unwrap();
     let session = new_session(runtime.deps());
@@ -2215,8 +2215,15 @@ fn task_facts_with_contract(
         })
         .unwrap();
     runtime
-        .task_facts_for(&handle, ledger, task_id)
+        .task_facts_variants_for(&handle, ledger, task_id)
         .expect("the durable task identity and row are readable")
+}
+
+pub(crate) fn task_facts_with_contract(
+    contract: faktor_core::EngineeringContract,
+    ledger: &TaskLedger,
+) -> TaskFacts {
+    task_facts_variants_with_contract(contract, ledger).baseline
 }
 
 /// Retrieval contract: a small or calm task keeps the baseline work item
@@ -2240,11 +2247,10 @@ fn small_and_calm_tasks_keep_the_baseline_work_item_byte_identical() {
         criteria: Vec::new(),
     };
     let contract = design_focus_contract();
-    let focus = faktor_core::design_focus_terms(&contract);
     let duplicated_bytes = changed.iter().map(|path| path.len() + 1).sum::<usize>();
     assert!(
-        !faktor_core::design_focus_is_economic(duplicated_bytes, &focus),
-        "the small baseline must fail the economic gate"
+        !faktor_core::design_focus_should_run(true, duplicated_bytes),
+        "the small baseline must fail the lazy focus gate"
     );
 
     let facts = task_facts_with_contract(contract, &ledger);
@@ -2267,12 +2273,13 @@ fn small_and_calm_tasks_keep_the_baseline_work_item_byte_identical() {
     );
 }
 
-/// Retrieval contract: when the gate proves a dividend, only the work item's
-/// DUPLICATED path list is replaced. The unique step title, every precise
-/// owned/recent path need and all required needs are unchanged, and no second
-/// work-item need or prompt section is appended.
+/// Retrieval contract: when the lazy gate allows a focused variant, only the
+/// work item's DUPLICATED path list is replaced. The unique step title, every
+/// precise owned/recent path need and all required needs are unchanged, and no
+/// second work-item need or prompt section is appended. Adoption of that
+/// variant is decided later by the REAL final wire-token dividend gate.
 #[test]
-fn economic_focus_replaces_only_duplicated_paths_and_preserves_path_needs() {
+fn focused_variant_replaces_only_duplicated_paths_and_preserves_path_needs() {
     let step = "implement the parser fix evidence://42";
     let changed: Vec<String> = (0..12)
         .map(|index| format!("src/module_{index:02}_{}.rs", "x".repeat(240)))
@@ -2284,14 +2291,15 @@ fn economic_focus_replaces_only_duplicated_paths_and_preserves_path_needs() {
         ..Default::default()
     };
     let contract = design_focus_contract();
-    let focus = faktor_core::design_focus_terms(&contract);
-    let duplicated_bytes = changed.iter().map(|path| path.len() + 1).sum::<usize>();
+    let variants = task_facts_variants_with_contract(contract, &ledger);
     assert!(
-        faktor_core::design_focus_is_economic(duplicated_bytes, &focus),
-        "the duplicated path material must clear the economic gate"
+        variants.focus.evaluated,
+        "the large duplicated path material must pass the lazy gate"
     );
-
-    let facts = task_facts_with_contract(contract, &ledger);
+    let facts = variants
+        .focused
+        .expect("the lazy gate yields a focused variant");
+    let baseline_facts = variants.baseline;
     let work = facts
         .active_work_item
         .as_ref()
@@ -2304,18 +2312,10 @@ fn economic_focus_replaces_only_duplicated_paths_and_preserves_path_needs() {
         work.paths.is_empty(),
         "only the duplicated path list is replaced"
     );
-    assert_eq!(work.criteria, focus);
+    assert_eq!(work.criteria, variants.focus.terms);
     assert_eq!(facts.owned_paths, changed);
     assert_eq!(facts.changed_files, changed);
 
-    let mut baseline_facts = facts.clone();
-    baseline_facts.active_work_item = Some(WorkItem {
-        id: "step:0".into(),
-        title: step.into(),
-        state: "open".into(),
-        paths: changed.clone(),
-        criteria: Vec::new(),
-    });
     let baseline_needs = NeedSet::from_facts(&baseline_facts);
     let focus_needs = NeedSet::from_facts(&facts);
     let path_needs = |needs: &NeedSet| -> Vec<_> {
@@ -2382,4 +2382,216 @@ fn economic_focus_replaces_only_duplicated_paths_and_preserves_path_needs() {
         refs.contains(&faktor_context::compiler::EvidenceId(42)),
         "the preserved title keeps the explicit evidence reference: {refs:?}"
     );
+}
+
+#[test]
+fn lazy_focus_does_zero_work_without_an_active_step_or_under_two_kib() {
+    let contract = design_focus_contract();
+    let large: Vec<String> = (0..12)
+        .map(|index| format!("src/module_{index:02}_{}.rs", "x".repeat(240)))
+        .collect();
+    let no_step = TaskLedger {
+        goal: "fix the parser".into(),
+        changed_files: large.clone(),
+        ..Default::default()
+    };
+    let variants = task_facts_variants_with_contract(contract.clone(), &no_step);
+    assert!(!variants.focus.evaluated, "no active step => zero focus work");
+    assert!(variants.focus.terms.is_empty());
+    assert!(variants.focused.is_none());
+
+    let small = TaskLedger {
+        goal: "fix the parser".into(),
+        open_steps: vec!["step".into()],
+        changed_files: vec!["src/a.rs".into()],
+        ..Default::default()
+    };
+    let variants = task_facts_variants_with_contract(contract.clone(), &small);
+    assert!(
+        !variants.focus.evaluated,
+        "at most 2 KiB duplicated => zero focus work"
+    );
+    assert!(variants.focus.terms.is_empty());
+    assert!(variants.focused.is_none());
+
+    let big = TaskLedger {
+        goal: "fix the parser".into(),
+        open_steps: vec!["step".into()],
+        changed_files: large,
+        ..Default::default()
+    };
+    let variants = task_facts_variants_with_contract(contract, &big);
+    assert!(variants.focus.evaluated);
+    assert!(!variants.focus.terms.is_empty());
+    assert!(variants.focused.is_some());
+}
+
+#[test]
+fn runtime_focus_policy_preserves_priority_ranked_terms() {
+    let mut contract = faktor_core::EngineeringContract::default();
+    contract.proof_obligations.push(faktor_core::ProofObligation {
+        id: "p1:focus".into(),
+        claim: "parse_token must reject replay".into(),
+        requirement: faktor_core::Requirement::Required,
+        evidence: faktor_core::ProofEvidenceKind::ContractCheck,
+        evidence_binding: faktor_core::EvidenceBinding::TestSelector(
+            "auth::refresh::replay_is_rejected".into(),
+        ),
+        accepted_strength: faktor_core::AcceptedStrength::Supported,
+        state: faktor_core::ClaimState::Unknown,
+        origin: faktor_core::ContractOrigin::User,
+        confidence_bps: None,
+        evidence_refs: Vec::new(),
+        proofs: Vec::new(),
+        binding_updates: Vec::new(),
+    });
+    contract.invariants.push(faktor_core::Invariant {
+        id: "i1:focus".into(),
+        statement: "migration stays atomic".into(),
+        origin: faktor_core::ContractOrigin::User,
+    });
+    contract.risks.push(faktor_core::RiskHypothesis {
+        id: "r1:focus".into(),
+        description: "cache race on refresh".into(),
+        severity: faktor_core::RiskSeverity::High,
+        origin: faktor_core::ContractOrigin::Heuristic,
+    });
+    contract.constraints.push(faktor_core::Constraint {
+        id: "c1:focus".into(),
+        statement: "generic constraint word".into(),
+        origin: faktor_core::ContractOrigin::User,
+    });
+    let changed: Vec<String> = (0..12)
+        .map(|index| format!("src/module_{index:02}_{}.rs", "x".repeat(240)))
+        .collect();
+    let ledger = TaskLedger {
+        goal: "fix the parser".into(),
+        open_steps: vec!["step".into()],
+        changed_files: changed,
+        ..Default::default()
+    };
+    let variants = task_facts_variants_with_contract(contract, &ledger);
+    let terms = &variants.focus.terms;
+    let position = |needle: &str| {
+        terms
+            .iter()
+            .position(|term| term == needle)
+            .unwrap_or_else(|| panic!("missing {needle}: {terms:?}"))
+    };
+    assert!(position("auth") < position("replay_is_rejected"));
+    assert!(position("replay_is_rejected") < position("parse_token"));
+    assert!(position("parse_token") < position("migration"));
+    assert!(position("migration") < position("cache"));
+    assert!(position("cache") < position("generic"));
+    assert_eq!(
+        terms.iter().filter(|term| term.as_str() == "refresh").count(),
+        1
+    );
+    assert_eq!(
+        variants.focused.unwrap().active_work_item.unwrap().criteria,
+        *terms
+    );
+}
+
+fn focus_probe_plan(evidence: &[Evidence]) -> faktor_context::wire_plan::WirePlan {
+    let ledger = TaskLedger {
+        goal: "fix the parser".into(),
+        open_steps: vec!["step".into()],
+        ..Default::default()
+    };
+    crate::wire_plan::plan_wire_turn_with_prior(
+        "You are a test agent.\n",
+        "",
+        &[],
+        "",
+        &ledger,
+        "",
+        &[],
+        evidence,
+        &ContextBudget::default(),
+        "gpt-5",
+        &TokenCache::new(),
+        None,
+    )
+    .expect("the real wire planner renders the probe request")
+}
+
+#[test]
+fn key_bytes_shrink_but_wire_tokens_grow_keeps_the_baseline_byte_identical() {
+    let baseline_path = format!("deep/{}", "x".repeat(600));
+    let baseline_evidence = vec![Evidence {
+        path: baseline_path.clone(),
+        snippet: "alpha".into(),
+        score: 1.0,
+    }];
+    let focused_evidence = vec![Evidence {
+        path: "f.rs".into(),
+        snippet: "token ".repeat(400),
+        score: 1.0,
+    }];
+    let baseline_plan = focus_probe_plan(&baseline_evidence);
+    let focused_plan = focus_probe_plan(&focused_evidence);
+    assert!(
+        baseline_path.len() > focused_evidence[0].path.len(),
+        "the focused key material is smaller in bytes"
+    );
+    assert!(
+        focused_plan.total_tokens > baseline_plan.total_tokens,
+        "the real tokenizer says the focused prompt is larger"
+    );
+    assert!(!faktor_core::design_focus_has_dividend(
+        baseline_plan.total_tokens,
+        focused_plan.total_tokens
+    ));
+    let (chosen, chosen_evidence) = crate::wire_plan::choose_design_focus_plan(
+        baseline_plan.clone(),
+        baseline_evidence.clone(),
+        Some((focused_plan, focused_evidence)),
+    );
+    assert_eq!(
+        chosen, baseline_plan,
+        "a failed token dividend keeps the baseline plan byte-identical"
+    );
+    assert_eq!(chosen_evidence, baseline_evidence);
+}
+
+#[test]
+fn real_wire_token_dividend_adopts_the_focused_plan() {
+    let baseline_evidence: Vec<Evidence> = (0..4)
+        .map(|index| Evidence {
+            path: format!("deep/{index}/{}", "x".repeat(200)),
+            snippet: "alpha ".repeat(300),
+            score: 1.0,
+        })
+        .collect();
+    let focused_evidence = vec![Evidence {
+        path: "f.rs".into(),
+        snippet: "alpha".into(),
+        score: 1.0,
+    }];
+    let baseline_plan = focus_probe_plan(&baseline_evidence);
+    let focused_plan = focus_probe_plan(&focused_evidence);
+    let saved = baseline_plan
+        .total_tokens
+        .saturating_sub(focused_plan.total_tokens);
+    assert!(
+        saved >= faktor_core::MIN_DESIGN_FOCUS_SAVINGS_TOKENS,
+        "the fixture must prove at least 512 final tokens: {saved}"
+    );
+    assert!(
+        (saved as u128) * 8 >= baseline_plan.total_tokens as u128,
+        "the fixture must prove at least 12.5%: {saved}/{}",
+        baseline_plan.total_tokens
+    );
+    assert!(faktor_core::design_focus_has_dividend(
+        baseline_plan.total_tokens,
+        focused_plan.total_tokens
+    ));
+    let (chosen, chosen_evidence) = crate::wire_plan::choose_design_focus_plan(
+        baseline_plan,
+        baseline_evidence,
+        Some((focused_plan.clone(), focused_evidence.clone())),
+    );
+    assert_eq!(chosen, focused_plan);
+    assert_eq!(chosen_evidence, focused_evidence);
 }

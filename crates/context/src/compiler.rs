@@ -930,6 +930,36 @@ impl ContextCompiler {
     /// a fixed sequence).
     pub fn compile(&self, input: &CompilerInput) -> Result<CompiledContext, CompilerError> {
         let need_set = NeedSet::from_facts(&input.facts);
+        let envelopes = self.acquire_envelopes(input)?;
+        self.select_from_envelopes(input, need_set, &envelopes)
+    }
+
+    /// Compile the baseline and the focused variant of ONE turn against the
+    /// SAME acquired candidate set. Candidate acquisition runs exactly ONCE
+    /// (from `baseline`; a focused work item only replaces duplicated path
+    /// material with in-memory terms, so the baseline's referenced ids are a
+    /// superset). Each NeedSet is then selected independently over the shared
+    /// envelopes, which is what makes the later wire-token comparison a true
+    /// apples-to-apples dividend rather than a second retrieval.
+    pub fn compile_variants(
+        &self,
+        baseline: &CompilerInput,
+        focused: &CompilerInput,
+    ) -> Result<(CompiledContext, CompiledContext), CompilerError> {
+        let baseline_needs = NeedSet::from_facts(&baseline.facts);
+        let focused_needs = NeedSet::from_facts(&focused.facts);
+        let envelopes = self.acquire_envelopes(baseline)?;
+        let baseline_compiled = self.select_from_envelopes(baseline, baseline_needs, &envelopes)?;
+        let focused_compiled = self.select_from_envelopes(focused, focused_needs, &envelopes)?;
+        Ok((baseline_compiled, focused_compiled))
+    }
+
+    /// Acquire the turn's evidence candidate set once: supplementals first,
+    /// directly referenced ids by id, then bounded newest pages.
+    fn acquire_envelopes(
+        &self,
+        input: &CompilerInput,
+    ) -> Result<Vec<EvidenceEnvelope>, CompilerError> {
         let mut envelopes = input.supplemental.clone();
         // Deduplicate by evidence id: supplemental first, then fetched order.
         let mut seen = std::collections::HashSet::new();
@@ -980,6 +1010,16 @@ impl ContextCompiler {
                 pages += 1;
             }
         }
+        Ok(envelopes)
+    }
+
+    /// Select one NeedSet over an already-acquired candidate set.
+    fn select_from_envelopes(
+        &self,
+        input: &CompilerInput,
+        need_set: NeedSet,
+        envelopes: &[EvidenceEnvelope],
+    ) -> Result<CompiledContext, CompilerError> {
         if envelopes.is_empty() || need_set.is_empty() {
             return Ok(CompiledContext::empty(need_set.needs()));
         }
@@ -995,7 +1035,7 @@ impl ContextCompiler {
         let mut last_budget = evidence_ceiling;
         for attempt in 0..=MAX_COMPILE_RETRIES {
             let policy = AttemptPolicy::for_attempt(attempt, &self.limits);
-            let (candidates, metas) = build_candidates(&envelopes, &need_set, &policy);
+            let (candidates, metas) = build_candidates(envelopes, &need_set, &policy);
             // The minimal required set is reserved BEFORE any competition;
             // a corrected retry shrinks the variants, so the reservation
             // follows the cheapest full-coverage forms.
@@ -1023,7 +1063,7 @@ impl ContextCompiler {
             };
             match selection {
                 Ok(selected) => {
-                    return Ok(finish(need_set, selected, &metas, &envelopes, attempt));
+                    return Ok(finish(need_set, selected, &metas, envelopes, attempt));
                 }
                 Err(InformationError::Oversized {
                     required_tokens, ..
@@ -2464,5 +2504,142 @@ mod tests {
             "zero-unread revision stays cached"
         );
         assert_eq!(calls.get(), 3, "no recompute within the same revision");
+    }
+
+    /// Variant selection acquires the evidence candidate set exactly ONCE and
+    /// evaluates the baseline and focused NeedSets over those same envelopes.
+    #[test]
+    fn compile_variants_acquires_candidates_once_and_selects_both_need_sets() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingSource {
+            inner: MemoryEvidenceStore,
+            newest_lists: AtomicUsize,
+            gets: AtomicUsize,
+        }
+
+        impl ScopedEvidenceSource for CountingSource {
+            fn list_scoped_newest(
+                &self,
+                ctx: &EvidenceAccessContext,
+                before: Option<u64>,
+                limit: usize,
+            ) -> Result<EvidencePage, EvidenceError> {
+                self.newest_lists.fetch_add(1, Ordering::SeqCst);
+                Ok(MemoryEvidenceStore::list_scoped_newest(
+                    &self.inner,
+                    ctx,
+                    before,
+                    limit,
+                ))
+            }
+
+            fn list_scoped_envelopes(
+                &self,
+                ctx: &EvidenceAccessContext,
+                limit: usize,
+            ) -> Result<Vec<EvidenceEnvelope>, EvidenceError> {
+                Ok(MemoryEvidenceStore::list_scoped_envelopes(
+                    &self.inner,
+                    ctx,
+                    limit,
+                ))
+            }
+
+            fn get_scoped(
+                &self,
+                id: EvidenceId,
+                ctx: &EvidenceAccessContext,
+            ) -> Result<StoredEvidence, EvidenceError> {
+                self.gets.fetch_add(1, Ordering::SeqCst);
+                MemoryEvidenceStore::stored_scoped(&self.inner, id, ctx)
+            }
+        }
+
+        let mut baseline_facts = facts(&[], &[]);
+        baseline_facts.active_work_item = Some(WorkItem {
+            id: "step:0".into(),
+            title: "step".into(),
+            state: "open".into(),
+            paths: vec!["alpha/parser.rs".into()],
+            criteria: Vec::new(),
+        });
+        let mut focused_facts = baseline_facts.clone();
+        {
+            let item = focused_facts.active_work_item.as_mut().unwrap();
+            item.paths.clear();
+            item.criteria = vec!["focusedterm".into()];
+        }
+
+        let mut store = MemoryEvidenceStore::new(64 * 1024);
+        store
+            .insert(
+                envelope(
+                    1,
+                    1,
+                    2,
+                    "alpha module implementation",
+                    "alpha/parser.rs",
+                    EvidenceKind::SymbolSet,
+                ),
+                None,
+            )
+            .unwrap();
+        store
+            .insert(
+                envelope(
+                    2,
+                    1,
+                    2,
+                    "focusedterm module implementation",
+                    "focus/term.rs",
+                    EvidenceKind::SymbolSet,
+                ),
+                None,
+            )
+            .unwrap();
+        let source = Arc::new(CountingSource {
+            inner: store,
+            newest_lists: AtomicUsize::new(0),
+            gets: AtomicUsize::new(0),
+        });
+        let compiler = ContextCompiler::new(Some(source.clone()), None);
+        let volatile = VolatileClaims {
+            evidence_tokens: 32_768,
+            ..VolatileClaims::default()
+        };
+        let baseline_input =
+            CompilerInput::new(baseline_facts, 32_768).with_volatile(volatile);
+        let focused_input = CompilerInput::new(focused_facts, 32_768).with_volatile(volatile);
+        // Control: ONE ordinary compile's acquisition cost on this store. The
+        // pair must pay that same cost, never twice (two independent compiles).
+        let control_input = baseline_input.clone();
+        compiler
+            .compile(&control_input)
+            .expect("control compile");
+        let one_acquisition = source.newest_lists.load(Ordering::SeqCst);
+        source.newest_lists.store(0, Ordering::SeqCst);
+        let (baseline, focused) = compiler
+            .compile_variants(&baseline_input, &focused_input)
+            .expect("variant compile");
+
+        let baseline_paths: Vec<&str> = baseline
+            .selected
+            .iter()
+            .map(|item| item.path.as_str())
+            .collect();
+        let focused_paths: Vec<&str> = focused
+            .selected
+            .iter()
+            .map(|item| item.path.as_str())
+            .collect();
+        assert_eq!(baseline_paths, vec!["alpha/parser.rs"]);
+        assert_eq!(focused_paths, vec!["focus/term.rs"]);
+        assert_eq!(
+            source.newest_lists.load(Ordering::SeqCst),
+            one_acquisition,
+            "both NeedSets must share ONE acquired candidate set, not two"
+        );
+        assert_eq!(source.gets.load(Ordering::SeqCst), 0);
     }
 }

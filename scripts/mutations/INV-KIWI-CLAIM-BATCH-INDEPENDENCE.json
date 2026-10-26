@@ -1,0 +1,12 @@
+{
+  "id": "INV-KIWI-CLAIM-BATCH-INDEPENDENCE",
+  "file": "crates/kiwi/src/wire.rs",
+  "find": "        if !self.constraints.is_empty() || !self.invariants.is_empty() || !self.risks.is_empty() {",
+  "replace": "        if false {",
+  "gate": "cargo test -p faktor-kiwi --test loopback submit_refuses_contract_context_on_a_claim_batch_before_any_request",
+  "expect": "FAILED",
+  "note": "Dropping the claim-batch contract-context guard lets a production submission carry local constraints/invariants/risks (and therefore readiness text) to Kiwi.",
+  "capabilities": [],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+}

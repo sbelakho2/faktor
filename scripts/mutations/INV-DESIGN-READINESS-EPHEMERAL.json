@@ -1,0 +1,21 @@
+{
+  "id": "INV-DESIGN-READINESS-EPHEMERAL",
+  "files": [
+    {
+      "file": "crates/agent/src/runtime/contract_compiler.rs",
+      "find": "        let compiled = match &provider {",
+      "replace": "        let mut compiled = match &provider {"
+    },
+    {
+      "file": "crates/agent/src/runtime/contract_compiler.rs",
+      "find": "        let readiness = faktor_core::audit_compiled_design(&compiled);",
+      "replace": "        let readiness = faktor_core::audit_compiled_design(&compiled);\n        let _ = faktor_core::apply_design_readiness(&mut compiled, &readiness);"
+    }
+  ],
+  "gate": "cargo test -p faktor-agent --lib compile_path_audits_readiness_ephemerally_without_side_effects",
+  "expect": "FAILED",
+  "note": "Applying readiness to the compiled contract makes the advisory findings durable risk rows and breaks the zero-row/zero-artifact ephemeral invariant.",
+  "capabilities": [],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+}

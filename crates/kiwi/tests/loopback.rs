@@ -10,8 +10,8 @@ mod support;
 use std::sync::Arc;
 
 use faktor_core::{
-    CancellationToken, ClaimState, Constraint, ContractOrigin, EngineeringContract, EvidenceRef,
-    Invariant, OpId, ProofEvidenceKind, RiskHypothesis, RiskSeverity, SessionId, WorkspaceId,
+    CancellationToken, ClaimState, ContractOrigin, EngineeringContract, EvidenceRef, OpId,
+    ProofEvidenceKind, RiskHypothesis, RiskSeverity, SessionId, WorkspaceId,
 };
 use faktor_kiwi::{
     job_id_for, KiwiJob, KiwiProviderConfig, KiwiVerificationProvider, KIWI_SCHEMA_VERSION,
@@ -97,108 +97,173 @@ fn http_reply(body: serde_json::Value) -> Reply {
 }
 
 #[tokio::test]
-async fn submission_carries_objective_acceptance_and_contract_without_expected_results() {
+async fn production_claim_batch_never_carries_readiness_or_contract_context() {
     let server = FakeKiwi::start();
     let provider = provider(&server, 5_000);
-    let req = claim_request();
 
-    let contract = EngineeringContract {
-        constraints: vec![Constraint {
-            id: "c1".into(),
-            statement: "existing sessions remain valid".into(),
-            origin: ContractOrigin::User,
-        }],
-        invariants: vec![Invariant {
-            id: "i1".into(),
-            statement: "revoked sessions cannot authenticate".into(),
-            origin: ContractOrigin::Policy,
-        }],
+    // A real readiness gap (elevated risk + legacy category proof) that the
+    // local audit WOULD turn into bounded risk rows. Those rows are ephemeral
+    // advisory state and must never reach the independent verifier.
+    let mut contract = EngineeringContract {
         risks: vec![RiskHypothesis {
             id: "r1".into(),
             description: "race conditions".into(),
             severity: RiskSeverity::High,
             origin: ContractOrigin::Heuristic,
         }],
-        proof_obligations: Vec::new(),
+        ..EngineeringContract::default()
     };
-    let job = KiwiJob::for_contract(
-        &req,
-        "migrate authentication to rotating refresh tokens",
-        vec!["existing sessions remain valid".to_string()],
-        &contract,
-    )
-    .unwrap();
+    contract
+        .proof_obligations
+        .push(EngineeringContract::obligation_bound(
+            "the refresh race is closed",
+            ProofEvidenceKind::TestExecution,
+            ContractOrigin::User,
+            faktor_core::Requirement::Required,
+            faktor_core::EvidenceBinding::Category,
+            faktor_core::AcceptedStrength::for_requirement(faktor_core::Requirement::Required),
+        ));
+    let audit = faktor_core::audit_compiled_design(&contract);
+    assert!(
+        faktor_core::apply_design_readiness(&mut contract, &audit) > 0,
+        "the fixture must carry real readiness rows"
+    );
+    assert!(
+        contract
+            .risks
+            .iter()
+            .any(|risk| risk.id.starts_with("dr1:")),
+        "fixture readiness rows exist: {contract:?}"
+    );
+
+    // Production verification submits the neutral claim batch derived from
+    // the contract obligations, never the contract itself.
+    let claims: Vec<ClaimRequest> = contract
+        .proof_obligations
+        .iter()
+        .map(|obligation| ClaimRequest {
+            obligation_id: obligation.id.clone(),
+            claim: obligation.claim.clone(),
+            evidence_kind: ProofEvidenceKind::Review,
+            requirement: faktor_core::Requirement::Required,
+            binding: faktor_core::EvidenceBinding::ProviderClaim("kiwi.claim".into()),
+            accepted_strength: faktor_core::AcceptedStrength::for_requirement(
+                faktor_core::Requirement::Required,
+            ),
+        })
+        .collect();
+    let req = request(VerificationOp::VerifyClaim).with_claims(claims.clone());
+    let job = KiwiJob::for_claims(&req).unwrap();
+    assert!(job.constraints.is_empty() && job.invariants.is_empty() && job.risks.is_empty());
     let claim_id = job.proof_obligations[0].id.clone();
     server.push(http_reply(serde_json::json!({
         "v": KIWI_SCHEMA_VERSION,
         "op": "verify_claim",
         "job_id": job.job_id,
         "outcome": "passed",
-        "summary": "no counterexample found",
-        "claims": [{"claim_id": claim_id, "state": "supported", "evidence": [
-            {"kind": "review", "source": "kiwi", "detail": "attack suite clean"}
-        ]}],
+        "summary": "independent claim verdict",
+        "claims": [{
+            "claim_id": claim_id,
+            "state": "supported",
+            "evidence": [{
+                "kind": "review",
+                "source": "kiwi.independent",
+                "detail": "independent review clean"
+            }]
+        }],
         "evidence": [],
     })));
 
-    let response = provider.submit(req.clone(), job).await.unwrap();
+    let response = provider.verify(req).await.unwrap();
     assert_eq!(response.outcome, VerificationOutcome::Passed);
-    assert_eq!(response.provider.as_str(), "kiwi");
-    assert_eq!(response.exit_code, None);
+    assert_eq!(response.claims.len(), 1);
 
-    // The request reached the endpoint as a typed, bounded frame.
     let recorded = server.requests();
     assert_eq!(recorded.len(), 1);
     assert_eq!(recorded[0].method, "POST");
     assert_eq!(recorded[0].path, "/verify");
-    assert_eq!(recorded[0].header("content-type"), Some("application/json"));
-    let frame: serde_json::Value = serde_json::from_str(&recorded[0].body).unwrap();
-    assert_eq!(frame["v"], KIWI_SCHEMA_VERSION);
-    assert_eq!(frame["op"], "verify_claim");
+    let body = &recorded[0].body;
+    let frame: serde_json::Value = serde_json::from_str(body).unwrap();
     let job = &frame["job"];
-    assert_eq!(job["workspace_id"], 1);
-    assert_eq!(job["session_id"], 3);
-    assert_eq!(
-        job["objective"],
-        "migrate authentication to rotating refresh tokens"
-    );
-    assert_eq!(
-        job["acceptance_criteria"][0],
-        "existing sessions remain valid"
-    );
-    assert_eq!(
-        job["constraints"][0]["statement"],
-        "existing sessions remain valid"
-    );
-    assert_eq!(job["constraints"][0]["origin"], "user");
-    assert_eq!(
-        job["invariants"][0]["statement"],
-        "revoked sessions cannot authenticate"
-    );
-    assert_eq!(job["risks"][0]["description"], "race conditions");
-    assert_eq!(job["risks"][0]["severity"], "high");
-    let obligations = job["proof_obligations"].as_array().unwrap();
-    assert!(!obligations.is_empty());
-    // The submitted obligation carries required behavior, no prior verdict.
-    assert_eq!(obligations[0]["state"], "unknown");
-    assert_eq!(obligations[0]["confidence_bps"], serde_json::Value::Null);
-    assert!(obligations[0]["evidence_refs"]
-        .as_array()
-        .unwrap()
-        .is_empty());
-    assert_eq!(job["claim"], "refresh tokens cannot be replayed");
-    assert_eq!(
-        job["max_output_bytes"],
-        faktor_verify::DEFAULT_MAX_OUTPUT_BYTES as u64
-    );
-    // No wire field prescribes an expected result.
-    let text = &recorded[0].body;
+    assert!(job["constraints"].as_array().unwrap().is_empty());
+    assert!(job["invariants"].as_array().unwrap().is_empty());
+    assert!(job["risks"].as_array().unwrap().is_empty());
+    assert_eq!(job["proof_obligations"].as_array().unwrap().len(), 1);
+    // Readiness text and the original local risk hypothesis never reach the
+    // wire, not even as prose in objective/acceptance.
+    for forbidden in [
+        "design-readiness",
+        "dr1:",
+        "race conditions",
+        "without a claim-bound proof obligation",
+        "not claim-bound",
+    ] {
+        assert!(
+            !body.contains(forbidden),
+            "readiness/contract text {forbidden:?} leaked into the Kiwi batch: {body}"
+        );
+    }
     for forbidden in ["expected", "expecte", "expectation"] {
         assert!(
-            !text.contains(forbidden),
+            !body.contains(forbidden),
             "submission prescribes {forbidden:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn submit_refuses_contract_context_on_a_claim_batch_before_any_request() {
+    let server = FakeKiwi::start();
+    let provider = provider(&server, 5_000);
+    let req = request(VerificationOp::VerifyClaim).with_claims(vec![ClaimRequest {
+        obligation_id: "po1:guard".into(),
+        claim: "the local claim holds".into(),
+        evidence_kind: ProofEvidenceKind::Review,
+        requirement: faktor_core::Requirement::Required,
+        binding: faktor_core::EvidenceBinding::ProviderClaim("kiwi.claim".into()),
+        accepted_strength: faktor_core::AcceptedStrength::for_requirement(
+            faktor_core::Requirement::Required,
+        ),
+    }]);
+    let mut job = KiwiJob::for_claims(&req).unwrap();
+    // A benign (marker-free) risk exercises the claim-batch guard on its own:
+    // the readiness-marker refusal is covered by the unit guards.
+    job.risks.push(RiskHypothesis {
+        id: "local-risk".into(),
+        description: "local contract context".into(),
+        severity: RiskSeverity::Medium,
+        origin: ContractOrigin::Heuristic,
+    });
+    let err = provider
+        .submit(req, job)
+        .await
+        .expect_err("a claim batch with contract context must be refused");
+    assert!(matches!(err, VerificationError::Malformed(_)), "{err:?}");
+    assert!(
+        server.requests().is_empty(),
+        "the guard must refuse before any request is framed"
+    );
+}
+
+#[test]
+fn production_sources_have_no_contract_job_constructor() {
+    // Static half of the independence guard: no production path may build a
+    // Kiwi job from the engineering contract, and the claim-batch path must
+    // use the neutral claim constructor plus the runtime guard.
+    let wire = include_str!("../src/wire.rs");
+    let client = include_str!("../src/client.rs");
+    assert!(
+        !wire.contains("for_contract"),
+        "a contract-derived Kiwi job constructor must not exist"
+    );
+    assert!(
+        client.contains("KiwiJob::for_claims"),
+        "production claims must use the neutral claim-batch constructor"
+    );
+    assert!(
+        client.contains("validate_claim_batch"),
+        "the runtime submission guard must be wired"
+    );
 }
 
 #[tokio::test]

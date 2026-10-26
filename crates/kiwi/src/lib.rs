@@ -3,21 +3,22 @@
 //! faktor-kiwi — the OPTIONAL external (Kiwi-shaped) verification provider.
 //!
 //! Kiwi is external INDEPENDENT verification (`docs/specs/autonomous-engineering.md`):
-//! Faktor submits the engineering objective, acceptance criteria, constraints,
-//! invariants, risks and proof obligations, and Kiwi returns evidence or a
-//! counterexample per claim. Faktor never tells Kiwi what results to expect
-//! beyond the required behavior, and Kiwi is never required for ordinary
-//! operation: the crate is DISABLED by default and an unconfigured daemon
-//! simply has no external provider (the native baseline degrades honestly).
+//! production verification submits the neutral CLAIM BATCH (the claims and
+//! their required evidence), and Kiwi returns evidence or a counterexample
+//! per claim. Faktor never tells Kiwi what results to expect beyond the
+//! required behavior, and Kiwi is never required for ordinary operation: the
+//! crate is DISABLED by default and an unconfigured daemon simply has no
+//! external provider (the native baseline degrades honestly).
 //!
 //! Two hard invariants are structural:
 //!
-//! 1. **Submission carries the contract, never expected results.** The bounded
-//!    [`KiwiJob`] payload is built from the frozen
-//!    [`faktor_core::EngineeringContract`] types; prior evaluation state,
+//! 1. **Submission is claim-batch only, never local contract context.** The
+//!    bounded [`KiwiJob`] payload for a production claim batch carries exactly
+//!    the neutral claims: no constraints, invariants or risk hypotheses (and
+//!    therefore no ephemeral design-readiness text). Prior evaluation state,
 //!    confidence and evidence refs are STRIPPED before submission, and the
-//!    wire has no field for an expected outcome. Proof obligations are stated
-//!    as required behavior.
+//!    wire has no field for an expected outcome. Constraints/invariants/risks
+//!    are refused at both job validation and submission time.
 //! 2. **Ingestion is typed and bounded.** The response is parsed into
 //!    [`KiwiReply`] / [`KiwiEvidence`] with strict per-field and per-count
 //!    bounds; claim ids must be obligation ids the job actually submitted

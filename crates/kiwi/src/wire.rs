@@ -51,10 +51,12 @@
 //!
 //! Rules enforced by this module:
 //!
-//! - The submission is assembled ONLY from the frozen contract types and
-//!   never carries an expected result: prior obligation state, confidence and
-//!   evidence refs are stripped in [`KiwiJob::for_contract`] /
-//!   [`KiwiJob::for_request`].
+//! - The submission is assembled ONLY from the neutral request: a claim
+//!   batch carries exactly its claim obligations (prior evaluation state,
+//!   confidence and evidence refs stripped), and an op-only job carries the
+//!   derived required behavior. Production never submits the engineering
+//!   contract's constraints/invariants/risks, so ephemeral design-readiness
+//!   findings and other local context can never prescribe anything to Kiwi.
 //! - Every string, list and claim id is bounded; a job or reply that exceeds
 //!   a bound is a typed refusal, never silently cut by the wire layer.
 //! - Evidence must reference obligation ids the job actually submitted;
@@ -69,8 +71,9 @@
 use std::collections::BTreeSet;
 
 use faktor_core::{
-    ClaimState, Constraint, ContractOrigin, EngineeringContract, Invariant, ProofEvidenceKind,
-    ProofObligation, Requirement, RiskHypothesis, SessionId, WorkspaceId,
+    contains_design_readiness_marker, is_design_readiness_id, ClaimState, Constraint,
+    ContractOrigin, EngineeringContract, Invariant, ProofEvidenceKind, ProofObligation,
+    Requirement, RiskHypothesis, SessionId, WorkspaceId,
 };
 use faktor_verify::{
     evidence_adequacy, ArtifactRef, EvidenceStrength, VerificationError, VerificationOp,
@@ -170,47 +173,6 @@ impl KiwiJob {
         Ok(job)
     }
 
-    /// The full job for a caller that holds the engineering contract: the
-    /// objective and acceptance criteria are the caller's, the contract's
-    /// constraints/invariants/risks/obligations ride verbatim EXCEPT that
-    /// every obligation's prior evaluation state, confidence and evidence
-    /// refs are stripped — Faktor asks a question, it does not prescribe the
-    /// answer.
-    pub fn for_contract(
-        request: &VerificationRequest,
-        objective: impl Into<String>,
-        acceptance_criteria: Vec<String>,
-        contract: &EngineeringContract,
-    ) -> Result<Self, VerificationError> {
-        let mut obligations = sanitize_obligations(&contract.proof_obligations);
-        if obligations.is_empty() {
-            let claim = derived_claim(request.op, request.claim.as_deref());
-            obligations.push(EngineeringContract::obligation(
-                &claim,
-                evidence_kind_for(request.op),
-                ContractOrigin::Policy,
-            ));
-        }
-        let job = Self {
-            job_id: job_id_for(request),
-            op: request.op,
-            workspace_id: request.workspace_id,
-            session_id: request.session_id,
-            objective: objective.into(),
-            acceptance_criteria,
-            constraints: contract.constraints.clone(),
-            invariants: contract.invariants.clone(),
-            risks: contract.risks.clone(),
-            proof_obligations: obligations,
-            target: request.target.clone(),
-            claim: request.claim.clone(),
-            max_output_bytes: request.max_output_bytes as u64,
-            deadline_ms: request.deadline_ms,
-        };
-        job.validate()?;
-        Ok(job)
-    }
-
     /// The full-contract claim-batch job: every claim the neutral request
     /// named rides as a proof obligation with the SAME obligation id (claim
     /// identity is preserved end to end), the same evidence kind, requirement,
@@ -287,7 +249,7 @@ impl KiwiJob {
     /// Strict bounds. Every failure is typed; nothing is silently cut.
     pub fn validate(&self) -> Result<(), VerificationError> {
         validate_id("job_id", &self.job_id)?;
-        validate_text("objective", &self.objective, true, MAX_KIWI_JOB_TEXT_BYTES)?;
+        validate_independent_text("objective", &self.objective, true, MAX_KIWI_JOB_TEXT_BYTES)?;
         if self.acceptance_criteria.len() > MAX_KIWI_ACCEPTANCE_CRITERIA {
             return Err(VerificationError::Malformed(format!(
                 "job carries {} acceptance criteria, over the {MAX_KIWI_ACCEPTANCE_CRITERIA} bound",
@@ -295,7 +257,7 @@ impl KiwiJob {
             )));
         }
         for (index, criterion) in self.acceptance_criteria.iter().enumerate() {
-            validate_text(
+            validate_independent_text(
                 &format!("acceptance_criteria[{index}]"),
                 criterion,
                 true,
@@ -314,8 +276,8 @@ impl KiwiJob {
             }
         }
         for constraint in &self.constraints {
-            validate_text("constraint.id", &constraint.id, true, MAX_KIWI_ID_BYTES)?;
-            validate_text(
+            validate_independent_id("constraint.id", &constraint.id)?;
+            validate_independent_text(
                 "constraint.statement",
                 &constraint.statement,
                 true,
@@ -323,8 +285,8 @@ impl KiwiJob {
             )?;
         }
         for invariant in &self.invariants {
-            validate_text("invariant.id", &invariant.id, true, MAX_KIWI_ID_BYTES)?;
-            validate_text(
+            validate_independent_id("invariant.id", &invariant.id)?;
+            validate_independent_text(
                 "invariant.statement",
                 &invariant.statement,
                 true,
@@ -332,8 +294,8 @@ impl KiwiJob {
             )?;
         }
         for risk in &self.risks {
-            validate_text("risk.id", &risk.id, true, MAX_KIWI_ID_BYTES)?;
-            validate_text(
+            validate_independent_id("risk.id", &risk.id)?;
+            validate_independent_text(
                 "risk.description",
                 &risk.description,
                 true,
@@ -353,8 +315,8 @@ impl KiwiJob {
         }
         let mut seen = BTreeSet::new();
         for obligation in &self.proof_obligations {
-            validate_id("obligation.id", &obligation.id)?;
-            validate_text(
+            validate_independent_id("obligation.id", &obligation.id)?;
+            validate_independent_text(
                 "obligation.claim",
                 &obligation.claim,
                 true,
@@ -369,7 +331,22 @@ impl KiwiJob {
         }
         self.target.validate()?;
         if let Some(claim) = &self.claim {
-            validate_text("claim", claim, true, MAX_KIWI_JOB_TEXT_BYTES)?;
+            validate_independent_text("claim", claim, true, MAX_KIWI_JOB_TEXT_BYTES)?;
+        }
+        Ok(())
+    }
+
+    /// A claim batch may carry ONLY its neutral claim obligations — never
+    /// the engineering contract's constraints, invariants or risk
+    /// hypotheses. This is the structural independence guard: local
+    /// design-readiness findings are ephemeral and can never ride a
+    /// production claim-batch submission.
+    pub fn validate_claim_batch(&self) -> Result<(), VerificationError> {
+        if !self.constraints.is_empty() || !self.invariants.is_empty() || !self.risks.is_empty() {
+            return Err(VerificationError::Malformed(
+                "a production claim batch must not carry contract constraints, invariants or risks"
+                    .to_string(),
+            ));
         }
         Ok(())
     }
@@ -499,15 +476,6 @@ impl KiwiReply {
     }
 }
 
-/// Strip prior evaluation state from contract obligations: Faktor submits
-/// REQUIRED BEHAVIOR, never a claimed prior result.
-fn sanitize_obligations(obligations: &[ProofObligation]) -> Vec<ProofObligation> {
-    obligations
-        .iter()
-        .map(ProofObligation::without_evaluation_state)
-        .collect()
-}
-
 /// The required behavior of one op, stated as a claim (never an expected
 /// result).
 fn derived_claim(op: VerificationOp, request_claim: Option<&str>) -> String {
@@ -564,6 +532,37 @@ pub fn evidence_kind_for(op: VerificationOp) -> ProofEvidenceKind {
 
 fn validate_id(name: &str, value: &str) -> Result<(), VerificationError> {
     validate_text(name, value, true, MAX_KIWI_ID_BYTES)
+}
+
+/// IDs on an independent-verification submission must never be readiness
+/// finding identities: those are local advisory state, not claims.
+fn validate_independent_id(name: &str, value: &str) -> Result<(), VerificationError> {
+    validate_id(name, value)?;
+    if is_design_readiness_id(value) {
+        return Err(VerificationError::Malformed(format!(
+            "kiwi {name} must not carry an ephemeral design-readiness finding id"
+        )));
+    }
+    Ok(())
+}
+
+/// Free text on an independent-verification submission must never carry
+/// readiness markers (the applied description prefix or an embedded
+/// `dr1:` identity): Kiwi must adjudicate Faktor's required behavior, not
+/// Faktor's local readiness hypotheses.
+fn validate_independent_text(
+    name: &str,
+    value: &str,
+    non_empty: bool,
+    max: usize,
+) -> Result<(), VerificationError> {
+    validate_text(name, value, non_empty, max)?;
+    if contains_design_readiness_marker(value) {
+        return Err(VerificationError::Malformed(format!(
+            "kiwi {name} must not carry ephemeral design-readiness text"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_text(
@@ -652,52 +651,36 @@ mod tests {
         );
     }
 
+    fn claim_request() -> faktor_verify::ClaimRequest {
+        faktor_verify::ClaimRequest {
+            obligation_id: EngineeringContract::obligation_id(
+                "concurrent refresh produces one valid result",
+                ProofEvidenceKind::TestExecution,
+            ),
+            claim: "concurrent refresh produces one valid result".to_string(),
+            evidence_kind: ProofEvidenceKind::TestExecution,
+            requirement: Requirement::Required,
+            binding: faktor_core::EvidenceBinding::TestSelector("refresh::concurrent".to_string()),
+            accepted_strength: faktor_core::AcceptedStrength::for_requirement(
+                Requirement::Required,
+            ),
+        }
+    }
+
     #[test]
-    fn contract_job_carries_every_contract_surface_without_expected_results() {
-        let mut contract = EngineeringContract {
-            constraints: vec![Constraint {
-                id: "c1".into(),
-                statement: "existing sessions remain valid".into(),
-                origin: ContractOrigin::User,
-            }],
-            invariants: vec![Invariant {
-                id: "i1".into(),
-                statement: "revoked sessions cannot authenticate".into(),
-                origin: ContractOrigin::User,
-            }],
-            risks: vec![RiskHypothesis {
-                id: "r1".into(),
-                description: "race conditions".into(),
-                severity: faktor_core::RiskSeverity::High,
-                origin: ContractOrigin::Heuristic,
-            }],
-            proof_obligations: Vec::new(),
-        };
-        let mut satisfied = EngineeringContract::obligation(
-            "concurrent refresh produces one valid result",
-            ProofEvidenceKind::TestExecution,
-            ContractOrigin::User,
+    fn claim_batch_job_carries_exactly_the_neutral_claims() {
+        let claim = claim_request();
+        let req = request().with_claims(vec![claim.clone()]);
+        let job = KiwiJob::for_claims(&req).unwrap();
+        assert!(
+            job.constraints.is_empty() && job.invariants.is_empty() && job.risks.is_empty(),
+            "a production claim batch carries no contract context"
         );
-        satisfied.state = ClaimState::KnownTrue;
-        satisfied.confidence_bps = Some(9_000);
-        satisfied.evidence_refs.push(faktor_core::EvidenceRef {
-            kind: ProofEvidenceKind::TestExecution,
-            source: "cargo test".into(),
-            detail: "passed".into(),
-        });
-        contract.proof_obligations.push(satisfied);
-        let job = KiwiJob::for_contract(
-            &request(),
-            "migrate authentication to rotating refresh tokens",
-            vec!["existing sessions remain valid".to_string()],
-            &contract,
-        )
-        .unwrap();
-        assert_eq!(job.constraints.len(), 1);
-        assert_eq!(job.invariants.len(), 1);
-        assert_eq!(job.risks.len(), 1);
+        job.validate_claim_batch().unwrap();
         assert_eq!(job.proof_obligations.len(), 1);
         let obligation = &job.proof_obligations[0];
+        assert_eq!(obligation.id, claim.obligation_id);
+        assert_eq!(obligation.claim, claim.claim);
         assert_eq!(
             obligation.state,
             ClaimState::Unknown,
@@ -716,6 +699,55 @@ mod tests {
             );
         }
         assert!(!serde_json::to_string(&json).unwrap().contains("expected"));
+    }
+
+    #[test]
+    fn readiness_markers_and_contract_context_are_refused() {
+        // Ephemeral readiness text can never ride any submission surface,
+        // even if a hostile caller constructs the job by hand.
+        let mut job = KiwiJob::for_request(&request()).unwrap();
+        job.objective = format!(
+            "{}design-readiness: a local hypothesis",
+            faktor_core::DESIGN_READINESS_DESCRIPTION_PREFIX
+        );
+        assert!(matches!(
+            job.validate(),
+            Err(VerificationError::Malformed(_))
+        ));
+        job.objective = "verify the claim".to_string();
+        job.proof_obligations[0].claim = format!(
+            "embedded {} marker",
+            "dr1:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        );
+        assert!(matches!(
+            job.validate(),
+            Err(VerificationError::Malformed(_))
+        ));
+
+        // A claim batch must not carry contract constraints/invariants/risks.
+        let claim = claim_request();
+        let req = request().with_claims(vec![claim]);
+        let mut batch = KiwiJob::for_claims(&req).unwrap();
+        batch.risks.push(RiskHypothesis {
+            id: "risk-1".into(),
+            description: "benign local context".into(),
+            severity: faktor_core::RiskSeverity::Low,
+            origin: ContractOrigin::Heuristic,
+        });
+        assert!(matches!(
+            batch.validate_claim_batch(),
+            Err(VerificationError::Malformed(_))
+        ));
+        batch.risks.clear();
+        batch.invariants.push(Invariant {
+            id: "inv-1".into(),
+            statement: "local invariant".into(),
+            origin: ContractOrigin::User,
+        });
+        assert!(matches!(
+            batch.validate_claim_batch(),
+            Err(VerificationError::Malformed(_))
+        ));
     }
 
     #[test]

@@ -1,8 +1,8 @@
 {
   "schema": "faktor-test-programme-registry/v1",
-  "generated_at": "2026-10-26T00:24:14.152Z",
-  "commit": "df3a65559f2fb2542b327c3bf5f256b1fa7d2fa0",
-  "tree": "0d6535785a1c5c0f99e762bd3be5080494216990",
+  "generated_at": "2026-10-26T17:21:48.151Z",
+  "commit": "a60ba5a506a2ab73aaa255a2280b2da97efc78f1",
+  "tree": "a3270aae4bfdb9363569ebb4a894340814547e81",
   "layers": [
     "structural",
     "unit",
@@ -19,7 +19,7 @@
     "release"
   ],
   "counts": {
-    "rows": 1030,
+    "rows": 1034,
     "by_kind": {
       "acceptance-scenario": 40,
       "act-now": 8,
@@ -28,7 +28,7 @@
       "cli-command": 49,
       "config-key": 53,
       "control": 200,
-      "invariant": 208,
+      "invariant": 212,
       "jetbrains-contribution": 1,
       "native-route": 299,
       "provider-adapter": 6,
@@ -38,22 +38,22 @@
       "workflow": 16
     },
     "by_status": {
-      "deferred": 886,
+      "deferred": 890,
       "proven": 76,
       "stub": 68
     },
     "by_lane": {
-      "nightly": 562,
-      "pull": 699,
-      "trusted": 1029,
+      "nightly": 566,
+      "pull": 703,
+      "trusted": 1033,
       "weekly-live": 342
     },
     "by_layer": {
       "agent-evals": 1,
       "contracts": 436,
       "ide-screen-readers": 385,
-      "state-model-crash": 306,
-      "unit-property": 291
+      "state-model-crash": 310,
+      "unit-property": 295
     }
   },
   "rows": [
@@ -14887,7 +14887,7 @@
       "evidence": null
     },
     {
-      "id": "invariant.INV-DESIGN-FOCUS-ECONOMIC",
+      "id": "invariant.INV-DESIGN-FOCUS-DIVIDEND",
       "kind": "invariant",
       "path": "tests/invariants.toml",
       "layers": [
@@ -14900,16 +14900,16 @@
         "trusted"
       ],
       "test_ids": [
-        "economic_gate_boundaries_at_one_eighth_and_two_kib",
-        "mutation_witness_economic_gate_rejects_each_boundary_crossing"
+        "focused_wire_plan_never_grows_and_activation_saves_512_tokens_and_one_eighth",
+        "real_wire_dividend_requires_512_tokens_and_one_eighth"
       ],
       "evidence_kind": "property",
       "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
       "status": "deferred",
       "meta": {
-        "mutation": "node scripts/mutation-run.mjs INV-DESIGN-FOCUS-ECONOMIC",
-        "unit_test": "economic_gate_boundaries_at_one_eighth_and_two_kib",
-        "wiring_test": "mutation_witness_economic_gate_rejects_each_boundary_crossing"
+        "mutation": "node scripts/mutation-run.mjs INV-DESIGN-FOCUS-DIVIDEND",
+        "unit_test": "real_wire_dividend_requires_512_tokens_and_one_eighth",
+        "wiring_test": "focused_wire_plan_never_grows_and_activation_saves_512_tokens_and_one_eighth"
       },
       "adversarial": [
         "planted-mutation",
@@ -14931,7 +14931,7 @@
         "trusted"
       ],
       "test_ids": [
-        "focus_terms_are_sanitized_bounded_unique_sorted_and_deterministic",
+        "focus_terms_are_sanitized_bounded_unique_priority_ranked_and_deterministic",
         "mutation_witness_focus_sanitization_strips_prompt_section_syntax"
       ],
       "evidence_kind": "property",
@@ -14939,8 +14939,39 @@
       "status": "deferred",
       "meta": {
         "mutation": "node scripts/mutation-run.mjs INV-DESIGN-FOCUS-SANITIZATION",
-        "unit_test": "focus_terms_are_sanitized_bounded_unique_sorted_and_deterministic",
+        "unit_test": "focus_terms_are_sanitized_bounded_unique_priority_ranked_and_deterministic",
         "wiring_test": "mutation_witness_focus_sanitization_strips_prompt_section_syntax"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-DESIGN-READINESS-CONCERN-MATCH",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "migration_and_schema_need_each_specific_concern_covered",
+        "replay_proof_does_not_cover_a_deadlock_concern"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-DESIGN-READINESS-CONCERN-MATCH",
+        "unit_test": "replay_proof_does_not_cover_a_deadlock_concern",
+        "wiring_test": "migration_and_schema_need_each_specific_concern_covered"
       },
       "adversarial": [
         "planted-mutation",
@@ -14963,7 +14994,7 @@
       ],
       "test_ids": [
         "apply_never_exceeds_the_contract_entry_bound",
-        "compile_path_applies_readiness_once_without_side_effects"
+        "readiness_seam_only_appends_bounded_medium_risks_to_the_compiled_contract"
       ],
       "evidence_kind": "property",
       "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
@@ -14971,7 +15002,69 @@
       "meta": {
         "mutation": "node scripts/mutation-run.mjs INV-DESIGN-READINESS-CONTRACT-BOUND",
         "unit_test": "apply_never_exceeds_the_contract_entry_bound",
-        "wiring_test": "compile_path_applies_readiness_once_without_side_effects"
+        "wiring_test": "readiness_seam_only_appends_bounded_medium_risks_to_the_compiled_contract"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-DESIGN-READINESS-ELEVATED-MATCH",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "elevated_risk_gap_requires_a_subject_matching_claim_binding",
+        "high_payment_risk_is_not_covered_by_an_unrelated_ui_proof"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-DESIGN-READINESS-ELEVATED-MATCH",
+        "unit_test": "high_payment_risk_is_not_covered_by_an_unrelated_ui_proof",
+        "wiring_test": "elevated_risk_gap_requires_a_subject_matching_claim_binding"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-DESIGN-READINESS-EPHEMERAL",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "compile_path_audits_readiness_ephemerally_without_side_effects",
+        "focused_projection_and_wire_digest_survive_a_manager_restart"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-DESIGN-READINESS-EPHEMERAL",
+        "unit_test": "compile_path_audits_readiness_ephemerally_without_side_effects",
+        "wiring_test": "focused_projection_and_wire_digest_survive_a_manager_restart"
       },
       "adversarial": [
         "planted-mutation",
@@ -15859,6 +15952,37 @@
         "mutation": "node scripts/mutation-run.mjs INV-JOURNAL-INTEGRITY",
         "unit_test": "journal_session_problems_flag_each_open_invariant",
         "wiring_test": "journal_verify_open_maps_a_torn_journal_to_the_typed_corruption_surface"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-KIWI-CLAIM-BATCH-INDEPENDENCE",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "production_claim_batch_never_carries_readiness_or_contract_context",
+        "submit_refuses_contract_context_on_a_claim_batch_before_any_request"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-KIWI-CLAIM-BATCH-INDEPENDENCE",
+        "unit_test": "production_claim_batch_never_carries_readiness_or_contract_context",
+        "wiring_test": "submit_refuses_contract_context_on_a_claim_batch_before_any_request"
       },
       "adversarial": [
         "planted-mutation",
@@ -27336,7 +27460,7 @@
             "passed": true,
             "observed": {
               "status": 200,
-              "handle": "vault://provider_key/73e81d5aa352088269b2180201d58691"
+              "handle": "vault://provider_key/054737c25c0132639a8d9a39b1466921"
             }
           },
           {

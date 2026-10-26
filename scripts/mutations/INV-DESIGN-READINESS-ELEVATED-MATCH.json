@@ -1,0 +1,12 @@
+{
+  "id": "INV-DESIGN-READINESS-ELEVATED-MATCH",
+  "file": "crates/core/src/design_readiness.rs",
+  "find": "    !risk_subjects.is_empty() && !risk_subjects.is_disjoint(&proof.subjects)",
+  "replace": "    !risk_subjects.is_empty()",
+  "gate": "cargo test -p faktor-core --lib mutation_witness_elevated_risk_requires_subject_overlap",
+  "expect": "FAILED",
+  "note": "Accepting any bound proof whenever the risk has a non-empty profile lets an unrelated UI proof suppress the high payment risk finding.",
+  "capabilities": [],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+}

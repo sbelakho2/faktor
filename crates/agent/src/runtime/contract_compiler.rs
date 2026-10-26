@@ -517,7 +517,7 @@ impl AgentRuntime {
         // questions are built from; it is pure and bounded.
         let native = compile_contract(&request);
         let provider = self.system_intelligence_provider();
-        let mut compiled = match &provider {
+        let compiled = match &provider {
             Some(provider) => {
                 // The organization-contract enrichment BOUNDARY: consulting
                 // the org's system-intelligence provider (and applying its
@@ -603,22 +603,20 @@ impl AgentRuntime {
             }
         }
         // Fresh-context design readiness without another agent/model call:
-        // inspect only the compiled contract + bounded compiler facts. Findings
-        // are risk hypotheses, never proof, and no capsule/transcript/artifact
-        // is created. The audit cannot newly promote a calm task to Faktor's
-        // expensive High/Unknown risk route; it preserves an escalation only
-        // when the authoritative pre-audit contract already justified one.
-        // Tangerine has already enriched through the existing neutral call;
-        // Kiwi remains downstream independent verification.
+        // inspect only the compiled contract + bounded compiler facts. The
+        // audit is ADVISORY and EPHEMERAL: its findings are never applied to
+        // the durable contract, so they create no risk rows, artifacts,
+        // evidence, model/Tangerine calls or second source of truth. Tangerine
+        // has already enriched through the single existing neutral call; Kiwi
+        // remains downstream independent verification of neutral claims only.
         let readiness = faktor_core::audit_compiled_design(&compiled);
-        let readiness_applied = faktor_core::apply_design_readiness(&mut compiled, &readiness);
-        if readiness_applied > 0 {
+        if !readiness.findings.is_empty() {
             tracing::info!(
                 session = %session,
                 task_id = task.task_id.raw(),
-                findings = readiness_applied,
+                findings = readiness.findings.len(),
                 focus_terms = readiness.focus_terms.len(),
-                "fresh-context design readiness added bounded risk hypotheses"
+                "fresh-context design readiness reported advisory findings (not persisted)"
             );
         }
         if compiled.contract.is_empty() {

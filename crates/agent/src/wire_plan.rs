@@ -323,6 +323,29 @@ pub fn plan_wire_turn_with_counter(
     }))
 }
 
+/// Adopt the focused plan/evidence pair only when the REAL final wire-token
+/// dividend gate passes (`focused <= baseline - max(512, 12.5%)`). Otherwise
+/// the baseline plan and evidence are returned untouched, so the rendered
+/// baseline stays byte-identical. The gate is evaluated on the tokenizer
+/// counts the provider will actually receive, never on key bytes.
+pub(crate) fn choose_design_focus_plan(
+    baseline_plan: WirePlan,
+    baseline_evidence: Vec<Evidence>,
+    focused: Option<(WirePlan, Vec<Evidence>)>,
+) -> (WirePlan, Vec<Evidence>) {
+    match focused {
+        Some((focused_plan, focused_evidence))
+            if faktor_core::design_focus_has_dividend(
+                baseline_plan.total_tokens,
+                focused_plan.total_tokens,
+            ) =>
+        {
+            (focused_plan, focused_evidence)
+        }
+        _ => (baseline_plan, baseline_evidence),
+    }
+}
+
 /// Keep a planner message window pairing-aware (the renderer never rewrites
 /// history): while the OLDEST kept message is a user message carrying a
 /// tool result whose call is not inside the window, drop that oldest

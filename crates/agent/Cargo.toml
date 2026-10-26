@@ -43,6 +43,8 @@ tempfile.workspace = true
 [dev-dependencies]
 # Unit tests arm the store's deterministic crash seam (queue windows).
 faktor-store = { workspace = true, features = ["fault-injection"] }
+# Readiness wire probes compile evidence through the real in-memory store.
+faktor-evidence.workspace = true
 # Hostile OpenAI-compatible stream certificates run the REAL adapter against
 # a loopback mock server (the permissive transport is test-utils gated).
 faktor-openai.workspace = true

@@ -1,0 +1,12 @@
+{
+  "id": "INV-DESIGN-FOCUS-DIVIDEND",
+  "file": "crates/core/src/design_readiness.rs",
+  "find": "    baseline_tokens >= required && focused_tokens <= baseline_tokens - required",
+  "replace": "    focused_tokens <= baseline_tokens.saturating_sub(required)",
+  "gate": "cargo test -p faktor-core --lib real_wire_dividend_requires_512_tokens_and_one_eighth",
+  "expect": "FAILED",
+  "note": "Saturating subtraction accepts a zero-token focused plan against any baseline below the 512-token minimum, defeating the absolute dividend floor.",
+  "capabilities": [],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+}

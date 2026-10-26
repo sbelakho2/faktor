@@ -250,6 +250,11 @@ impl KiwiVerificationProvider {
     ) -> Result<VerificationResponse, VerificationError> {
         request.validate()?;
         job.validate()?;
+        // Every production submission is claim-batch-only by construction:
+        // an op-only job is equally neutral, so no job may carry contract
+        // context (constraints/invariants/risks, including ephemeral
+        // readiness) to the independent verifier.
+        job.validate_claim_batch()?;
         if !self.capabilities.supports(request.op) {
             // Capability truth is the negotiated subset: an operation outside
             // it is refused typed before any request is ever framed.

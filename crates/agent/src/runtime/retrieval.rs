@@ -928,6 +928,47 @@ fn is_retrieval_noise(token: &str) -> bool {
         )
 }
 
+/// The baseline task facts plus the optional focused variant of ONE turn.
+/// Both variants come from the same durable read; `focused` only exists when
+/// the lazy focus gate evaluated the contract, and it is never persisted.
+pub(crate) struct TaskFactsVariants {
+    pub(crate) baseline: TaskFacts,
+    pub(crate) focused: Option<TaskFacts>,
+    /// This turn's ephemeral focus policy. `evaluated == false` means the
+    /// lazy gate did ZERO focus work. Test/probe assertion surface only; the
+    /// production path consumes `focused`.
+    #[allow(dead_code)]
+    pub(crate) focus: faktor_core::DesignFocusPolicy,
+}
+
+/// One turn's compiled evidence under the baseline and (when the lazy gate
+/// ran) the focused NeedSet. Both were selected from ONE acquired candidate
+/// set; `focused` is only surfaced when the baseline selection is non-empty.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct TurnEvidenceVariants {
+    pub(crate) baseline: Option<Vec<Evidence>>,
+    pub(crate) focused: Option<Vec<Evidence>>,
+}
+
+/// Map one compiled context onto the planner's evidence shape; an empty
+/// selection is `None` so the caller keeps its producer evidence.
+fn evidence_from_compiled(compiled: &faktor_context::CompiledContext) -> Option<Vec<Evidence>> {
+    if compiled.is_empty() {
+        return None;
+    }
+    Some(
+        compiled
+            .selected
+            .iter()
+            .map(|item| Evidence {
+                path: item.path.clone(),
+                snippet: item.body.clone(),
+                score: if item.required { 1.0 } else { item.score },
+            })
+            .collect(),
+    )
+}
+
 impl AgentRuntime {
     /// The CURRENT user prompt (the newest durable user row), never the
     /// session title. The title is a label (often "task" or "cli run") and
@@ -1014,12 +1055,35 @@ impl AgentRuntime {
     /// neutral (empty criteria/failures) — never a synthetic success; an
     /// UNREADABLE identity/ledger is a typed error (authority law), never
     /// fabricated facts.
+    #[allow(dead_code)]
     pub(crate) fn task_facts_for(
         &self,
         handle: &faktor_session::SessionHandle,
         ledger: &TaskLedger,
         task_id: TaskId,
     ) -> faktor_core::Result<TaskFacts> {
+        Ok(self
+            .task_facts_variants_for(handle, ledger, task_id)?
+            .baseline)
+    }
+
+    /// The baseline facts plus the optional EPHEMERAL focused variant of the
+    /// SAME durable turn. Both variants share the same criteria, failures,
+    /// owned/changed paths and verification state; the focused variant only
+    /// replaces the active work item's DUPLICATED path list with this turn's
+    /// focus policy. The policy is derived from the durable contract per turn
+    /// and never written back: no risk row, prompt section or second document.
+    ///
+    /// The lazy gate runs FIRST: no active step or at most
+    /// [`faktor_core::MIN_DESIGN_FOCUS_DUPLICATED_BYTES`] duplicated path
+    /// bytes means ZERO focus work (`focused` is `None` and the contract is
+    /// never scanned).
+    pub(crate) fn task_facts_variants_for(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        ledger: &TaskLedger,
+        task_id: TaskId,
+    ) -> faktor_core::Result<TaskFactsVariants> {
         // Authority law: an unreadable session identity or task ledger is a
         // TYPED error, never fabricated facts (guessed workspace 1 / empty
         // tasks); the compiler caller keeps producer evidence on error.
@@ -1059,42 +1123,15 @@ impl AgentRuntime {
                 failures.push(test.clone());
             }
         }
-        // Zero-artifact Elephant memory: derive a tiny focus projection from
-        // the authoritative durable contract in memory. It may REPLACE only
-        // this work item's DUPLICATED material: the path list is a copy of
-        // `changed_files`, which still feeds the owned/recent path needs below,
-        // so those precise path needs survive unchanged. The step title is
-        // unique retrieval/evidence material (it can carry `evidence://`
-        // refs), so it is always preserved. Replacement happens only behind
-        // the tokenizer-free economic gate (>=12.5% AND >=2 KiB smaller) and
-        // is measured against the material actually removed, never the title.
-        // No prompt section, memory fact, CAS object or second design document.
-        let design_focus = task
-            .map(|task| faktor_core::design_focus_terms(&task.contract))
-            .unwrap_or_default();
-        let active_work_item = ledger.open_steps.first().map(|step| {
-            let duplicated_bytes = ledger.changed_files.iter().fold(0usize, |total, path| {
-                total.saturating_add(path.len()).saturating_add(1)
-            });
-            if faktor_core::design_focus_is_economic(duplicated_bytes, &design_focus) {
-                WorkItem {
-                    id: "step:0".to_string(),
-                    title: step.clone(),
-                    state: "open".to_string(),
-                    paths: Vec::new(),
-                    criteria: design_focus,
-                }
-            } else {
-                WorkItem {
-                    id: "step:0".to_string(),
-                    title: step.clone(),
-                    state: "open".to_string(),
-                    paths: ledger.changed_files.clone(),
-                    criteria: Vec::new(),
-                }
-            }
+        let active_step = ledger.open_steps.first();
+        let active_work_item = active_step.map(|step| WorkItem {
+            id: "step:0".to_string(),
+            title: step.clone(),
+            state: "open".to_string(),
+            paths: ledger.changed_files.clone(),
+            criteria: Vec::new(),
         });
-        Ok(TaskFacts {
+        let baseline = TaskFacts {
             session_id: handle.id(),
             workspace_id,
             task_id: Some(task_id.raw()),
@@ -1110,6 +1147,47 @@ impl AgentRuntime {
             // absence — never a positive mismatch — so no evidence edge is
             // falsely marked stale.
             semantic_snapshot: None,
+        };
+
+        // Zero-artifact Elephant memory: derive this turn's ephemeral focus
+        // policy from the authoritative durable contract in memory. It may
+        // REPLACE only the work item's DUPLICATED material: the path list is a
+        // copy of `changed_files`, which still feeds the owned/recent path
+        // needs below, so those precise path needs survive unchanged. The step
+        // title is unique retrieval/evidence material (it can carry
+        // `evidence://` refs), so it is always preserved. No contract scan is
+        // attempted until the lazy gate passes; no prompt section, memory fact,
+        // CAS object or second design document is created.
+        let duplicated_bytes = if active_step.is_some() {
+            ledger.changed_files.iter().fold(0usize, |total, path| {
+                total.saturating_add(path.len()).saturating_add(1)
+            })
+        } else {
+            0
+        };
+        let focus_policy = task
+            .map(|task| {
+                faktor_core::design_focus_policy(
+                    &task.contract,
+                    active_step.is_some(),
+                    duplicated_bytes,
+                )
+            })
+            .unwrap_or_default();
+        let focused = if focus_policy.evaluated && !focus_policy.terms.is_empty() {
+            let mut facts = baseline.clone();
+            if let Some(item) = facts.active_work_item.as_mut() {
+                item.paths.clear();
+                item.criteria = focus_policy.terms.clone();
+            }
+            Some(facts)
+        } else {
+            None
+        };
+        Ok(TaskFactsVariants {
+            baseline,
+            focused,
+            focus: focus_policy,
         })
     }
 
@@ -1247,6 +1325,7 @@ impl AgentRuntime {
     /// envelope from them by marginal information (required evidence is
     /// hard-reserved), within its explicit memory/runtime ceilings — never a
     /// fixed third of the context.
+    #[allow(dead_code)] // compatibility entry; production uses the variants twin
     pub(crate) fn compile_turn_evidence(
         &self,
         handle: &faktor_session::SessionHandle,
@@ -1255,32 +1334,48 @@ impl AgentRuntime {
         budget: &ContextBudget,
         volatile: VolatileClaims,
     ) -> Result<Option<Vec<Evidence>>, CompilerError> {
+        Ok(self
+            .compile_turn_evidence_variants(handle, task_id, ledger, budget, volatile)?
+            .baseline)
+    }
+
+    /// Compile the turn's baseline and focused evidence from ONE acquired
+    /// candidate set. The context compiler fetches the durable envelopes once
+    /// and selects both NeedSets over the same candidates; the focused
+    /// variant exists only behind the lazy gate. Empty selections keep the
+    /// caller's producer evidence byte-for-byte (`None`).
+    pub(crate) fn compile_turn_evidence_variants(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        task_id: TaskId,
+        ledger: &TaskLedger,
+        budget: &ContextBudget,
+        volatile: VolatileClaims,
+    ) -> Result<TurnEvidenceVariants, CompilerError> {
         let Some(compiler) = self.context_compiler() else {
-            return Ok(None);
+            return Ok(TurnEvidenceVariants::default());
         };
-        let facts = self
-            .task_facts_for(handle, ledger, task_id)
+        let variants = self
+            .task_facts_variants_for(handle, ledger, task_id)
             .map_err(|e| CompilerError::Selection(format!("task facts unreadable: {e}")))?;
-        let input = CompilerInput::new(
-            facts,
-            u32::try_from(budget.context_max()).unwrap_or(u32::MAX),
-        )
-        .with_volatile(volatile);
-        let compiled = compiler.compile(&input)?;
-        if compiled.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(
-            compiled
-                .selected
-                .iter()
-                .map(|item| Evidence {
-                    path: item.path.clone(),
-                    snippet: item.body.clone(),
-                    score: if item.required { 1.0 } else { item.score },
-                })
-                .collect(),
-        ))
+        let budget_tokens = u32::try_from(budget.context_max()).unwrap_or(u32::MAX);
+        let baseline_input =
+            CompilerInput::new(variants.baseline, budget_tokens).with_volatile(volatile);
+        let Some(focused_facts) = variants.focused else {
+            let compiled = compiler.compile(&baseline_input)?;
+            return Ok(TurnEvidenceVariants {
+                baseline: evidence_from_compiled(&compiled),
+                focused: None,
+            });
+        };
+        let focused_input =
+            CompilerInput::new(focused_facts, budget_tokens).with_volatile(volatile);
+        let (baseline, focused) = compiler.compile_variants(&baseline_input, &focused_input)?;
+        let baseline = evidence_from_compiled(&baseline);
+        let focused = baseline
+            .as_ref()
+            .and_then(|_| evidence_from_compiled(&focused));
+        Ok(TurnEvidenceVariants { baseline, focused })
     }
 
     /// Durable learning hook dispatch (audits 65-67/92), gated by

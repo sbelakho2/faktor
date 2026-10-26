@@ -1,0 +1,12 @@
+{
+  "id": "INV-DESIGN-READINESS-CONCERN-MATCH",
+  "file": "crates/core/src/design_readiness.rs",
+  "find": "    proof.concepts.contains(&concept) && !statement_subjects.is_disjoint(&proof.subjects)",
+  "replace": "    proof.concepts.iter().any(|candidate| candidate.kind == concept.kind) && !statement_subjects.is_disjoint(&proof.subjects)",
+  "gate": "cargo test -p faktor-core --lib mutation_witness_concern_coverage_is_statement_specific",
+  "expect": "FAILED",
+  "note": "Collapsing concept matching to the concern class lets a replay proof with a shared subject cover the distinct deadlock concern.",
+  "capabilities": [],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+}
