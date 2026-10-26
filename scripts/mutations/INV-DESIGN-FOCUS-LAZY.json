@@ -1,0 +1,12 @@
+{
+  "id": "INV-DESIGN-FOCUS-LAZY",
+  "file": "crates/core/src/design_readiness.rs",
+  "find": "    active_step && duplicated_path_bytes > MIN_DESIGN_FOCUS_DUPLICATED_BYTES",
+  "replace": "    active_step || duplicated_path_bytes > MIN_DESIGN_FOCUS_DUPLICATED_BYTES",
+  "gate": "cargo test -p faktor-core --lib mutation_witness_lazy_focus_gate_skips_without_step_or_below_two_kib",
+  "expect": "FAILED",
+  "note": "Loosening the lazy gate to `||` runs the focus projection for a turn with no active step (zero focus work is required), so the witness fails.",
+  "capabilities": [],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+}

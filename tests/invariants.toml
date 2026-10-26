@@ -2900,9 +2900,40 @@ mutation_debt = ""
 release_critical = true
 platforms = ["linux", "macos", "windows"]
 
+
+[[invariant]]
+id = "INV-DESIGN-FOCUS-LAZY"
+statement = "The focus projection does ZERO work when there is no active step or at most 2 KiB of duplicated path material: no contract scan, no term derivation, no focused variant, and the baseline facts stay byte-identical."
+owner = "crates/core design readiness + crates/agent task facts"
+authority = "crates/core/src/design_readiness.rs design_focus_should_run/design_focus_policy; crates/agent/src/runtime/retrieval.rs task_facts_variants_for"
+script_check = ""
+unit_test = "lazy_focus_does_zero_work_without_an_active_step_or_under_two_kib"
+production_wiring = "lazy_focus_does_zero_work_without_an_active_step_or_under_two_kib"
+fault = ""
+mutation_witness = "mutation_witness_lazy_focus_gate_skips_without_step_or_below_two_kib"
+mutation_command = "node scripts/mutation-run.mjs INV-DESIGN-FOCUS-LAZY"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-DESIGN-FOCUS-RANKING"
+statement = "Focus terms are priority-ranked binding selectors, component/symbol ids, invariant subjects, high-risk subjects, generic words, deduplicated preserving that order (never alphabetically sorted)."
+owner = "crates/core design readiness"
+authority = "crates/core/src/design_readiness.rs design_focus_terms; crates/agent/src/runtime/retrieval.rs task_facts_variants_for"
+script_check = ""
+unit_test = "priority_rank_orders_binding_selector_component_invariant_risk_then_generic"
+production_wiring = "runtime_focus_policy_preserves_priority_ranked_terms"
+fault = ""
+mutation_witness = "priority_rank_orders_binding_selector_component_invariant_risk_then_generic"
+mutation_command = "node scripts/mutation-run.mjs INV-DESIGN-FOCUS-RANKING"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
 [[invariant]]
 id = "INV-DESIGN-FOCUS-SANITIZATION"
-statement = "Every focus-projection term is a bounded lowercase ASCII alphanumeric/underscore run, unique and sorted, so hostile contract text can never inject prompt-section structure through the projection."
+statement = "Every focus-projection term is a bounded lowercase ASCII alphanumeric/underscore run, unique and priority-ordered (never alphabetically sorted), so hostile contract text can never inject prompt-section structure through the projection."
 owner = "crates/core design readiness"
 authority = "crates/core/src/design_readiness.rs scan_tokens, collect_source_terms and design_focus_terms"
 script_check = ""

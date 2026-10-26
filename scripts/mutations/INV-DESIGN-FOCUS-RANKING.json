@@ -1,0 +1,12 @@
+{
+  "id": "INV-DESIGN-FOCUS-RANKING",
+  "file": "crates/core/src/design_readiness.rs",
+  "find": "            collect_ranked_terms(\n                target,\n                FOCUS_RANK_BINDING_SELECTOR,",
+  "replace": "            collect_ranked_terms(\n                target,\n                FOCUS_RANK_GENERIC,",
+  "gate": "cargo test -p faktor-core --lib priority_rank_orders_binding_selector_component_invariant_risk_then_generic",
+  "expect": "FAILED",
+  "note": "Demoting binding selectors to the generic rank lets component/symbol ids leapfrog them, breaking the priority order the witness asserts.",
+  "capabilities": [],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+}
