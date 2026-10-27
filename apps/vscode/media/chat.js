@@ -1042,8 +1042,22 @@
     if (back) {
       back.hidden = key === 'work';
     }
+    var settingsNav = byId('settings-nav');
+    if (settingsNav) {
+      settingsNav.hidden = key !== 'settings';
+    }
     document.body.setAttribute('data-mode', key === 'settings' ? 'settings' : 'chat');
     setOverflowOpen(false);
+    window.setTimeout(function () {
+      try {
+        vscode.postMessage({
+          type: 'uiDomDump',
+          html: document.documentElement.outerHTML.slice(0, 300000),
+          mode: document.body.getAttribute('data-mode') + ':' + key,
+          version: (byId('ui-version') || {}).textContent || '',
+        });
+      } catch (e) {}
+    }, 400);
   }
 
   var MENU_ITEMS = [
@@ -6451,9 +6465,27 @@
       openView('work');
     });
   }
+  var settingsBack = byId('settings-back-chat');
+  if (settingsBack) {
+    settingsBack.addEventListener('click', function () {
+      openView('work');
+    });
+  }
   byId('btn-overflow').addEventListener('click', function () {
     toggleOverflow();
   });
+  // One-shot diagnostic: report the exact rendered DOM to the host so a
+  // stale/wrong surface can be identified from evidence instead of guesses.
+  window.setTimeout(function () {
+    try {
+      vscode.postMessage({
+        type: 'uiDomDump',
+        html: document.documentElement.outerHTML.slice(0, 300000),
+        mode: document.body.getAttribute('data-mode'),
+        version: (byId('ui-version') || {}).textContent || '',
+      });
+    } catch (e) {}
+  }, 1500);
   byId('menu-chat').addEventListener('click', function () {
     openView('work');
   });

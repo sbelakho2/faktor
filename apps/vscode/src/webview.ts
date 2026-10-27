@@ -13,6 +13,7 @@
 
 import * as vscode from 'vscode';
 import { randomBytes } from 'node:crypto';
+import { writeFileSync } from 'node:fs';
 import type { FaktorSnapshot } from './state';
 import type { UserErrorProjection } from './errors';
 import { renderEdition8AppMarkup } from './edition8/html';
@@ -142,6 +143,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private handleMessage(message: unknown): void {
+    const rawDump = message as { type?: string; html?: string; mode?: string; version?: string } | null;
+    if (rawDump && rawDump.type === 'uiDomDump' && typeof rawDump.html === 'string') {
+      try {
+        writeFileSync('/tmp/faktor-ui-dump.html', rawDump.html);
+        writeFileSync('/tmp/faktor-ui-meta.json', JSON.stringify({ mode: rawDump.mode, version: rawDump.version, at: Date.now() }));
+      } catch {
+        /* diagnostic only */
+      }
+      return;
+    }
     if (!validChatMessage(message)) return;
     if (message.type.startsWith('e8')) {
       if (message.type === 'e8Ready' && this.pendingSettings !== null) {
@@ -438,8 +449,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 <meta charset="UTF-8">
 <meta http-equiv="Content-Security-Policy" content="${csp}">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<link href="${settingsStyleUri}?v=0.2.3" rel="stylesheet">
-<link href="${styleUri}?v=0.2.3" rel="stylesheet">
+<link href="${settingsStyleUri}?v=0.2.6" rel="stylesheet">
+<link href="${styleUri}?v=0.2.6" rel="stylesheet">
 <title>Faktor</title>
 </head>
 <body data-surface="sidebar">
@@ -447,7 +458,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   <header>
     <button id="btn-back-chat" class="toggle back-to-chat" type="button" title="Back to chat" aria-label="Back to chat" hidden>← Chat</button>
     <span id="brand">Faktor</span>
-    <span id="ui-version" class="header-status" title="Installed Faktor build">v0.2.3</span>
+    <span id="ui-version" class="header-status" title="Installed Faktor build">v0.2.6</span>
     <span id="daemon-dot" class="dot dot-stopped" aria-hidden="true"></span>
     <span id="daemon-text" class="header-status">Ready</span>
     <span class="spacer"></span>
@@ -762,15 +773,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     </section>
   </section>
   <section id="settings-panel" class="view-panel settings-view" role="region" aria-label="Settings" tabindex="-1" hidden>
+<div id="settings-nav" class="settings-nav">
+  <button id="settings-back-chat" class="back-to-chat" type="button" title="Back to chat" aria-label="Back to chat">← Chat</button>
+  <span class="settings-nav-title">Settings</span>
+</div>
 ${settingsMarkup}
   </section>
 </div>
 <script nonce="${nonce}">document.body.setAttribute('data-mode', 'chat');</script>
-<script nonce="${nonce}" src="${settingsScriptUri}?v=0.2.3"></script>
-<script nonce="${nonce}" src="${boardUri}?v=0.2.3"></script>
-<script nonce="${nonce}" src="${historyUri}?v=0.2.3"></script>
-<script nonce="${nonce}" src="${composerUri}?v=0.2.3"></script>
-<script nonce="${nonce}" src="${scriptUri}?v=0.2.3"></script>
+<script nonce="${nonce}" src="${settingsScriptUri}?v=0.2.6"></script>
+<script nonce="${nonce}" src="${boardUri}?v=0.2.6"></script>
+<script nonce="${nonce}" src="${historyUri}?v=0.2.6"></script>
+<script nonce="${nonce}" src="${composerUri}?v=0.2.6"></script>
+<script nonce="${nonce}" src="${scriptUri}?v=0.2.6"></script>
 </body>
 </html>`;
   }

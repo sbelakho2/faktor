@@ -229,9 +229,9 @@ header button {
   display: inline-flex;
   align-items: center;
   gap: var(--space-1);
-  min-width: 36px;
-  min-height: 28px;
-  padding: 2px 10px;
+  min-width: 46px;
+  min-height: 32px;
+  padding: 4px 12px;
   border: 1px solid var(--faktor-border);
   border-radius: var(--faktor-radius-control);
 }
@@ -253,9 +253,9 @@ header button {
 
 @media (max-width: 559px) {
   .control-center-toggle {
-    min-width: 36px;
-    min-height: 28px;
-    padding: 2px 8px;
+    min-width: 46px;
+    min-height: 32px;
+    padding: 4px 10px;
     justify-content: center;
   }
   .control-center-label {
@@ -2561,3 +2561,18 @@ button.intent-option:focus-visible {
 #settings-panel .e8-header,
 #settings-panel .e8-destination { display: none; }
 #settings-panel { padding-top: var(--space-2); }
+
+/* Settings has its OWN always-visible back bar inside the surface: returning
+   to chat can never depend on the header being reachable or clickable. */
+.settings-nav {
+  position: sticky;
+  top: 0;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  background: var(--vscode-sideBar-background, var(--vscode-editor-background));
+  border-bottom: 1px solid var(--faktor-border);
+}
+.settings-nav-title { font-weight: 600; }
