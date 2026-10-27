@@ -854,7 +854,21 @@ function destinationMarkup(destination: E8Destination, state: E8PanelState, init
   </div>`;
 }
 
-export function renderEdition8Html(options: Edition8HtmlOptions): string {
+export interface Edition8AppOptions {
+  readonly state: E8PanelState;
+  readonly initialScreen: string;
+  readonly host: 'vscode' | 'jetbrains';
+  readonly mode?: 'shell' | 'settings';
+  /** Embedded in the Faktor window: the host refreshes immediately. */
+  readonly omitEmptyBanner?: boolean;
+}
+
+/**
+ * The body of the Edition 8 surface without the document wrapper. The VS Code
+ * window renders this app inside its ONE editor panel next to Chat, so the
+ * settings surface never becomes a competing editor tab or sidebar view.
+ */
+export function renderEdition8AppMarkup(options: Edition8AppOptions): string {
   const initial = E8_SCREENS.some((screen) => screen.id === options.initialScreen)
     ? options.initialScreen
     : 'S01';
@@ -862,18 +876,9 @@ export function renderEdition8Html(options: Edition8HtmlOptions): string {
   const destinations: readonly E8Destination[] =
     mode === 'settings' ? ['settings'] : ['work', 'inspect', 'history'];
   const loading = options.state.loading;
-  const noSnapshot = options.state.snapshot === null && !loading && options.state.error === null;
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${esc(options.cspSource)} 'unsafe-inline'; script-src 'nonce-${options.nonce}'; img-src ${esc(options.cspSource)} data:; connect-src 'none'; base-uri 'none'; form-action 'none';" />
-<link rel="stylesheet" href="${esc(options.styleUri)}" />
-<title>Faktor ${mode === 'settings' ? 'Settings' : 'Work'}</title>
-</head>
-<body data-host="${esc(options.host)}" data-mode="${mode}">
-<div id="e8-app">
+  const noSnapshot =
+    options.omitEmptyBanner !== true && options.state.snapshot === null && !loading && options.state.error === null;
+  return `<div id="e8-app">
   <header class="e8-header">
     <div class="e8-brand"><span class="e8-mark" aria-hidden="true">F</span><span>Faktor</span></div>
     <nav id="e8-router" aria-label="Faktor destinations">
@@ -924,7 +929,25 @@ export function renderEdition8Html(options: Edition8HtmlOptions): string {
       <button type="button" class="e8-primary" id="e8-apply" disabled aria-keyshortcuts="Control+Enter Meta+Enter">Apply changes</button>
     </div>
   </footer>
-</div>
+</div>`;
+}
+
+export function renderEdition8Html(options: Edition8HtmlOptions): string {
+  const initial = E8_SCREENS.some((screen) => screen.id === options.initialScreen)
+    ? options.initialScreen
+    : 'S01';
+  const mode = options.mode ?? (destinationOf(E8_SCREENS.find((screen) => screen.id === initial)!) === 'settings' ? 'settings' : 'shell');
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${esc(options.cspSource)} 'unsafe-inline'; script-src 'nonce-${options.nonce}'; img-src ${esc(options.cspSource)} data:; connect-src 'none'; base-uri 'none'; form-action 'none';" />
+<link rel="stylesheet" href="${esc(options.styleUri)}" />
+<title>Faktor ${mode === 'settings' ? 'Settings' : 'Work'}</title>
+</head>
+<body data-host="${esc(options.host)}" data-mode="${mode}">
+${renderEdition8AppMarkup(options)}
 <script nonce="${options.nonce}">window.__faktorE8Initial = ${scriptJson(initial)};</script>
 <script nonce="${options.nonce}" src="${esc(options.scriptUri)}"></script>
 </body>

@@ -3,9 +3,7 @@
 // policy or completion; it stages typed changes and posts exact commands.
 
 import * as vscode from 'vscode';
-import { randomBytes } from 'node:crypto';
 import type { E8Backend } from './client.ts';
-import { renderEdition8Html } from './html.ts';
 import {
   EMPTY_VIEW_CACHE,
   INITIAL_CONTROLLER_STATE,
@@ -22,7 +20,6 @@ import {
 import { E8_SCREENS } from '../generated/edition8Registry.ts';
 import { E8_BINDINGS, bindingOf8 } from './bindings.ts';
 import type { Json } from './contract.ts';
-import { destinationOf, isShellScreen } from './view.ts';
 import { exactPendingApprovalId, pendingApprovalIds } from './approval.ts';
 
 export interface Edition8PanelDeps {
@@ -36,7 +33,7 @@ export interface Edition8PanelDeps {
   readonly output: vscode.OutputChannel;
 }
 
-interface PanelMessage {
+export interface PanelMessage {
   readonly type?: unknown;
   readonly controlId?: unknown;
   readonly command?: unknown;
@@ -91,7 +88,7 @@ function payloadOf(value: unknown): Record<string, Json> {
   return out;
 }
 
-class Edition8Controller {
+export class Edition8Controller {
   public state: E8ControllerState = INITIAL_CONTROLLER_STATE;
   private cache: E8ViewCache = EMPTY_VIEW_CACHE;
   private inFlight: Promise<void> | null = null;
@@ -100,7 +97,6 @@ class Edition8Controller {
   constructor(
     private readonly deps: Edition8PanelDeps,
     private readonly post: (message: unknown) => Thenable<boolean> | void,
-    private readonly revealScreen: (screen: string) => void,
   ) {}
 
   public dispose(): void {
@@ -214,10 +210,9 @@ class Edition8Controller {
         return;
       }
       case 'e8SelectScreen': {
-        const screen = text(message.screen, 16);
-        if (screen !== null && E8_SCREENS.some((entry) => entry.id === screen)) {
-          this.revealScreen(screen);
-        }
+        // The webview already selected this destination locally. Echoing it
+        // back would loop host<->webview forever; the host only requests a
+        // screen with its own e8SelectScreen message.
         return;
       }
       case 'e8OpenScreen': {
@@ -411,152 +406,4 @@ function isStagedChange(value: unknown): value is { controlId: string; key: stri
     (typeof staged === 'number' && Number.isFinite(staged)) ||
     (typeof staged === 'string' && staged.length <= MAX_STAGED_STRING)
   );
-}
-
-export class Edition8Panel {
-  public static current: Edition8Panel | null = null;
-  private static readonly viewType = 'faktor.edition8.settings';
-  private readonly controller: Edition8Controller;
-
-  public static createOrShow(context: vscode.ExtensionContext, deps: Edition8PanelDeps, screen = 'S29'): Edition8Panel {
-    const column = vscode.ViewColumn.One;
-    if (Edition8Panel.current !== null) {
-      Edition8Panel.current.panel.reveal(column);
-      Edition8Panel.current.controller.handle({ type: 'e8SelectScreen', screen });
-      return Edition8Panel.current;
-    }
-    const panel = vscode.window.createWebviewPanel(
-      Edition8Panel.viewType,
-      'Faktor Settings',
-      column,
-      {
-        enableScripts: true,
-        retainContextWhenHidden: true,
-        localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, 'media')],
-      },
-    );
-    Edition8Panel.current = new Edition8Panel(panel, context, deps, screen);
-    return Edition8Panel.current;
-  }
-
-  private constructor(
-    private readonly panel: vscode.WebviewPanel,
-    private readonly context: vscode.ExtensionContext,
-    deps: Edition8PanelDeps,
-    screen: string,
-  ) {
-    const initial = E8_SCREENS.some((entry) => entry.id === screen) ? screen : 'S29';
-    this.controller = new Edition8Controller(deps, (message) => {
-      return this.panel.webview.postMessage(message);
-    }, (next) => {
-      // Selection is a client-side view switch; re-rendering the whole
-      // document would discard staged drafts and input focus. S29 is the
-      // descriptor home, which is not a registry screen page.
-      void this.panel.webview.postMessage(
-        next === 'S29' ? { type: 'e8SettingsHome' } : { type: 'e8SelectScreen', screen: next },
-      );
-    });
-    // Register the message handler BEFORE handing the document to the
-    // webview: the script posts `e8Ready` as soon as it runs, and a gap here
-    // dropped that handshake (the panel then kept its initial empty rows).
-    panel.webview.onDidReceiveMessage((message: PanelMessage) => {
-      void this.controller.handle(message);
-    });
-    panel.webview.html = this.render(initial);
-    panel.onDidDispose(() => {
-      this.controller.dispose();
-      if (Edition8Panel.current === this) Edition8Panel.current = null;
-    });
-  }
-
-  private render(screen: string): string {
-    const webview = this.panel.webview;
-    const nonce = randomBytes(16).toString('hex');
-    const styleUri = webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'edition8.css'));
-    const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'edition8.js'));
-    const entry = E8_SCREENS.find((candidate) => candidate.id === screen) ?? E8_SCREENS.find((candidate) => candidate.id === 'S29')!;
-    return renderEdition8Html({
-      nonce,
-      cspSource: webview.cspSource,
-      scriptUri: scriptUri.toString(),
-      styleUri: styleUri.toString(),
-      state: { snapshot: this.controller.state.snapshot, loading: this.controller.state.loading, error: this.controller.state.error, focusControl: null },
-      initialScreen: entry.id,
-      host: 'vscode',
-      mode: destinationOf(entry) === 'settings' ? 'settings' : 'shell',
-    });
-  }
-}
-
-export class Edition8ViewProvider implements vscode.WebviewViewProvider {
-  public static readonly viewType = 'faktor.edition8';
-  private view: vscode.WebviewView | null = null;
-  private controller: Edition8Controller | null = null;
-  private initialScreen = 'S01';
-
-  constructor(
-    private readonly context: vscode.ExtensionContext,
-    private readonly deps: Edition8PanelDeps,
-  ) {}
-
-  public resolveWebviewView(view: vscode.WebviewView): void {
-    this.view = view;
-    view.webview.options = {
-      enableScripts: true,
-      localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, 'media')],
-    };
-    this.controller = new Edition8Controller(this.deps, (message) => {
-      return view.webview.postMessage(message);
-    }, (screen) => {
-      this.initialScreen = screen;
-    });
-    // Handler before HTML: `e8Ready` is posted by the script immediately.
-    view.webview.onDidReceiveMessage((message: PanelMessage) => {
-      void this.controller?.handle(message);
-    });
-    view.webview.html = this.render(this.initialScreen);
-    // A WebviewView can be resolved while hidden; posts to a hidden document
-    // are not a durable replay buffer. On every reveal, invalidate the keyed
-    // cache so the visible document receives the complete served state (the
-    // snapshot itself is retained and never re-read here).
-    view.onDidChangeVisibility(() => {
-      if (view.visible !== true) return;
-      this.controller?.resetView();
-      void this.controller?.refresh();
-    });
-  }
-
-  public show(screen: string): void {
-    if (screen !== 'S01') this.initialScreen = screen;
-    if (this.view !== null) {
-      this.view.show?.(true);
-      this.view.webview.html = this.render(this.initialScreen);
-      void this.controller?.refresh();
-    } else {
-      void vscode.commands.executeCommand('faktor.edition8.focus');
-    }
-  }
-
-  private render(screen: string): string {
-    if (this.view === null) return '';
-    const webview = this.view.webview;
-    const nonce = randomBytes(16).toString('hex');
-    const styleUri = webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'edition8.css'));
-    const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'edition8.js'));
-    return renderEdition8Html({
-      nonce,
-      cspSource: webview.cspSource,
-      scriptUri: scriptUri.toString(),
-      styleUri: styleUri.toString(),
-      state: {
-        snapshot: this.controller?.state.snapshot ?? null,
-        loading: this.controller?.state.loading ?? false,
-        error: this.controller?.state.error ?? null,
-        focusControl: null,
-      },
-      initialScreen: isShellScreen(screen) ? screen : 'S01',
-      host: 'vscode',
-      mode: 'shell',
-    });
-  }
 }

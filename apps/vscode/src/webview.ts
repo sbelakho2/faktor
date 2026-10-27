@@ -15,6 +15,12 @@ import * as vscode from 'vscode';
 import { randomBytes } from 'node:crypto';
 import type { FaktorSnapshot } from './state';
 import type { UserErrorProjection } from './errors';
+import { renderEdition8AppMarkup } from './edition8/html';
+import {
+  Edition8Controller,
+  type Edition8PanelDeps,
+  type PanelMessage,
+} from './edition8/panel';
 
 /** Messages the webview sends to the extension host. */
 export interface ChatMessage {
@@ -59,11 +65,24 @@ export interface ChatHost {
   onViewResolved?(): void | Promise<void>;
 }
 
-export class ChatViewProvider implements vscode.WebviewViewProvider {
-  public static readonly viewType = 'faktor.chat';
+export type FaktorView = 'work' | 'settings' | 'inspect' | 'history' | 'diagnostics';
 
-  private view: vscode.WebviewView | null = null;
+/**
+ * The ONE Faktor window. It is an editor-area WebviewPanel (opened like a
+ * document), not a sidebar view and not a second settings panel. Chat,
+ * Settings, Inspect, History and Diagnostics are internal destinations of
+ * this same webview: the host never creates a panel per surface and never
+ * splits an editor column.
+ */
+export class ChatViewProvider {
+  public static readonly viewType = 'faktor.panel';
+
+  private panel: vscode.WebviewPanel | null = null;
+  private edition8Controller: Edition8Controller | null = null;
   private snapshot: FaktorSnapshot | null = null;
+  private initialScreen = 'S29';
+  private pendingView: FaktorView | null = null;
+  private pendingSettings: { readonly screen: string; readonly home: boolean } | null = null;
   /**
    * One pending full snapshot. The store can emit several patches in a burst
    * (session patches, task patches, transcript patch); a newer full snapshot
@@ -76,38 +95,134 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private flushTimer: NodeJS.Timeout | null = null;
 
   constructor(
-    private readonly extensionUri: vscode.Uri,
+    private readonly context: vscode.ExtensionContext,
     private readonly host: ChatHost,
+    private readonly edition8: (() => Edition8PanelDeps) | null = null,
   ) {}
 
-  resolveWebviewView(view: vscode.WebviewView): void {
-    this.view = view;
-    view.webview.options = {
-      enableScripts: true,
-      localResourceRoots: [vscode.Uri.joinPath(this.extensionUri, 'media')],
-    };
-    view.webview.html = this.render(view.webview);
-    view.webview.onDidReceiveMessage((message: ChatMessage) => {
+  private get extensionUri(): vscode.Uri {
+    return this.context.extensionUri;
+  }
+
+  /** Create the one panel or focus the existing one without moving columns. */
+  private openPanel(): vscode.WebviewPanel {
+    if (this.panel !== null) {
+      this.panel.reveal(undefined, false);
+      return this.panel;
+    }
+    const panel = vscode.window.createWebviewPanel(
+      ChatViewProvider.viewType,
+      'Faktor',
+      vscode.ViewColumn.Active,
+      {
+        enableScripts: true,
+        retainContextWhenHidden: true,
+        localResourceRoots: [vscode.Uri.joinPath(this.extensionUri, 'media')],
+      },
+    );
+    this.panel = panel;
+    const deps = this.edition8 === null ? null : this.edition8();
+    if (deps !== null) {
+      this.edition8Controller = new Edition8Controller(deps, (message) => this.post(message));
+    }
+    // Register the handler before the document so the `ready`/`e8Ready`
+    // handshakes cannot fall into a gap.
+    panel.webview.onDidReceiveMessage((message: unknown) => {
       if (!validChatMessage(message)) return;
+      if (message.type.startsWith('e8')) {
+        if (message.type === 'e8Ready' && this.pendingSettings !== null) {
+          this.post(
+            this.pendingSettings.home
+              ? { type: 'e8SettingsHome' }
+              : { type: 'e8SelectScreen', screen: this.pendingSettings.screen },
+          );
+        }
+        void this.edition8Controller?.handle(message as PanelMessage);
+        return;
+      }
+      if (message.type === 'openSettingsView') {
+        this.showSettings('S29');
+        return;
+      }
+      if (message.type === 'ready') {
+        if (this.pendingView !== null) {
+          this.post({ type: 'faktorShowView', view: this.pendingView });
+        }
+        void this.host.onViewResolved?.();
+      }
       void this.host.handle(message);
     });
-    view.onDidDispose(() => {
-      this.view = null;
+    panel.webview.html = this.render(panel.webview);
+    panel.onDidDispose(() => {
+      this.edition8Controller?.dispose();
+      this.edition8Controller = null;
+      this.panel = null;
       if (this.flushTimer !== null) {
         clearTimeout(this.flushTimer);
         this.flushTimer = null;
       }
       this.pendingSnapshot = null;
     });
-    if (this.flushTimer !== null) {
-      clearTimeout(this.flushTimer);
-      this.flushTimer = null;
-    }
-    this.pendingSnapshot = null;
     if (this.snapshot !== null) {
       this.post({ type: 'snapshot', snapshot: this.snapshot });
     }
     void this.host.onViewResolved?.();
+    return panel;
+  }
+
+  /** `Open` and the activity-bar launcher focus the one panel on Chat. */
+  focus(): void {
+    this.pendingView = 'work';
+    this.openPanel();
+    this.post({ type: 'faktorShowView', view: 'work' });
+    void this.host.onViewResolved?.();
+  }
+
+  /** Switch an already-open (or newly-created) panel to an internal view. */
+  showView(view: FaktorView): void {
+    this.pendingView = view;
+    this.openPanel();
+    if (view === 'settings') {
+      this.pendingSettings = { screen: 'S29', home: true };
+      this.post({ type: 'e8SettingsHome' });
+    }
+    this.post({ type: 'faktorShowView', view });
+    if (view === 'settings') this.refreshSettings();
+  }
+
+  /**
+   * Open Settings inside the same panel. `home` selects the one settings
+   * descriptor surface; otherwise the requested registry screen is selected.
+   */
+  showSettings(screen = 'S29', home = true): void {
+    this.pendingView = 'settings';
+    this.pendingSettings = { screen, home };
+    this.openPanel();
+    this.post({ type: 'faktorShowView', view: 'settings' });
+    if (home) {
+      this.post({ type: 'e8SettingsHome' });
+    } else {
+      this.post({ type: 'e8SelectScreen', screen });
+    }
+    this.refreshSettings();
+  }
+
+  /** Map an Edition 8 command entry point onto the shared internal views. */
+  showEdition8Screen(screen: string): void {
+    if (screen === 'S01') {
+      this.showView('work');
+    } else if (screen === 'S41') {
+      this.showView('inspect');
+    } else if (screen === 'S26') {
+      this.showView('history');
+    } else {
+      this.showSettings(screen, false);
+    }
+  }
+
+  private refreshSettings(): void {
+    this.edition8Controller?.resetView();
+    void this.edition8Controller?.refresh();
   }
 
   /** Push a full state snapshot; the webview re-renders from it. */
@@ -134,7 +249,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const next = this.pendingSnapshot;
     this.pendingSnapshot = null;
     if (next !== null) {
-      void this.view?.webview.postMessage({ type: 'snapshot', snapshot: next });
+      void this.panel?.webview.postMessage({ type: 'snapshot', snapshot: next });
     }
   }
 
@@ -260,10 +375,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.post({ type: 'streamRecovery', recovering: recovering === true });
   }
 
-  focus(): void {
-    void vscode.commands.executeCommand('faktor.chat.focus');
-  }
-
   private post(message: unknown): void {
     if (
       message !== null &&
@@ -272,7 +383,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     ) {
       this.flushPendingSnapshot();
     }
-    void this.view?.webview.postMessage(message);
+    void this.panel?.webview.postMessage(message);
   }
 
   private render(webview: vscode.Webview): string {
@@ -292,9 +403,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const styleUri = webview.asWebviewUri(
       vscode.Uri.joinPath(this.extensionUri, 'media', 'chat.css'),
     );
+    const settingsStyleUri = webview.asWebviewUri(
+      vscode.Uri.joinPath(this.extensionUri, 'media', 'edition8.css'),
+    );
+    const settingsScriptUri = webview.asWebviewUri(
+      vscode.Uri.joinPath(this.extensionUri, 'media', 'edition8.js'),
+    );
+    const settingsMarkup = renderEdition8AppMarkup({
+      state: { snapshot: null, loading: false, error: null, focusControl: null },
+      initialScreen: this.initialScreen,
+      host: 'vscode',
+      mode: 'settings',
+      omitEmptyBanner: true,
+    });
     const csp = [
       "default-src 'none'",
-      `style-src ${webview.cspSource}`,
+      `style-src ${webview.cspSource} 'unsafe-inline'`,
       `font-src ${webview.cspSource}`,
       `img-src ${webview.cspSource} data:`,
       `script-src 'nonce-${nonce}'`,
@@ -308,6 +432,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 <meta charset="UTF-8">
 <meta http-equiv="Content-Security-Policy" content="${csp}">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link href="${settingsStyleUri}" rel="stylesheet">
 <link href="${styleUri}" rel="stylesheet">
 <title>Faktor</title>
 </head>
@@ -326,6 +451,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     <button id="menu-run-action" class="menu-item" tabindex="-1" type="button" role="menuitem" hidden></button>
     <button id="menu-inspect" class="menu-item" tabindex="-1" type="button" role="menuitem">Inspect</button>
     <button id="menu-history" class="menu-item" tabindex="-1" type="button" role="menuitem">History</button>
+    <button id="menu-settings" class="menu-item" tabindex="-1" type="button" role="menuitem">Settings</button>
     <button id="menu-diagnostics" class="menu-item" tabindex="-1" type="button" role="menuitem">Diagnostics</button>
     <button id="menu-stop" class="menu-item destructive" tabindex="-1" type="button" role="menuitem" hidden>Stop current run</button>
   </nav>
@@ -366,6 +492,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       <div class="composer-actions">
         <button id="btn-refresh" class="secondary" type="button" title="Refresh state">Refresh</button>
       </div>
+    </section>
+    <section id="run-diagnostics" aria-labelledby="run-diagnostics-title">
+      <h3 id="run-diagnostics-title">Run</h3>
+      <div class="meta-row"><span class="meta-key">Machine state</span><span id="diag-machine-state">unknown</span></div>
+      <div class="meta-row"><span class="meta-key">Run state</span><span id="diag-run-state">—</span></div>
+      <div class="meta-row"><span class="meta-key">Proof state</span><span id="diag-proof-state">—</span></div>
+      <div class="meta-row"><span class="meta-key">Stream state</span><span id="diag-stream-state">stopped</span></div>
+      <div class="meta-row"><span class="meta-key">Service state</span><span id="diag-daemon-state">stopped</span></div>
+      <div class="meta-row"><span class="meta-key">Last error</span><span id="diag-last-error">—</span></div>
     </section>
     <div id="stream-cursor" class="muted" hidden></div>
     <section id="sandbox-setup" class="setup-card" aria-labelledby="sandbox-setup-title">
@@ -505,10 +640,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           <span id="overview-status-copy" class="state-strip-copy muted"></span>
         </div>
         <dl id="overview-summary-list" class="overview-summary-list"></dl>
-        <details id="overview-advanced" class="technical-disclosure">
-          <summary>Advanced diagnostics</summary>
-          <div id="overview-advanced-body" class="muted"></div>
-        </details>
       </section>
       <section id="inspect-card" class="card">
         <div id="task-completion" class="completion"></div>
@@ -645,12 +776,58 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       </section>
     </section>
   </section>
+  <section id="settings-panel" class="view-panel settings-view" role="region" aria-label="Settings" tabindex="-1" hidden>
+${settingsMarkup}
+  </section>
 </div>
+<script nonce="${nonce}">document.body.setAttribute('data-mode', 'settings'); window.__faktorE8Initial = "S29";</script>
+<script nonce="${nonce}" src="${settingsScriptUri}"></script>
 <script nonce="${nonce}" src="${boardUri}"></script>
 <script nonce="${nonce}" src="${historyUri}"></script>
 <script nonce="${nonce}" src="${composerUri}"></script>
 <script nonce="${nonce}" src="${scriptUri}"></script>
 </body>
 </html>`;
+  }
+}
+
+/**
+ * The activity-bar entry is ONLY a launcher. Resolving it opens (or focuses)
+ * the one editor panel; the sidebar never hosts a second chat or settings
+ * surface. The small launcher card remains usable for a second click.
+ */
+export class LauncherViewProvider implements vscode.WebviewViewProvider {
+  public static readonly viewType = 'faktor.launcher';
+
+  resolveWebviewView(view: vscode.WebviewView): void {
+    const nonce = randomBytes(16).toString('hex');
+    view.webview.options = { enableScripts: true };
+    view.webview.html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${view.webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}'; base-uri 'none'; form-action 'none';" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Faktor</title>
+</head>
+<body>
+<main style="font-family: var(--vscode-font-family); color: var(--vscode-foreground); padding: 12px; display: grid; gap: 8px;">
+  <p style="margin: 0;">Faktor opens in the editor, as one window.</p>
+  <button type="button" data-faktor-open="true" style="min-height: 28px;">Open Faktor</button>
+</main>
+<script nonce="${nonce}">
+  const vscode = acquireVsCodeApi();
+  document.querySelector('[data-faktor-open]').addEventListener('click', function () {
+    vscode.postMessage({ type: 'open' });
+  });
+  vscode.postMessage({ type: 'open' });
+</script>
+</body>
+</html>`;
+    view.webview.onDidReceiveMessage((message: { type?: unknown }) => {
+      if (message !== null && typeof message === 'object' && message.type === 'open') {
+        void vscode.commands.executeCommand('faktor.openChat');
+      }
+    });
   }
 }

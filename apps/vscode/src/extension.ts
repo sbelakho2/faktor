@@ -120,7 +120,7 @@ import { loadConversation, sendAskTurn } from './askFlow.ts';
 import { composerIntentOf } from './uxState.ts';
 import { refreshReadPlan } from './refreshReads.ts';
 import { Edition8Client } from './edition8/client.ts';
-import { Edition8Panel, Edition8ViewProvider, type Edition8PanelDeps } from './edition8/panel.ts';
+import type { Edition8PanelDeps } from './edition8/panel.ts';
 import { pickModel, registerEdition8 } from './edition8/commands.ts';
 import { registerLspDiagnostics } from './lspDiagnostics.ts';
 import { addContextDraft, toggleFavorite } from './edition8/hostDraft.ts';
@@ -213,7 +213,7 @@ import {
   storeControlPlaneToken,
   watchControlPlaneSecretChanges,
 } from './controlPlaneAuth';
-import { ChatMessage, ChatViewProvider } from './webview';
+import { ChatMessage, ChatViewProvider, LauncherViewProvider } from './webview';
 
 const HISTORY_PAGE_LIMIT = 100;
 const MAX_EVIDENCE_PREVIEW_BYTES = 256 * 1024;
@@ -4387,8 +4387,9 @@ async function handleWebviewMessage(
     // `Return to run`: the chat command focuses the panel and the webview's
     // own Work subview switch happens locally (one surface, no round trip
     // needed for the view move).
-    case 'openControlCenter':
-      openControlCenter(context, typeof message.screen === 'string' ? message.screen : 'S29');
+    case 'openSettingsView':
+      // An internal destination of the one panel: no new panel is created.
+      openControlCenter(context, 'S29');
       return;
     case 'openWork':
       await vscode.commands.executeCommand('faktor.openChat');
@@ -4417,13 +4418,12 @@ async function handleWebviewMessage(
 // ---------------------------------------------------------- Settings surface
 
 /**
- * Settings is its own full-window editor tab over the Edition 8 surface.
- * The legacy Edition 5 control-center tab is gone: one surface, one row per
- * descriptor, one Apply footer. The shared live client/session still drives
- * every staged write.
+ * Settings renders INSIDE the one Faktor editor panel. There is no settings
+ * tab, no editor split and no sidebar duplicate: the panel's internal view
+ * router swaps Chat / Settings / Inspect / History / Diagnostics.
  */
-function openControlCenter(context: vscode.ExtensionContext, screen = 'S29'): void {
-  Edition8Panel.createOrShow(context, edition8Deps(context), screen);
+function openControlCenter(_context: vscode.ExtensionContext, screen = 'S29'): void {
+  chatProvider?.showSettings(screen, screen === 'S29');
 }
 
 // ------------------------------------------------------- Edition 8 surfaces
@@ -4546,16 +4546,20 @@ export function activate(context: vscode.ExtensionContext): void {
   // resolution + trust): the Work empty state shows exactly this view.
   publishPreflight(context);
 
-  chatProvider = new ChatViewProvider(context.extensionUri, {
-    handle: (message) => handleWebviewMessage(message, context),
-    onViewResolved: () => {
-      postHostOwnedViewState();
-      // Opening Faktor is the ONE automatic trigger: a verified installed
-      // executable starts without a Start-service decision. The supervisor
-      // dedupes this with command/task triggers.
-      void ensureServiceLifecycle(context).open();
+  chatProvider = new ChatViewProvider(
+    context,
+    {
+      handle: (message) => handleWebviewMessage(message, context),
+      onViewResolved: () => {
+        postHostOwnedViewState();
+        // Opening Faktor is the ONE automatic trigger: a verified installed
+        // executable starts without a Start-service decision. The supervisor
+        // dedupes this with command/task triggers.
+        void ensureServiceLifecycle(context).open();
+      },
     },
-  });
+    () => edition8Deps(context),
+  );
 
   // EXTERNAL SecretStorage changes (another window, the OS keychain UI, an
   // import) must reach the RUNNING client: `onDidChange` re-runs the same
@@ -4588,24 +4592,18 @@ export function activate(context: vscode.ExtensionContext): void {
       session: () => active.sessionId,
       workspaceRoot: () => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? null,
     }),
-    vscode.window.registerWebviewViewProvider(ChatViewProvider.viewType, chatProvider, {
+    vscode.window.registerWebviewViewProvider(LauncherViewProvider.viewType, new LauncherViewProvider(), {
       webviewOptions: { retainContextWhenHidden: true },
     }),
     (() => {
       const deps = edition8Deps(context);
-      const view = new Edition8ViewProvider(context, deps);
-      return vscode.Disposable.from(
-        vscode.window.registerWebviewViewProvider(Edition8ViewProvider.viewType, view, {
-          webviewOptions: { retainContextWhenHidden: true },
-        }),
-        registerEdition8(context, {
-          deps,
-          view,
-          openSettings: (screen: string) => Edition8Panel.createOrShow(context, deps, screen),
-          cancelRun: () => cancelActiveRun(),
-          switchConversation: () => switchSessionFromCommand(context),
-        }),
-      );
+      return registerEdition8(context, {
+        deps,
+        view: { show: (screen: string) => chatProvider?.showEdition8Screen(screen) },
+        openSettings: (screen: string) => chatProvider?.showSettings(screen, screen === 'S29'),
+        cancelRun: () => cancelActiveRun(),
+        switchConversation: () => switchSessionFromCommand(context),
+      });
     })(),
     vscode.commands.registerCommand('faktor.startServer', async () => {
       try {

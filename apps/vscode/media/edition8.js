@@ -5,7 +5,7 @@
 (function () {
   'use strict';
 
-  var vscode = acquireVsCodeApi();
+  var vscode = window.__faktorVsCode || (window.__faktorVsCode = acquireVsCodeApi());
   var app = document.getElementById('e8-app');
   if (!app) return;
 

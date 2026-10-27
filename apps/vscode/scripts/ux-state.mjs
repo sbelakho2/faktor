@@ -114,16 +114,31 @@ test('needs-input, failed check and unrecoverable failures have distinct labels'
   assert.equal(unrecoverable.presentationAction.key, 'openDiagnostics');
 });
 
-test('machine terms stay behind Advanced diagnostics', () => {
+test('machine terms never enter the chat projection (Diagnostics reads the snapshot)', () => {
   const ux = projectUx({
-    machineState: 'failed_recoverable',
+    daemon: 'running',
+    machineState: 'ready_for_next_turn',
     lastError: 'corrupt_durable_state',
-    runs: [{ state: 'failed' }],
+    runs: [{ state: 'Verifying' }],
+    proofTaskState: 'verifying',
+    streamStatus: 'open',
     activeRunId: 'run-1',
   });
   assert.doesNotMatch(ux.presentationLabel, /failed_recoverable|corrupt_durable_state/);
-  assert.ok(ux.advanced.some((line) => line.includes('failed_recoverable')));
-  assert.ok(ux.advanced.some((line) => line.includes('corrupt_durable_state')));
+  assert.ok(!('advanced' in ux), 'the projection carries no machine-state tail');
+  const serialized = JSON.stringify(ux);
+  for (const term of [
+    'ready_for_next_turn',
+    'Verifying',
+    'verifying',
+    'machine state',
+    'run state',
+    'proof state',
+    'daemon',
+    'stream',
+  ]) {
+    assert.ok(!serialized.includes(term), `the chat projection must not carry ${term}`);
+  }
 });
 
 test('attention is aggregated to at most three groups, with absence omitted', () => {

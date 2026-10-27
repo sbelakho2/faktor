@@ -9319,29 +9319,21 @@ async function attentionWebviewTests() {
     assertEqual(card.hidden, true, 'a recovered error is omitted');
   });
 
-  await test('the snapshot lastError fallback surfaces once in the attention card', () => {
+  await test('a raw snapshot lastError stays in Diagnostics and never makes a chat card', () => {
     const harness = runChatWebview(webviewSnapshot([]));
     const snapshot = { ...webviewSnapshot([]), lastError: 'native API error 500 internal: boom' };
     harness.deliver({ type: 'snapshot', snapshot });
     const card = harness.dom.document.getElementById('attention-card');
-    assertEqual(card.hidden, false, 'the raw error surfaces the attention card');
+    assertEqual(card.hidden, true, 'a non-actionable raw error never surfaces a chat card');
     assertEqual(
-      harness.dom.document.getElementById('attention-card-title').textContent,
-      'Faktor hit a problem',
+      harness.dom.document.getElementById('diag-last-error').textContent,
+      'native API error 500 internal: boom',
+      'the raw error is available in Diagnostics',
     );
-    assertEqual(harness.dom.document.getElementById('attention-technical').hidden, false);
-    assert(
-      harness.dom.document
-        .getElementById('attention-technical-body')
-        .textContent.includes('native API error 500 internal: boom'),
-      harness.dom.document.getElementById('attention-technical-body').textContent,
-    );
-    harness.deliver({ type: 'snapshot', snapshot: { ...snapshot } });
-    assertEqual(card.hidden, false);
     assertEqual(
       harness.dom.document.querySelectorAll('.user-error').length,
       0,
-      'an unchanged raw error never appends a duplicate card',
+      'no legacy generic error card exists',
     );
   });
 
@@ -15999,6 +15991,110 @@ async function askFirstUxTests() {
       !entriesScroll(mutateRule(css, '#entries', 'overflow-y: auto;', 'overflow-y: visible;')),
       'mutation witness: a non-scrolling transcript is detected',
     );
+    const oneColumn = (source) => {
+      const rule = ruleOf(source, '#work-panel');
+      return (
+        /display:\s*flex/.test(rule) &&
+        /flex-direction:\s*column/.test(rule) &&
+        !/grid-template-columns/.test(rule)
+      );
+    };
+    assert(oneColumn(css), 'chat is one column at every width');
+    assert(
+      !oneColumn(mutateRule(css, '#work-panel', 'flex-direction: column;', 'flex-direction: row;')),
+      'mutation witness: a side-by-side chat row is detected',
+    );
+    const gridRule = ruleOf(css, '#work-panel')
+      .replace('display: flex;', 'display: grid;')
+      .replace('flex-direction: column;', 'grid-template-columns: 1fr 1fr;');
+    assert(
+      !oneColumn(css.replace(ruleOf(css, '#work-panel'), gridRule)),
+      'mutation witness: a two-column chat grid is detected',
+    );
+    assert(!css.includes('.work-status'), 'no residual second chat status row');
+  });
+
+  await test('chat DOM never renders machine/run/proof/stream/daemon state lines', () => {
+    const snapshot = webviewSnapshot([]);
+    snapshot.daemon = 'running';
+    snapshot.machineState = 'ready_for_next_turn';
+    snapshot.machineLabel = 'Ready for next turn';
+    snapshot.runs = [{ state: 'Verifying' }];
+    snapshot.proofTaskState = 'verifying';
+    snapshot.streamStatus = 'open';
+    snapshot.lastError = 'native API error 500 internal: boom';
+    snapshot.ux = {
+      ...ux.projectUx({
+        daemon: snapshot.daemon,
+        machineState: snapshot.machineState,
+        runs: snapshot.runs,
+        proofTaskState: snapshot.proofTaskState,
+        streamStatus: snapshot.streamStatus,
+        lastError: snapshot.lastError,
+      }),
+      // Adversarial tail: any renderer that copies machine vocabulary fails.
+      advanced: [
+        'machine state: ready_for_next_turn',
+        'run state: Verifying',
+        'proof state: verifying',
+        'stream: open',
+        'daemon: running',
+      ],
+    };
+    const { dom } = runChatWebview(snapshot);
+    const chatText = fakeText(dom.document.getElementById('work-panel')).toLowerCase();
+    for (const forbidden of [
+      'ready_for_next_turn',
+      'machine state:',
+      'run state:',
+      'proof state:',
+      'stream:',
+      'daemon:',
+      'verification-record',
+      'contract-state',
+    ]) {
+      assert(!chatText.includes(forbidden), `chat leaked ${forbidden}: ${chatText}`);
+    }
+    assertEqual(dom.document.getElementById('diag-machine-state').textContent, 'ready_for_next_turn');
+    assertEqual(dom.document.getElementById('diag-run-state').textContent, 'Verifying');
+    assertEqual(dom.document.getElementById('diag-proof-state').textContent, 'verifying');
+    assertEqual(dom.document.getElementById('diag-stream-state').textContent, 'open');
+    assertEqual(dom.document.getElementById('diag-daemon-state').textContent, 'running');
+    assertEqual(
+      dom.document.getElementById('diag-last-error').textContent,
+      'native API error 500 internal: boom',
+    );
+  });
+
+  await test('mutation witness: machine-state leakage into the chat projection is detected', () => {
+    const uxSource = readFileSync(new URL('../src/uxState.ts', import.meta.url), 'utf8');
+    const chatSource = readFileSync(new URL('../media/chat.js', import.meta.url), 'utf8');
+    const projectionLeaks = (source) =>
+      /push\('(?:machine|run|proof) state'|push\('(?:stream|daemon)'/.test(source);
+    assert(!projectionLeaks(uxSource), 'the UX projection carries no machine-state push');
+    assert(
+      projectionLeaks(
+        uxSource.replace(
+          '/** Project one served',
+          "function advancedLines() { var lines = []; lines.push('machine state'); return lines; }\n/** Project one served",
+        ),
+      ),
+      'mutation witness: a machine-state projection push is detected',
+    );
+    const rendererLeaks = (source) =>
+      /ux\.advanced/.test(source) || /overview-advanced-body/.test(source);
+    assert(!rendererLeaks(chatSource), 'the chat renderer never reads a machine-state tail');
+    assert(
+      rendererLeaks(
+        chatSource.replace(
+          'var technical = [];',
+          "var technical = []; technical.push(String(ux.advanced[a]));",
+        ),
+      ),
+      'mutation witness: a chat technical tail copying advanced state is detected',
+    );
+    const markup = readFileSync(new URL('../src/webview.ts', import.meta.url), 'utf8');
+    assert(!markup.includes('overview-advanced'), 'no advanced machine-state block remains in chat/inspect');
   });
 }
 

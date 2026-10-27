@@ -34,6 +34,8 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { mkdtempSync } from 'node:fs';
+import { projectUx } from '../src/uxState.ts';
+import { renderEdition8AppMarkup } from '../src/edition8/html.ts';
 
 // Node's global WebSocket is flag-gated before Node 22. Re-exec once with
 // the flag so the harness works on every supported Node without asking the
@@ -199,10 +201,21 @@ function harnessSnapshot(empty = false, permissions = false, problem = false) {
       model: 'gpt-5',
       state: 'running',
     },
-    machineState: 'running',
-    machineLabel: 'Running · ready',
+    machineState: 'ready_for_next_turn',
+    machineLabel: 'Ready for next turn',
     sessions: [],
-    runs: [],
+    // Adversarial raw states: the chat body must never render any of them.
+    runs: [
+      {
+        taskId: '3',
+        runId: 'r1',
+        mode: 'in_session',
+        state: 'Verifying',
+        goal: 'Close the UX audit interaction defects',
+        model: null,
+      },
+    ],
+    proofTaskState: 'verifying',
     activeRunId: 'r1',
     permissions: permissions
       ? [
@@ -557,6 +570,7 @@ function harnessSnapshot(empty = false, permissions = false, problem = false) {
     snapshot.usagePanel = null;
     snapshot.indexCoverage = null;
     snapshot.runs = [];
+    snapshot.proofTaskState = null;
     snapshot.board = {
       available: false,
       source: 'none',
@@ -566,6 +580,32 @@ function harnessSnapshot(empty = false, permissions = false, problem = false) {
       posts: [],
     };
   }
+  // The real host derives this projection from the same snapshot. The
+  // adversarial `advanced` tail models the legacy leak: if the chat renderer
+  // ever copies it into the attention card, the DOM assertion catches it.
+  snapshot.ux = {
+    ...projectUx({
+      daemon: snapshot.daemon,
+      machineState: snapshot.machineState,
+      activeRunId: snapshot.activeRunId,
+      runs: snapshot.runs,
+      proofTaskState: snapshot.proofTaskState,
+      task: snapshot.task,
+      verification: snapshot.verification,
+      cockpit: null,
+      changes: snapshot.changes,
+      permissions: snapshot.permissions,
+      streamStatus: snapshot.streamStatus,
+      lastError: snapshot.lastError,
+    }),
+    advanced: [
+      'machine state: ready_for_next_turn',
+      'run state: Verifying',
+      'proof state: verifying',
+      'stream: open',
+      'daemon: running',
+    ],
+  };
   return snapshot;
 }
 
@@ -593,6 +633,8 @@ export function buildHarnessHtml(
   const fileUrl = (path) => pathToFileURL(path).href;
   for (const [placeholder, path] of [
     ['${styleUri}', join(MEDIA, 'chat.css')],
+    ['${settingsStyleUri}', join(MEDIA, 'edition8.css')],
+    ['${settingsScriptUri}', join(MEDIA, 'edition8.js')],
     ['${boardUri}', join(MEDIA, 'board-state.js')],
     ['${historyUri}', join(MEDIA, 'history-state.js')],
     ['${composerUri}', join(MEDIA, 'composer-state.js')],
@@ -603,6 +645,19 @@ export function buildHarnessHtml(
     }
     html = html.replace(placeholder, fileUrl(path));
   }
+  if (!html.includes('${settingsMarkup}')) {
+    throw new Error('src/webview.ts lost the ${settingsMarkup} placeholder');
+  }
+  html = html.replace(
+    '${settingsMarkup}',
+    renderEdition8AppMarkup({
+      state: { snapshot: null, loading: false, error: null, focusControl: null },
+      initialScreen: 'S29',
+      host: 'vscode',
+      mode: 'settings',
+      omitEmptyBanner: true,
+    }),
+  );
   const themeStyle = `<style id="faktor-harness-theme">${themeCss}</style>`;
   const apiStub = `<script>window.__posted = []; window.acquireVsCodeApi = function () { return { postMessage: function (message) { window.__posted.push(message); } }; };</script>`;
   const snapshotJson = JSON.stringify(
@@ -795,11 +850,27 @@ const SURFACE_SCRIPT = `(() => {
   };
   const visible = (el) => !!el && !el.hidden && el.getClientRects().length > 0;
   const work = document.getElementById('work-panel');
+  const workStyle = work ? getComputedStyle(work) : null;
   const surfaces = [];
   if (work) {
     for (const child of work.children) {
       if (!visible(child)) continue;
-      surfaces.push({ id: child.id || child.className, ...rect(child) });
+      surfaces.push({
+        id: child.id || child.className,
+        position: getComputedStyle(child).position,
+        ...rect(child),
+      });
+    }
+  }
+  const columnXs = new Set(surfaces.map((surface) => Math.round(surface.x * 10) / 10));
+  const layered = [];
+  if (work) {
+    for (const el of work.querySelectorAll('*')) {
+      if (!visible(el) || el.closest('.sr-only')) continue;
+      const position = getComputedStyle(el).position;
+      if (position === 'absolute' || position === 'fixed' || position === 'sticky') {
+        layered.push((el.id ? '#' + el.id : el.tagName.toLowerCase()) + ':' + position);
+      }
     }
   }
   const attention = document.getElementById('attention-card');
@@ -827,6 +898,11 @@ const SURFACE_SCRIPT = `(() => {
       : null,
     noticesVisible: document.querySelectorAll('#notices .notice').length,
     surfaces,
+    workDisplay: workStyle ? workStyle.display : null,
+    workDirection: workStyle ? workStyle.flexDirection : null,
+    workColumns: columnXs.size,
+    layered,
+    workText: work ? String(work.innerText || work.textContent || '') : '',
     composer: composer ? { ...rect(composer), position: getComputedStyle(composer).position } : null,
     transcript: document.getElementById('transcript-card')
       ? rect(document.getElementById('transcript-card'))
@@ -1012,9 +1088,46 @@ function assertLayout(result, context, failures, { targets = true, primaryVisibl
  * `problem` is true for the fixture that serves authority + blocked stream +
  * a raw error; false for the healthy populated surface.
  */
+const FORBIDDEN_CHAT_STATE = [
+  'ready_for_next_turn',
+  'machine state:',
+  'run state:',
+  'proof state:',
+  'stream:',
+  'daemon:',
+  'verification-record',
+  'contract-state',
+];
+
 function assertSurface(result, context, failures, problem) {
   if (result.headerCount !== 1) {
     failures.push(`${context}: expected ONE header, found ${result.headerCount}`);
+  }
+  // The chat body is conversation-only: raw machine/daemon/run/proof/stream
+  // vocabulary never appears, even when the snapshot serves it.
+  const chatText = String(result.workText || '').toLowerCase();
+  for (const forbidden of FORBIDDEN_CHAT_STATE) {
+    if (chatText.includes(forbidden)) {
+      failures.push(`${context}: chat body leaked machine state ${JSON.stringify(forbidden)}`);
+    }
+  }
+  // ONE column, always: every chat region shares the same inline origin and
+  // the work panel itself is a column flexbox (never a grid/side-by-side).
+  if (result.workDisplay !== 'flex' || result.workDirection !== 'column') {
+    failures.push(
+      `${context}: chat must be one column (display ${String(result.workDisplay)}, direction ${String(result.workDirection)})`,
+    );
+  }
+  if (result.workColumns > 1) {
+    failures.push(`${context}: chat split into ${result.workColumns} columns`);
+  }
+  for (const surface of result.surfaces || []) {
+    if (surface.position === 'absolute' || surface.position === 'fixed' || surface.position === 'sticky') {
+      failures.push(`${context}: ${surface.id} is an overlapping ${surface.position} layer`);
+    }
+  }
+  if ((result.layered || []).length > 0) {
+    failures.push(`${context}: chat contains overlapping layers ${result.layered.join(', ')}`);
   }
   if (result.chatTabs !== 0 || result.strayTabs !== 0) {
     failures.push(

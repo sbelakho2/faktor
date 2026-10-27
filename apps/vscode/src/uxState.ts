@@ -2,8 +2,9 @@
 //
 // Product boundary: the model translates served machine conditions into a
 // SMALL vocabulary of user-facing states. Raw enum names, provider error
-// text and identifiers are never headlines; they stay in `advanced` (the
-// Advanced diagnostics disclosure). The same enum names are mirrored in
+// text and identifiers are never part of this projection: they live ONLY in
+// the Diagnostics surface, which reads the served snapshot directly. The
+// same enum names are mirrored in
 // `apps/jetbrains/shared/src/main/kotlin/dev/faktor/shared/UxStateModel.kt`.
 //
 // Everything here is pure and dependency-free so the webview contract, the
@@ -76,8 +77,6 @@ export interface UxProjection {
   /** Aggregated, at most three groups, most actionable/informative first. */
   readonly attention: readonly AttentionItem[];
   readonly summary: UxSummary;
-  /** Machine terms only; rendered behind Advanced diagnostics. */
-  readonly advanced: readonly string[];
 }
 
 export interface UxRunLike {
@@ -158,7 +157,6 @@ export interface UxInput {
 const MAX_ATTENTION_GROUPS = 3;
 const MAX_LABEL_CHARS = 72;
 const MAX_DETAIL_CHARS = 220;
-const MAX_ADVANCED_CHARS = 240;
 
 function text(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
@@ -611,23 +609,6 @@ function summaryOf(input: UxInput, presentation: TaskPresentation): UxSummary {
   };
 }
 
-function advancedLines(input: UxInput): readonly string[] {
-  const lines: string[] = [];
-  const push = (prefix: string, value: unknown): void => {
-    const raw = text(value);
-    if (raw.length === 0) return;
-    lines.push(bound(`${prefix}: ${raw}`, MAX_ADVANCED_CHARS));
-  };
-  push('machine state', input.machineState);
-  push('run state', input.runs?.[0]?.state);
-  push('proof state', input.proofTaskState);
-  push('stream', input.streamStatus);
-  push('daemon', input.daemon);
-  push('error kind', input.errorKind);
-  push('error', input.lastError);
-  return lines;
-}
-
 /** Project one served snapshot/condition set into the shared UX model. */
 export function projectUx(input: UxInput, intent: ComposerIntent = DEFAULT_COMPOSER_INTENT): UxProjection {
   const checksFailed = checksFailedOf(input);
@@ -642,7 +623,6 @@ export function projectUx(input: UxInput, intent: ComposerIntent = DEFAULT_COMPO
     presentationAction: cause?.action ?? base.action,
     attention: aggregateAttention(input),
     summary: summaryOf(input, presentation),
-    advanced: advancedLines(input),
   };
 }
 

@@ -64,6 +64,8 @@ body {
 #work-panel {
   display: flex;
   flex-direction: column;
+  flex-wrap: nowrap;
+  align-items: stretch;
   flex: 1 1 auto;
   gap: var(--space-2);
   min-height: 0;
@@ -71,13 +73,39 @@ body {
   padding: var(--space-2) var(--space-3) 0;
 }
 
+/* ONE chat column, always: every chat region spans the same inline axis and
+   stacks in flow. There is no split/side-by-side chat layout at any width. */
+#work-panel > * {
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+}
+
 #inspect-panel,
 #history-panel,
+#settings-panel,
 #diagnostics {
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
   padding: var(--space-2) var(--space-3);
+}
+
+/* Settings is the SAME surface as Chat: no second header, no editor tab and
+   no second column. The one chat header stays above it. */
+#settings-panel {
+  display: block;
+  padding: 0;
+}
+
+#settings-panel .e8-header {
+  display: none;
+}
+
+#settings-panel #e8-app {
+  min-height: 0;
+  height: auto;
+  grid-template-rows: auto minmax(0, 1fr) auto;
 }
 
 /* One active destination at a time. Order is explicit because the semantic
@@ -89,6 +117,7 @@ body {
 #app > #work-panel { order: 4; }
 #app > #inspect-panel { order: 5; }
 #app > #history-panel { order: 6; }
+#app > #settings-panel { order: 7; }
 
 .view-panel,
 .inspect-subpanel {
@@ -748,38 +777,6 @@ button.toggle[aria-expanded='true'] {
   flex: none;
   max-height: 100%;
   overflow-y: auto;
-}
-
-/* One compact run status row while a run exists: state, tokens and approvals.
-   Run details (goal, plan, candidate boundary) live in Inspect; idle chat has
-   no second header at all. */
-.work-status {
-  flex: none;
-  border: 1px solid var(--faktor-border);
-  border-left: 3px solid var(--faktor-accent);
-  border-radius: var(--faktor-radius);
-  padding: 4px var(--space-2);
-  background: var(--vscode-sideBar-background, var(--vscode-editor-background, transparent));
-}
-
-.work-status .run-strip {
-  min-height: 28px;
-}
-
-.work-status .run-chip {
-  font-size: 0.78em;
-}
-
-.work-status .status-stop,
-.work-status .status-inspect {
-  min-height: 28px;
-  padding: 1px 8px;
-  font-size: 0.82em;
-}
-
-.work-status #run-state {
-  margin-top: 2px;
-  font-size: 0.88em;
 }
 
 .run-strip {

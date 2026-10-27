@@ -5,7 +5,7 @@
 (function () {
   'use strict';
 
-  var vscode = acquireVsCodeApi();
+  var vscode = window.__faktorVsCode || (window.__faktorVsCode = acquireVsCodeApi());
   var composerPolicy = (typeof FaktorComposer !== 'undefined' && FaktorComposer) || {
     afterStart: function (draft) {
       return String(draft == null ? '' : draft);
@@ -261,6 +261,7 @@
   var activeMenuAction = null;
   var VIEW_PANELS = {
     work: 'work-panel',
+    settings: 'settings-panel',
     inspect: 'inspect-panel',
     history: 'history-panel',
     diagnostics: 'diagnostics',
@@ -1021,6 +1022,7 @@
       work: 'menu-chat',
       inspect: 'menu-inspect',
       history: 'menu-history',
+      settings: 'menu-settings',
       diagnostics: 'menu-diagnostics',
     };
     for (var panelKey in VIEW_PANELS) {
@@ -1044,6 +1046,7 @@
     'menu-run-action',
     'menu-inspect',
     'menu-history',
+    'menu-settings',
     'menu-diagnostics',
     'menu-stop',
   ];
@@ -4580,23 +4583,17 @@
     }
     var task = snapshot.task;
     var hasActiveRun = snapshot.busy === true || snapshot.activeRunId != null;
+    var spec = runStateSpec(snapshot);
     if (hasActiveRun && task) {
-      var state =
-        typeof task.phase === 'string' && task.phase.length > 0
-          ? task.phase
-          : String(task.state == null ? '' : task.state);
       var agents = Array.isArray(snapshot.agents) ? snapshot.agents.length : 0;
-      var parts = ['Running'];
+      var label = spec !== null && spec.label && spec.label !== 'Ready' ? spec.label : 'Running';
+      var parts = [label];
       if (agents > 0) {
         parts.push(agents + (agents === 1 ? ' agent' : ' agents'));
-      }
-      if (state.length > 0) {
-        parts.push(state);
       }
       return parts.join(' · ');
     }
     var model = snapshot.session && snapshot.session.model ? String(snapshot.session.model) : '';
-    var spec = runStateSpec(snapshot);
     if (spec !== null && spec.label && spec.label !== 'Ready') {
       return model.length > 0 ? spec.label + ' · ' + model : spec.label;
     }
@@ -5313,12 +5310,9 @@
       return null;
     }
     var first = visible[0];
+    // Machine vocabulary (machine/run/proof/stream/daemon state) is
+    // Diagnostics-only: the chat projection never copies it into the card.
     var technical = [];
-    if (ux && Array.isArray(ux.advanced)) {
-      for (var a = 0; a < ux.advanced.length; a++) {
-        technical.push(String(ux.advanced[a]));
-      }
-    }
     for (var r = 1; r < visible.length; r++) {
       technical.push(
         String(visible[r].label || '') +
@@ -5433,7 +5427,9 @@
         }
       }
     }
-    if (chosen === null) {
+    // Calm tasks and non-actionable conditions stay silent: the chat card
+    // appears only when a genuinely actionable cause is served.
+    if (chosen === null || chosen.action === null) {
       card.hidden = true;
       renderedProblemKey = null;
       setText('attention-card-title', 'Needs attention');
@@ -5532,12 +5528,6 @@
       dd.textContent = String(rows[i][1]);
       list.appendChild(dt);
       list.appendChild(dd);
-    }
-    var advancedBody = byId('overview-advanced-body');
-    if (advancedBody) {
-      clear(advancedBody);
-      var lines = Array.isArray(ux.advanced) ? ux.advanced : [];
-      advancedBody.textContent = lines.join('\n');
     }
   }
 
@@ -5640,6 +5630,7 @@
     setText('machine-label', snapshot.machineLabel || snapshot.machineState);
     setText('stream-status', streamStatusLabel(snapshot.streamStatus));
     setText('index-coverage', indexCoverageText(snapshot));
+    renderDiagnosticsState(snapshot);
     renderComposerModel(snapshot.session);
     renderAttention(snapshot);
     renderOverviewSummary(snapshot);
@@ -5676,28 +5667,27 @@
         setProblemSource('user', null);
       }
       lastRenderedError = null;
-    } else if (lastError !== lastRenderedError) {
+    } else {
+      // The RAW last error is Diagnostics-only. A healthy/calm chat never
+      // gets a generic "hit a problem" card from it; only a cause-specific,
+      // actionable projection may surface in the chat body.
       lastRenderedError = lastError;
-      // A served authority/stream/attention problem or an already-projected
-      // user error with the SAME tail explains this raw text; never append a
-      // generic duplicate.
-      var existingUser = problemSources.user;
-      var explained =
-        problemSources.authority !== null ||
-        problemSources.stream !== null ||
-        problemSources.attention !== null ||
-        (existingUser !== null && existingUser.technical.indexOf(lastError) !== -1);
-      if (!explained) {
-        showUserError({
-          kind: 'unexpected',
-          summary: 'Faktor hit a problem',
-          hint: 'Try the action again; open Diagnostics for the raw detail.',
-          action: null,
-          technical: lastError,
-          code: null,
-        });
-      }
     }
+  }
+
+  /**
+   * Diagnostics → Run: the ONLY surface that carries raw served machine
+   * vocabulary. The chat body reads the human projection, never these rows.
+   */
+  function renderDiagnosticsState(snapshot) {
+    var runs = snapshot && Array.isArray(snapshot.runs) ? snapshot.runs : [];
+    var newest = runs.length > 0 ? runs[0] : null;
+    setText('diag-machine-state', snapshot ? snapshot.machineState : null);
+    setText('diag-run-state', newest && newest.state != null ? newest.state : null);
+    setText('diag-proof-state', snapshot ? snapshot.proofTaskState : null);
+    setText('diag-stream-state', snapshot ? snapshot.streamStatus : null);
+    setText('diag-daemon-state', snapshot ? snapshot.daemon : null);
+    setText('diag-last-error', snapshot ? snapshot.lastError : null);
   }
 
   /** The composer's model chip: session identity, quiet and non-interactive. */
@@ -5928,6 +5918,13 @@
     if (message.type === 'snapshot') {
       pendingSnapshot = message.snapshot;
       scheduleSnapshotFlush();
+    } else if (message.type === 'faktorShowView') {
+      // The host selected an internal destination of this SAME panel. No
+      // panel, column or sidebar is created; the local view router moves.
+      var requestedView = message.view === 'chat' ? 'work' : message.view;
+      if (VIEW_PANELS[requestedView]) {
+        openView(requestedView);
+      }
     } else if (message.type === 'evidence') {
       deliverEvidence(message.id, message.text, message.truncated);
     } else if (message.type === 'boardPosted' || message.type === 'boardRefused') {
@@ -6409,7 +6406,8 @@
   // Diagnostics) and the scoped Stop action. It is NOT a second header:
   // selecting an item swaps the full-window view and closes the menu.
   byId('btn-control-center').addEventListener('click', function () {
-    vscode.postMessage({ type: 'openControlCenter', screen: 'S29' });
+    openView('settings');
+    vscode.postMessage({ type: 'openSettingsView' });
   });
   byId('btn-overflow').addEventListener('click', function () {
     toggleOverflow();
@@ -6429,6 +6427,10 @@
   });
   byId('menu-history').addEventListener('click', function () {
     openView('history');
+  });
+  byId('menu-settings').addEventListener('click', function () {
+    openView('settings');
+    vscode.postMessage({ type: 'openSettingsView' });
   });
   byId('menu-diagnostics').addEventListener('click', function () {
     openView('diagnostics');

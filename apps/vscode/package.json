@@ -13,6 +13,7 @@
   ],
   "icon": "media/faktor-icon.png",
   "activationEvents": [
+    "onView:faktor.launcher",
     "onCommand:faktor.startServer",
     "onCommand:faktor.stopServer",
     "onCommand:faktor.openChat",
@@ -25,11 +26,9 @@
     "onCommand:faktor.reconnectStream",
     "onCommand:faktor.switchSession",
     "onCommand:faktor.locateDaemon",
-    "onView:faktor.chat",
     "onCommand:faktor.openControlCenter",
     "onCommand:faktor.openModelPicker",
     "onCommand:faktor.openSettings",
-    "onView:faktor.edition8",
     "onCommand:faktor.openEdition8",
     "onCommand:faktor.openInspect8",
     "onCommand:faktor.openHistory8",
@@ -244,13 +243,8 @@
     "views": {
       "faktor": [
         {
-          "id": "faktor.chat",
-          "name": "Chat",
-          "type": "webview"
-        },
-        {
-          "id": "faktor.edition8",
-          "name": "Work \u00b7 Inspect \u00b7 History",
+          "id": "faktor.launcher",
+          "name": "Faktor",
           "type": "webview"
         }
       ]
@@ -410,7 +404,7 @@
   "scripts": {
     "build": "tsc -p .",
     "selftest": "node scripts/selftest.mjs",
-    "render:check": "node scripts/settings-surface-check.mjs && node scripts/render-webview.mjs --check && node scripts/render-edition5.mjs --check",
+    "render:check": "node scripts/settings-surface-check.mjs && node scripts/window-architecture-check.mjs && node scripts/render-webview.mjs --check && node scripts/render-edition5.mjs --check",
     "render:screenshots": "node scripts/render-webview.mjs --screenshots --prefix render",
     "package:vsix": "npx --no-install vsce package",
     "render:edition5": "node scripts/render-edition5.mjs --write",
@@ -424,7 +418,8 @@
     "optical:edition8": "node scripts/edition8-optical.mjs",
     "e2e:edition8": "node scripts/stream-probe.mjs && bash ../../scripts/edition8/dogfood.sh",
     "perf:edition8": "node ../../tests/edition8/perf.mjs --check",
-    "settings:check": "node scripts/settings-surface-check.mjs"
+    "settings:check": "node scripts/settings-surface-check.mjs",
+    "window:check": "node scripts/window-architecture-check.mjs"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

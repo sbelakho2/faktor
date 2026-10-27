@@ -5,14 +5,17 @@
 
 import * as vscode from 'vscode';
 import type { Edition8PanelDeps } from './panel.ts';
-import type { Edition8ViewProvider } from './panel.ts';
 import { isObject, type E8Snapshot, type Json } from './contract.ts';
 import { arrayAt, stringAt } from './contract.ts';
 import { addContextDraft, contextDraftSources } from './hostDraft.ts';
 
+export interface Edition8Surface {
+  show(screen: string): void;
+}
+
 export interface Edition8Runtime {
   readonly deps: Edition8PanelDeps;
-  readonly view: Edition8ViewProvider;
+  readonly view: Edition8Surface;
   readonly openSettings: (screen: string) => void;
   readonly cancelRun: () => void;
   readonly switchConversation: () => Promise<void>;
