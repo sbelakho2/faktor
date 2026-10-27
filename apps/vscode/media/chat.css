@@ -42,47 +42,49 @@ body {
   overflow: hidden;
 }
 
+/* ONE full-window chat surface. The app owns the viewport height; only the
+   active destination scrolls, and the transcript/composer share the remaining
+   height without overlap. */
 #app {
+  position: relative;
   display: flex;
   flex-direction: column;
-  gap: var(--space-2);
-  padding: var(--space-2) var(--space-3);
+  gap: 0;
+  padding: 0;
   box-sizing: border-box;
   height: 100vh;
+  height: 100dvh;
   min-height: 0;
   overflow: hidden;
 }
 
-/* Work is the conversation surface: the transcript owns the flexible height
-   and the composer stays anchored to the bottom edge. Inspect and History
-   scroll as their own destinations. */
+/* Chat is the conversation surface: a compact run/attention region, the
+   transcript owning the flexible height, and the composer in normal flow at
+   the bottom edge (never fixed or overlapping). */
 #work-panel {
+  display: flex;
+  flex-direction: column;
   flex: 1 1 auto;
+  gap: var(--space-2);
   min-height: 0;
   overflow: hidden;
+  padding: var(--space-2) var(--space-3) 0;
 }
 
 #inspect-panel,
-#history-panel {
+#history-panel,
+#diagnostics {
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
+  padding: var(--space-2) var(--space-3);
 }
 
-#diagnostics {
-  flex: none;
-  max-height: 45vh;
-  overflow-y: auto;
-}
-
-/* Primary hierarchy: one active view at a time. Work (conversation → current
-   run → composer) is the default; Inspect and History are destinations of
-   the header switcher. Diagnostics/notices stay global so a transient error
-   is visible from every view. Order is expressed here so the semantic DOM
-   (and every id) stays intact. */
+/* One active destination at a time. Order is explicit because the semantic
+   DOM keeps Diagnostics before Chat for its legacy ids. */
 #app > header { order: 0; }
-#app > #diagnostics { order: 1; }
-#app > #stream-recovery { order: 2; }
+#app > #overflow-menu { order: 1; }
+#app > #diagnostics { order: 2; }
 #app > #notices { order: 3; }
 #app > #work-panel { order: 4; }
 #app > #inspect-panel { order: 5; }
@@ -99,16 +101,57 @@ header {
   display: flex;
   align-items: center;
   gap: 6px;
-  /* The product header is ONE compact row: brand, status, the Work /
-     Inspect / History switcher, `⋯`. The status ellipsizes; service
-     controls live behind the labeled overflow. */
+  /* The product header is ONE compact row: brand, model/status, `⋯`, gear.
+     No view switcher, no second status header. The status ellipsizes. */
+  flex: none;
   flex-wrap: nowrap;
-  position: sticky;
-  top: 0;
-  z-index: 2;
-  padding-bottom: 6px;
+  position: relative;
+  z-index: 3;
+  padding: 6px var(--space-3);
   background: var(--vscode-sideBar-background, transparent);
   border-bottom: 1px solid var(--faktor-border);
+}
+
+/* The overflow menu is a transient destination list, not a panel in the
+   chat body. It overlays the header edge and closes on selection. */
+.overflow-menu {
+  position: absolute;
+  top: 38px;
+  right: var(--space-3);
+  z-index: 4;
+  display: flex;
+  flex-direction: column;
+  min-width: 168px;
+  padding: var(--space-1);
+  background: var(--vscode-editorWidget-background, var(--vscode-sideBar-background, transparent));
+  border: 1px solid var(--faktor-border);
+  border-radius: var(--faktor-radius);
+  box-shadow: 0 4px 12px var(--faktor-shadow);
+}
+
+.menu-item {
+  width: 100%;
+  min-height: 30px;
+  text-align: left;
+  background: transparent;
+  color: var(--vscode-foreground);
+  border: 1px solid transparent;
+  border-radius: var(--faktor-radius-control);
+  padding: 4px 10px;
+}
+
+.menu-item:hover:not(:disabled),
+.menu-item:focus-visible {
+  background: var(--faktor-hover);
+}
+
+.menu-item[aria-current='page'] {
+  color: var(--faktor-accent);
+  border-color: var(--faktor-accent);
+}
+
+.menu-item.destructive {
+  color: var(--vscode-testing-iconFailed, #f85149);
 }
 
 .spacer {
@@ -180,17 +223,9 @@ header button {
 }
 
 
-/* ------------------------------------------------ Work/Inspect/History shell
-   ONE compact switcher: three tab controls, the selected one carried by the
-   theme accent (text + border), never color alone (aria-selected is set). */
-.nav-switcher {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-  flex: none;
-}
-
-.nav-tab,
+/* Inspect/History full-window subviews keep real tablists; the chat body has
+   no tabs. The selected tab is carried by the accent (text + border), never
+   color alone (aria-selected is set). */
 .tab {
   background: transparent;
   color: var(--vscode-foreground);
@@ -199,12 +234,10 @@ header button {
   min-height: 28px;
 }
 
-.nav-tab:hover:not(:disabled),
 .tab:hover:not(:disabled) {
   background: var(--faktor-hover);
 }
 
-.nav-tab[aria-selected='true'],
 .tab[aria-selected='true'] {
   color: var(--faktor-accent);
   border-color: var(--faktor-accent);
@@ -699,11 +732,12 @@ button.toggle[aria-expanded='true'] {
   color: var(--vscode-descriptionForeground);
 }
 
-/* The conversation is the product: no card chrome, room to breathe. */
+/* The conversation is the product: no card chrome, room to breathe. It owns
+   the remaining height and scrolls on its own; the composer never covers it. */
 .transcript-card {
   border: none;
   padding: 0;
-  flex: 1 1 auto;
+  flex: 1 1 0;
   min-height: 0;
   display: flex;
   flex-direction: column;
@@ -712,17 +746,18 @@ button.toggle[aria-expanded='true'] {
 
 .transcript-card > #welcome {
   flex: none;
+  max-height: 100%;
+  overflow-y: auto;
 }
 
-/* One compact sticky run status row: state, run, tokens and approvals only.
-   Run details (goal, plan, candidate boundary) live in Inspect. */
+/* One compact run status row while a run exists: state, tokens and approvals.
+   Run details (goal, plan, candidate boundary) live in Inspect; idle chat has
+   no second header at all. */
 .work-status {
-  position: sticky;
-  top: 0;
-  z-index: 2;
   flex: none;
   border: 1px solid var(--faktor-border);
   border-left: 3px solid var(--faktor-accent);
+  border-radius: var(--faktor-radius);
   padding: 4px var(--space-2);
   background: var(--vscode-sideBar-background, var(--vscode-editor-background, transparent));
 }
@@ -1329,13 +1364,17 @@ details summary {
 #composer {
   display: flex;
   flex-direction: column;
+  flex: none;
   gap: var(--space-2);
+  min-width: 0;
+  margin-bottom: var(--space-2);
   padding: var(--space-3);
+  /* Safe-area padding keeps the send action reachable above host chrome. */
+  padding-bottom: max(var(--space-3), env(safe-area-inset-bottom));
   border: 1px solid var(--faktor-border);
   border-radius: var(--faktor-radius);
   background: var(--faktor-surface);
   box-shadow: 0 1px 3px var(--faktor-shadow);
-  min-width: 0;
 }
 
 .composer-label {
@@ -1529,20 +1568,13 @@ button.attachment-remove {
   min-height: 24px;
 }
 
-#stream-recovery {
-  border-color: var(--vscode-inputValidation-errorBorder, rgba(248, 81, 73, 0.4));
-}
-
-#stream-recovery-reason {
-  white-space: pre-wrap;
-  word-break: break-word;
-  margin-bottom: var(--space-1);
-}
-
 /* ------------------------------------------------ permission attention card
    A pending approval is an event, not a destination: this card sits in the
    main flow right under the run strip and carries the decision. */
 .permission-card {
+  flex: none;
+  max-height: 30vh;
+  overflow-y: auto;
   border-color: var(--vscode-editorWarning-foreground, #d29922);
   border-left-width: 3px;
 }
@@ -1729,11 +1761,40 @@ button.intent-option:focus-visible {
   padding-top: var(--space-1);
 }
 
-/* ------------------------------------------------ attention and summary
-   "Needs attention" is aggregated: at most three grouped rows. The Overview
-   answers five user questions with no contract wall. */
+/* ------------------------------------------------ ONE attention problem
+   Every failure source merges here: one title, one short cause, one action
+   and an optional Technical details disclosure. No stacked error cards. */
 .attention-card {
-  border-left: 3px solid var(--vscode-editorWarning-foreground, #d29922);
+  flex: none;
+  max-height: 34vh;
+  overflow-y: auto;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--vscode-inputValidation-errorBorder, rgba(248, 81, 73, 0.4));
+  border-left: 3px solid var(--vscode-testing-iconFailed, #f85149);
+  border-radius: var(--faktor-radius);
+  background: var(--vscode-inputValidation-errorBackground, rgba(248, 81, 73, 0.12));
+  min-width: 0;
+}
+
+.attention-head {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.attention-icon {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  margin-top: 5px;
+  border-radius: 50%;
+  background: var(--vscode-testing-iconFailed, #f85149);
+}
+
+.attention-icon-authority,
+.attention-icon-stream {
+  background: var(--vscode-editorWarning-foreground, #d29922);
 }
 
 .attention-card h2,
@@ -1742,46 +1803,30 @@ button.intent-option:focus-visible {
   margin: 0 0 var(--space-1);
 }
 
-.attention-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
+.attention-card h2 {
+  color: var(--vscode-foreground);
+  overflow-wrap: break-word;
+}
+
+.attention-cause {
+  margin: 0 0 var(--space-1);
+  font-size: 0.9em;
+  overflow-wrap: break-word;
+}
+
+.attention-actions {
   display: flex;
-  flex-direction: column;
+  flex-wrap: wrap;
   gap: var(--space-1);
 }
 
-.attention-item {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 2px var(--space-2);
-  align-items: center;
-  padding: var(--space-1) 0;
-  border-top: 1px solid var(--faktor-border-quiet);
-}
-
-.attention-item:first-child {
-  border-top: none;
-}
-
-.attention-label {
-  font-weight: 600;
-  min-width: 0;
-  overflow-wrap: break-word;
-}
-
-.attention-detail {
-  grid-column: 1;
-  font-size: 0.9em;
-  min-width: 0;
-  overflow-wrap: break-word;
-}
-
 .attention-action {
-  grid-column: 2;
-  grid-row: 1 / span 2;
-  align-self: center;
   flex: none;
+  min-height: 28px;
+}
+
+.attention-card .technical-disclosure {
+  margin-top: var(--space-1);
 }
 
 .overview-status {
@@ -1816,16 +1861,6 @@ button.intent-option:focus-visible {
 
   .overview-summary-list dd {
     margin-bottom: var(--space-1);
-  }
-
-  .attention-item {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .attention-action {
-    grid-column: 1;
-    grid-row: auto;
-    justify-self: start;
   }
 
   /* Identifiers ellipsize in the narrow layout; details stay reachable
@@ -2380,9 +2415,9 @@ button.intent-option:focus-visible {
 
 /* ------------------------------------------------- container-width behavior
    The webview viewport IS the container: VS Code sidebar views render around
-   240-420 CSS px and the panel area renders wide (>700px). Two-column rows
-   stack before they can overflow, and no action menu is introduced (this
-   panel has no pre-existing overflow menu to move actions into). */
+   240-480 CSS px and the panel area renders wide (>700px). The one header
+   stays compact at every width; destinations move only through the `⋯`
+   menu. Two-column rows stack before they can overflow. */
 
 /* Sidebar range: let every two-column row wrap instead of overflowing. */
 @media (max-width: 420px) {
@@ -2405,12 +2440,6 @@ button.intent-option:focus-visible {
     min-width: 24px;
     font-size: 0.9em;
   }
-  /* The switcher stays a compact row: tabs tighten instead of overflowing. */
-  .nav-switcher,
-  .tablist {
-    gap: 0;
-  }
-  .nav-tab,
   .tab {
     padding: 0 6px;
   }
@@ -2419,39 +2448,37 @@ button.intent-option:focus-visible {
   }
 }
 
-/* The narrowest sidebar range (240-319px): the top clusters stay compact by
-   letting the switcher take its own full-width row; everything is one
-   column, the primary decisions stay visible and utilities stay behind the
-   labeled `⋯` overflow. ONE column: labels above their
-   values, full-width evidence/finish rows, and the action groups stack (the
-   main action bar never sits horizontal; a two-action preflight decision
-   still shares one wrapped row instead of overflowing). */
+/* The narrowest sidebar range (240-319px): ONE compact header row (brand,
+   ellipsized status, `⋯`, gear); everything is one column and the primary
+   decisions stay visible. No view tabs exist in the chat body. */
 @media (max-width: 319px) {
   #app {
-    padding: 6px var(--space-1);
-    gap: 6px;
+    padding: 0;
+    gap: 0;
   }
   header {
     flex-wrap: wrap;
+    padding: 4px var(--space-1);
   }
   .spacer {
     display: none;
   }
-  /* Below the compact range the three tabs wrap onto multiple rows
-     (min-content) instead of overflowing the ~120px effective budget. */
-  #nav-switcher {
-    order: 10;
-    flex: 1 1 100%;
-    flex-wrap: wrap;
-  }
-  .nav-tab {
-    flex: 1 1 auto;
-    min-width: min-content;
-    text-align: center;
-  }
   #meta,
-  .card {
+  .card,
+  .attention-card {
     padding: var(--space-1);
+  }
+  /* Ask|Task stays visible at the 120px effective zoom budget: the segmented
+     control takes its own full row and the two options share it. */
+  .composer-intent-row {
+    gap: var(--space-1);
+  }
+  .composer-intent {
+    flex: 1 1 100%;
+  }
+  button.intent-option {
+    flex: 1 1 50%;
+    padding: 2px 6px;
   }
   /* Labels above their fields. */
   .meta-row,
@@ -2513,14 +2540,9 @@ button.intent-option:focus-visible {
   }
 }
 
-/* Wide panel range: use the extra width for the cockpit grid and a taller
-   transcript instead of stretching single-column rows edge to edge. */
+/* Wide panel range: use the extra width for the cockpit grid; the chat
+   surface still fills the whole webview width. */
 @media (min-width: 701px) {
-  #app {
-    padding: var(--space-3) 16px;
-    max-width: 1024px;
-    margin: 0 auto;
-  }
   .cockpit {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));

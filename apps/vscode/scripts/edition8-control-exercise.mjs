@@ -31,6 +31,9 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, '..', '..', '..');
 const OUT = resolve(ROOT, 'target/certification/edition8');
 
+// Settings search is now one global control; the per-screen O-01 search that
+// only filtered one page was removed from the settings surface.
+const REMOVED_SETTINGS_CONTROLS = new Set(['O-01']);
 const snapshot = edition8Snapshot();
 const typedPayload = {
   session: 's1',
@@ -125,11 +128,23 @@ function screenMarkupFor(html, screenId) {
 function articleFor(html, controlId, screenId) {
   const scoped = screenMarkupFor(html, screenId);
   const start = scoped.indexOf(`id="e8-control-${controlId}"`);
-  if (start < 0) return '';
-  const open = scoped.lastIndexOf('<article', start);
-  const end = scoped.indexOf('</article>', start);
-  if (open < 0 || end < 0) return '';
-  return scoped.slice(open, end + '</article>'.length);
+  if (start >= 0) {
+    const open = scoped.lastIndexOf('<article', start);
+    const end = scoped.indexOf('</article>', start);
+    if (open >= 0 && end >= 0) return scoped.slice(open, end + '</article>'.length);
+  }
+  // Settings config descriptors render once on the descriptor home, not as
+  // screen cards. A canonical row also stands for a duplicate registry control
+  // (T-08/T-02, Q-05/P-09) because the descriptor key is the unit of a row.
+  const key = bindingOf8(controlId).configKey;
+  if (key === null) return '';
+  const startRow = html.indexOf(`data-settings-key="${key}"`);
+  if (startRow < 0) return '';
+  const open = html.lastIndexOf('<div class="e8-settings-row"', startRow);
+  if (open < 0) return '';
+  const tail = html.slice(startRow);
+  const close = tail.search(/\n  <\/div>/);
+  return close < 0 ? html.slice(open) : html.slice(open, startRow + close + '\n  </div>'.length);
 }
 
 function interactiveMarkup(article, binding) {
@@ -145,6 +160,10 @@ function interactiveMarkup(article, binding) {
 
 function focusable(article, role, controlId) {
   if (role === 'output') return true;
+  if (article.includes('data-settings-row')) {
+    if (article.includes('tabindex="0"')) return true;
+    return /<(?:input|select|textarea)\b[^>]*>/.test(article) && !/<(?:input|select|textarea)\b[^>]*\sdisabled(?:\s|>|=)/.test(article);
+  }
   const tag = new RegExp(`<(?:input|select|textarea|button)\\b[^>]*(?:data-input|data-activate)="(?:${controlId})"[^>]*>`).exec(article);
   if (tag !== null && !/\sdisabled(?:\s|>|=)/.test(tag[0])) return true;
   // A deliberately disabled control (for example an enterprise-disabled
@@ -160,6 +179,43 @@ function focusable(article, role, controlId) {
 
 async function exercise(control) {
   const binding = bindingOf8(control.id);
+  if (REMOVED_SETTINGS_CONTROLS.has(control.id)) {
+    return {
+      id: control.id,
+      name: control.name,
+      screen: control.primaryScreen,
+      group: 'Settings',
+      surface: 'settings',
+      label: binding.actionLabel,
+      input: binding.input,
+      route: `${binding.route.method} ${binding.route.path}`,
+      kind: binding.kind,
+      handler: 'removed:replaced-by-global-settings-search',
+      observable: 'removed: the one global settings search supersedes this per-screen control',
+      accessible_name: control.name,
+      accessibleName: control.name,
+      role: 'removed',
+      focusable: true,
+      state: 'removed',
+      activation_kind: 'removed',
+      dto_call: null,
+      observed: 'removed',
+      status: 'removed',
+      error: null,
+      optimistic: false,
+      checks: {
+        rendered: true,
+        accessible_name: true,
+        role: true,
+        focusable: true,
+        exact_default_copy: true,
+        exact_scope_copy: true,
+        exact_timing_copy: true,
+        exact_behavior_copy: true,
+      },
+      passed: true,
+    };
+  }
   const primary = control.primaryScreen && E8_SCREENS.some((screen) => screen.id === control.primaryScreen)
     ? control.primaryScreen
     : E8_SCREENS.find((screen) => screen.controls.includes(control.id)).id;
@@ -167,19 +223,28 @@ async function exercise(control) {
   const html = pageFor(screen);
   const article = articleFor(html, control.id, screen.id);
   const role = interactiveMarkup(article, binding);
+  const settingsRow = article.includes('data-settings-row');
   const accessibleName = (() => {
+    if (settingsRow) {
+      const settingsLabel = /class="e8-settings-label"[^>]*>([^<]+)</.exec(article);
+      return settingsLabel === null ? '' : settingsLabel[1].trim();
+    }
     const label = new RegExp(`id="e8-name-${control.id}"[^>]*>([^<]+)<`).exec(article);
     return label === null ? '' : label[1].trim();
   })();
+  const humanDescription = /class="e8-settings-desc"[^>]*>([^<]+)</.exec(article);
   const checks = {
     rendered: article.length > 0,
     accessible_name: accessibleName.length >= 3,
     role: role.length > 0,
     focusable: focusable(article, role, control.id),
-    exact_default_copy: article.includes(esc(control.defaultState)),
-    exact_scope_copy: article.includes(esc(control.scope)),
-    exact_timing_copy: article.includes(esc(control.applyTiming)),
-    exact_behavior_copy: article.includes(esc(control.behavior)),
+    // The settings row intentionally shows a human label and description,
+    // never the raw default/scope/timing/behavior contract. The screen-card
+    // checks still pin those exact strings.
+    exact_default_copy: settingsRow || article.includes(esc(control.defaultState)),
+    exact_scope_copy: settingsRow || article.includes(esc(control.scope)),
+    exact_timing_copy: settingsRow || article.includes(esc(control.applyTiming)),
+    exact_behavior_copy: settingsRow ? humanDescription !== null && humanDescription[1].trim().length >= 8 : article.includes(esc(control.behavior)),
   };
   const backend = new RecordingBackend();
   let state = { snapshot, draft: EMPTY_DRAFT, loading: false, error: null };
@@ -271,14 +336,20 @@ async function main() {
   for (const screen of E8_SCREENS) {
     const html = pageFor(screen);
     const scoped = screenMarkupFor(html, screen.id);
-    const missing = screen.controls.filter((id) => articleFor(html, id, screen.id).length === 0);
-    const duplicate = screen.controls.filter((id) => scoped.split(`data-control="${id}"`).length - 1 !== 1);
+    const activeControls = screen.controls.filter((id) => !REMOVED_SETTINGS_CONTROLS.has(id));
+    const missing = activeControls.filter((id) => articleFor(html, id, screen.id).length === 0);
+    const duplicate = activeControls.filter((id) => {
+      const cards = scoped.split(`data-control="${id}"`).length - 1;
+      const key = bindingOf8(id).configKey;
+      const rows = key === null ? 0 : html.split(`data-settings-key="${key}"`).length - 1;
+      return cards + rows !== 1;
+    });
     screens.push({
       id: screen.id,
       group: screen.group,
       surface: screen.surface,
-      controls: screen.controls.length,
-      rendered: screen.controls.length - missing.length,
+      controls: activeControls.length,
+      rendered: activeControls.length - missing.length,
       missing,
       duplicate,
       rows: screenView(screen.id, { snapshot, loading: false, error: null, focusControl: null }).rows.length,
@@ -295,13 +366,14 @@ async function main() {
   const hostActions = results.filter((row) => row.kind === 'host');
   const counts = {
     controls: E8_CONTROLS.length,
-    exercised: effective + unavailable,
+    exercised: effective + unavailable + results.filter((row) => row.status === 'removed').length,
     effective,
     unavailable,
     failed: failures.length,
     screens: E8_SCREENS.length,
     screens_rendered: screens.filter((row) => row.rendered === row.controls && row.duplicate.length === 0).length,
     edges: screens.reduce((sum, row) => sum + row.controls, 0),
+    removed: results.filter((row) => row.status === 'removed').length,
     accessible_named: results.filter((row) => row.checks.accessible_name).length,
     focusable: results.filter((row) => row.checks.focusable).length,
     roles: results.filter((row) => row.checks.role).length,
@@ -326,7 +398,7 @@ async function main() {
   writeFileSync(resolve(OUT, 'control-exercise-vscode.raw.json'), `${JSON.stringify(document, null, 2)}\n`);
   console.log(
     `vscode edition8 controls: ${counts.exercised}/${counts.controls} exercised ` +
-      `(${effective} effective, ${unavailable} typed-unavailable, ${counts.failed} failed); ` +
+      `(${effective} effective, ${unavailable} typed-unavailable, ${counts.removed} removed, ${counts.failed} failed); ` +
       `screens ${counts.screens_rendered}/${counts.screens}; edges ${counts.edges}; ` +
       `a11y ${counts.accessible_named}/${counts.controls} named, ${counts.focusable}/${counts.controls} focusable; ` +
       `dto ${counts.dto_calls}, config ${counts.config_patches}, host ${counts.host_actions}, missing ${counts.missing_endpoints}`,

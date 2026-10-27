@@ -187,7 +187,7 @@ export function findChrome() {
 }
 
 /** The deterministic, self-contained snapshot the harness renders. */
-function harnessSnapshot(empty = false, permissions = false) {
+function harnessSnapshot(empty = false, permissions = false, problem = false) {
   const snapshot = {
     daemon: 'running',
     daemonDetail: 'http://127.0.0.1:7337',
@@ -525,6 +525,24 @@ function harnessSnapshot(empty = false, permissions = false) {
       failureDetail: null,
     },
   };
+  if (problem) {
+    // The adversarial problem fixture: an authority refusal, a blocked
+    // stream and the raw last error all describe the same failure family.
+    // The redesigned chat body must merge them into ONE inline attention
+    // card; the legacy surface stacked three separate panels.
+    snapshot.streamStatus = 'protocol_blocked';
+    snapshot.serviceAuthority = {
+      kind: 'outside_trusted_install',
+      label: 'Faktor refused an untrusted executable',
+      copy: 'The configured service executable is outside the trusted install, so Faktor did not start it.',
+      actions: [
+        { key: 'locateDaemon', label: 'Locate service…' },
+        { key: 'openDiagnostics', label: 'Open Diagnostics' },
+      ],
+      detail: '/tmp/faktor-cli resolves outside the trusted install /opt/faktor/install',
+    };
+    snapshot.lastError = '[outside_trusted_install] /tmp/faktor-cli resolves outside the trusted install /opt/faktor/install';
+  }
   if (empty) {
     // The onboarding/empty-state fixture: no conversation, no run, no
     // agents — the welcome state is the only content in the transcript slot.
@@ -587,7 +605,9 @@ export function buildHarnessHtml(
   }
   const themeStyle = `<style id="faktor-harness-theme">${themeCss}</style>`;
   const apiStub = `<script>window.__posted = []; window.acquireVsCodeApi = function () { return { postMessage: function (message) { window.__posted.push(message); } }; };</script>`;
-  const snapshotJson = JSON.stringify(harnessSnapshot(empty, permissions)).replace(/</g, '\\u003c');
+  const snapshotJson = JSON.stringify(
+    harnessSnapshot(empty, permissions, options.problem === true),
+  ).replace(/</g, '\\u003c');
   // The attachment fixture exercises the compact attachment cards (ready and
   // refused) exactly the way the host delivers them.
   const attachmentsScript = attachments
@@ -764,6 +784,60 @@ export async function launchChrome(chrome) {
   }
 }
 
+// Surface/overlap probe: ONE header, NO tabs inside Chat, ONE problem card,
+// and the composer in normal flow below a transcript that owns the remaining
+// height. Every visible direct child of #work-panel is measured in DOM order
+// so stacked cards can never be reported as overlapping.
+const SURFACE_SCRIPT = `(() => {
+  const rect = (el) => {
+    const r = el.getBoundingClientRect();
+    return { x: r.x, y: r.y, w: r.width, h: r.height, bottom: r.bottom, right: r.right };
+  };
+  const visible = (el) => !!el && !el.hidden && el.getClientRects().length > 0;
+  const work = document.getElementById('work-panel');
+  const surfaces = [];
+  if (work) {
+    for (const child of work.children) {
+      if (!visible(child)) continue;
+      surfaces.push({ id: child.id || child.className, ...rect(child) });
+    }
+  }
+  const attention = document.getElementById('attention-card');
+  const composer = document.getElementById('composer');
+  const entries = document.getElementById('entries');
+  const technical = document.getElementById('attention-technical');
+  const actionButtons = document.querySelectorAll('#attention-card-actions button');
+  const header = document.querySelector('#app > header');
+  return {
+    headerCount: document.querySelectorAll('#app > header').length,
+    header: visible(header) ? rect(header) : null,
+    chatTabs: work
+      ? work.querySelectorAll('[role="tab"], .nav-tab, #nav-switcher, [id^="nav-"]').length
+      : 0,
+    strayTabs: document.querySelectorAll('#nav-switcher, .nav-tab, #overflow-menu [role="tab"]').length,
+    problemSurfaces: Array.from(document.querySelectorAll('[data-problem-surface]')).filter(visible).length,
+    attention: visible(attention)
+      ? {
+          ...rect(attention),
+          title: (document.getElementById('attention-card-title') || {}).textContent || '',
+          cause: (document.getElementById('attention-card-cause') || {}).textContent || '',
+          actions: actionButtons.length,
+          technical: visible(technical),
+        }
+      : null,
+    noticesVisible: document.querySelectorAll('#notices .notice').length,
+    surfaces,
+    composer: composer ? { ...rect(composer), position: getComputedStyle(composer).position } : null,
+    transcript: document.getElementById('transcript-card')
+      ? rect(document.getElementById('transcript-card'))
+      : null,
+    entries: entries
+      ? { ...rect(entries), overflowY: getComputedStyle(entries).overflowY }
+      : null,
+    innerHeight: window.innerHeight,
+  };
+})()`;
+
 const MEASURE_SCRIPT = `(() => {
   const selector = 'button, [role="button"], input, select, textarea, a[href], summary, [tabindex]:not([tabindex="-1"])';
   const out = [];
@@ -926,6 +1000,85 @@ function assertLayout(result, context, failures, { targets = true, primaryVisibl
   }
 }
 
+/**
+ * The redesigned chat-surface contract. Every leg proves:
+ *  - exactly ONE product header and ZERO tabs inside the chat body;
+ *  - at most ONE visible problem surface, and when a problem is served it has
+ *    a title, a short cause, exactly one action and a technical disclosure;
+ *  - visible direct children of #work-panel do not overlap and stay in flow
+ *    order (attention/status -> transcript -> composer);
+ *  - the transcript owns scroll and the composer is static/relative with its
+ *    bottom inside the viewport.
+ * `problem` is true for the fixture that serves authority + blocked stream +
+ * a raw error; false for the healthy populated surface.
+ */
+function assertSurface(result, context, failures, problem) {
+  if (result.headerCount !== 1) {
+    failures.push(`${context}: expected ONE header, found ${result.headerCount}`);
+  }
+  if (result.chatTabs !== 0 || result.strayTabs !== 0) {
+    failures.push(
+      `${context}: chat body must contain no view tabs (chat ${result.chatTabs}, global ${result.strayTabs})`,
+    );
+  }
+  if (problem) {
+    if (result.problemSurfaces !== 1) {
+      failures.push(`${context}: expected ONE attention card, found ${result.problemSurfaces}`);
+    }
+    if (!result.attention) {
+      failures.push(`${context}: the served problem must render the attention card`);
+    } else {
+      if (result.attention.title.trim().length === 0) {
+        failures.push(`${context}: attention card has no title`);
+      }
+      if (result.attention.cause.trim().length === 0) {
+        failures.push(`${context}: attention card has no short cause`);
+      }
+      if (result.attention.actions !== 1) {
+        failures.push(`${context}: attention card must expose exactly one action (found ${result.attention.actions})`);
+      }
+      if (!result.attention.technical) {
+        failures.push(`${context}: attention card must expose Technical details when a tail exists`);
+      }
+    }
+    if (result.noticesVisible !== 0) {
+      failures.push(`${context}: a visible notice card duplicates the attention surface (${result.noticesVisible})`);
+    }
+  } else if (result.problemSurfaces !== 0) {
+    failures.push(`${context}: a healthy surface must omit the attention card (found ${result.problemSurfaces})`);
+  }
+  if (result.header && result.surfaces.length > 0 && result.surfaces[0].y + 0.5 < result.header.bottom) {
+    failures.push(`${context}: first surface overlaps the header`);
+  }
+  for (let i = 1; i < result.surfaces.length; i += 1) {
+    const previous = result.surfaces[i - 1];
+    const current = result.surfaces[i];
+    if (previous.bottom > current.y + 0.5) {
+      failures.push(
+        `${context}: ${previous.id} overlaps ${current.id} (bottom ${Math.round(previous.bottom * 10) / 10} > top ${Math.round(current.y * 10) / 10})`,
+      );
+    }
+  }
+  if (!result.composer) {
+    failures.push(`${context}: composer is missing`);
+  } else {
+    if (result.composer.position === 'fixed' || result.composer.position === 'absolute' || result.composer.position === 'sticky') {
+      failures.push(`${context}: composer must stay in normal flow, found position ${result.composer.position}`);
+    }
+    if (result.composer.bottom > result.innerHeight + 0.5) {
+      failures.push(
+        `${context}: composer leaves the viewport (bottom ${Math.round(result.composer.bottom * 10) / 10} > ${result.innerHeight})`,
+      );
+    }
+  }
+  if (!result.transcript || result.transcript.h < 40) {
+    failures.push(`${context}: transcript does not fill the remaining height (h ${result.transcript ? result.transcript.h : 'missing'})`);
+  }
+  if (!result.entries || result.entries.overflowY !== 'auto') {
+    failures.push(`${context}: transcript must own scrolling (entries overflow-y ${result.entries ? result.entries.overflowY : 'missing'})`);
+  }
+}
+
 /** Fresh load, Tab, then prove the keyboard focus ring renders. */
 async function checkKeyboardFocus(cdp, context, failures) {
   await cdp.send('Input.dispatchKeyEvent', {
@@ -953,19 +1106,19 @@ async function checkKeyboardFocus(cdp, context, failures) {
 
 /** Fresh load, pointer click, then prove pointer focus does NOT ring. */
 async function checkPointerSuppression(cdp, context, failures) {
-  const refreshBox = await cdp.evaluate(`(() => {
-    const r = document.getElementById('nav-inspect').getBoundingClientRect();
+  const triggerBox = await cdp.evaluate(`(() => {
+    const r = document.getElementById('btn-overflow').getBoundingClientRect();
     return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
   })()`);
-  await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: refreshBox.x, y: refreshBox.y, button: 'left', clickCount: 1 });
-  await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: refreshBox.x, y: refreshBox.y, button: 'left', clickCount: 1 });
+  await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: triggerBox.x, y: triggerBox.y, button: 'left', clickCount: 1 });
+  await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: triggerBox.x, y: triggerBox.y, button: 'left', clickCount: 1 });
   const pointer = await cdp.evaluate(`(() => {
     const el = document.activeElement;
     const cs = getComputedStyle(el);
     return { id: el.id, outlineStyle: cs.outlineStyle };
   })()`);
   if (pointer.outlineStyle !== 'none') {
-    failures.push(`${context}: pointer click on #nav-inspect left outline ${pointer.outlineStyle}`);
+    failures.push(`${context}: pointer click on #btn-overflow left outline ${pointer.outlineStyle}`);
   }
   return pointer;
 }
@@ -981,6 +1134,7 @@ function parseArgs(argv) {
     finish: false,
     contract: false,
     error: false,
+    problem: false,
     theme: 'both',
     prefix: 'shot',
     out: SHOT_DIR,
@@ -995,6 +1149,7 @@ function parseArgs(argv) {
     else if (argv[i] === '--finish') args.finish = true;
     else if (argv[i] === '--contract') args.contract = true;
     else if (argv[i] === '--error') args.error = true;
+    else if (argv[i] === '--problem') args.problem = true;
     else if (argv[i] === '--theme') args.theme = argv[++i];
     else if (argv[i] === '--prefix') args.prefix = argv[++i];
     else if (argv[i] === '--out') args.out = argv[++i];
@@ -1017,16 +1172,37 @@ export async function runHarness(args) {
   // One page per theme. Screenshots keep the historical dark render unless
   // --theme light was selected explicitly.
   const pageUrls = new Map();
+  const problemUrls = new Map();
   for (const theme of themeNames) {
-    const html = buildHarnessHtml(
-      args.empty === true,
-      args.attachments === true,
-      args.permissions === true,
+    pageUrls.set(
       theme,
+      writeHarnessPage(
+        buildHarnessHtml(
+          args.empty === true,
+          args.attachments === true,
+          args.permissions === true,
+          theme,
+          { problem: false },
+        ),
+        'faktor-render-page-',
+      ),
     );
-    pageUrls.set(theme, writeHarnessPage(html, 'faktor-render-page-'));
+    problemUrls.set(
+      theme,
+      writeHarnessPage(
+        buildHarnessHtml(
+          args.empty === true,
+          args.attachments === true,
+          args.permissions === true,
+          theme,
+          { problem: true },
+        ),
+        'faktor-render-page-problem-',
+      ),
+    );
   }
-  const pageUrl = pageUrls.get('dark') || pageUrls.get(themeNames[0]);
+  const pageUrl =
+    (args.problem ? problemUrls : pageUrls).get('dark') || (args.problem ? problemUrls : pageUrls).get(themeNames[0]);
 
   const { child, pageWs } = await launchChrome(chrome);
   const cdp = await connect(pageWs);
@@ -1047,9 +1223,24 @@ export async function runHarness(args) {
           const result = await cdp.evaluate(MEASURE_SCRIPT);
           layouts += 1;
           assertLayout(result, `${theme}@${width}px`, failures);
+          const surface = await cdp.evaluate(SURFACE_SCRIPT);
+          assertSurface(surface, `${theme}@${width}px`, failures, false);
           for (const control of result.controls) {
             measured.set(`${theme}/${control.name}`, control);
           }
+        }
+      }
+      // The PROBLEM leg: service authority + a blocked stream + a raw error
+      // must merge into ONE attention card with no overlap at every width.
+      for (const theme of themeNames) {
+        const themeUrl = problemUrls.get(theme);
+        for (const width of WIDTHS) {
+          await loadPage(cdp, themeUrl, width);
+          const result = await cdp.evaluate(MEASURE_SCRIPT);
+          layouts += 1;
+          assertLayout(result, `${theme} problem@${width}px`, failures);
+          const surface = await cdp.evaluate(SURFACE_SCRIPT);
+          assertSurface(surface, `${theme} problem@${width}px`, failures, true);
         }
       }
       // The EMPTY state (welcome + preflight card visible) is its own layout:
@@ -1066,6 +1257,8 @@ export async function runHarness(args) {
           const result = await cdp.evaluate(MEASURE_SCRIPT);
           layouts += 1;
           assertLayout(result, `${theme} empty@${width}px`, failures);
+          const surface = await cdp.evaluate(SURFACE_SCRIPT);
+          assertSurface(surface, `${theme} empty@${width}px`, failures, false);
         }
       }
       // Keyboard focus ring + pointer suppression: fresh load per theme,
@@ -1091,6 +1284,8 @@ export async function runHarness(args) {
             const result = await cdp.evaluate(MEASURE_SCRIPT);
             layouts += 1;
             assertLayout(result, `${theme} dpr${dprLabel}@${width}px`, failures);
+            const surface = await cdp.evaluate(SURFACE_SCRIPT);
+            assertSurface(surface, `${theme} dpr${dprLabel}@${width}px`, failures, false);
           }
           await loadPage(cdp, themeUrl, 480, 1000, dpr);
           await checkKeyboardFocus(cdp, `${theme} dpr${dprLabel}@480px focus`, failures);
@@ -1119,6 +1314,8 @@ export async function runHarness(args) {
               primaryVisible: true,
               documentOverflow: false,
             });
+            const surface = await cdp.evaluate(SURFACE_SCRIPT);
+            assertSurface(surface, context, failures, false);
             const spills = await cdp.evaluate(ZOOM_SPILL_SCRIPT);
             for (const spill of spills) {
               failures.push(`${context}: ${spill} overflows the main action surfaces`);

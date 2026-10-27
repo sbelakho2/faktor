@@ -43,7 +43,7 @@ import * as oc from '../src/outcomes.ts';
 import * as ux from '../src/uxState.ts';
 import * as rr from '../src/refreshReads.ts';
 import { renderEdition8Html, scriptJson } from '../src/edition8/html.ts';
-import { loadEdition8Snapshot } from '../src/edition8/source.ts';
+import { descriptorMap, loadEdition8Snapshot } from '../src/edition8/source.ts';
 import { controlView, screenView } from '../src/edition8/view.ts';
 import { bindingOf8 } from '../src/edition8/bindings.ts';
 import { E8_CONTROLS } from '../src/generated/edition8Registry.ts';
@@ -90,6 +90,9 @@ async function test(label, fn) {
   } catch (error) {
     failed += 1;
     console.error(`FAIL  ${label} — ${error && error.message ? error.message : String(error)}`);
+    if (process.env.FAKTOR_TEST_STACK && error && error.stack) {
+      console.error(error.stack);
+    }
   }
 }
 
@@ -3006,7 +3009,7 @@ async function stateTests() {
     );
   });
 
-  await test('the Work status row carries state, run, exact tokens and approval count only', () => {
+  await test('the run status lives in the ONE header; approvals stay in the approval card', () => {
     const snapshot = webviewSnapshot([]);
     snapshot.daemon = 'running';
     snapshot.task = {
@@ -3031,14 +3034,18 @@ async function stateTests() {
     };
     snapshot.permissions = [{ id: 'p1' }, { id: 'p2' }];
     const { dom } = runChatWebview(snapshot);
-    const tokensNode = dom.document.getElementById('work-status-tokens');
-    const approvalsNode = dom.document.getElementById('work-status-approvals');
-    const tokens = findFake(tokensNode, (node) => node.textContent.includes('tokens'));
-    const approvals = findFake(approvalsNode, (node) => node.textContent.includes('approvals'));
-    assert(tokens && tokens.textContent === '1,234 tokens / 120,000', tokens && tokens.textContent);
-    assert(approvals && approvals.textContent === '2 approvals', approvals && approvals.textContent);
-    assertEqual(dom.document.getElementById('task-state').textContent, 'running');
-    assertEqual(dom.document.getElementById('task-goal').textContent, 'ship');
+    assert(
+      dom.document.getElementById('daemon-text').textContent.includes('Running'),
+      dom.document.getElementById('daemon-text').textContent,
+    );
+    assertEqual(dom.document.getElementById('permission-card').hidden, false);
+    assertEqual(
+      dom.document.getElementById('permission-list').children.length,
+      2,
+      'both approvals stay in the approval card',
+    );
+    assertEqual(dom.document.getElementById('attention-card').hidden, true, 'approvals are not a problem card');
+    assertEqual(dom.document.getElementById('task-goal').textContent, 'ship', 'run detail lives in Inspect');
   });
 
   await test('transcript is bounded to MAX_TRANSCRIPT_ENTRIES', () => {
@@ -3400,6 +3407,43 @@ async function daemonTests() {
         join(root, 'launcher'),
       );
     } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  await test('daemon resolves the verified in-root executable written by `faktor install`', () => {
+    const root = mkdtempSync(join(tmpdir(), 'faktor-in-root-selftest-'));
+    const saved = process.env.FAKTOR_BIN;
+    delete process.env.FAKTOR_BIN;
+    try {
+      const installRoot = join(root, 'trusted');
+      const inRoot = join(installRoot, 'faktor');
+      mkdirSync(installRoot, { recursive: true });
+      writeExecutable(inRoot, '#!/bin/sh\nexit 0\n');
+
+      // No launcher/current/versions: the in-root executable is resolved.
+      assertEqual(dm.bootstrapBinary({ workspaceRoot: '/nonexistent', installRoot }), null);
+      assertEqual(dm.installRootExecutable({ workspaceRoot: '/nonexistent', installRoot }), inRoot);
+      const resolved = dm.resolveDaemon({ workspaceRoot: '/nonexistent', installRoot });
+      assertEqual(resolved.executable, inRoot);
+      assertEqual(resolved.source, 'install-root-executable');
+      // It is NOT assumed verified: the checksum record is still required.
+      assertEqual(
+        dm.binaryTrust(resolved).state,
+        'unverified',
+        'the in-root model must never inherit the launcher signature authority',
+      );
+      const digest = createHash('sha256').update(readFileSync(inRoot)).digest('hex');
+      writeFileSync(`${inRoot}.sha256`, `${digest}  faktor\n`);
+      assertEqual(dm.binaryTrust(resolved).state, 'verified');
+      // A signed launcher layout still wins over the in-root executable.
+      mkdirSync(join(installRoot, 'versions'));
+      writeFileSync(join(installRoot, 'launcher'), '#!/bin/sh\n');
+      assertEqual(dm.resolveDaemon({ workspaceRoot: '/nonexistent', installRoot }).source, 'install-layout');
+    } finally {
+      if (saved !== undefined) {
+        process.env.FAKTOR_BIN = saved;
+      }
       rmSync(root, { recursive: true, force: true });
     }
   });
@@ -4122,6 +4166,97 @@ async function serviceLifecycleTests() {
       })?.kind,
       'outside_trusted_install',
       'an automatic start requires the trusted install',
+    );
+    // The installer's in-root model: a VERIFIED executable inside the root
+    // auto-starts without a launcher.
+    const inRoot = servicePlan('/home/operator/.faktor-live/bin/faktor', {
+      source: 'install-root-executable',
+      installRoot: '/home/operator/.faktor-live/bin',
+    });
+    assertEqual(
+      sl.servicePlanAuthority({
+        plan: inRoot,
+        mode: 'auto',
+        workspaceTrusted: true,
+        workspaceRoot: '/repo',
+        allowUnverified: false,
+      }),
+      null,
+      'a verified in-root executable auto-starts',
+    );
+    assertEqual(
+      sl.servicePlanAuthority({
+        plan: inRoot,
+        mode: 'restart',
+        workspaceTrusted: true,
+        workspaceRoot: '/repo',
+        allowUnverified: false,
+      }),
+      null,
+      'a verified in-root executable is also restart-eligible',
+    );
+    // A machine-scoped binaryPath that points inside the root is the same
+    // model with an explicit path.
+    const configuredInRoot = servicePlan('/home/operator/.faktor-live/bin/faktor', {
+      source: 'binaryPath-setting',
+      installRoot: '/home/operator/.faktor-live/bin',
+    });
+    assertEqual(
+      sl.servicePlanAuthority({
+        plan: configuredInRoot,
+        mode: 'auto',
+        workspaceTrusted: true,
+        workspaceRoot: '/repo',
+        allowUnverified: false,
+      }),
+      null,
+      'a machine-scoped binaryPath inside the trusted install auto-starts',
+    );
+    const unverifiedInRoot = servicePlan('/home/operator/.faktor-live/bin/faktor', {
+      source: 'install-root-executable',
+      installRoot: '/home/operator/.faktor-live/bin',
+      trust: { state: 'unverified', source: 'install-root-executable', detail: 'no record' },
+    });
+    assertEqual(
+      sl.servicePlanAuthority({
+        plan: unverifiedInRoot,
+        mode: 'auto',
+        workspaceTrusted: true,
+        workspaceRoot: '/repo',
+        allowUnverified: false,
+      })?.kind,
+      'trust_unverified',
+      'the in-root executable is only accepted when its checksum verifies',
+    );
+    const launcherOutsideRoot = servicePlan('/tmp/launcher', {
+      source: 'install-layout',
+      installRoot: '/home/operator/.faktor/install',
+    });
+    assertEqual(
+      sl.servicePlanAuthority({
+        plan: launcherOutsideRoot,
+        mode: 'auto',
+        workspaceTrusted: true,
+        workspaceRoot: '/repo',
+        allowUnverified: true,
+      })?.kind,
+      'outside_trusted_install',
+      'even an install-layout source must be inside the declared root',
+    );
+    const emptyRoot = servicePlan('/home/operator/.faktor-live/bin/faktor', {
+      source: 'install-root-executable',
+      installRoot: '',
+    });
+    assertEqual(
+      sl.servicePlanAuthority({
+        plan: emptyRoot,
+        mode: 'auto',
+        workspaceTrusted: true,
+        workspaceRoot: '/repo',
+        allowUnverified: true,
+      })?.kind,
+      'outside_trusted_install',
+      'an automatic start never runs without a trusted install root',
     );
     const envPlan = servicePlan('/home/operator/.faktor/install/launcher', {
       source: 'environment',
@@ -8779,45 +8914,58 @@ async function presentationWebviewTests() {
     });
   });
 
-  await test('Work / Inspect / History is a tablist shell with Work as the default view', () => {
+  await test('Chat is the single default surface; the overflow opens full-window destinations', () => {
     const harness = runChatWebview(webviewSnapshot([]));
     const { posted, dom } = harness;
-    const work = dom.document.getElementById('nav-work');
-    const inspect = dom.document.getElementById('nav-inspect');
-    const history = dom.document.getElementById('nav-history');
-    assertEqual(work.getAttribute('aria-selected'), 'true', 'Work is the default view');
-    assertEqual(work.getAttribute('tabindex'), '0', 'the selected tab is the roving tabindex entry');
-    assertEqual(inspect.getAttribute('aria-selected'), 'false');
-    assertEqual(inspect.getAttribute('tabindex'), '-1');
-    assertEqual(history.getAttribute('aria-selected'), 'false');
-    assertEqual(dom.document.getElementById('work-panel').hidden, false);
+    const chat = dom.document.getElementById('menu-chat');
+    const inspect = dom.document.getElementById('menu-inspect');
+    const history = dom.document.getElementById('menu-history');
+    const diagnostics = dom.document.getElementById('menu-diagnostics');
+    const overflow = dom.document.getElementById('btn-overflow');
+    const menu = dom.document.getElementById('overflow-menu');
+    assertEqual(dom.document.getElementById('work-panel').hidden, false, 'Chat is the default view');
     assertEqual(dom.document.getElementById('inspect-panel').hidden, true);
     assertEqual(dom.document.getElementById('history-panel').hidden, true);
+    assertEqual(dom.document.getElementById('diagnostics').hidden, true);
+    assertEqual(
+      dom.document.getElementById('work-panel').querySelectorAll('[role="tab"]').length,
+      0,
+      'the chat body contains no tabs',
+    );
+    overflow.click();
+    assertEqual(menu.hidden, false, 'the overflow opens a menu, not a panel');
+    assertEqual(overflow.getAttribute('aria-expanded'), 'true');
     const before = posted.length;
     inspect.click();
-    assertEqual(inspect.getAttribute('aria-selected'), 'true');
-    assertEqual(work.getAttribute('aria-selected'), 'false');
+    assertEqual(menu.hidden, true, 'selecting a destination closes the menu');
     assertEqual(dom.document.getElementById('work-panel').hidden, true);
     assertEqual(dom.document.getElementById('inspect-panel').hidden, false);
-    assertEqual(posted.length, before, 'switching views is a local move (no host round trip)');
+    assertEqual(inspect.getAttribute('aria-current'), 'page');
     history.click();
-    assertEqual(dom.document.getElementById('history-panel').hidden, false);
+    assertEqual(dom.document.getElementById('history-panel').hidden, false, 'History is a full-window view');
     assertEqual(dom.document.getElementById('inspect-panel').hidden, true);
-    work.click();
+    assertEqual(history.getAttribute('aria-current'), 'page');
+    chat.click();
     assertEqual(dom.document.getElementById('work-panel').hidden, false);
-    // The `⋯` overflow is the labeled transient options surface: Escape
-    // closes it and returns focus to the EXACT trigger; it never cancels a
-    // run (no cancel message is ever posted).
-    const overflow = dom.document.getElementById('btn-overflow');
+    assertEqual(chat.getAttribute('aria-current'), 'page');
+    diagnostics.click();
+    assertEqual(dom.document.getElementById('diagnostics').hidden, false, 'Diagnostics is a full-window view');
+    assertEqual(dom.document.getElementById('work-panel').hidden, true);
+    assertEqual(posted.length, before, 'switching views is a local move (no host round trip)');
+    // Escape closes the menu and returns focus to the EXACT trigger; it never
+    // cancels a run (no cancel message is ever posted).
+    chat.click();
     overflow.click();
-    assertEqual(dom.document.getElementById('diagnostics').hidden, false);
-    assertEqual(overflow.getAttribute('aria-expanded'), 'true');
+    assertEqual(menu.hidden, false);
+    assertEqual(chat.focused, true, 'opening the menu focuses its first item');
+    inspect.dispatch('keydown', { key: 'ArrowDown', preventDefault() {} });
+    assertEqual(history.focused, true, 'ArrowDown moves through the menu without posting');
+    history.dispatch('keydown', { key: 'Home', preventDefault() {} });
+    assertEqual(chat.focused, true, 'Home returns to the first item');
     harness.keydown({ key: 'Escape' });
-    assertEqual(dom.document.getElementById('diagnostics').hidden, true);
+    assertEqual(menu.hidden, true);
     assertEqual(overflow.getAttribute('aria-expanded'), 'false');
     assertEqual(overflow.focused, true, 'Escape returns focus to the exact trigger');
-    // Opening the Faktor view never grants execution or launches anything:
-    // the panel only announced itself with `ready`.
     assertDeepEqual(posted, [{ type: 'ready' }]);
   });
 }
@@ -9115,7 +9263,7 @@ async function attentionWebviewTests() {
     }
   });
 
-  await test('a structured userError renders summary, action and a demoted technical disclosure', () => {
+  await test('a structured userError renders into the ONE attention card with action and technical details', () => {
     const harness = runChatWebview(webviewSnapshot([]));
     const projection = ue.projectError({
       kind: 'stream_gap',
@@ -9123,40 +9271,128 @@ async function attentionWebviewTests() {
       code: 'protocol_blocked',
     });
     harness.deliver({ type: 'userError', error: projection });
-    const notices = harness.dom.document.getElementById('notices');
-    const card = notices.children[0];
-    assert(card && String(card.className).includes('user-error'), card && card.className);
-    const text = fakeText(card);
-    assert(text.includes('Live updates paused'), text);
-    assert(text.includes('Technical details'), text);
-    assert(text.includes('durable frame 5 data is not JSON'), text);
-    const summary = findFake(card, (node) => String(node.className).includes('user-error-summary'));
+    const card = harness.dom.document.getElementById('attention-card');
+    assertEqual(card.hidden, false, 'the user error renders the attention card');
+    const title = harness.dom.document.getElementById('attention-card-title');
+    assertEqual(title.textContent, 'Live updates paused');
     assert(
-      !summary.textContent.includes('protocol_blocked'),
+      !title.textContent.includes('protocol_blocked'),
       'the typed code never leaks into the headline',
     );
-    const action = findFake(card, (node) => node.tagName === 'button' && node.textContent === 'Reconnect');
+    assertEqual(
+      harness.dom.document.getElementById('attention-technical').hidden,
+      false,
+      'the technical disclosure is present',
+    );
+    assert(
+      harness.dom.document
+        .getElementById('attention-technical-body')
+        .textContent.includes('durable frame 5 data is not JSON'),
+      harness.dom.document.getElementById('attention-technical-body').textContent,
+    );
+    const action = findFake(
+      harness.dom.document.getElementById('attention-card-actions'),
+      (node) => node.tagName === 'button' && node.textContent === 'Reconnect',
+    );
     assert(action, 'the projected action renders a real button');
     action.click();
     assertDeepEqual(harness.posted[harness.posted.length - 1], { type: 'recoverStream' });
     // An identical error never stacks.
     harness.deliver({ type: 'userError', error: projection });
-    assertEqual(notices.children.length, 1, 'an identical technical tail is deduplicated');
+    assertEqual(
+      harness.dom.document.querySelectorAll('.user-error').length,
+      0,
+      'user errors never create a second visible card',
+    );
+    assertEqual(card.hidden, false);
+    assertEqual(
+      harness.dom.document.getElementById('attention-card-actions').children.length,
+      1,
+      'the attention card keeps exactly one action',
+    );
+    // A raw failure the host no longer serves is omitted, not left stale.
+    harness.deliver({
+      type: 'snapshot',
+      snapshot: { ...webviewSnapshot([]), lastError: 'durable frame 5 data is not JSON' },
+    });
+    harness.deliver({ type: 'snapshot', snapshot: { ...webviewSnapshot([]), lastError: null } });
+    assertEqual(card.hidden, true, 'a recovered error is omitted');
   });
 
-  await test('the snapshot lastError fallback surfaces once through the same renderer', () => {
+  await test('the snapshot lastError fallback surfaces once in the attention card', () => {
     const harness = runChatWebview(webviewSnapshot([]));
     const snapshot = { ...webviewSnapshot([]), lastError: 'native API error 500 internal: boom' };
     harness.deliver({ type: 'snapshot', snapshot });
-    const notices = harness.dom.document.getElementById('notices');
-    assertEqual(notices.children.length, 1, 'the raw error surfaces once');
-    assert(fakeText(notices.children[0]).includes('Technical details'));
+    const card = harness.dom.document.getElementById('attention-card');
+    assertEqual(card.hidden, false, 'the raw error surfaces the attention card');
+    assertEqual(
+      harness.dom.document.getElementById('attention-card-title').textContent,
+      'Faktor hit a problem',
+    );
+    assertEqual(harness.dom.document.getElementById('attention-technical').hidden, false);
     assert(
-      fakeText(notices.children[0]).includes('native API error 500 internal: boom'),
-      fakeText(notices.children[0]),
+      harness.dom.document
+        .getElementById('attention-technical-body')
+        .textContent.includes('native API error 500 internal: boom'),
+      harness.dom.document.getElementById('attention-technical-body').textContent,
     );
     harness.deliver({ type: 'snapshot', snapshot: { ...snapshot } });
-    assertEqual(notices.children.length, 1, 'an unchanged raw error is not re-announced');
+    assertEqual(card.hidden, false);
+    assertEqual(
+      harness.dom.document.querySelectorAll('.user-error').length,
+      0,
+      'an unchanged raw error never appends a duplicate card',
+    );
+  });
+
+  await test('mutation witness: authority + blocked stream + raw error merge into one attention card', () => {
+    const harness = runChatWebview(webviewSnapshot([]));
+    const snapshot = {
+      ...webviewSnapshot([]),
+      streamStatus: 'protocol_blocked',
+      lastError: 'native API error 500 internal: boom',
+      serviceAuthority: {
+        kind: 'outside_trusted_install',
+        label: 'Faktor refused an untrusted executable',
+        copy: 'The configured service executable is outside the trusted install.',
+        actions: [{ key: 'locateDaemon', label: 'Locate service…' }],
+        detail: '/tmp/faktor-cli resolves outside /opt/faktor/install',
+      },
+    };
+    harness.deliver({ type: 'snapshot', snapshot });
+    harness.deliver({
+      type: 'userError',
+      error: ue.projectError({
+        kind: 'permission_blocked',
+        message: 'native API error 500 internal: boom',
+        code: 'unexpected',
+      }),
+    });
+    const card = harness.dom.document.getElementById('attention-card');
+    assertEqual(card.hidden, false, 'one attention card is visible');
+    const title = harness.dom.document.getElementById('attention-card-title');
+    assertEqual(
+      title.textContent,
+      'Faktor refused an untrusted executable',
+      'authority outranks the generic duplicate',
+    );
+    const actions = harness.dom.document.getElementById('attention-card-actions');
+    assertEqual(
+      actions.children.filter((child) => child.tagName === 'button').length,
+      1,
+      'the merged card exposes exactly one action',
+    );
+    assert(
+      fakeText(harness.dom.document.getElementById('attention-technical-body')).includes(
+        '/tmp/faktor-cli resolves outside',
+      ),
+      'the technical tail stays available in the collapsed disclosure',
+    );
+    // Mutation witness: the legacy surfaces would have created these nodes.
+    assertEqual(harness.dom.document.querySelectorAll('.user-error').length, 0);
+    assertEqual(harness.dom.document.querySelectorAll('.stream-recovery').length, 0);
+    assertEqual(harness.dom.document.querySelectorAll('.preflight-attention').length, 0);
+    assertEqual(harness.dom.document.getElementById('notices').children.length, 0);
   });
 }
 
@@ -9353,9 +9589,18 @@ async function composerAttachmentTests() {
       'attachment-list',
       'attachment-notice',
       'btn-send',
-      'stream-recovery',
-      'btn-refresh-snapshot',
-      'btn-reconnect-stream',
+      'attention-card',
+      'attention-card-title',
+      'attention-card-cause',
+      'attention-card-actions',
+      'attention-technical',
+      'attention-technical-body',
+      'overflow-menu',
+      'menu-chat',
+      'menu-inspect',
+      'menu-history',
+      'menu-diagnostics',
+      'menu-stop',
       'board-card',
       'board-header',
       'board-posts',
@@ -9363,9 +9608,6 @@ async function composerAttachmentTests() {
       'board-body',
       'btn-board-read',
       'btn-board-post',
-      'nav-work',
-      'nav-inspect',
-      'nav-history',
       'work-panel',
       'inspect-panel',
       'history-panel',
@@ -9386,16 +9628,17 @@ async function composerAttachmentTests() {
     assert(/<label for="goal"/.test(markup), 'the goal textarea must have a real <label for>');
     assert(markup.includes('>Ask Faktor…</label>'), 'the accessible name must be the visible label text');
     assert(
-      /<main id="work-panel"[^>]*role="tabpanel"/.test(markup),
-      'the default Work surface is a real tabpanel',
+      /<main id="work-panel"[^>]*role="region"[^>]*aria-label="Chat"/.test(markup),
+      'Chat is the default full-window region',
     );
     assert(
-      /<nav id="nav-switcher"[^>]*role="tablist"/.test(markup),
-      'the Work / Inspect / History switcher is a real tablist',
+      /<nav id="overflow-menu"[^>]*role="menu"[^>]*hidden/.test(markup),
+      'the overflow is a menu, not a tablist',
     );
-    assert(/id="nav-work"[^>]*aria-selected="true"/.test(markup), 'Work ships selected (the default view)');
+    assert(!markup.includes('nav-switcher'), 'the chat header has no view switcher');
     assert(/id="inspect-panel"[^>]*hidden/.test(markup), 'Inspect starts hidden');
     assert(/id="history-panel"[^>]*hidden/.test(markup), 'History starts hidden');
+    assert(/id="diagnostics"[^>]*hidden/.test(markup), 'Diagnostics starts hidden');
     assert(
       /<div id="inspect-tabs"[^>]*role="tablist"/.test(markup),
       'the Inspect subviews are a real tablist',
@@ -9417,26 +9660,31 @@ async function composerAttachmentTests() {
       /<button id="btn-board-post" type="submit">Post<\/button>/.test(markup),
       'the board post control must be a submit inside the board form',
     );
-    // Conversation-first Work: one compact status row (state/run/tokens/
-    // approvals), transcript, anchored composer. Run details and the board
-    // are not part of this surface.
-    for (const id of ['task-card', 'task-state', 'work-status-tokens', 'work-status-approvals', 'btn-status-inspect']) {
-      assert(markup.includes(`id="${id}"`), `the Work status row must carry #${id}`);
-    }
+    // Conversation-only Work: ONE attention card, transcript and composer.
+    // No status header, board, view tabs or recovery/preflight panels.
     const workStart = markup.indexOf('<main id="work-panel"');
     const workEnd = markup.indexOf('</main>', workStart);
     const workMarkup = markup.slice(workStart, workEnd);
-    assert(!workMarkup.includes('board-card'), 'the coordination board must never render inside Work');
-    assert(!workMarkup.includes('board-post'), 'the board composer must never render inside Work');
+    assert(!workMarkup.includes('board-card'), 'the coordination board must never render inside Chat');
+    assert(!workMarkup.includes('board-post'), 'the board composer must never render inside Chat');
+    assert(!workMarkup.includes('id="task-card"'), 'Chat has no second run-status header');
+    assert(!workMarkup.includes('id="stream-recovery"'), 'a blocked stream is not a second panel');
+    assert(!workMarkup.includes('preflight-card'), 'service authority is not a second panel');
+    // Mutation witness: the same predicate rejects injected view tabs.
+    const chatTabViolation = (slice) =>
+      /role="tab"|nav-switcher|class="nav-tab"/.test(slice);
+    assert(!chatTabViolation(workMarkup), 'the chat body contains no view tabs');
+    assert(
+      chatTabViolation(`${workMarkup}<nav id="nav-switcher" role="tablist"></nav>`),
+      'mutation witness: an injected chat tablist is detected',
+    );
     const inspectStart = markup.indexOf('id="inspect-panel"');
     const inspectEnd = markup.indexOf('id="history-panel"');
     const inspectMarkup = markup.slice(inspectStart, inspectEnd);
     assert(/<details id="board-card"/.test(inspectMarkup), 'the board must be an explicit collapsed drawer inside Inspect');
     assert(!/<details id="board-card"[^>]*open/.test(inspectMarkup), 'the board drawer starts collapsed');
-    assert(workMarkup.indexOf('id="task-card"') < workMarkup.indexOf('id="transcript-card"'), 'the status row precedes the transcript');
+    assert(workMarkup.indexOf('id="attention-card"') < workMarkup.indexOf('id="transcript-card"'), 'the attention card precedes the transcript');
     assert(workMarkup.indexOf('id="transcript-card"') < workMarkup.indexOf('id="composer"'), 'the composer follows the transcript');
-    assert(markup.includes('never skipped'), 'the recovery affordance must say the frame is replayed');
-    assert(markup.includes('faktor-cli doctor'), 'the recovery affordance must name the daemon doctor');
     const entries = /<div id="entries"([^>]*)>/.exec(markup);
     assert(entries, 'the transcript container must exist');
     assert(entries[1].includes('role="log"'), entries[1]);
@@ -9590,9 +9838,9 @@ async function composerAttachmentTests() {
       'faktor.locateDaemon': 'Locate daemon…',
       // Revision 8 adds the Work/Inspect/History shell and the native
       // settings/Quick Pick surfaces. Their IDs and labels are pinned too.
-      'faktor.openControlCenter': 'Open Control Center',
+      'faktor.openControlCenter': 'Open Settings',
       'faktor.openModelPicker': 'Models and Capabilities',
-      'faktor.openSettings': 'Settings: Edition 5',
+      'faktor.openSettings': 'Settings: Revision 8',
       'faktor.openControl8': 'Faktor: Open Settings Screen',
       'faktor.openEdition8': 'Faktor: Open Work',
       'faktor.openInspect8': 'Faktor: Open Inspect',
@@ -10147,10 +10395,10 @@ async function composerAttachmentTests() {
     );
   });
 
-  await test('a protocol-blocked snapshot surfaces recovery affordances wired to the host', () => {
+  await test('a protocol-blocked snapshot merges into the ONE attention card with one action', () => {
     const harness = runChatWebview(webviewSnapshot([]));
-    const section = harness.dom.document.getElementById('stream-recovery');
-    assertEqual(section.hidden, true, 'no recovery surface on a healthy stream');
+    const card = harness.dom.document.getElementById('attention-card');
+    assertEqual(card.hidden, true, 'no attention surface on a healthy stream');
     harness.deliver({ type: 'streamBlocked', reason: 'durable frame 5 data is not JSON' });
     harness.deliver({
       type: 'snapshot',
@@ -10160,20 +10408,27 @@ async function composerAttachmentTests() {
         lastError: 'durable frame 5 data is not JSON',
       },
     });
-    assertEqual(section.hidden, false, 'a blocked status shows the recovery surface');
-    assert(
-      harness.dom.document
-        .getElementById('stream-recovery-reason')
-        .textContent.includes('durable frame 5 data is not JSON'),
-      harness.dom.document.getElementById('stream-recovery-reason').textContent,
+    assertEqual(card.hidden, false, 'a blocked status shows the attention card');
+    assertEqual(
+      harness.dom.document.getElementById('attention-card-title').textContent,
+      pf.T28_PAUSED.label,
     );
-    harness.dom.document.getElementById('btn-reconnect-stream').click();
+    assert(
+      fakeText(harness.dom.document.getElementById('attention-technical-body')).includes(
+        'durable frame 5 data is not JSON',
+      ),
+      'the blocked reason stays in the technical disclosure',
+    );
+    const buttons = harness.dom.document
+      .getElementById('attention-card-actions')
+      .children.filter((child) => child.tagName === 'button');
+    assertEqual(buttons.length, 1, 'the merged card exposes exactly one action');
+    assertEqual(buttons[0].textContent, 'Reconnect');
+    buttons[0].click();
     assertDeepEqual(harness.posted[harness.posted.length - 1], { type: 'recoverStream' });
-    harness.dom.document.getElementById('btn-refresh-snapshot').click();
-    assertDeepEqual(harness.posted[harness.posted.length - 1], { type: 'refresh' });
     harness.deliver({ type: 'streamBlocked', reason: null });
     harness.deliver({ type: 'snapshot', snapshot: { ...webviewSnapshot([]), streamStatus: 'open' } });
-    assertEqual(section.hidden, true, 'a recovered stream hides the recovery surface');
+    assertEqual(card.hidden, true, 'a recovered stream hides the attention card');
   });
 
   await test('Enter is a newline, Ctrl/Cmd+Enter starts, Escape dismisses, focus returns', () => {
@@ -10265,12 +10520,15 @@ async function navigationWebviewTests() {
     tab('subtab-overview').dispatch('keydown', { key: 'a', preventDefault() {} });
     assertDeepEqual(selected(), ['subtab-overview']);
     assertEqual(posted.length, before, 'tab navigation is purely local (no host message)');
-    // The top-level switcher has the same tablist contract.
-    dom.document.getElementById('nav-work').dispatch('keydown', { key: 'ArrowRight', preventDefault() {} });
-    assertEqual(dom.document.getElementById('nav-inspect').getAttribute('aria-selected'), 'true');
+    // Destinations are menu items, not a tablist: selecting Inspect opens the
+    // full-window view and closes the menu with no host message.
+    dom.document.getElementById('btn-overflow').click();
+    assertEqual(dom.document.getElementById('overflow-menu').hidden, false);
+    dom.document.getElementById('menu-inspect').click();
     assertEqual(dom.document.getElementById('inspect-panel').hidden, false);
     assertEqual(dom.document.getElementById('work-panel').hidden, true);
-    assertEqual(posted.length, before, 'the top switcher is local too');
+    assertEqual(dom.document.getElementById('overflow-menu').hidden, true);
+    assertEqual(posted.length, before, 'menu destination switching is local too');
   });
 
   await test('History round-trip preserves the Inspect subview, scope breadcrumb and composer draft', () => {
@@ -10292,9 +10550,11 @@ async function navigationWebviewTests() {
       dom.document.getElementById('inspect-breadcrumb-diagnostics-body').textContent.includes('session 7'),
       'the session id is available as advanced diagnostics',
     );
-    dom.document.getElementById('nav-history').click();
+    dom.document.getElementById('btn-overflow').click();
+    dom.document.getElementById('menu-history').click();
     assertEqual(dom.document.getElementById('history-panel').hidden, false);
-    dom.document.getElementById('nav-inspect').click();
+    dom.document.getElementById('btn-overflow').click();
+    dom.document.getElementById('menu-inspect').click();
     assertEqual(dom.document.getElementById('inspect-panel').hidden, false);
     assertEqual(
       dom.document.getElementById('subtab-verification').getAttribute('aria-selected'),
@@ -14261,9 +14521,9 @@ async function preflightTests() {
       // The normal surface never renders the service matrix: only genuine
       // authority gets a card. The exact T00-T05 rows live in Diagnostics.
       assertEqual(
-        dom.document.getElementById('preflight-card').hidden,
+        dom.document.getElementById('attention-card').hidden,
         true,
-        `${row.copy.state} normal card stays hidden`,
+        `${row.copy.state} normal surface omits the attention card`,
       );
       assertEqual(dom.document.getElementById('diag-preflight-label').textContent, row.copy.label);
       assertEqual(dom.document.getElementById('diag-preflight-copy').textContent, row.copy.copy);
@@ -14345,9 +14605,9 @@ async function preflightTests() {
       harness.dom.document.getElementById('readiness-label').textContent,
     );
     assertEqual(
-      harness.dom.document.getElementById('preflight-card').hidden,
+      harness.dom.document.getElementById('attention-card').hidden,
       true,
-      'a not-ready service is Diagnostics detail, not a normal service card',
+      'a not-ready service is Diagnostics detail, not a normal attention card',
     );
     assertEqual(harness.dom.document.getElementById('diag-preflight-label').textContent, pf.T05_STARTING.label);
   });
@@ -14364,7 +14624,7 @@ async function preflightTests() {
     );
     assert(!view.actions.some((action) => /start/i.test(action.label)), 'no start action');
     const harness = runChatWebview({ ...webviewSnapshot([]), preflight: view });
-    assertEqual(harness.dom.document.getElementById('preflight-card').hidden, true);
+    assertEqual(harness.dom.document.getElementById('attention-card').hidden, true);
     const labels = actionLabels(harness.dom.document.getElementById('diag-preflight-actions'));
     assertDeepEqual(labels, ['Locate daemon…']);
     assert(!labels.some((label) => /start/i.test(label)), 'the rendered Diagnostics row never offers a start');
@@ -14383,7 +14643,7 @@ async function preflightTests() {
     );
     const harness = runChatWebview({ ...webviewSnapshot([]), preflight: view });
     const { dom } = harness;
-    assertEqual(dom.document.getElementById('preflight-card').hidden, true);
+    assertEqual(dom.document.getElementById('attention-card').hidden, true);
     const detail = dom.document.getElementById('diag-preflight-detail').textContent;
     assert(detail.includes('/opt/faktor/bin/faktor-cli'), detail);
     assert(detail.includes('No checksum record'), detail);
@@ -14396,20 +14656,26 @@ async function preflightTests() {
     assertDeepEqual(harness.posted[harness.posted.length - 1], { type: 'confirmStart' });
     dom.document.getElementById('diag-preflight-actions').children[1].click();
     assertDeepEqual(harness.posted[harness.posted.length - 1], { type: 'cancelConfirm' });
-    // The normal card renders authority, not a Start-service decision.
+    // The ONE attention card renders authority, not a Start-service decision.
     const authority = sl.serviceAuthority(
       'trust_unverified',
       'no checksum record exists for /opt/faktor/bin/faktor-cli',
     );
     const normal = runChatWebview({ ...webviewSnapshot([]), serviceAuthority: authority });
-    assertEqual(normal.dom.document.getElementById('preflight-card').hidden, false);
-    assertEqual(normal.dom.document.getElementById('preflight-label').textContent, authority.label);
-    assertEqual(normal.dom.document.getElementById('preflight-copy').textContent, authority.copy);
-    assertDeepEqual(actionLabels(normal.dom.document.getElementById('preflight-actions')), [
+    assertEqual(normal.dom.document.getElementById('attention-card').hidden, false);
+    assertEqual(
+      normal.dom.document.getElementById('attention-card-title').textContent,
+      authority.label,
+    );
+    assertEqual(
+      normal.dom.document.getElementById('attention-card-cause').textContent,
+      authority.copy,
+    );
+    assertDeepEqual(actionLabels(normal.dom.document.getElementById('attention-card-actions')), [
       'Review in Diagnostics',
     ]);
     assert(
-      !actionLabels(normal.dom.document.getElementById('preflight-actions')).some((label) =>
+      !actionLabels(normal.dom.document.getElementById('attention-card-actions')).some((label) =>
         /start/i.test(label),
       ),
       'the normal authority row never offers Start anyway',
@@ -14435,64 +14701,40 @@ async function preflightTests() {
     );
   });
 
-  await test('T27/T28 stream recovery renders verbatim copy with Wait/Refresh and Reconnect/Refresh from snapshot', () => {
+  await test('T27/T28 stream recovery merges into the single attention card copy', () => {
     const harness = runChatWebview({ ...webviewSnapshot([]), streamStatus: 'open' });
     const { dom, posted } = harness;
-    const section = dom.document.getElementById('stream-recovery');
-    const pausedVisible = () =>
-      ['btn-reconnect-stream', 'btn-refresh-snapshot']
-        .filter((id) => dom.document.getElementById(id).hidden !== true)
-        .map((id) => dom.document.getElementById(id).textContent);
-    const reconnectingVisible = () =>
-      ['btn-wait-stream', 'btn-refresh-reconnecting']
-        .filter((id) => dom.document.getElementById(id).hidden !== true)
-        .map((id) => dom.document.getElementById(id).textContent);
+    const card = dom.document.getElementById('attention-card');
     harness.deliver({ type: 'streamBlocked', reason: 'durable frame 5 data is not JSON' });
     harness.deliver({
       type: 'snapshot',
       snapshot: { ...webviewSnapshot([]), streamStatus: 'protocol_blocked' },
     });
-    assertEqual(section.hidden, false, 'T28 shows while the durable event is unreadable');
-    assertEqual(dom.document.getElementById('stream-recovery-title').textContent, pf.T28_PAUSED.label);
-    assertEqual(dom.document.getElementById('stream-recovery-copy').textContent, pf.T28_PAUSED.copy);
-    assertDeepEqual(pausedVisible(), ['Reconnect', 'Refresh from snapshot']);
-    assertDeepEqual(reconnectingVisible(), []);
+    assertEqual(card.hidden, false, 'T28 shows while the durable event is unreadable');
+    assertEqual(dom.document.getElementById('attention-card-title').textContent, pf.T28_PAUSED.label);
+    assertEqual(dom.document.getElementById('attention-card-cause').textContent, pf.T28_PAUSED.copy);
+    const actions = () =>
+      dom.document
+        .getElementById('attention-card-actions')
+        .children.filter((child) => child.tagName === 'button');
+    assertDeepEqual(actions().map((button) => button.textContent), ['Reconnect']);
     assert(
-      !fakeText(section).toLowerCase().includes('skip'),
+      !fakeText(card).toLowerCase().includes('skip'),
       'never a skip action in the paused card',
     );
-    // The explicit reconnect flips the card to T27; the cursor is preserved.
+    actions()[0].click();
+    assertDeepEqual(posted[posted.length - 1], { type: 'recoverStream' });
+    // A transient reconnect is named by the header, not a second card.
     harness.deliver({ type: 'streamBlocked', reason: null });
     harness.deliver({ type: 'streamRecovery', recovering: true });
     harness.deliver({
       type: 'snapshot',
       snapshot: { ...webviewSnapshot([]), streamStatus: 'connecting' },
     });
-    assertEqual(section.hidden, false, 'T27 shows while reconnecting');
-    assertEqual(
-      dom.document.getElementById('stream-recovery-title').textContent,
-      pf.T27_RECONNECTING.label,
-    );
-    assertEqual(dom.document.getElementById('stream-recovery-copy').textContent, pf.T27_RECONNECTING.copy);
-    assertDeepEqual(pausedVisible(), []);
-    assertDeepEqual(reconnectingVisible(), ['Wait', 'Refresh']);
-    const beforeWait = posted.length;
-    dom.document.getElementById('btn-wait-stream').click();
-    assertEqual(section.hidden, true, 'Wait hides T27 without touching the stream');
-    assertEqual(posted.length, beforeWait, 'Wait posts nothing');
-    assert(
-      !fakeText(section).toLowerCase().includes('skip'),
-      'never a skip action in the reconnecting card',
-    );
-    dom.document.getElementById('btn-refresh-reconnecting').click();
-    assertDeepEqual(posted[posted.length - 1], { type: 'refresh' });
-    // A fresh pause re-arms the card after Wait, and the open status ends it.
-    harness.deliver({ type: 'streamBlocked', reason: 'durable frame 6 is not JSON' });
-    assertEqual(section.hidden, false, 'a fresh pause re-arms the card');
-    harness.deliver({ type: 'streamBlocked', reason: null });
+    assertEqual(card.hidden, true, 'reconnecting adds no duplicate problem card');
     harness.deliver({ type: 'streamRecovery', recovering: false });
     harness.deliver({ type: 'snapshot', snapshot: { ...webviewSnapshot([]), streamStatus: 'open' } });
-    assertEqual(section.hidden, true, 'a recovered stream hides the card');
+    assertEqual(card.hidden, true, 'a recovered stream hides the card');
   });
 
   await test('T32 sandbox guidance is guidance-only: exact copy, copyable command, no write control', () => {
@@ -14800,9 +15042,8 @@ async function approvedStateCopyTests() {
       type: 'userError',
       error: ue.projectError({ kind: 'run_failure', message: 'lost the response' }),
     });
-    const notices = dom.document.getElementById('notices');
     const retry = findFake(
-      notices,
+      dom.document.getElementById('attention-card-actions'),
       (node) => node.tagName === 'button' && node.textContent === 'Review and retry',
     );
     assert(retry, 'the existing Review and retry control renders');
@@ -14875,7 +15116,7 @@ async function approvedStateCopyTests() {
     );
   });
 
-  await test('T12 checking renders only from the proof body embedded task state', () => {
+  await test('T12 checking is named by the header only from the proof body embedded state', () => {
     // The served wire value: `GET /native/tasks/{id}/proof` body `task.state`
     // (proof_tests.rs proves `verifying` is served), projected exactly as the
     // host patches `proofTaskState`.
@@ -14887,33 +15128,15 @@ async function approvedStateCopyTests() {
       snapshot.proofTaskState = proofTaskStateOf(state);
       snapshot.task = runTaskFixture('running');
       const { dom } = runChatWebview(snapshot);
-      const strip = dom.document.getElementById('run-state');
-      assertEqual(strip.hidden, false, `${state}: the T12 strip renders`);
-      assertEqual(
-        dom.document.getElementById('run-state-label').textContent,
-        'Checking the change',
-        `${state} label`,
+      assert(
+        dom.document.getElementById('daemon-text').textContent.includes('Checking the change'),
+        `${state}: the header names T12 (${dom.document.getElementById('daemon-text').textContent})`,
       );
-      assertEqual(
-        dom.document.getElementById('run-state-copy').textContent,
-        'Required results remain attached to this candidate.',
-        `${state} copy`,
-      );
-      assertEqual(dom.document.getElementById('run-state-glyph').textContent, '\u2026', `${state} glyph`);
-      // The useful actions are the EXISTING controls: Inspect, Cancel run and
-      // the conversation; the strip renders no duplicate buttons.
-      assertEqual(
-        strip.children.filter((child) => child.tagName === 'button').length,
-        0,
-        `${state}: no duplicate action buttons`,
-      );
+      assertEqual(dom.document.getElementById('menu-run-action').hidden, true, `${state}: no duplicate action`);
+      assertEqual(dom.document.getElementById('attention-card').hidden, true, `${state}: no extra card`);
     };
     assertChecking('verifying');
     assertChecking('needs_verification');
-    // Negative: a proof absent or carrying a non-verifying task state renders
-    // nothing extra — a VERIFIED / terminal / running proof state is never
-    // re-labelled "Checking the change" (nor run-cancelled/run-failed, which
-    // only the durable task-run rows serve).
     const prohibited = {
       'Checking the change': 'T12',
       'Run cancelled': 'T25',
@@ -14924,7 +15147,7 @@ async function approvedStateCopyTests() {
       snapshot.proofTaskState = state;
       snapshot.task = runTaskFixture('running');
       const { dom } = runChatWebview(snapshot);
-      const label = dom.document.getElementById('run-state-label').textContent;
+      const label = dom.document.getElementById('daemon-text').textContent;
       assert(
         !Object.prototype.hasOwnProperty.call(prohibited, label),
         `proof task state ${String(state)} must not render ${prohibited[label]}`,
@@ -14941,46 +15164,25 @@ async function approvedStateCopyTests() {
       goal: 'close the audit',
       model: null,
     });
-    const assertRow = (state, label, copy, glyph) => {
+    const headerOf = (dom) => dom.document.getElementById('daemon-text').textContent;
+    const assertRow = (state, label) => {
       const snapshot = webviewSnapshot([]);
       snapshot.task = runTaskFixture('running');
       snapshot.runs = [runRow(state)];
       const { dom } = runChatWebview(snapshot);
-      const strip = dom.document.getElementById('run-state');
-      assertEqual(strip.hidden, false, `${state}: the run strip renders`);
-      assertEqual(dom.document.getElementById('run-state-label').textContent, label, `${state} label`);
-      assertEqual(dom.document.getElementById('run-state-copy').textContent, copy, `${state} copy`);
-      assertEqual(dom.document.getElementById('run-state-glyph').textContent, glyph, `${state} glyph`);
-      // The useful actions are the EXISTING controls: Inspect, Cancel run and
-      // the conversation; the strip renders no duplicate buttons.
-      assertEqual(
-        strip.children.filter((child) => child.tagName === 'button').length,
-        0,
-        `${state}: no duplicate action buttons`,
-      );
+      assert(headerOf(dom).includes(label), `${state}: header ${headerOf(dom)}`);
+      assertEqual(dom.document.getElementById('attention-card').hidden, true, `${state}: no extra card`);
     };
-    assertRow(
-      'Cancelled',
-      'Run cancelled',
-      'Cancellation is a terminal run outcome, not verification success.',
-      '\u2298',
-    );
-    assertRow(
-      'Failed',
-      'Run failed',
-      'The result and reason remain available for inspection.',
-      '\u2717',
-    );
-    assertRow('Running', 'Running', 'The candidate is separate from your workspace.', '\u25b6');
+    assertRow('Cancelled', 'Run cancelled');
+    assertRow('Failed', 'Run failed');
+    assertRow('Running', 'Running');
     // The FIRST row is the newest one: a later Running row never overrides a
     // newest Cancelled row.
     const newestFirst = webviewSnapshot([]);
     newestFirst.task = runTaskFixture('running');
     newestFirst.runs = [runRow('Cancelled', 'r2'), runRow('Running', 'r1')];
-    const firstHarness = runChatWebview(newestFirst);
-    assertEqual(
-      firstHarness.dom.document.getElementById('run-state-label').textContent,
-      'Run cancelled',
+    assert(
+      headerOf(runChatWebview(newestFirst).dom).includes('Run cancelled'),
       'the newest (first) task-run row decides',
     );
     // A verifying proof outranks the still-running row (the run row of a
@@ -14989,10 +15191,8 @@ async function approvedStateCopyTests() {
     checking.task = runTaskFixture('running');
     checking.runs = [runRow('Running')];
     checking.proofTaskState = 'verifying';
-    const checkingHarness = runChatWebview(checking);
-    assertEqual(
-      checkingHarness.dom.document.getElementById('run-state-label').textContent,
-      'Checking the change',
+    assert(
+      headerOf(runChatWebview(checking).dom).includes('Checking the change'),
       'T12 outranks T09 while the run row still reads Running',
     );
     // A terminal row outranks a stale verifying proof state.
@@ -15000,10 +15200,8 @@ async function approvedStateCopyTests() {
     terminal.task = runTaskFixture('running');
     terminal.runs = [runRow('Failed')];
     terminal.proofTaskState = 'verifying';
-    const terminalHarness = runChatWebview(terminal);
-    assertEqual(
-      terminalHarness.dom.document.getElementById('run-state-label').textContent,
-      'Run failed',
+    assert(
+      headerOf(runChatWebview(terminal).dom).includes('Run failed'),
       'the terminal run row outranks the proof state',
     );
     // A session tag `running` with no task-run rows keeps only T09.
@@ -15011,34 +15209,24 @@ async function approvedStateCopyTests() {
     tagOnly.task = runTaskFixture('running');
     const tagHarness = runChatWebview(tagOnly);
     assertEqual(tagOnly.runs.length, 0, 'no task-run rows are served');
-    assertEqual(tagHarness.dom.document.getElementById('run-state').hidden, false);
-    assertEqual(tagHarness.dom.document.getElementById('run-state-label').textContent, 'Running');
-    assertEqual(
-      tagHarness.dom.document.getElementById('run-state-copy').textContent,
-      'The candidate is separate from your workspace.',
-    );
-    // No rows, no proof and no running tag: nothing renders.
+    assert(headerOf(tagHarness.dom).includes('Running'));
+    // No rows, no proof and no running tag: the header stays Ready.
     const none = webviewSnapshot([]);
     none.task = runTaskFixture('done');
     const noneHarness = runChatWebview(none);
-    assertEqual(noneHarness.dom.document.getElementById('run-state').hidden, true);
+    assert(headerOf(noneHarness.dom).startsWith('Ready'));
+    assertEqual(noneHarness.dom.document.getElementById('attention-card').hidden, true);
     // Adversarial: a malformed newest row (null / non-string state) renders
     // nothing and never throws.
     const malformed = webviewSnapshot([]);
     malformed.task = runTaskFixture('done');
     malformed.runs = [null, { state: 7 }];
     const malformedHarness = runChatWebview(malformed);
-    assertEqual(malformedHarness.dom.document.getElementById('run-state').hidden, true);
-    // No task at all and no served run condition: nothing renders.
-    const empty = runChatWebview(webviewSnapshot([]));
-    assertEqual(empty.dom.document.getElementById('run-state').hidden, true);
+    assert(headerOf(malformedHarness.dom).startsWith('Ready'));
+    assertEqual(malformedHarness.dom.document.getElementById('attention-card').hidden, true);
   });
 
   await test('negative: the collapsed session tag alone can never render T12/T25/T26', () => {
-    // The collapsed tag source (`GET /native/session/{id}/tasks`) serves only
-    // `running | in_progress | done | idle`; none of those may be mapped to
-    // the proof/terminal rows. With no task-run rows and no proof, the tag is
-    // the ONLY run source.
     const prohibited = {
       'Checking the change': 'T12',
       'Run cancelled': 'T25',
@@ -15050,18 +15238,17 @@ async function approvedStateCopyTests() {
       assertEqual(snapshot.runs.length, 0);
       assertEqual(snapshot.proofTaskState, null);
       const { dom } = runChatWebview(snapshot);
-      const strip = dom.document.getElementById('run-state');
-      const label = dom.document.getElementById('run-state-label').textContent;
+      const label = dom.document.getElementById('daemon-text').textContent;
       assert(
         !Object.prototype.hasOwnProperty.call(prohibited, label),
         `tag ${tag}: the collapsed tag alone must never render ${prohibited[label]}`,
       );
       if (tag === 'running') {
-        assertEqual(strip.hidden, false, 'the tag `running` may keep only T09');
-        assertEqual(label, 'Running');
+        assert(label.includes('Running'), `tag ${tag}: the tag may keep only T09 (${label})`);
       } else {
-        assertEqual(strip.hidden, true, `tag ${tag}: nothing renders`);
+        assert(label.startsWith('Ready'), `tag ${tag}: the header stays Ready (${label})`);
       }
+      assertEqual(dom.document.getElementById('attention-card').hidden, true);
     }
   });
 
@@ -15597,24 +15784,32 @@ async function askFirstUxTests() {
     });
   });
 
-  await test('run state uses the shared cause-specific labels and never says resend', () => {
+  await test('run state uses the shared cause-specific labels in the header and menu action', () => {
     const render = (input) => {
       const snapshot = webviewSnapshot([]);
       snapshot.ux = ux.projectUx(input);
-      return runChatWebview(snapshot).dom;
+      return runChatWebview(snapshot);
     };
-    const credentialSnapshot = webviewSnapshot([]);
-    credentialSnapshot.ux = ux.projectUx({
+    const credentialHarness = render({
       machineState: 'failed_recoverable',
       lastError: 'provider 401 invalid api key',
       activeRunId: 'r1',
     });
-    const credentialHarness = runChatWebview(credentialSnapshot);
     const credential = credentialHarness.dom;
-    assertEqual(credential.document.getElementById('run-state-label').textContent, 'Provider setup needed');
-    assertEqual(credential.document.getElementById('run-state-label').textContent.includes('recovery'), false);
+    assert(
+      credential.document.getElementById('daemon-text').textContent.includes('Provider setup needed'),
+      credential.document.getElementById('daemon-text').textContent,
+    );
+    assert(
+      !credential.document.getElementById('daemon-text').textContent.includes('recovery'),
+    );
+    assertEqual(
+      credential.document.getElementById('attention-card-title').textContent,
+      'Provider connection needs attention',
+      'the credential cause is the ONE problem card',
+    );
     const providerAction = findFake(
-      credential.document.getElementById('run-state'),
+      credential.document.getElementById('attention-card-actions'),
       (node) => node.tagName === 'button' && node.textContent === 'Open provider settings',
     );
     assert(providerAction, 'the credential cause offers one provider-settings action');
@@ -15623,32 +15818,39 @@ async function askFirstUxTests() {
       credentialHarness.posted.some((message) => message.type === 'openProviderSettings'),
       'the action is wired to the host',
     );
-    const paused = render({ runs: [{ state: 'paused' }], task: { state: 'paused', goal: 'g' } });
-    assertEqual(paused.document.getElementById('run-state-label').textContent, 'Paused');
-    assert(!paused.document.getElementById('run-state-copy').textContent.includes('send'));
-    assert(
-      findFake(
-        paused.document.getElementById('run-state'),
-        (node) => node.tagName === 'button' && node.textContent === 'Resume',
-      ),
-      'a durable pause offers Resume, never resend',
-    );
+    const pausedHarness = render({ runs: [{ state: 'paused' }], task: { state: 'paused', goal: 'g' } });
+    const paused = pausedHarness.dom;
+    assert(paused.document.getElementById('daemon-text').textContent.includes('Paused'));
+    const resume = paused.document.getElementById('menu-run-action');
+    assertEqual(resume.hidden, false);
+    assertEqual(resume.textContent, 'Resume');
+    resume.click();
+    assertDeepEqual(pausedHarness.posted[pausedHarness.posted.length - 1], {
+      type: 'uxAction',
+      action: 'resumeRun',
+    });
     const transient = render({
       machineState: 'failed_recoverable',
       lastError: 'provider 503 overloaded',
       activeRunId: 'r1',
     });
-    assertEqual(transient.document.getElementById('run-state-label').textContent, 'Retrying automatically');
+    assert(
+      transient.dom.document.getElementById('daemon-text').textContent.includes('Retrying automatically'),
+      transient.dom.document.getElementById('daemon-text').textContent,
+    );
     const preRun = render({
       machineState: 'failed_recoverable',
       lastError: 'admission refused before the run',
       errorKind: 'run_failure',
       activeRunId: null,
     });
-    assertEqual(preRun.document.getElementById('run-state-label').textContent, "Couldn't start");
+    assert(
+      preRun.dom.document.getElementById('daemon-text').textContent.includes("Couldn't start"),
+      preRun.dom.document.getElementById('daemon-text').textContent,
+    );
   });
 
-  await test('attention is aggregated to at most three grouped rows and absent groups are omitted', () => {
+  await test('attention is ONE card: top problem + one action, approvals stay in the approval card', () => {
     const snapshot = webviewSnapshot([]);
     snapshot.ux = ux.projectUx({
       permissions: [{ id: 'p1' }, { id: 'p2' }],
@@ -15662,9 +15864,22 @@ async function askFirstUxTests() {
     const { dom } = runChatWebview(snapshot);
     const card = dom.document.getElementById('attention-card');
     assertEqual(card.hidden, false);
-    const items = dom.document.getElementById('attention-list').children;
-    assertEqual(items.length, 3, 'never more than three grouped items');
-    assert(fakeText(items[0]).includes('2 approvals waiting'), fakeText(items[0]));
+    assertEqual(
+      dom.document.getElementById('attention-card-title').textContent,
+      '1 check found a problem',
+      'the highest-priority non-approval problem is the headline',
+    );
+    assertDeepEqual(
+      actionLabels(dom.document.getElementById('attention-card-actions')),
+      ['View checks'],
+      'the merged card exposes exactly one action',
+    );
+    const technical = fakeText(dom.document.getElementById('attention-technical-body'));
+    assert(technical.includes('2 questions need your answer'), technical);
+    assert(
+      !technical.includes('2 approvals waiting'),
+      'approvals are not duplicated in the problem card',
+    );
     const empty = runChatWebview(webviewSnapshot([]));
     assertEqual(empty.dom.document.getElementById('attention-card').hidden, true, 'absence is omitted');
   });
@@ -15740,6 +15955,50 @@ async function askFirstUxTests() {
     assert(css.includes('overflow-wrap: break-word'), 'prose wraps at word boundaries');
     assert(css.includes('@media (max-width: 320px)'), 'the 240-320px layout is explicit');
     assert(/text-overflow: ellipsis/.test(css), 'identifiers ellipsize instead of stacking');
+  });
+
+  await test('mutation witness: the transcript/composer flow predicate rejects overlap regressions', () => {
+    const css = readFileSync(new URL('../media/chat.css', import.meta.url), 'utf8');
+    const ruleOf = (source, selector) => {
+      const start = source.indexOf(`${selector} {`);
+      if (start === -1) return '';
+      const end = source.indexOf('}', start);
+      return end === -1 ? '' : source.slice(start, end + 1);
+    };
+    const transcriptFills = (source) => {
+      const rule = ruleOf(source, '.transcript-card');
+      return /flex:\s*1 1 0/.test(rule) && /min-height:\s*0/.test(rule);
+    };
+    const composerInFlow = (source) => {
+      const rule = ruleOf(source, '#composer');
+      return (
+        /flex:\s*none/.test(rule) &&
+        /safe-area-inset-bottom/.test(rule) &&
+        !/position:\s*(fixed|absolute|sticky)/.test(rule)
+      );
+    };
+    const entriesScroll = (source) => /overflow-y:\s*auto/.test(ruleOf(source, '#entries'));
+    const mutateRule = (source, selector, needle, replacement) => {
+      const rule = ruleOf(source, selector);
+      assert(rule.includes(needle), `the ${selector} rule must contain ${needle}`);
+      return source.replace(rule, rule.replace(needle, replacement));
+    };
+    assert(transcriptFills(css), 'the transcript owns the remaining height');
+    assert(composerInFlow(css), 'the composer stays in normal flow with safe-area padding');
+    assert(entriesScroll(css), 'the transcript owns scrolling');
+    // Mutations that restore the reported overlap must fail the same predicate.
+    assert(
+      !transcriptFills(mutateRule(css, '.transcript-card', 'flex: 1 1 0;', 'flex: none;')),
+      'mutation witness: a non-growing transcript is detected',
+    );
+    assert(
+      !composerInFlow(mutateRule(css, '#composer', 'flex: none;', 'position: fixed;')),
+      'mutation witness: a fixed composer is detected',
+    );
+    assert(
+      !entriesScroll(mutateRule(css, '#entries', 'overflow-y: auto;', 'overflow-y: visible;')),
+      'mutation witness: a non-scrolling transcript is detected',
+    );
   });
 }
 
@@ -16698,7 +16957,8 @@ async function outcomeTests() {
       0,
       'normal snapshots never trigger a ledger read',
     );
-    dom.document.getElementById('nav-history').click();
+    dom.document.getElementById('btn-overflow').click();
+    dom.document.getElementById('menu-history').click();
     dom.document.getElementById('history-tab-outcomes').click();
     assertEqual(posted[posted.length - 1].type, 'readOutcomes', 'opening Outcomes posts exactly one read');
     assertEqual(posted[posted.length - 1].beforeMs, undefined, 'the top read carries no cursor');
@@ -16947,7 +17207,7 @@ async function capabilityMatrixTests() {
       ],
       'faktor.locateDaemon': ['locateDaemon(', ['locateDaemon', ['applyMachineScopedWrite(']]],
       'faktor.openControlCenter': ['openControlCenter(context, ', null],
-      'faktor.openModelPicker': ['openControlCenter(context, ', null],
+      'faktor.openModelPicker': ['pickModel(edition8Deps(context))', null],
       'faktor.openSettings': ['openControlCenter(context, ', null],
     };
     for (const command of Object.keys(matrix)) {
@@ -17178,9 +17438,9 @@ async function edition8HtmlSafetyTests() {
       initialScreen: 'S64',
       host: 'vscode',
     });
-    assert(settingsHtml.includes('data-settings-search="O-01"'), 'settings search input is absent');
-    assert(settingsHtml.includes('data-activate="O-01"'), 'settings search does not dispatch the served route');
-    assert(settingsHtml.includes('data-settings-count'), 'settings search result count is not live');
+    assert(settingsHtml.includes('data-settings-global-search'), 'settings search input is absent');
+    assert(settingsHtml.includes('data-settings-global-count'), 'settings search result count is not live');
+    assert(!settingsHtml.includes('data-settings-search="O-01"'), 'the dead per-screen search control survived');
     for (const id of ['Q-02', 'Q-03', 'Q-04', 'X-12']) {
       const binding = bindingOf8(id);
       assertEqual(binding.kind, 'read');
@@ -17196,25 +17456,61 @@ async function edition8HtmlSafetyTests() {
     assert(receipt.valueText.includes('admission receipt'), `receipt not served: ${receipt.valueText}`);
   });
 
-  await test('edition8: settings is one searchable domain surface with one apply and human values', () => {
+  await test('edition8: settings renders one row per descriptor, six domains, one apply and no raw IDs', () => {
+    const fixture = edition8Snapshot();
     const html = renderEdition8Html({
       nonce: 'testnonce',
       cspSource: 'vscode-resource:',
       scriptUri: 'media/edition8.js',
       styleUri: 'media/edition8.css',
-      state: { snapshot: edition8Snapshot(), loading: false, error: null, focusControl: null },
+      state: { snapshot: fixture, loading: false, error: null, focusControl: null },
       initialScreen: 'S29',
       host: 'vscode',
     });
+    const rowCount = (value) => [...value.matchAll(/data-settings-row\b/g)].length;
+    const keys = (value) => [...value.matchAll(/data-settings-key="([^"]+)"/g)].map((match) => match[1]);
+    const declared = Number((html.match(/data-settings-descriptor-count="(\d+)"/) ?? [])[1]);
+    const served = descriptorMap(fixture.descriptors).size;
     assert(html.includes('id="e8-settings-home"'), 'settings home is absent');
     assert(html.includes('data-settings-global-search'), 'global settings search is absent');
     for (const domain of ['Providers and models', 'Context and compaction', 'Tools and MCP', 'Permissions', 'Billing and usage', 'Appearance and general']) {
       assert(html.includes(`>${domain}</h3>`), `settings domain ${domain} is missing`);
     }
     assert(html.includes('Autosave is off'), 'the save model is not explicit');
-    assert(html.includes('data-settings-row'), 'settings rows are absent');
     assert(html.includes('e8-settings-advanced'), 'advanced settings are not disclosed');
     assert(!html.includes('data-primary-apply'), 'a duplicate per-screen apply survived in settings');
+    assert(!/<article class="e8-control"[^>]*data-config="true"/.test(html), 'a config control card was rendered beside the descriptor rows');
+    assert(!html.includes('e8-settings-row-id'), 'a raw screen ID column survived');
+    assert(!/<div class="e8-settings-row"[^>]*data-settings-open/.test(html), 'a descriptor row opened a legacy screen page');
+    assertEqual(rowCount(html), served, 'rendered settings rows != served descriptors');
+    assertEqual(new Set(keys(html)).size, served, 'a descriptor rendered more than once');
+    assertEqual(declared, served, 'the declared descriptor count drifted from the served count');
+    assertEqual((html.match(/class="e8-settings-value"/g) ?? []).length, served, 'a descriptor has no value cell');
+    for (const key of keys(html)) assert(!html.includes(`>${key}<`), `raw descriptor key ${key} is visible`);
+
+    // Mutation witness: duplicate row markup is observable, so the assertion
+    // above fails closed if the renderer ever emits a duplicate again.
+    const first = html.indexOf('data-settings-row');
+    const rowStart = html.lastIndexOf('<div class="e8-settings-row"', first);
+    const next = html.indexOf('<div class="e8-settings-row"', first + 1);
+    const duplicated = html.slice(0, next) + html.slice(rowStart, next) + html.slice(next);
+    assertEqual(rowCount(duplicated), served + 1, 'duplicate-row witness did not add a row');
+
+    // A duplicate descriptor in the served catalog still renders once.
+    const mutated = edition8Snapshot();
+    mutated.descriptors.descriptors.push({ ...mutated.descriptors.descriptors[0] });
+    const deduped = renderEdition8Html({
+      nonce: 'testnonce',
+      cspSource: 'vscode-resource:',
+      scriptUri: 'media/edition8.js',
+      styleUri: 'media/edition8.css',
+      state: { snapshot: mutated, loading: false, error: null, focusControl: null },
+      initialScreen: 'S29',
+      host: 'vscode',
+    });
+    assertEqual(rowCount(deduped), served, 'a duplicate served descriptor produced a duplicate row');
+    assertEqual(new Set(keys(deduped)).size, served, 'a duplicate served descriptor key survived');
+
     const allowed = controlView(E8_CONTROLS.find((entry) => entry.id === 'T-02'), edition8Snapshot(), false, null);
     assert(allowed.valueText.includes('2 values'), `list setting still renders raw JSON: ${allowed.valueText}`);
     assert(!allowed.valueText.includes('["'), 'raw JSON list leaked into the settings value');
@@ -17222,15 +17518,12 @@ async function edition8HtmlSafetyTests() {
     assert(label.label === 'Temperature', `descriptor label not used: ${label.label}`);
     assert(label.description.length > 0, 'descriptor description is empty');
     const script = readFileSync(new URL('../media/edition8.js', import.meta.url), 'utf8');
-    assert(
-      script.includes("vscode.postMessage({ type: 'e8Ready' });\n  installSettingsSearch();\n  installSettingsHome();"),
-      'the settings home interaction is not installed on boot',
-    );
-    assert(
-      script.includes("selectScreen(button.getAttribute('data-settings-open'), true)"),
-      'a settings row does not open its screen',
-    );
-    assert(script.includes("getElementById('e8-settings-back')"), 'the settings surface has no way back');
+    assert(script.includes("filterSettingsHome(input)"), 'the descriptor-row search is not wired');
+    assert(script.includes("data-settings-advanced"), 'search does not reveal matching advanced rows');
+    assert(script.includes("[data-settings-open]"), 'the action-page route is not wired');
+    assert(script.includes("'e8SettingsHome'"), 'the gear cannot return to the descriptor home');
+
+    assert(script.includes("getElementById('e8-settings-back')"), 'the action-page back route is not wired');
     assert(
       script.includes("window.__faktorE8Initial && !document.getElementById('e8-settings-home')"),
       'settings still boots into a single screen instead of the one surface',

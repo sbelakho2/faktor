@@ -1667,7 +1667,7 @@ internal class Edition8SettingsHomePanel(private val host: Edition8Host) : JPane
             Edition8Registry.controls.firstOrNull { it.id == id }?.name
         }.joinToString(" · ")
         val summaryText = if (controlNames.isEmpty()) groupSummary(screen.group) else controlNames
-        val summary = wrappedMutedLabel(summaryText + " · " + screen.id)
+        val summary = wrappedMutedLabel(summaryText)
         val text = pageColumn(gap = Spacing.XS, padding = 0)
         text.add(label)
         text.add(summary)
@@ -1708,7 +1708,7 @@ internal class Edition8SettingsHomePanel(private val host: Edition8Host) : JPane
             panel.isVisible = match
             if (match) visible += 1
         }
-        count.text = if (query.isEmpty()) "${rowRecords.size} settings screens"
+        count.text = if (query.isEmpty()) "${rowRecords.size} settings"
         else "$visible " + if (visible == 1) "setting matches" else "settings match"
         empty.isVisible = visible == 0
         rowsHost.revalidate()

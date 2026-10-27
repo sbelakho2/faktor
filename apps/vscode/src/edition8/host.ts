@@ -73,7 +73,12 @@ export function sampleFor(controlId: string, snapshot: E8Snapshot | null): strin
     const view = controlView(controlById(controlId), snapshot, false, null);
     if (view.options.length > 0) return view.options[0];
   }
-  return binding.sample;
+  let sample = binding.sample;
+  if (typeof sample === 'number') {
+    if (binding.min !== null && sample < binding.min) sample = binding.min;
+    if (binding.max !== null && sample > binding.max) sample = binding.max;
+  }
+  return sample;
 }
 
 function stageable(binding: E8Binding): boolean {

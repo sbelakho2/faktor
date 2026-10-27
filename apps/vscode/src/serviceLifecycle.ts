@@ -288,9 +288,11 @@ export interface ServicePlanGateInput {
 /**
  * The ONE pre-launch gate. It never spawns; it returns the typed authority
  * that explains why a start must not happen (or null when the plan is safe).
- * Automatic/restart starts additionally require the executable to come from
- * the trusted install (the signed layout launcher, or a path inside its
- * install root); repository paths are refused in every mode.
+ * Automatic/restart starts additionally require the executable to be INSIDE
+ * the trusted install root: the signed layout launcher, the verified in-root
+ * executable written by `faktor install`, or a machine-scoped binaryPath
+ * setting that points inside that root. Process-environment paths and paths
+ * outside the root are refused; repository paths are refused in every mode.
  */
 export function servicePlanAuthority(input: ServicePlanGateInput): ServiceAuthority | null {
   const { plan, mode } = input;
@@ -306,13 +308,23 @@ export function servicePlanAuthority(input: ServicePlanGateInput): ServiceAuthor
       `${plan.executable} is inside the workspace (${input.workspaceRoot}); repository-supplied executables are never started`,
     );
   }
-  if (mode !== 'explicit' && plan.source !== 'install-layout') {
-    if (plan.source === 'environment' || !isPathInside(plan.installRoot, plan.executable)) {
+  if (mode !== 'explicit') {
+    if (plan.source === 'environment') {
       return serviceAuthority(
         'outside_trusted_install',
-        plan.source === 'environment'
-          ? `${plan.executable} came from the process environment; only a machine-scoped installed executable starts automatically`
-          : `${plan.executable} is outside the trusted install ${plan.installRoot}; only machine-scoped installed executables start automatically`,
+        `${plan.executable} came from the process environment; only a machine-scoped installed executable starts automatically`,
+      );
+    }
+    if (plan.installRoot.length === 0) {
+      return serviceAuthority(
+        'outside_trusted_install',
+        `${plan.executable} resolved without a trusted install root; set the machine-scoped faktor.installRoot`,
+      );
+    }
+    if (!isPathInside(plan.installRoot, plan.executable)) {
+      return serviceAuthority(
+        'outside_trusted_install',
+        `${plan.executable} is outside the trusted install ${plan.installRoot}; only machine-scoped installed executables start automatically`,
       );
     }
   }

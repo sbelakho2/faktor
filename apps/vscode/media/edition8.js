@@ -196,8 +196,8 @@
   function selectScreen(screenId, moveFocus) {
     var screen = screens.get(screenId);
     if (!screen) return false;
-    // Settings is one surface: opening a setting replaces the domain index;
-    // Back returns to it. The registry screen stays the contract owner.
+    // Config descriptors stay on the home rows; action/diagnostic pages open
+    // as one full settings page and Back returns to the same search.
     var settingsHome = document.getElementById('e8-settings-home');
     var settingsBack = document.getElementById('e8-settings-back');
     if (settingsHome) settingsHome.hidden = true;
@@ -224,6 +224,18 @@
     return true;
   }
 
+  function controlLabel(controlId) {
+    var row = document.getElementById('e8-control-' + controlId);
+    if (row) {
+      var label = row.querySelector('.e8-settings-label');
+      if (label && label.textContent) return label.textContent.trim();
+      var name = row.querySelector('.e8-control-name');
+      if (name && name.textContent) return name.textContent.trim();
+    }
+    var input = document.querySelector('[data-input="' + controlId + '"]');
+    return input && input.getAttribute('data-label') ? input.getAttribute('data-label') : 'Setting';
+  }
+
   function footerPatch() {
     var list = document.getElementById('e8-patch-list');
     var count = document.getElementById('e8-staged-count');
@@ -246,13 +258,13 @@
       for (var entry of entries.slice().sort(function (a, b) { return a.controlId.localeCompare(b.controlId); })) {
         var chip = document.createElement('span');
         chip.className = 'e8-chip';
-        chip.textContent = entry.controlId + ' \u00b7 ' + entry.key + ' = ' + display(entry.value);
+        chip.textContent = controlLabel(entry.controlId) + ' = ' + display(entry.value);
         list.appendChild(chip);
       }
       for (var id of Array.from(unstaged).sort()) {
         var chip2 = document.createElement('span');
         chip2.className = 'e8-chip e8-chip-reset';
-        chip2.textContent = id + ' \u00b7 reset to inherited';
+        chip2.textContent = controlLabel(id) + ' \u00b7 reset to inherited';
         list.appendChild(chip2);
       }
     }
@@ -308,30 +320,52 @@
     var home = document.getElementById('e8-settings-home');
     if (!home) return;
     var query = input.value.trim().toLowerCase();
-    var rows = home.querySelectorAll('[data-settings-row]');
+    var rows = home.querySelectorAll('[data-settings-row], [data-settings-link-row]');
+    var descriptors = home.querySelectorAll('[data-settings-row]').length;
     var visible = 0;
     for (var i = 0; i < rows.length; i++) {
       var row = rows[i];
-      var haystack = row.getAttribute('data-settings-search') || '';
+      var haystack = row.getAttribute('data-settings-haystack') || '';
       var match = query.length === 0 || haystack.indexOf(query) !== -1;
       row.hidden = !match;
       if (match) visible += 1;
     }
     var domains = home.querySelectorAll('[data-settings-domain]');
     for (var d = 0; d < domains.length; d++) {
-      var domainRows = domains[d].querySelectorAll('[data-settings-row]');
+      var domainRows = domains[d].querySelectorAll('[data-settings-row], [data-settings-link-row]');
       var shown = 0;
       for (var r = 0; r < domainRows.length; r++) if (!domainRows[r].hidden) shown += 1;
       domains[d].hidden = shown === 0;
+      for (var details of domains[d].querySelectorAll('[data-settings-advanced], [data-settings-actions]')) {
+        var disclosed = 0;
+        for (var advancedRow of details.querySelectorAll('[data-settings-row], [data-settings-link-row]')) {
+          if (!advancedRow.hidden) disclosed += 1;
+        }
+        if (query.length > 0 && disclosed > 0) details.open = true;
+      }
     }
     var count = home.querySelector('[data-settings-global-count]');
     if (count) {
       count.textContent = query.length === 0
-        ? rows.length + ' settings screens'
+        ? descriptors + ' settings'
         : visible + (visible === 1 ? ' setting matches' : ' settings match');
     }
     var empty = home.querySelector('[data-settings-empty]');
     if (empty) empty.hidden = visible !== 0;
+  }
+
+  function showSettingsHome() {
+    var home = document.getElementById('e8-settings-home');
+    if (home) home.hidden = false;
+    for (var panel of Array.from(document.querySelectorAll('.e8-screen'))) panel.hidden = true;
+    var destination = document.querySelector('[data-destination-panel="settings"]');
+    if (destination) destination.hidden = true;
+    var back = document.getElementById('e8-settings-back');
+    if (back) back.hidden = true;
+    selected = null;
+    var search = document.getElementById('e8-settings-search');
+    if (search) search.focus();
+    if (home) home.scrollIntoView({ block: 'start' });
   }
 
   function installSettingsHome() {
@@ -354,16 +388,7 @@
     var back = document.getElementById('e8-settings-back');
     if (back && back.dataset.bound !== 'true') {
       back.dataset.bound = 'true';
-      back.addEventListener('click', function () {
-        var home = document.getElementById('e8-settings-home');
-        if (home) home.hidden = false;
-        for (var panel of Array.from(document.querySelectorAll('.e8-screen'))) panel.hidden = true;
-        back.hidden = true;
-        selected = null;
-        var search = document.getElementById('e8-settings-search');
-        if (search) search.focus();
-        if (home) home.scrollIntoView({ block: 'start' });
-      });
+      back.addEventListener('click', showSettingsHome);
     }
     var review = document.querySelector('[data-settings-review]');
     if (review && review.dataset.bound !== 'true') {
@@ -798,6 +823,9 @@
           footerPatch();
         }
         setNotice(message.message || '', message.ok === false ? 'error' : 'info');
+        return;
+      case 'e8SettingsHome':
+        showSettingsHome();
         return;
       case 'e8SelectScreen':
         if (typeof message.screen === 'string' && screens.has(message.screen)) selectScreen(message.screen, false);

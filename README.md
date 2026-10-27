@@ -31,8 +31,27 @@ behind **Inspect**.
 - **JetBrains** — install the Faktor plugin (`apps/jetbrains`), open the
   Faktor tool window and describe the task.
 - **CLI** — `faktor run "describe the task"`; `faktor --help` groups commands
-  into Daily (run, doctor, sessions), Service (serve, build, acp, bootstrap)
-  and Admin (commerce, enterprise, updater, worker).
+  into Daily (run, doctor, sessions), Service (serve, build, acp, bootstrap,
+  install) and Admin (commerce, enterprise, updater, worker).
+
+### Trusted install
+
+The extension auto-starts only a machine-scoped executable that is inside the
+configured install root and whose recorded sha256 matches. Create that identity
+reproducibly instead of copying and hashing by hand:
+
+```sh
+faktor install --dest ~/.faktor/install --data-dir ~/.faktor
+```
+
+This writes the **in-root executable model** (`faktor` + `faktor.sha256` +
+`install-identity.json`) and `INSTALL.md` / `install-settings.json` with the
+exact machine-scoped settings (`faktor.installRoot`, `faktor.binaryPath`, and
+`faktor.dataDir`). No signed `launcher`/`current`/`versions/` layout is
+required; when one already exists in the destination the installer refuses, so
+the signed layout keeps its single authority. Workspace-scoped settings,
+repository `target/` builds and `FAKTOR_BIN` are never used for automatic
+startup.
 
 **A native Rust engineering runtime with Faktor-owned IDE UIs.**
 

@@ -122,7 +122,7 @@
       },
       {
         "command": "faktor.openControlCenter",
-        "title": "Open Control Center",
+        "title": "Open Settings",
         "icon": "$(settings-gear)",
         "category": "Faktor"
       },
@@ -133,7 +133,7 @@
       },
       {
         "command": "faktor.openSettings",
-        "title": "Settings: Edition 5",
+        "title": "Settings: Revision 8",
         "category": "Faktor"
       },
       {
@@ -303,7 +303,7 @@
             "type": "string",
             "default": "",
             "scope": "machine",
-            "description": "Machine/user-scoped path to the faktor-cli executable. Workspace-scoped values are ignored and refused; repository target/ builds are never resolved or executed. Empty (default) resolves through the signed install layout (~/.faktor/install or faktor.installRoot) and otherwise refuses with a \"Locate daemon\u2026\" action."
+            "description": "Machine/user-scoped path to the faktor-cli executable. Workspace-scoped values are ignored and refused; repository target/ builds are never resolved or executed. Empty (default) resolves through the signed install layout (~/.faktor/install or faktor.installRoot) or the verified in-root executable written by `faktor install`, and otherwise refuses with a \"Locate daemon\u2026\" action."
           },
           "faktor.dataDir": {
             "type": "string",
@@ -315,7 +315,7 @@
             "type": "string",
             "default": "",
             "scope": "machine",
-            "description": "Machine/user-scoped install root holding the immutable release layout (current, launcher, versions/). When a layout exists there the daemon is spawned through the stable bootstrap launcher (which verifies the activated release digest), so the activated release and only that release runs; empty resolves to <faktor.dataDir>/install or ~/.faktor/install. Workspace-scoped values are ignored and refused."
+            "description": "Machine/user-scoped trusted install root. When the signed release layout (current, launcher, versions/) exists there, the daemon is spawned through the stable bootstrap launcher (which verifies the activated release digest). When no launcher exists, a `faktor` executable and its `faktor.sha256` written by `faktor install` are accepted only if they are inside this root and the checksum matches. Empty resolves to <faktor.dataDir>/install or ~/.faktor/install. Workspace-scoped values are ignored and refused."
           },
           "faktor.extraArgs": {
             "type": "array",
@@ -410,7 +410,7 @@
   "scripts": {
     "build": "tsc -p .",
     "selftest": "node scripts/selftest.mjs",
-    "render:check": "node scripts/render-webview.mjs --check && node scripts/render-edition5.mjs --check",
+    "render:check": "node scripts/settings-surface-check.mjs && node scripts/render-webview.mjs --check && node scripts/render-edition5.mjs --check",
     "render:screenshots": "node scripts/render-webview.mjs --screenshots --prefix render",
     "package:vsix": "npx --no-install vsce package",
     "render:edition5": "node scripts/render-edition5.mjs --write",
@@ -423,7 +423,8 @@
     "contrast:edition8": "node scripts/edition8-contrast.mjs",
     "optical:edition8": "node scripts/edition8-optical.mjs",
     "e2e:edition8": "node scripts/stream-probe.mjs && bash ../../scripts/edition8/dogfood.sh",
-    "perf:edition8": "node ../../tests/edition8/perf.mjs --check"
+    "perf:edition8": "node ../../tests/edition8/perf.mjs --check",
+    "settings:check": "node scripts/settings-surface-check.mjs"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

@@ -318,16 +318,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     <span id="daemon-dot" class="dot dot-stopped" aria-hidden="true"></span>
     <span id="daemon-text" class="header-status">Ready</span>
     <span class="spacer"></span>
-    <nav id="nav-switcher" class="nav-switcher" role="tablist" aria-label="Faktor views">
-      <button id="nav-work" class="nav-tab" type="button" role="tab" aria-selected="true" tabindex="0" aria-controls="work-panel">Work</button>
-      <button id="nav-inspect" class="nav-tab" type="button" role="tab" aria-selected="false" tabindex="-1" aria-controls="inspect-panel">Inspect</button>
-      <button id="nav-history" class="nav-tab" type="button" role="tab" aria-selected="false" tabindex="-1" aria-controls="history-panel">History</button>
-    </nav>
-    <button id="btn-overflow" class="toggle overflow-toggle" type="button" aria-expanded="false" aria-haspopup="true" title="Diagnostics and service controls" aria-label="Diagnostics and service controls">⋯</button>
-    <button id="btn-control-center" class="toggle control-center-toggle" type="button" title="Open the Faktor Control Center (models, providers, context, authority, routines, diagnostics)" aria-label="Open Faktor Control Center"><span class="control-center-label">Control Center</span><span class="control-center-glyph" aria-hidden="true">⚙</span></button>
+    <button id="btn-overflow" class="toggle overflow-toggle" type="button" aria-expanded="false" aria-haspopup="menu" aria-controls="overflow-menu" title="Faktor menu" aria-label="Faktor menu">⋯</button>
+    <button id="btn-control-center" class="toggle control-center-toggle" type="button" title="Open Faktor Settings (providers, context, tools, permissions, billing, appearance)" aria-label="Open Faktor Settings"><span class="control-center-label">Settings</span><span class="control-center-glyph" aria-hidden="true">⚙</span></button>
   </header>
-  <section id="diagnostics" class="card diagnostics" hidden>
-    <h2>Diagnostics</h2>
+  <nav id="overflow-menu" class="overflow-menu" role="menu" aria-label="Faktor menu" hidden>
+    <button id="menu-chat" class="menu-item" tabindex="-1" type="button" role="menuitem">Chat</button>
+    <button id="menu-run-action" class="menu-item" tabindex="-1" type="button" role="menuitem" hidden></button>
+    <button id="menu-inspect" class="menu-item" tabindex="-1" type="button" role="menuitem">Inspect</button>
+    <button id="menu-history" class="menu-item" tabindex="-1" type="button" role="menuitem">History</button>
+    <button id="menu-diagnostics" class="menu-item" tabindex="-1" type="button" role="menuitem">Diagnostics</button>
+    <button id="menu-stop" class="menu-item destructive" tabindex="-1" type="button" role="menuitem" hidden>Stop current run</button>
+  </nav>
+  <section id="diagnostics" class="view-panel diagnostics-view" role="region" aria-labelledby="diagnostics-title" tabindex="-1" hidden>
+    <h2 id="diagnostics-title">Diagnostics</h2>
     <section id="service-diagnostics" class="service-diagnostics" aria-labelledby="service-diagnostics-title">
       <h3 id="service-diagnostics-title">Service</h3>
       <section id="meta">
@@ -379,36 +382,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       </div>
     </section>
   </section>
-  <section id="stream-recovery" class="card" hidden aria-labelledby="stream-recovery-title">
-    <h2 id="stream-recovery-title">Live updates paused</h2>
-    <p id="stream-recovery-copy" class="recovery-copy">The client cannot read the next durable event. Nothing is skipped.</p>
-    <div id="stream-recovery-reason" class="warn" role="alert"></div>
-    <div class="composer-actions">
-      <button id="btn-reconnect-stream" type="button" title="Reconnect from the last good position after the Faktor service is upgraded">Reconnect</button>
-      <button id="btn-refresh-snapshot" class="secondary" type="button" title="Re-read the durable state (the blocked position is not skipped)">Refresh from snapshot</button>
-      <button id="btn-wait-stream" class="secondary" type="button" title="Keep waiting; the last valid journal position is kept" hidden>Wait</button>
-      <button id="btn-refresh-reconnecting" class="secondary" type="button" title="Re-read the durable state (the position is not skipped)" hidden>Refresh</button>
+  <section id="notices" class="sr-only" aria-live="polite" aria-atomic="false"></section>
+  <main id="work-panel" class="view-panel work-panel" role="region" aria-label="Chat" tabindex="-1">
+  <section id="attention-card" class="attention-card" hidden role="status" aria-live="polite" aria-labelledby="attention-card-title" data-problem-surface="attention">
+    <div class="attention-head">
+      <span id="attention-card-icon" class="attention-icon" aria-hidden="true"></span>
+      <h2 id="attention-card-title">Needs attention</h2>
     </div>
-    <details class="technical-disclosure">
+    <p id="attention-card-cause" class="attention-cause muted"></p>
+    <div id="attention-card-actions" class="attention-actions"></div>
+    <details id="attention-technical" class="technical-disclosure" hidden>
       <summary>Technical details</summary>
-      <div class="muted">The durable journal event that blocked the stream is never skipped. If the Faktor service predates this panel, upgrade it and reconnect; the service doctor (<code>faktor-cli doctor</code>) checks the journal.</div>
+      <pre id="attention-technical-body" class="excerpt"></pre>
     </details>
-  </section>
-  <section id="notices" aria-live="polite"></section>
-  <main id="work-panel" class="view-panel work-panel" role="tabpanel" aria-labelledby="nav-work">
-  <section id="task-card" class="card run-card work-status" aria-label="Run status" aria-live="polite">
-    <div class="run-strip">
-      <span id="task-state" class="state-chip" data-state="unknown">Ready</span>
-      <span id="work-status-tokens" class="run-meta" hidden></span>
-      <span id="work-status-approvals" class="run-meta" hidden></span>
-      <span class="spacer"></span>
-      <button id="btn-status-inspect" class="secondary status-inspect" type="button" title="Open the run details in Inspect">Details</button>
-      <button id="btn-cancel-run" class="secondary status-stop" type="button">Stop</button>
-    </div>
-  </section>
-  <section id="attention-card" class="card attention-card" hidden aria-labelledby="attention-card-title">
-    <h2 id="attention-card-title">Needs attention</h2>
-    <ul id="attention-list" class="attention-list" aria-label="Grouped items that need attention"></ul>
   </section>
   <section id="permission-card" class="card permission-card" hidden aria-labelledby="permission-card-title">
     <h2 id="permission-card-title">Faktor needs your approval</h2>
@@ -419,23 +405,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   <section id="transcript-card" class="card transcript-card">
     <h2 id="transcript-title">Conversation</h2>
     <section id="welcome" class="welcome">
-      <section id="preflight-card" class="preflight" aria-labelledby="preflight-label" hidden>
-        <div class="preflight-head">
-          <span id="preflight-dot" class="dot dot-stopped" aria-hidden="true"></span>
-          <h3 id="preflight-label" class="preflight-label">Faktor is stopped</h3>
-        </div>
-        <p id="preflight-copy" class="preflight-copy muted">Start the service when you are ready.</p>
-        <div id="preflight-path-row" class="preflight-meta" hidden>
-          <span class="preflight-key">Executable</span>
-          <code id="preflight-path" class="preflight-path"></code>
-        </div>
-        <div id="preflight-trust-row" class="preflight-meta" hidden>
-          <span class="preflight-key">Trust</span>
-          <span id="preflight-trust" class="preflight-trust"></span>
-        </div>
-        <div id="preflight-detail" class="muted preflight-detail" hidden></div>
-        <div id="preflight-actions" class="composer-actions preflight-actions"></div>
-      </section>
       <div class="welcome-mark" aria-hidden="true">
         <svg viewBox="0 0 5 5" width="36" height="36" class="pixel pixel-done">
           <rect class="pixel-body" x="1" y="0" width="3" height="5"></rect>
@@ -510,7 +479,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     </div>
   </form>
   </main>
-  <section id="inspect-panel" class="view-panel" role="tabpanel" aria-labelledby="nav-inspect" hidden>
+  <section id="inspect-panel" class="view-panel" role="region" aria-label="Inspect" tabindex="-1" hidden>
     <div class="inspect-nav">
       <div id="inspect-tabs" class="tablist" role="tablist" aria-label="Inspect subviews">
         <button id="subtab-overview" class="tab" type="button" role="tab" aria-selected="true" tabindex="0" aria-controls="inspect-subpanel-overview">Overview</button>
@@ -615,7 +584,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       </details>
     </div>
   </section>
-  <section id="history-panel" class="view-panel" role="tabpanel" aria-labelledby="nav-history" hidden>
+  <section id="history-panel" class="view-panel" role="region" aria-label="History" tabindex="-1" hidden>
     <div id="history-tabs" class="tablist history-tabs" role="tablist" aria-label="History surfaces">
       <button id="history-tab-conversations" class="tab" type="button" role="tab" aria-selected="true" tabindex="0" aria-controls="history-conversations">Conversations</button>
       <button id="history-tab-outcomes" class="tab" type="button" role="tab" aria-selected="false" tabindex="-1" aria-controls="history-outcomes">Outcomes</button>

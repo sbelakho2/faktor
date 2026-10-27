@@ -182,6 +182,16 @@ function jsonText(value: Json | null): string {
 }
 
 /**
+ * One human-readable value for a descriptor that has no dedicated control.
+ * Lists/objects keep their exact size instead of dumping a wire payload.
+ */
+export function descriptorValueText(snapshot: E8Snapshot | null, key: string): string {
+  if (snapshot === null) return 'Not served';
+  const value = configValueFor(lookupFor(snapshot), key);
+  return value === null ? 'Inherit (not configured)' : humanJsonText(value.value);
+}
+
+/**
  * Settings values are read by humans, never as raw JSON. Lists/objects keep
  * their exact size (a count is truthful) without dumping a wire payload into
  * a label. The editable control still carries the exact served value.

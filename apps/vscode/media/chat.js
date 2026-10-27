@@ -143,13 +143,6 @@
     label: 'composer-state-label',
     copy: 'composer-state-copy',
   };
-  var RUN_STATE_IDS = {
-    container: 'run-state',
-    glyph: 'run-state-glyph',
-    label: 'run-state-label',
-    copy: 'run-state-copy',
-  };
-
   // One logical submission at a time. The flag gates the composer BEFORE the
   // post, so a double click / Enter+click race can never emit a second
   // sendGoal; it is released ONLY by an explicit host result.
@@ -258,7 +251,20 @@
   var lastSnapshot = null;
   var historyQuery = '';
   var historyOpenInFlight = null;
-  var diagnosticsOpen = false;
+  var overflowOpen = false;
+  // The chat body has exactly ONE problem surface. Every failure source
+  // (served attention, service authority, a blocked stream, a host user
+  // error) writes its LATEST distinct problem here; the renderer chooses the
+  // highest-priority active one and never stacks duplicate cards.
+  var problemSources = { attention: null, authority: null, stream: null, user: null };
+  var renderedProblemKey = null;
+  var activeMenuAction = null;
+  var VIEW_PANELS = {
+    work: 'work-panel',
+    inspect: 'inspect-panel',
+    history: 'history-panel',
+    diagnostics: 'diagnostics',
+  };
   // I03: the locally selected change (preserved by PATH across refreshes,
   // clamped when the path disappears) and the last explicit review result
   // for exactly that path. I07: the active History sub-tab and the render
@@ -290,9 +296,6 @@
   var outcomesReading = false;
   /** The last raw snapshot error rendered, so it is not re-announced. */
   var lastRenderedError = null;
-  /** Technical tails currently displayed; identical errors never stack. */
-  var shownUserErrors = [];
-  var MAX_USER_ERRORS = 3;
   var MAX_PENDING_PERMISSIONS = 16;
   var WEBVIEW_MAX_ATTACHMENT_BYTES = 7 * 1024 * 1024;
   var WEBVIEW_MAX_ATTACHMENTS = 8;
@@ -928,11 +931,6 @@
     },
     { key: 'agents', label: 'Agents', tab: 'subtab-agents', sections: [] },
   ];
-  var TOP_TABS = [
-    { key: 'work', tab: 'nav-work', panel: 'work-panel' },
-    { key: 'inspect', tab: 'nav-inspect', panel: 'inspect-panel' },
-    { key: 'history', tab: 'nav-history', panel: 'history-panel' },
-  ];
   var CHANGES_EMPTY_LINE = 'No candidate changes are served for this run yet.';
   var MAX_CHANGED_PATHS = 200;
   var DIFF_UNAVAILABLE_LABEL = 'Diff unavailable';
@@ -1009,40 +1007,142 @@
     }
   }
 
+  /**
+   * ONE active destination at a time. Chat is the default; Inspect, History
+   * and Diagnostics are full-window views opened from the overflow menu.
+   * Selecting a destination closes the menu and never posts to the host.
+   */
   function setActiveView(key) {
-    for (var i = 0; i < TOP_TABS.length; i++) {
-      var selected = TOP_TABS[i].key === key;
-      if (selected) {
-        activeView = TOP_TABS[i].key;
-      }
-      setTabSelected(TOP_TABS[i].tab, selected);
-      var panel = byId(TOP_TABS[i].panel);
-      if (panel) {
-        panel.hidden = !selected;
-      }
-    }
-  }
-
-  function topTabKey(tabId) {
-    for (var i = 0; i < TOP_TABS.length; i++) {
-      if (TOP_TABS[i].tab === tabId) {
-        return TOP_TABS[i].key;
-      }
-    }
-    return null;
-  }
-
-  function selectTopTab(tabId, focusTab) {
-    var key = topTabKey(tabId);
-    if (key === null) {
+    if (!VIEW_PANELS[key]) {
       return;
     }
-    setActiveView(key);
-    if (focusTab === true) {
-      var node = byId(tabId);
-      if (node && typeof node.focus === 'function') {
-        node.focus();
+    activeView = key;
+    var currentMenu = {
+      work: 'menu-chat',
+      inspect: 'menu-inspect',
+      history: 'menu-history',
+      diagnostics: 'menu-diagnostics',
+    };
+    for (var panelKey in VIEW_PANELS) {
+      if (!Object.prototype.hasOwnProperty.call(VIEW_PANELS, panelKey)) {
+        continue;
       }
+      var panel = byId(VIEW_PANELS[panelKey]);
+      if (panel) {
+        panel.hidden = panelKey !== key;
+      }
+      var item = byId(currentMenu[panelKey]);
+      if (item && typeof item.setAttribute === 'function') {
+        item.setAttribute('aria-current', panelKey === key ? 'page' : 'false');
+      }
+    }
+    setOverflowOpen(false);
+  }
+
+  var MENU_ITEMS = [
+    'menu-chat',
+    'menu-run-action',
+    'menu-inspect',
+    'menu-history',
+    'menu-diagnostics',
+    'menu-stop',
+  ];
+
+  function visibleMenuItems() {
+    var items = [];
+    for (var i = 0; i < MENU_ITEMS.length; i++) {
+      var node = byId(MENU_ITEMS[i]);
+      if (node && node.hidden !== true) {
+        items.push(node);
+      }
+    }
+    return items;
+  }
+
+  /**
+   * Open a destination and move focus to its full-window region. Chat returns
+   * to the composer; the other destinations focus the region itself so a
+   * keyboard user never lands on a hidden menu item.
+   */
+  function openView(key) {
+    setActiveView(key);
+    var target = key === 'work' ? byId('goal') : byId(VIEW_PANELS[key]);
+    if (target && typeof target.focus === 'function') {
+      target.focus();
+    }
+  }
+
+  function setOverflowOpen(open) {
+    overflowOpen = open === true;
+    var menu = byId('overflow-menu');
+    if (menu) {
+      menu.hidden = !overflowOpen;
+    }
+    var button = byId('btn-overflow');
+    if (button && typeof button.setAttribute === 'function') {
+      button.setAttribute('aria-expanded', overflowOpen ? 'true' : 'false');
+    }
+    if (overflowOpen) {
+      var first = visibleMenuItems()[0];
+      if (first && typeof first.focus === 'function') {
+        first.focus();
+      }
+    } else if (menu && typeof menu.contains === 'function' && menu.contains(document.activeElement)) {
+      if (button && typeof button.focus === 'function') {
+        button.focus();
+      }
+    }
+  }
+
+  function toggleOverflow() {
+    setOverflowOpen(!overflowOpen);
+  }
+
+  /** WAI-ARIA menu keys: arrows wrap, Home/End jump, Escape is global. */
+  function wireMenuNavigation() {
+    for (var i = 0; i < MENU_ITEMS.length; i++) {
+      (function (id) {
+        var node = byId(id);
+        if (!node || typeof node.addEventListener !== 'function') {
+          return;
+        }
+        node.addEventListener('keydown', function (event) {
+          var key = event && event.key;
+          if (
+            key !== 'ArrowDown' &&
+            key !== 'ArrowUp' &&
+            key !== 'Home' &&
+            key !== 'End'
+          ) {
+            return;
+          }
+          var items = visibleMenuItems();
+          if (items.length === 0) {
+            return;
+          }
+          var current = -1;
+          for (var n = 0; n < items.length; n++) {
+            if (items[n] === node) {
+              current = n;
+              break;
+            }
+          }
+          var target = 0;
+          if (key === 'ArrowDown') {
+            target = current < 0 ? 0 : (current + 1) % items.length;
+          } else if (key === 'ArrowUp') {
+            target = current < 0 ? items.length - 1 : (current - 1 + items.length) % items.length;
+          } else if (key === 'End') {
+            target = items.length - 1;
+          }
+          if (event.preventDefault) {
+            event.preventDefault();
+          }
+          if (typeof items[target].focus === 'function') {
+            items[target].focus();
+          }
+        });
+      })(MENU_ITEMS[i]);
     }
   }
 
@@ -1932,7 +2032,6 @@
 
   function renderTask(snapshot) {
     var task = snapshot ? snapshot.task : null;
-    var card = byId('task-card');
     var spec = runStateSpec(snapshot);
     // Content guard: the status row is a pure function of the task, the run
     // strip source, the agent/approval counts and the proof's embedded state.
@@ -1958,86 +2057,31 @@
     }
     renderedTaskKey = guardKey;
     renderProbe('task');
-    // The status row is always present and quiet when idle. Run details
-    // (goal, plan, candidate boundary) live in Inspect, never as a second
-    // board above the conversation.
-    if (card) {
-      card.hidden = false;
+    // The product header carries the run status; there is no second status
+    // row in the chat body. Run detail (goal, tokens, plan, candidate
+    // boundary) lives in Inspect, and Stop lives in the overflow menu.
+    var hasRun =
+      task !== null ||
+      (snapshot ? snapshot.busy === true || snapshot.activeRunId != null : false);
+    var stopItem = byId('menu-stop');
+    if (stopItem) {
+      stopItem.hidden = !hasRun;
     }
-    renderRunStrip(task, snapshot);
-    writeStateStrip(RUN_STATE_IDS, spec);
-    renderRunStateAction(spec === null ? null : spec.action || null);
+    var action = spec !== null && spec.action ? spec.action : null;
+    activeMenuAction = action;
+    var menuAction = byId('menu-run-action');
+    if (menuAction) {
+      menuAction.hidden = action === null;
+      if (action !== null) {
+        menuAction.textContent = action.label;
+        menuAction.setAttribute('data-ux-action', action.key);
+      }
+    }
     renderTaskProgress(task);
-    renderStatusTokens(snapshot);
-    renderStatusApprovals(snapshot);
     renderTaskTests(task);
     renderTaskAgents(snapshot ? snapshot.agents : null);
     setText('task-goal', task ? task.goal : '—');
     renderCompletion(task);
-  }
-
-  /**
-   * Exact token accounting for the sticky status row: the served run budget
-   * wins, otherwise the session usage total. Nothing is estimated.
-   */
-  function renderStatusTokens(snapshot) {
-    var node = byId('work-status-tokens');
-    if (!node) {
-      return;
-    }
-    var budget = snapshot && snapshot.task ? snapshot.task.budget : null;
-    var spent =
-      budget && typeof budget.spentTokens === 'number' && isFinite(budget.spentTokens)
-        ? budget.spentTokens
-        : null;
-    var max =
-      budget && typeof budget.maxTokens === 'number' && isFinite(budget.maxTokens)
-        ? budget.maxTokens
-        : null;
-    var total =
-      spent === null && snapshot && snapshot.usage && typeof snapshot.usage.tokens === 'number'
-        ? snapshot.usage.tokens
-        : null;
-    clear(node);
-    if (spent === null && total === null) {
-      node.hidden = true;
-      return;
-    }
-    var value = spent === null ? total : spent;
-    var label = formatCount(value) + ' tokens';
-    if (max !== null) {
-      label += ' / ' + formatCount(max);
-    }
-    node.hidden = false;
-    span(node, label, 'chip run-chip run-chip-neutral');
-  }
-
-  /** Pending approvals are an attention count, not another transcript card. */
-  function renderStatusApprovals(snapshot) {
-    var node = byId('work-status-approvals');
-    if (!node) {
-      return;
-    }
-    var count =
-      snapshot && Array.isArray(snapshot.permissions) ? snapshot.permissions.length : 0;
-    clear(node);
-    if (count === 0) {
-      node.hidden = true;
-      node.setAttribute('data-state', '');
-      return;
-    }
-    node.hidden = false;
-    node.setAttribute('data-state', 'attention');
-    span(
-      node,
-      count === 1 ? '1 approval' : String(count) + ' approvals',
-      'chip run-chip run-chip-fail'
-    );
-  }
-
-  function formatCount(value) {
-    var text = String(Math.trunc(Number(value)));
-    return text.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
   }
 
   /** One lifecycle bucket per run state: the strip chip is theme-colored. */
@@ -2074,28 +2118,6 @@
     return 'unknown';
   }
 
-  /** The run strip: one state chip and the compact run identity. */
-  function renderRunStrip(task, snapshot) {
-    var node = byId('task-state');
-    if (!node) {
-      return;
-    }
-    var state = task ? String(task.state == null ? '' : task.state) : '';
-    var daemon = snapshot ? String(snapshot.daemon == null ? '' : snapshot.daemon) : '';
-    var running = snapshot ? snapshot.busy === true || snapshot.activeRunId != null : false;
-    var label = state;
-    if (label.length === 0) {
-      label = running ? 'Running' : daemon === 'running' ? 'Ready' : 'Idle';
-    }
-    var bucket = running ? 'running' : runStateClass(state);
-    if (!running && daemon !== 'running' && state.length === 0) {
-      bucket = 'unknown';
-    }
-    node.textContent = label;
-    node.className = 'state-chip state-' + bucket;
-    node.setAttribute('data-state', bucket);
-  }
-
   /**
    * One state strip: glyph + label + supporting copy, text-first (the glyph
    * is never the only signal). A null spec hides the strip and leaves the
@@ -2124,35 +2146,6 @@
     if (copy && copy.textContent !== spec.copy) {
       copy.textContent = spec.copy;
     }
-  }
-
-  /**
-   * The ONE action the shared state points at (Resume, Open provider
-   * settings, Reconnect, Retry, Reply, View checks, Diagnostics). It is
-   * rendered beside the run strip, never as a second competing control.
-   */
-  function renderRunStateAction(action) {
-    var container = byId('run-state');
-    if (!container) {
-      return;
-    }
-    var existing = byId('run-state-action');
-    if (existing && existing.parentNode === container) {
-      container.removeChild(existing);
-    }
-    if (!action || typeof action.key !== 'string' || !action.label) {
-      return;
-    }
-    var button = document.createElement('button');
-    button.id = 'run-state-action';
-    button.type = 'button';
-    button.className = 'secondary state-strip-action';
-    button.textContent = String(action.label);
-    button.setAttribute('data-ux-action', String(action.key));
-    button.addEventListener('click', function () {
-      dispatchUxAction(action);
-    });
-    container.appendChild(button);
   }
 
   /**
@@ -2703,7 +2696,7 @@
     button.type = 'button';
     button.textContent = 'Open setup guidance';
     button.addEventListener('click', function () {
-      setDiagnosticsOpen(true);
+      openView('diagnostics');
       setSandboxGuidanceOpen(true);
     });
     actions.appendChild(button);
@@ -4603,6 +4596,10 @@
       return parts.join(' · ');
     }
     var model = snapshot.session && snapshot.session.model ? String(snapshot.session.model) : '';
+    var spec = runStateSpec(snapshot);
+    if (spec !== null && spec.label && spec.label !== 'Ready') {
+      return model.length > 0 ? spec.label + ' · ' + model : spec.label;
+    }
     return model.length > 0 ? 'Ready · ' + model : 'Ready';
   }
 
@@ -4846,54 +4843,12 @@
   }
 
   /**
-   * The stream-recovery card: T28 `Live updates paused` while the next
-   * durable event cannot be read, T27 `Reconnecting live updates` while an
-   * explicit reconnect is in flight (the last valid journal position is
-   * kept). The two action rows swap; a skip action never exists.
+   * A blocked stream is a PROBLEM, not a second card: it contributes one
+   * source to the single inline attention surface. A transient reconnect is
+   * already named by the header status line, so it adds no duplicate card.
    */
   function renderStreamRecovery(status) {
-    var section = byId('stream-recovery');
-    if (!section) {
-      return;
-    }
-    var paused = status === 'protocol_blocked' || streamBlockedReason !== null;
-    var reconnecting = !paused && streamRecovering && !recoveryWaitDismissed;
-    if (!paused && !reconnecting) {
-      section.hidden = true;
-      return;
-    }
-    section.hidden = false;
-    var mode = paused ? STREAM_RECOVERY.paused : STREAM_RECOVERY.reconnecting;
-    setText('stream-recovery-title', mode.label);
-    setText('stream-recovery-copy', mode.copy);
-    var reasonNode = byId('stream-recovery-reason');
-    if (reasonNode) {
-      reasonNode.hidden = !paused;
-      reasonNode.textContent = paused
-        ? String(streamBlockedReason || 'the durable event stream is blocked')
-        : '';
-    }
-    var pausedButtons = ['btn-reconnect-stream', 'btn-refresh-snapshot'];
-    var reconnectingButtons = ['btn-wait-stream', 'btn-refresh-reconnecting'];
-    var i;
-    for (i = 0; i < pausedButtons.length; i++) {
-      var pausedNode = byId(pausedButtons[i]);
-      if (pausedNode) {
-        pausedNode.hidden = !paused;
-        if (paused) {
-          pausedNode.textContent = STREAM_RECOVERY.paused.actions[i].label;
-        }
-      }
-    }
-    for (i = 0; i < reconnectingButtons.length; i++) {
-      var reconnectNode = byId(reconnectingButtons[i]);
-      if (reconnectNode) {
-        reconnectNode.hidden = paused;
-        if (!paused) {
-          reconnectNode.textContent = STREAM_RECOVERY.reconnecting.actions[i].label;
-        }
-      }
-    }
+    setProblemSource('stream', problemFromStream(status));
   }
 
   /**
@@ -4974,22 +4929,6 @@
       // Fall through to the selection fallback.
     }
     fallback();
-  }
-
-  /**
-   * The diagnostics popover state. Escape closes it and returns focus to the
-   * EXACT trigger (the `⋯` button); Escape never cancels a run.
-   */
-  function setDiagnosticsOpen(open) {
-    diagnosticsOpen = open === true;
-    var panel = byId('diagnostics');
-    if (panel) {
-      panel.hidden = !diagnosticsOpen;
-    }
-    var button = byId('btn-overflow');
-    if (button && typeof button.setAttribute === 'function') {
-      button.setAttribute('aria-expanded', diagnosticsOpen ? 'true' : 'false');
-    }
   }
 
   /**
@@ -5092,7 +5031,7 @@
     } else if (key === 'manageWorkspaceTrust') {
       vscode.postMessage({ type: 'manageWorkspaceTrust' });
     } else if (key === 'openDiagnostics') {
-      setDiagnosticsOpen(true);
+      openView('diagnostics');
     } else if (key === 'startAnyway') {
       vscode.postMessage({ type: 'confirmStart' });
     } else if (key === 'cancelConfirm') {
@@ -5212,41 +5151,13 @@
   }
 
   /**
-   * The normal surface shows ONLY genuine authority. Healthy, connecting and
-   * reconnecting states use the transient header line instead, so a normal
-   * user never sees daemon/readiness vocabulary.
+   * The normal surface shows ONLY genuine authority, through the ONE inline
+   * attention card. Healthy, connecting and reconnecting states use the
+   * transient header line instead, so a normal user never sees daemon or
+   * readiness vocabulary.
    */
   function renderServiceAuthority(authority) {
-    var card = byId('preflight-card');
-    if (!card) {
-      return;
-    }
-    if (!authority) {
-      card.hidden = true;
-      return;
-    }
-    card.hidden = false;
-    card.className = 'preflight preflight-attention';
-    var dot = byId('preflight-dot');
-    if (dot) {
-      dot.className = 'dot dot-error';
-    }
-    setText('preflight-label', authority.label);
-    setText('preflight-copy', authority.copy);
-    var pathRow = byId('preflight-path-row');
-    if (pathRow) {
-      pathRow.hidden = true;
-    }
-    var trustRow = byId('preflight-trust-row');
-    if (trustRow) {
-      trustRow.hidden = true;
-    }
-    var detailNode = byId('preflight-detail');
-    if (detailNode) {
-      detailNode.hidden = true;
-      detailNode.textContent = '';
-    }
-    renderPreflightActions('preflight-actions', authority);
+    setProblemSource('authority', problemFromAuthority(authority));
   }
 
   /** Diagnostics → Service: the exact supervised lifecycle detail. */
@@ -5346,13 +5257,12 @@
       return;
     }
     if (action.key === 'openChecks') {
-      selectTopTab('nav-inspect');
+      openView('inspect');
       selectSubviewTab('subtab-verification');
       return;
     }
     if (action.key === 'openDiagnostics') {
-      var diagnostics = byId('diagnostics');
-      if (diagnostics) diagnostics.hidden = false;
+      openView('diagnostics');
       return;
     }
     if (action.key === 'reply') {
@@ -5361,45 +5271,234 @@
     }
   }
 
-  function renderAttention(snapshot) {
-    var card = byId('attention-card');
-    var list = byId('attention-list');
-    if (!card || !list) return;
-    var items = snapshot && snapshot.ux && Array.isArray(snapshot.ux.attention)
-      ? snapshot.ux.attention.slice(0, 3)
-      : [];
-    clear(list);
-    card.hidden = items.length === 0;
-    if (items.length === 0) return;
-    for (var i = 0; i < items.length; i++) {
-      var item = items[i];
-      var row = document.createElement('li');
-      row.className = 'attention-item';
-      row.setAttribute('data-kind', String(item.kind || ''));
-      var label = document.createElement('span');
-      label.className = 'attention-label';
-      label.textContent = String(item.label || '');
-      row.appendChild(label);
-      if (item.detail) {
-        var detail = document.createElement('span');
-        detail.className = 'attention-detail muted';
-        detail.textContent = String(item.detail);
-        row.appendChild(detail);
-      }
-      if (item.action && item.action.label) {
-        var button = document.createElement('button');
-        button.type = 'button';
-        button.className = 'secondary attention-action';
-        button.textContent = String(item.action.label);
-        (function (action) {
-          button.addEventListener('click', function () {
-            dispatchUxAction(action);
-          });
-        })(item.action);
-        row.appendChild(button);
-      }
-      list.appendChild(row);
+  /**
+   * One attention problem. Sources never append cards; they replace their
+   * own slot and the renderer selects exactly ONE problem by priority.
+   * `key` carries the visible copy and technical tail so an identical error
+   * can never stack, while a changed tail re-renders in place.
+   */
+  function attentionProblem(title, cause, action, actionKind, technical, source) {
+    var titleText = String(title == null ? '' : title).trim();
+    if (titleText.length === 0) {
+      return null;
     }
+    var causeText = String(cause == null ? '' : cause).trim();
+    var techText = String(technical == null ? '' : technical).trim();
+    return {
+      source: source,
+      title: titleText,
+      cause: causeText,
+      action: action && typeof action.key === 'string' ? action : null,
+      actionKind: actionKind,
+      technical: techText,
+      key:
+        source +
+        ':' +
+        hash128(titleText + '\u0000' + causeText + '\u0000' + techText),
+    };
+  }
+
+  function problemFromAttention(snapshot) {
+    var ux = snapshot && snapshot.ux ? snapshot.ux : null;
+    var items = ux && Array.isArray(ux.attention) ? ux.attention : [];
+    // Approval is the dedicated decision card below; never duplicate it in
+    // the problem surface.
+    var visible = [];
+    for (var i = 0; i < items.length; i++) {
+      if (items[i] && items[i].kind !== 'Approval') {
+        visible.push(items[i]);
+      }
+    }
+    if (visible.length === 0) {
+      return null;
+    }
+    var first = visible[0];
+    var technical = [];
+    if (ux && Array.isArray(ux.advanced)) {
+      for (var a = 0; a < ux.advanced.length; a++) {
+        technical.push(String(ux.advanced[a]));
+      }
+    }
+    for (var r = 1; r < visible.length; r++) {
+      technical.push(
+        String(visible[r].label || '') +
+          (visible[r].detail ? ' — ' + String(visible[r].detail) : ''),
+      );
+    }
+    return attentionProblem(
+      first.label || 'Needs attention',
+      first.detail || '',
+      first.action || null,
+      'ux',
+      technical.join('\n'),
+      'attention',
+    );
+  }
+
+  function problemFromAuthority(authority) {
+    if (!authority) {
+      return null;
+    }
+    var action =
+      Array.isArray(authority.actions) && authority.actions.length > 0
+        ? authority.actions[0]
+        : null;
+    return attentionProblem(
+      authority.label,
+      authority.copy,
+      action,
+      'authority',
+      authority.detail,
+      'authority',
+    );
+  }
+
+  function problemFromStream(status) {
+    var paused = status === 'protocol_blocked' || streamBlockedReason !== null;
+    if (!paused) {
+      return null;
+    }
+    return attentionProblem(
+      STREAM_RECOVERY.paused.label,
+      STREAM_RECOVERY.paused.copy,
+      STREAM_RECOVERY.paused.actions[0],
+      'stream',
+      streamBlockedReason || 'the durable event stream is blocked',
+      'stream',
+    );
+  }
+
+  function problemFromUserError(error) {
+    if (!error || typeof error !== 'object') {
+      return null;
+    }
+    var technical =
+      typeof error.technical === 'string' && error.technical.length > 0
+        ? error.technical
+        : 'no further detail was provided';
+    var code = typeof error.code === 'string' && error.code.length > 0 ? error.code : null;
+    return attentionProblem(
+      typeof error.summary === 'string' && error.summary.length > 0
+        ? error.summary
+        : 'Faktor hit a problem',
+      typeof error.hint === 'string' ? error.hint : '',
+      error.action && typeof error.action.key === 'string' ? error.action : null,
+      'userError',
+      code !== null ? '[' + code + '] ' + technical : technical,
+      'user',
+    );
+  }
+
+  function dispatchProblem(problem) {
+    if (!problem || !problem.action) {
+      return;
+    }
+    if (problem.actionKind === 'authority') {
+      dispatchPreflightAction(problem.action.key);
+    } else if (problem.actionKind === 'userError') {
+      dispatchUserErrorAction(problem.action.key);
+    } else if (problem.actionKind === 'stream') {
+      dispatchStreamRecoveryAction(problem.action.key);
+    } else {
+      dispatchUxAction(problem.action);
+    }
+  }
+
+  function setProblemSource(source, problem) {
+    var current = problemSources[source];
+    var currentKey = current === null ? null : current.key;
+    var nextKey = problem === null ? null : problem.key;
+    if (currentKey === nextKey) {
+      return;
+    }
+    problemSources[source] = problem;
+    renderProblem();
+  }
+
+  /** The single inline attention card. Absent sources omit their section. */
+  function renderProblem() {
+    var card = byId('attention-card');
+    if (!card) {
+      return;
+    }
+    var order = ['authority', 'user', 'stream', 'attention'];
+    var active = [];
+    var chosen = null;
+    for (var i = 0; i < order.length; i++) {
+      var problem = problemSources[order[i]];
+      if (problem !== null) {
+        active.push(problem);
+        if (chosen === null) {
+          chosen = problem;
+        }
+      }
+    }
+    if (chosen === null) {
+      card.hidden = true;
+      renderedProblemKey = null;
+      setText('attention-card-title', 'Needs attention');
+      var emptyCause = byId('attention-card-cause');
+      if (emptyCause) {
+        emptyCause.textContent = '';
+        emptyCause.hidden = true;
+      }
+      clear(byId('attention-card-actions'));
+      var emptyDetails = byId('attention-technical');
+      if (emptyDetails) emptyDetails.hidden = true;
+      clear(byId('attention-technical-body'));
+      return;
+    }
+    var technical = [];
+    for (var p = 0; p < active.length; p++) {
+      var lines = String(active[p].technical || '').split('\n');
+      for (var l = 0; l < lines.length; l++) {
+        var value = lines[l].trim();
+        if (value.length > 0 && technical.indexOf(value) === -1) {
+          technical.push(value);
+        }
+      }
+    }
+    var key = chosen.key + '#' + hash128(technical.join('\n'));
+    if (renderedProblemKey === key) {
+      return;
+    }
+    renderedProblemKey = key;
+    card.hidden = false;
+    card.setAttribute('data-problem-kind', chosen.source);
+    var icon = byId('attention-card-icon');
+    if (icon) {
+      icon.className = 'attention-icon attention-icon-' + chosen.source;
+    }
+    setText('attention-card-title', chosen.title);
+    var causeNode = byId('attention-card-cause');
+    if (causeNode) {
+      causeNode.textContent = chosen.cause;
+      causeNode.hidden = chosen.cause.length === 0;
+    }
+    var actions = byId('attention-card-actions');
+    clear(actions);
+    if (actions && chosen.action && typeof chosen.action.label === 'string') {
+      var button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'primary-action attention-action';
+      button.textContent = chosen.action.label;
+      (function (problem) {
+        button.addEventListener('click', function () {
+          dispatchProblem(problem);
+        });
+      })(chosen);
+      actions.appendChild(button);
+    }
+    var details = byId('attention-technical');
+    var body = byId('attention-technical-body');
+    if (details && body) {
+      body.textContent = technical.join('\n');
+      details.hidden = technical.length === 0;
+    }
+  }
+
+  function renderAttention(snapshot) {
+    setProblemSource('attention', problemFromAttention(snapshot));
   }
 
   function renderOverviewSummary(snapshot) {
@@ -5550,6 +5649,9 @@
     renderPreflightMirror(snapshot.preflight);
     renderComposerState();
     renderStreamRecovery(streamStatusValue);
+    // Initialize the ONE problem surface even when every source is absent
+    // (the markup starts hidden; the fake DOM and an empty snapshot agree).
+    renderProblem();
     renderTask(snapshot);
     renderPermissions(snapshot.permissions);
     renderInspectContent(snapshot);
@@ -5568,17 +5670,33 @@
         ? snapshot.lastError
         : null;
     if (lastError === null) {
+      // A raw failure that the host no longer serves is gone; clear its user
+      // problem so the ONE card never outlives the condition.
+      if (lastRenderedError !== null) {
+        setProblemSource('user', null);
+      }
       lastRenderedError = null;
     } else if (lastError !== lastRenderedError) {
       lastRenderedError = lastError;
-      showUserError({
-        kind: 'unexpected',
-        summary: 'Faktor hit a problem',
-        hint: 'Try the action again; open Diagnostics for the raw detail.',
-        action: null,
-        technical: lastError,
-        code: null,
-      });
+      // A served authority/stream/attention problem or an already-projected
+      // user error with the SAME tail explains this raw text; never append a
+      // generic duplicate.
+      var existingUser = problemSources.user;
+      var explained =
+        problemSources.authority !== null ||
+        problemSources.stream !== null ||
+        problemSources.attention !== null ||
+        (existingUser !== null && existingUser.technical.indexOf(lastError) !== -1);
+      if (!explained) {
+        showUserError({
+          kind: 'unexpected',
+          summary: 'Faktor hit a problem',
+          hint: 'Try the action again; open Diagnostics for the raw detail.',
+          action: null,
+          technical: lastError,
+          code: null,
+        });
+      }
     }
   }
 
@@ -5605,11 +5723,28 @@
     }
   }
 
+  /**
+   * Transient informational notices are screen-reader-only; a visible error
+   * is a problem and therefore uses the ONE attention card. No second
+   * visible notice surface exists.
+   */
   function showNotice(level, message) {
+    var textValue = String(message);
+    if (level === 'error') {
+      showUserError({
+        kind: 'unexpected',
+        summary: 'Faktor hit a problem',
+        hint: textValue,
+        action: null,
+        technical: textValue,
+        code: null,
+      });
+      return;
+    }
     var notices = byId('notices');
     var node = document.createElement('div');
-    node.className = level === 'error' ? 'notice error' : 'notice';
-    node.textContent = String(message);
+    node.className = 'notice';
+    node.textContent = textValue;
     notices.appendChild(node);
     while (notices.childNodes.length > 4) {
       notices.removeChild(notices.firstChild);
@@ -5638,7 +5773,7 @@
     } else if (key === 'attachFiles') {
       vscode.postMessage({ type: 'attachPick' });
     } else if (key === 'openDiagnostics') {
-      setDiagnosticsOpen(true);
+      openView('diagnostics');
     } else if (key === 'locateDaemon') {
       vscode.postMessage({ type: 'locateDaemon' });
     } else if (key === 'reviewTrust') {
@@ -5653,94 +5788,19 @@
     }
   }
 
-  function removeUserError(node, technical) {
-    var index = shownUserErrors.indexOf(technical);
-    if (index !== -1) {
-      shownUserErrors.splice(index, 1);
-    }
-    if (node && node.parentNode) {
-      node.parentNode.removeChild(node);
-    }
-  }
-
+  /**
+   * A structured user error feeds the SAME single attention card. Identical
+   * errors (same visible copy and same technical tail) are ignored, so a
+   * repeated host post can never stack a second card.
+   */
   function showUserError(error) {
-    if (!error || typeof error !== 'object') {
+    var problem = problemFromUserError(error);
+    if (problem === null) {
       return;
     }
-    var notices = byId('notices');
-    if (!notices) {
-      return;
-    }
-    var technical =
-      typeof error.technical === 'string' && error.technical.length > 0
-        ? error.technical
-        : 'no further detail was provided';
-    if (shownUserErrors.indexOf(technical) !== -1) {
-      return;
-    }
-    var node = document.createElement('div');
-    node.className = 'notice error user-error';
-    node.setAttribute('data-error-kind', String(error.kind == null ? 'unexpected' : error.kind));
-    line(
-      node,
-      typeof error.summary === 'string' && error.summary.length > 0
-        ? error.summary
-        : 'Faktor hit a problem',
-      'user-error-summary',
-    );
-    if (typeof error.hint === 'string' && error.hint.length > 0) {
-      line(node, error.hint, 'muted user-error-hint');
-    }
-    var action = error.action;
-    if (
-      action &&
-      typeof action === 'object' &&
-      typeof action.key === 'string' &&
-      typeof action.label === 'string' &&
-      action.label.length > 0
-    ) {
-      var actions = document.createElement('div');
-      actions.className = 'composer-actions';
-      var button = document.createElement('button');
-      button.type = 'button';
-      button.className = 'user-error-action';
-      button.textContent = action.label;
-      button.addEventListener('click', function () {
-        dispatchUserErrorAction(action.key);
-      });
-      actions.appendChild(button);
-      node.appendChild(actions);
-    }
-    var details = document.createElement('details');
-    details.className = 'technical-disclosure';
-    var summary = document.createElement('summary');
-    summary.textContent = 'Technical details';
-    details.appendChild(summary);
-    var code = typeof error.code === 'string' && error.code.length > 0 ? error.code : null;
-    var pre = document.createElement('pre');
-    pre.className = 'excerpt user-error-technical';
-    pre.textContent = code !== null ? '[' + code + '] ' + technical : technical;
-    details.appendChild(pre);
-    node.appendChild(details);
-    node.setAttribute('data-error-technical', technical);
-    notices.appendChild(node);
-    shownUserErrors.push(technical);
-    while (shownUserErrors.length > MAX_USER_ERRORS) {
-      var technicalToDrop = shownUserErrors[0];
-      var holders = notices.querySelectorAll('[data-error-technical]');
-      var drop = null;
-      for (var h = 0; h < holders.length; h++) {
-        if (holders[h].getAttribute('data-error-technical') === technicalToDrop) {
-          drop = holders[h];
-          break;
-        }
-      }
-      if (drop) {
-        removeUserError(drop, technicalToDrop);
-      } else {
-        shownUserErrors.shift();
-      }
-    }
+    // One user slot: an identical error is a no-op, a different one replaces
+    // it, and a recurrence after recovery is shown again.
+    setProblemSource('user', problem);
   }
 
   /**
@@ -6306,15 +6366,15 @@
     ingestFiles(transfer.files);
   });
 
-  // Escape closes the transient diagnostics/options surface first (returning
-  // focus to its EXACT trigger — the `⋯` button) and otherwise dismisses the
-  // transient notice. Escape never cancels a run.
+  // Escape closes the overflow menu first (returning focus to its EXACT
+  // trigger — the `⋯` button) and otherwise dismisses the transient notice.
+  // Escape never cancels a run.
   window.addEventListener('keydown', function (event) {
     if (!event || event.key !== 'Escape') {
       return;
     }
-    if (diagnosticsOpen) {
-      setDiagnosticsOpen(false);
+    if (overflowOpen) {
+      setOverflowOpen(false);
       var trigger = byId('btn-overflow');
       if (trigger && typeof trigger.focus === 'function') {
         trigger.focus();
@@ -6345,27 +6405,38 @@
     }
     vscode.postMessage({ type: 'clearAttachments' });
   });
-  // The `⋯` overflow holds the service/diagnostics vocabulary: session and
-  // stream metadata, the raw service URL, Refresh/Start/Stop and the raw
-  // stream position. Nothing in it is product copy, so it stays collapsed
-  // until asked for (Escape closes it and returns focus here).
+  // The `⋯` menu holds the destinations (Chat / Inspect / History /
+  // Diagnostics) and the scoped Stop action. It is NOT a second header:
+  // selecting an item swaps the full-window view and closes the menu.
   byId('btn-control-center').addEventListener('click', function () {
-    vscode.postMessage({ type: 'openControlCenter', screen: 'S01' });
+    vscode.postMessage({ type: 'openControlCenter', screen: 'S29' });
   });
   byId('btn-overflow').addEventListener('click', function () {
-    setDiagnosticsOpen(!diagnosticsOpen);
+    toggleOverflow();
   });
-  byId('btn-refresh-snapshot').addEventListener('click', function () {
-    vscode.postMessage({ type: 'refresh' });
+  byId('menu-chat').addEventListener('click', function () {
+    openView('work');
   });
-  byId('btn-reconnect-stream').addEventListener('click', function () {
-    dispatchStreamRecoveryAction('reconnectStream');
+  byId('menu-run-action').addEventListener('click', function () {
+    var action = activeMenuAction;
+    setOverflowOpen(false);
+    if (action !== null) {
+      dispatchUxAction(action);
+    }
   });
-  byId('btn-wait-stream').addEventListener('click', function () {
-    dispatchStreamRecoveryAction('wait');
+  byId('menu-inspect').addEventListener('click', function () {
+    openView('inspect');
   });
-  byId('btn-refresh-reconnecting').addEventListener('click', function () {
-    dispatchStreamRecoveryAction('refresh');
+  byId('menu-history').addEventListener('click', function () {
+    openView('history');
+  });
+  byId('menu-diagnostics').addEventListener('click', function () {
+    openView('diagnostics');
+  });
+  wireMenuNavigation();
+  byId('menu-stop').addEventListener('click', function () {
+    setOverflowOpen(false);
+    vscode.postMessage({ type: 'cancelRun' });
   });
   byId('btn-open-sandbox-guidance').addEventListener('click', function () {
     setSandboxGuidanceOpen(true);
@@ -6379,15 +6450,6 @@
   }
   // The guidance disclosure starts closed in every rendering context.
   setSandboxGuidanceOpen(false);
-  byId('btn-cancel-run').addEventListener('click', function () {
-    vscode.postMessage({ type: 'cancelRun' });
-  });
-  // Run details are an Inspect destination: the status row never duplicates
-  // the plan, goal or candidate boundary inside the conversation.
-  byId('btn-status-inspect').addEventListener('click', function () {
-    setActiveView('inspect');
-    setActiveSubview('overview');
-  });
   byId('btn-refresh').addEventListener('click', function () {
     vscode.postMessage({ type: 'refresh' });
   });
@@ -6399,10 +6461,9 @@
   });
 
   // ------------------------------------------------------- shell wiring
-  // The Work / Inspect / History switcher, the Inspect subview tablist and
-  // the History Conversations/Outcomes pair. Work is the default view; every
-  // tablist keeps roving tabindex semantics.
-  wireTablist(['nav-work', 'nav-inspect', 'nav-history'], selectTopTab);
+  // Chat is the default full-window surface. The Inspect subview tablist and
+  // the History Conversations/Outcomes pair keep roving tabindex semantics
+  // inside their own full-window views; the chat body has no tabs.
   wireTablist(
     ['subtab-overview', 'subtab-plan', 'subtab-changes', 'subtab-verification', 'subtab-agents'],
     selectSubviewTab,

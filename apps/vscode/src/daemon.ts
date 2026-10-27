@@ -202,8 +202,9 @@ let starting: Promise<DaemonHandle> | null = null;
  */
 export function missingDaemonMessage(): string {
   return (
-    'faktor-cli binary not found: install the Faktor daemon into the signed install layout ' +
-    '(~/.faktor/install, or the machine-scoped "faktor.installRoot"), or set the machine-scoped ' +
+    'faktor-cli binary not found: run `faktor install --dest <dir>` to create the verified ' +
+    'in-root layout (or install the signed release layout) under the machine-scoped ' +
+    '"faktor.installRoot" (~/.faktor/install by default), or set the machine-scoped ' +
     '"faktor.binaryPath" setting (or FAKTOR_BIN) to the executable — use "Locate daemon…" to pick it. ' +
     'Workspace-scoped settings and workspace target/ builds are never resolved or executed.'
   );
@@ -312,7 +313,11 @@ export async function applyMachineScopedWrite<T>(
 }
 
 /** Where the resolved executable came from (never a workspace). */
-export type DaemonResolutionSource = 'binaryPath-setting' | 'environment' | 'install-layout';
+export type DaemonResolutionSource =
+  | 'binaryPath-setting'
+  | 'environment'
+  | 'install-layout'
+  | 'install-root-executable';
 
 export interface ResolvedDaemon {
   readonly executable: string;
@@ -335,6 +340,14 @@ export function resolveDaemon(options: DaemonOptions): ResolvedDaemon {
   const bootstrap = bootstrapBinary(options);
   if (bootstrap !== null) {
     return { executable: bootstrap, source: 'install-layout' };
+  }
+  // The in-root executable model (`faktor install`): the verified binary and
+  // its `<binary>.sha256` live directly in the install root, with no signed
+  // launcher layout. Its checksum is enforced by binaryTrust like any other
+  // explicit machine-scoped path; it is never assumed verified.
+  const inRoot = installRootExecutable(options);
+  if (inRoot !== null) {
+    return { executable: inRoot, source: 'install-root-executable' };
   }
   throw new Error(missingDaemonMessage());
 }
@@ -376,9 +389,23 @@ export function bootstrapBinary(options: DaemonOptions): string | null {
 }
 
 /**
+ * The verified in-root executable written by `faktor install`:
+ * `<installRoot>/faktor` (or `faktor.exe` on Windows). `null` when absent.
+ * Unlike the bootstrap launcher this path carries NO signature authority of
+ * its own, so binaryTrust still requires the `.sha256` record to match.
+ */
+export function installRootExecutable(options: DaemonOptions): string | null {
+  const root = installRootFor(options);
+  const name = process.platform === 'win32' ? 'faktor.exe' : 'faktor';
+  const candidate = join(root, name);
+  return existsSync(candidate) ? candidate : null;
+}
+
+/**
  * The executable to spawn: an explicit machine-scoped operator override
- * first, then the bootstrap launcher when an install layout exists. Exactly
- * one of those decides; a workspace is never consulted.
+ * first, then the bootstrap launcher when an install layout exists, then the
+ * verified in-root executable when no launcher exists. Exactly one of those
+ * decides; a workspace is never consulted.
  */
 export function resolveExecutable(options: DaemonOptions): string {
   return resolveDaemon(options).executable;
@@ -388,7 +415,8 @@ export function resolveExecutable(options: DaemonOptions): string {
  * The trust state of a resolved executable:
  *  - `verified`: either resolved through the signed install layout (the
  *    bootstrap launcher authenticates the activated release digest before
- *    exec) or matched an existing checksum record;
+ *    exec) or matched an existing checksum record (this includes the
+ *    `faktor install` in-root executable: it is NEVER assumed verified);
  *  - `unverified`: no checksum record exists — documented warn + explicit
  *    confirm is required before start;
  *  - `refused`: a checksum record exists but does not confirm the file (a

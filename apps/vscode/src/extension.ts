@@ -119,11 +119,9 @@ import { CockpitTaskVerification, CockpitUsagePanel, buildUsagePanel, projectCoc
 import { loadConversation, sendAskTurn } from './askFlow.ts';
 import { composerIntentOf } from './uxState.ts';
 import { refreshReadPlan } from './refreshReads.ts';
-import { Edition5Client } from './edition5/client.ts';
-import { Edition5Panel } from './edition5/panel.ts';
 import { Edition8Client } from './edition8/client.ts';
 import { Edition8Panel, Edition8ViewProvider, type Edition8PanelDeps } from './edition8/panel.ts';
-import { registerEdition8 } from './edition8/commands.ts';
+import { pickModel, registerEdition8 } from './edition8/commands.ts';
 import { registerLspDiagnostics } from './lspDiagnostics.ts';
 import { addContextDraft, toggleFavorite } from './edition8/hostDraft.ts';
 import type { PixelPresence } from './pixelAgents';
@@ -4390,7 +4388,7 @@ async function handleWebviewMessage(
     // own Work subview switch happens locally (one surface, no round trip
     // needed for the view move).
     case 'openControlCenter':
-      openControlCenter(context, typeof message.screen === 'string' ? message.screen : 'S01');
+      openControlCenter(context, typeof message.screen === 'string' ? message.screen : 'S29');
       return;
     case 'openWork':
       await vscode.commands.executeCommand('faktor.openChat');
@@ -4416,51 +4414,16 @@ async function handleWebviewMessage(
   }
 }
 
-// ------------------------------------------------------- Edition 5 control center
-
-let controlCenterOutput: vscode.OutputChannel | null = null;
+// ---------------------------------------------------------- Settings surface
 
 /**
- * One Faktor-owned editor tab over the Edition 5 native contract. The panel
- * shares the live client/session; native host actions (sign-in, keymap help,
- * setup guidance, accessibility audit, worktree switch) stay host-native.
+ * Settings is its own full-window editor tab over the Edition 8 surface.
+ * The legacy Edition 5 control-center tab is gone: one surface, one row per
+ * descriptor, one Apply footer. The shared live client/session still drives
+ * every staged write.
  */
-function openControlCenter(context: vscode.ExtensionContext, screen = 'S01'): void {
-  if (controlCenterOutput === null) {
-    controlCenterOutput = vscode.window.createOutputChannel('Faktor Control Center');
-    context.subscriptions.push(controlCenterOutput);
-  }
-  const output = controlCenterOutput;
-  Edition5Panel.createOrShow(
-    context,
-    {
-      backend: () => (active.client === null ? null : new Edition5Client(active.client)),
-      session: () => active.sessionId,
-      hostAction: async (controlId: string) => {
-        switch (controlId) {
-          case 'O-07':
-            await controlPlaneSignIn(context);
-            return 'The native control-plane sign-in flow finished; the secret store holds any credential.';
-          case 'D-11':
-            await vscode.commands.executeCommand('workbench.action.showCommands');
-            return 'The native command palette is open; Faktor commands are registered under Faktor.';
-          case 'D-14':
-            await vscode.commands.executeCommand('workbench.action.showCommands');
-            return 'Native accessibility settings are reachable through Preferences: Open Accessibility Settings.';
-          case 'D-15':
-            await switchSessionFromCommand(context);
-            return 'The native conversation switcher finished; per-session drafts are preserved.';
-          case 'Q-11':
-            await vscode.commands.executeCommand('faktor.openChat');
-            return 'The native shell-isolation setup guidance is shown in the Faktor view diagnostics.';
-          default:
-            return 'Native VS Code action completed.';
-        }
-      },
-      output,
-    },
-    screen,
-  );
+function openControlCenter(context: vscode.ExtensionContext, screen = 'S29'): void {
+  Edition8Panel.createOrShow(context, edition8Deps(context), screen);
 }
 
 // ------------------------------------------------------- Edition 8 surfaces
@@ -4663,10 +4626,10 @@ export function activate(context: vscode.ExtensionContext): void {
       chatProvider?.focus();
     }),
     vscode.commands.registerCommand('faktor.openControlCenter', () => {
-      openControlCenter(context, 'S01');
+      openControlCenter(context, 'S29');
     }),
     vscode.commands.registerCommand('faktor.openModelPicker', () => {
-      openControlCenter(context, 'S02');
+      void pickModel(edition8Deps(context));
     }),
     vscode.commands.registerCommand('faktor.openSettings', () => {
       openControlCenter(context, 'S29');

@@ -450,8 +450,11 @@ export class Edition8Panel {
       return this.panel.webview.postMessage(message);
     }, (next) => {
       // Selection is a client-side view switch; re-rendering the whole
-      // document would discard staged drafts and input focus.
-      void next;
+      // document would discard staged drafts and input focus. S29 is the
+      // descriptor home, which is not a registry screen page.
+      void this.panel.webview.postMessage(
+        next === 'S29' ? { type: 'e8SettingsHome' } : { type: 'e8SelectScreen', screen: next },
+      );
     });
     // Register the message handler BEFORE handing the document to the
     // webview: the script posts `e8Ready` as soon as it runs, and a gap here

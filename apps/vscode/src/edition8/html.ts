@@ -6,6 +6,8 @@
 
 import { E8_CONTROLS, E8_SCREENS, type E8Control, type E8Screen } from '../generated/edition8Registry.ts';
 import {
+  controlView,
+  descriptorValueText,
   destinationOf,
   screenView,
   screensFor,
@@ -15,7 +17,9 @@ import {
   type E8PanelState,
   type E8ScreenView,
 } from './view.ts';
-import { microUsdInput } from './contract.ts';
+import { microUsdInput, stringAt } from './contract.ts';
+import { bindingFor8 } from './bindings.ts';
+import { descriptorMap, type E8Descriptor } from './source.ts';
 
 export interface Edition8HtmlOptions {
   readonly nonce: string;
@@ -216,7 +220,7 @@ function controlInput(control: E8Control, view: E8ControlView): string {
   const id = `e8-input-${control.id}`;
   const disabled = view.disabled ? ' disabled' : '';
   const describedBy = `e8-desc-${control.id}`;
-  const common = `id="${id}" data-input="${control.id}" data-kind="${binding.input}" aria-describedby="${describedBy}"`;
+  const common = `id="${id}" data-input="${control.id}" data-label="${esc(view.label)}" data-kind="${binding.input}" aria-describedby="${describedBy}"`;
   if (control.id === 'O-01') {
     return `<div class="e8-search">
       <input type="search" ${common} data-action-input="O-01" data-settings-search="O-01" placeholder="Filter settings by name, key or description" autocomplete="off" spellcheck="false"${disabled} />
@@ -338,7 +342,7 @@ function controlMarkup(view: E8ControlView): string {
     binding.input === 'readonly' || binding.input === 'action' || view.valueText === '' || view.valueText === 'Inherit (not configured)'
       ? ''
       : view.valueText;
-  return `<article class="e8-control" id="e8-control-${control.id}" data-control="${control.id}" data-state="${view.state}" data-kind="${binding.input}" data-route="${esc(binding.route.method)} ${esc(binding.route.path)}"${missing} tabindex="-1" aria-labelledby="e8-name-${control.id}">
+  return `<article class="e8-control" id="e8-control-${control.id}" data-control="${control.id}" data-config="${binding.configKey === null ? 'false' : 'true'}" data-state="${view.state}" data-kind="${binding.input}" data-route="${esc(binding.route.method)} ${esc(binding.route.path)}"${missing} tabindex="-1" aria-labelledby="e8-name-${control.id}">
     <div class="e8-control-main">
       <div class="e8-control-copy">
         <div class="e8-control-head">
@@ -480,10 +484,10 @@ function screenMarkup(screen: E8ScreenView, initial: boolean, host: 'vscode' | '
 
 
 /**
- * The one searchable settings surface. The 72-screen registry stays the
- * contract, but a person configures by domain, not by screen ID: providers
- * and models, context and compaction, tools and MCP, permissions, billing
- * and appearance. Advanced screens stay behind one disclosure per domain.
+ * The one searchable settings surface. Rows come from the served descriptor
+ * catalog, never from screen pages: one descriptor, one row, one value
+ * control. Categorical grouping is a presentation concern; the registry
+ * screen stays the contract owner for the control itself.
  */
 interface SettingsDomain {
   readonly key: string;
@@ -497,12 +501,111 @@ const SETTINGS_DOMAINS: readonly SettingsDomain[] = [
   { key: 'tools', label: 'Tools and MCP', description: 'Tool authority, MCP servers, skills, hooks and terminals.' },
   { key: 'permissions', label: 'Permissions', description: 'One effective policy, sandbox isolation and remembered rules.' },
   { key: 'billing', label: 'Billing and usage', description: 'Entitlements, quota, spend and the account connection.' },
-  { key: 'appearance', label: 'Appearance and general', description: 'Budgets, display, diagnostics and revision conflicts.' },
+  { key: 'appearance', label: 'Appearance and general', description: 'Display, telemetry, diagnostics and revision conflicts.' },
 ];
 
-const SETTINGS_ADVANCED = new Set(['S21', 'S28', 'S30', 'S31', 'S55', 'S56', 'S58', 'S60', 'S64']);
+// Usage, diagnostics and account are real settings-destination screens but
+// expose served state and host actions, not configurable descriptors. They
+// stay reachable as single full-window pages; the config home never renders
+// them beside the descriptor rows.
+const SETTINGS_DETAIL_SCREENS = new Set(['S27', 'S30', 'S53', 'S55']);
 
-function settingsDomainFor(screen: E8Screen): string {
+const SETTINGS_DESCRIPTIONS: Readonly<Record<string, string>> = {
+  'faktor.defaultProvider': 'Provider for new tasks until a task overrides it.',
+  'faktor.defaultModel': 'Default model for new tasks.',
+  'faktor.model.contextLimit': 'Context window used for admission and compaction.',
+  'faktor.generation.maxOutput': 'Maximum tokens the provider may return.',
+  'faktor.generation.temperature': 'Sampling randomness for model calls.',
+  'faktor.generation.topP': 'Nucleus sampling threshold for model calls.',
+  'faktor.context.compactionMinReduction': 'Minimum context reduction a compaction must achieve.',
+  'faktor.efficiency.failureLearning': 'Reuse verified failure lessons in later runs.',
+  'faktor.efficiency.ccr': 'Compress tool evidence before it enters context.',
+  'faktor.efficiency.typedHandoff': 'Pass typed handoffs between agents.',
+  'faktor.efficiency.semanticContext': 'Select context semantically instead of by position.',
+  'faktor.efficiency.reworkGuard': 'Stop repeated failed edits from consuming the run.',
+  'faktor.memory.captureMode': 'When durable memory is captured.',
+  'faktor.permissions.preset': 'Baseline approval policy for tool calls.',
+  'faktor.permissions.allowedTools': 'Tools the agent may call without a new decision.',
+  'faktor.sandbox.shell': 'Terminal authority for commands.',
+  'faktor.sandbox.network': 'Network access allowed to tools and providers.',
+  'faktor.sandbox.allowLoopback': 'Permit loopback connections inside the sandbox.',
+  'faktor.budget.maxTokens': 'Token ceiling for one task; zero means no limit.',
+  'faktor.budget.maxCostMicro': 'Spending ceiling for one task.',
+  'faktor.budget.warnAtPercent': 'Show a warning at this share of the ceiling.',
+  'faktor.retry.maxAttempts': 'Total attempts before a retryable failure is final.',
+  'faktor.retry.baseDelayMs': 'Base delay for exponential retry backoff.',
+  'faktor.runtime.binaryPath': 'Daemon executable resolved by the host.',
+  'faktor.telemetry.enabled': 'Share anonymous product telemetry.',
+  'faktor.telemetry.categories': 'Telemetry categories that may be shared.',
+  'faktor.retrieval.strategy': 'How context is retrieved for a run.',
+  'faktor.retrieval.embeddingProvider': 'Provider used to embed retrieval content.',
+};
+
+interface SettingsRowModel {
+  readonly key: string;
+  readonly label: string;
+  readonly description: string;
+  readonly category: string | null;
+  readonly domain: string;
+  readonly control: E8Control | null;
+  readonly view: E8ControlView | null;
+  readonly advanced: boolean;
+}
+
+function settingsCategoryForControl(control: E8Control): string | null {
+  switch (control.categoryCode) {
+    case 'M':
+      return 'models';
+    case 'G':
+      return 'generation';
+    case 'C':
+      return 'context';
+    case 'K':
+      return 'efficiency';
+    case 'B':
+      return 'budgets';
+    case 'P':
+      return 'sandbox';
+    case 'Q':
+      return 'permissions';
+    case 'O':
+      return 'privacy';
+    default:
+      return null;
+  }
+}
+
+const SETTINGS_CONTROL_INDEX: ReadonlyMap<string, E8Control> = (() => {
+  const index = new Map<string, E8Control>();
+  for (const control of E8_CONTROLS) {
+    const key = bindingFor8(control).configKey;
+    if (key !== null && !index.has(key)) index.set(key, control);
+  }
+  return index;
+})();
+
+function settingsDomainForRow(row: { readonly key: string; readonly category: string | null }): string {
+  if (row.key === 'faktor.permissions.allowedTools' || row.key === 'faktor.sandbox.shell') return 'tools';
+  switch (row.category) {
+    case 'models':
+    case 'generation':
+      return 'providers';
+    case 'context':
+    case 'efficiency':
+    case 'memory':
+      return 'context';
+    case 'permissions':
+    case 'sandbox':
+      return 'permissions';
+    case 'budgets':
+    case 'reliability':
+      return 'billing';
+    default:
+      return 'appearance';
+  }
+}
+
+function settingsDomainForScreen(screen: E8Screen): string {
   if (screen.group === 'Models and providers') return 'providers';
   if (screen.group === 'Context' || screen.group === 'Instructions and memory') return 'context';
   if (screen.id === 'S16' || screen.id === 'S17' || screen.id === 'S18' || screen.id === 'S19' || screen.id === 'S20' || screen.id === 'S15' || screen.id === 'S68') return 'tools';
@@ -511,54 +614,166 @@ function settingsDomainFor(screen: E8Screen): string {
   return 'appearance';
 }
 
-function settingsDescription(screen: E8Screen): string {
-  const prefix = `${screen.group}. `;
-  const body = screen.job.startsWith(prefix) ? screen.job.slice(prefix.length) : screen.job;
-  const first = body.split('. ')[0].trim();
-  return first.length === 0 ? (GROUP_SUMMARY[screen.group] ?? screen.job) : first;
+function settingsHasActions(screen: E8Screen): boolean {
+  return screen.controls.some((id) => {
+    const control = E8_CONTROLS.find((entry) => entry.id === id);
+    return control !== undefined && bindingFor8(control).configKey === null;
+  });
 }
 
-function settingsRow(screen: E8Screen): string {
+function settingsScreenView(screenId: string, state: E8PanelState): E8ScreenView {
+  const view = screenView(screenId, state);
+  return {
+    ...view,
+    controls: view.controls.filter(
+      (control) => control.binding.configKey === null && control.control.id !== 'O-01',
+    ),
+    rows: view.rows.filter(
+      (row) => !row.key.startsWith('config-') && !row.key.startsWith('faktor.') && !row.label.startsWith('faktor.'),
+    ),
+  };
+}
+
+function settingsIsAdvanced(descriptor: E8Descriptor | null): boolean {
+  if (descriptor === null) return false;
+  return (
+    descriptor.writable === false || stringAt(descriptor.runtimeConsumer, 'state') === 'stored_only'
+  );
+}
+
+function humanSettingKey(key: string): string {
+  const tail = key.split('.').pop() ?? key;
+  return tail.replace(/([a-z0-9])([A-Z])/g, '$1 $2').replace(/^./, (letter) => letter.toUpperCase());
+}
+
+function settingsRows(state: E8PanelState): readonly SettingsRowModel[] {
+  const snapshot = state.snapshot;
+  const descriptors = descriptorMap(snapshot?.descriptors ?? null);
+  // The descriptor catalog is the single source of truth. A control-only
+  // fallback keeps the surface usable while the first descriptor read is in
+  // flight, but a served catalog is never widened by the registry.
+  const keys = descriptors.size > 0 ? [...descriptors.keys()] : [...SETTINGS_CONTROL_INDEX.keys()];
+  const rows: SettingsRowModel[] = [];
+  const seen = new Set<string>();
+  for (const key of keys) {
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const descriptor = descriptors.get(key) ?? null;
+    const control = SETTINGS_CONTROL_INDEX.get(key) ?? null;
+    if (descriptor === null && control === null) continue;
+    const view = control === null ? null : controlView(control, snapshot, state.loading, state.error);
+    const category = descriptor?.category ?? (control === null ? null : settingsCategoryForControl(control));
+    const label = descriptor?.label ?? view?.label ?? control?.name ?? humanSettingKey(key);
+    const description =
+      SETTINGS_DESCRIPTIONS[key] ??
+      descriptor?.description ??
+      view?.description ??
+      (category === null ? 'Persistent Faktor setting.' : `Persistent setting in the ${category} category.`);
+    rows.push({
+      key,
+      label,
+      description,
+      category,
+      domain: settingsDomainForRow({ key, category }),
+      control,
+      view,
+      advanced: settingsIsAdvanced(descriptor),
+    });
+  }
+  return rows;
+}
+
+function settingsValueMarkup(row: SettingsRowModel, state: E8PanelState): string {
+  if (row.control !== null && row.view !== null) {
+    const current = `<span id="e8-desc-${esc(row.control.id)}" class="sr-only" data-settings-current>${esc(row.view.valueText)}</span>`;
+    return `${controlInput(row.control, row.view)}${current}`;
+  }
+  return `<output class="e8-readonly" data-settings-readonly="${esc(row.key)}">${esc(descriptorValueText(state.snapshot, row.key))}</output>`;
+}
+
+function settingsRowMarkup(row: SettingsRowModel, state: E8PanelState): string {
+  const control = row.control;
+  const controlAttrs =
+    control === null
+      ? ''
+      : ` id="e8-control-${esc(control.id)}" data-state="${row.view?.state ?? 'available'}"`;
+  const label =
+    control === null
+      ? `<span class="e8-settings-label">${esc(row.label)}</span>`
+      : `<label class="e8-settings-label" for="e8-input-${esc(control.id)}">${esc(row.label)}</label>`;
+  const stateText =
+    row.view === null || row.view.stateText.length === 0
+      ? ''
+      : `<p class="e8-settings-state" data-settings-state${control === null ? '' : ` data-control-state="${esc(control.id)}"`}>${esc(row.view.stateText)}</p>`;
+  const domain = SETTINGS_DOMAINS.find((entry) => entry.key === row.domain);
+  const search = `${row.label} ${row.description} ${domain?.label ?? ''} ${domain?.description ?? ''} ${row.key}`.toLowerCase();
+  const rowFocus = row.view?.disabled ? ' tabindex="0"' : '';
+  return `<div class="e8-settings-row"${controlAttrs}${rowFocus} data-settings-row data-settings-key="${esc(row.key)}" data-settings-haystack="${esc(search)}"${row.advanced ? ' data-settings-advanced-row="true"' : ''}>
+    <div class="e8-settings-copy">
+      ${label}
+      <p class="e8-settings-desc">${esc(row.description)}</p>
+      ${stateText}
+    </div>
+    <div class="e8-settings-value">${settingsValueMarkup(row, state)}</div>
+  </div>`;
+}
+
+function settingsDescription(screen: E8Screen): string {
+  const first = screen.job.split('. ')[0].trim();
+  return first.length === 0 ? screen.job : first;
+}
+
+function settingsActionRowMarkup(screen: E8Screen): string {
   const summary = settingsDescription(screen);
-  const controlNames = screen.controls
-    .map((id) => E8_CONTROLS.find((control) => control.id === id)?.name ?? id)
-    .slice(0, 3)
-    .join(' ');
-  const search = `${screen.id} ${screen.title} ${screen.group} ${summary} ${controlNames}`.toLowerCase();
-  return `<button type="button" class="e8-settings-row" data-settings-open="${esc(screen.id)}" data-settings-search="${esc(search)}" data-settings-row>
-    <span class="e8-settings-row-title">${esc(screen.title)}</span>
-    <span class="e8-settings-row-desc">${esc(summary)}</span>
+  const search = `${screen.title} ${screen.group} ${summary}`.toLowerCase();
+  return `<button type="button" class="e8-settings-action-link" data-settings-open="${esc(screen.id)}" data-settings-link-row data-settings-haystack="${esc(search)}">
+    <span class="e8-settings-action-title">${esc(screen.title)}</span>
+    <span class="e8-settings-action-desc">${esc(summary)}</span>
   </button>`;
 }
 
-function settingsHomeMarkup(): string {
-  const screens = screensFor('settings');
+function settingsHomeMarkup(state: E8PanelState): string {
+  const rows = settingsRows(state);
   const domains = SETTINGS_DOMAINS.map((domain) => {
-    const rows = screens.filter((screen) => settingsDomainFor(screen) === domain.key);
-    const primary = rows.filter((screen) => !SETTINGS_ADVANCED.has(screen.id));
-    const advanced = rows.filter((screen) => SETTINGS_ADVANCED.has(screen.id));
-    const advancedMarkup = advanced.length === 0
-      ? ''
-      : `<details class="e8-settings-advanced"><summary>Advanced · ${advanced.length}</summary>${advanced.map(settingsRow).join('')}</details>`;
+    const domainRows = rows.filter((row) => row.domain === domain.key);
+    if (domainRows.length === 0) return '';
+    const primary = domainRows.filter((row) => !row.advanced);
+    const advanced = domainRows.filter((row) => row.advanced);
+    const advancedMarkup =
+      advanced.length === 0
+        ? ''
+        : `<details class="e8-settings-advanced" data-settings-advanced><summary>Advanced · ${advanced.length}</summary>${advanced
+            .map((row) => settingsRowMarkup(row, state))
+            .join('')}</details>`;
+    const actionScreens = screensFor('settings').filter(
+      (screen) => settingsDomainForScreen(screen) === domain.key && settingsHasActions(screen),
+    );
+    const actionsMarkup =
+      actionScreens.length === 0
+        ? ''
+        : `<details class="e8-settings-actions" data-settings-actions><summary>Actions and diagnostics · ${actionScreens.length}</summary>${actionScreens
+            .map((screen) => settingsActionRowMarkup(screen))
+            .join('')}</details>`;
     return `<section class="e8-settings-domain" data-settings-domain="${domain.key}">
       <header class="e8-settings-domain-head">
         <h3>${esc(domain.label)}</h3>
         <p>${esc(domain.description)}</p>
       </header>
-      <div class="e8-settings-rows">${primary.map(settingsRow).join('')}</div>
+      <div class="e8-settings-rows">${primary.map((row) => settingsRowMarkup(row, state)).join('')}</div>
       ${advancedMarkup}
+      ${actionsMarkup}
     </section>`;
   }).join('');
   return `<div class="e8-settings-route">
   <button type="button" id="e8-settings-back" class="e8-secondary e8-settings-back" data-settings-back hidden>Back to settings</button>
-  <section id="e8-settings-home" class="e8-settings-home" aria-labelledby="e8-settings-title">
+  <section id="e8-settings-home" class="e8-settings-home" data-settings-descriptor-count="${rows.length}" aria-labelledby="e8-settings-title">
     <header class="e8-settings-head">
       <div>
         <h2 id="e8-settings-title">Settings</h2>
         <p class="e8-settings-lead">One surface for every persistent setting. Values are staged locally; the one Apply action commits them together.</p>
       </div>
       <label class="e8-search e8-settings-search"><span class="sr-only">Search settings</span><input type="search" id="e8-settings-search" data-settings-global-search placeholder="Search settings by name, domain or description" autocomplete="off" spellcheck="false" /></label>
-      <p class="e8-settings-search-count" data-settings-global-count role="status" aria-live="polite">${screens.length} settings screens</p>
+      <p class="e8-settings-search-count" data-settings-global-count role="status" aria-live="polite">${rows.length} settings</p>
     </header>
     <div class="e8-settings-save" role="status" aria-live="polite">
       <span id="e8-settings-save-state" data-state="clean">Autosave is off — no staged changes.</span>
@@ -603,12 +818,38 @@ function screenBrowser(destination: E8Destination, initialScreen: string): strin
 }
 
 function destinationMarkup(destination: E8Destination, state: E8PanelState, initialScreen: string, host: 'vscode' | 'jetbrains', mode: 'shell' | 'settings'): string {
+  // Settings renders descriptors, not screen pages. Keeping the 43 hidden
+  // screens here was the legacy+new double render: every descriptor existed
+  // once as a screen control and again as a served "Current state" row.
+  if (mode === 'settings') {
+    if (SETTINGS_DETAIL_SCREENS.has(initialScreen)) {
+      const detail = screensFor('settings').find((screen) => screen.id === initialScreen);
+      if (detail === undefined) return '';
+      return `<div class="e8-destination" data-destination-panel="settings">
+        <div class="e8-screens-host">
+          ${screenMarkup(screenView(detail.id, state), true, host, mode)}
+        </div>
+      </div>`;
+    }
+    // Config descriptors live once in the home rows. The registry pages stay
+    // reachable for their actions/read-only diagnostics, but every config
+    // control and every config-key served row is filtered out so no knob can
+    // be rendered twice.
+    const actionScreens = screensFor('settings')
+      .map((screen) => ({ screen, view: settingsScreenView(screen.id, state) }))
+      .filter((entry) => entry.view.controls.length > 0 || entry.view.rows.length > 0);
+    return `<div class="e8-destination" data-destination-panel="settings" hidden>
+      <div class="e8-screens-host">
+        ${actionScreens.map((entry) => screenMarkup(entry.view, false, host, mode)).join('\n')}
+      </div>
+    </div>`;
+  }
   const screens = screensFor(destination);
   const visible = screens.some((screen) => screen.id === initialScreen);
   return `<div class="e8-destination" data-destination-panel="${destination}"${visible ? '' : ' hidden'}>
     ${screenBrowser(destination, initialScreen)}
     <div class="e8-screens-host">
-      ${screens.map((screen) => screenMarkup(screenView(screen.id, state), screen.id === initialScreen && visible && mode !== 'settings', host, mode)).join('\n')}
+      ${screens.map((screen) => screenMarkup(screenView(screen.id, state), screen.id === initialScreen && visible, host, mode)).join('\n')}
     </div>
   </div>`;
 }
@@ -664,7 +905,7 @@ export function renderEdition8Html(options: Edition8HtmlOptions): string {
       : ''
   }
   <main id="e8-main">
-    ${mode === 'settings' ? settingsHomeMarkup() : ''}
+    ${mode === 'settings' && !SETTINGS_DETAIL_SCREENS.has(initial) ? settingsHomeMarkup(options.state) : ''}
     ${destinations
       .map((destination) => destinationMarkup(destination, options.state, initial, options.host, mode))
       .join('\n')}

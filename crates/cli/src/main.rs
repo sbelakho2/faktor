@@ -43,6 +43,7 @@ mod engineering;
 mod evidence;
 mod graph;
 mod impact;
+mod install;
 mod mcp_bridge;
 mod mcp_oauth;
 mod payload;
@@ -65,7 +66,7 @@ use graph::DaemonGraph;
     about = "Faktor — an engineering agent for code investigation, implementation and verification",
     long_about = "Faktor — an engineering agent for code investigation, implementation and verification.\n\n\
                   Daily:   run, doctor, sessions\n\
-                  Service: serve, build, acp, bootstrap\n\
+                  Service: serve, build, acp, bootstrap, install\n\
                   Admin:   commerce, enterprise, updater, worker"
 )]
 struct Cli {
@@ -84,6 +85,29 @@ pub(crate) enum Command {
         data_dir: String,
         #[arg(long)]
         config: Option<String>,
+    },
+    /// Install the running executable as the verified trusted-install identity
+    /// (`<dest>/faktor` + `<dest>/faktor.sha256` + identity/settings
+    /// guidance). This is the reproducible IN-ROOT EXECUTABLE layout the VS
+    /// Code extension auto-starts; it refuses a root that already holds a
+    /// signed `launcher`/`current`/`versions/` layout.
+    #[command(display_order = 15)]
+    Install {
+        /// The trusted install root (absolute). Created when absent.
+        #[arg(long)]
+        dest: String,
+        /// Executable to install (default: the running executable).
+        #[arg(long)]
+        source: Option<String>,
+        /// Daemon data dir to include in the machine-scoped settings guidance.
+        #[arg(long)]
+        data_dir: Option<String>,
+        /// Replace an existing in-root executable (the checksum is rewritten).
+        #[arg(long)]
+        force: bool,
+        /// Print the structured receipt instead of the human summary.
+        #[arg(long)]
+        json: bool,
     },
     /// Headless: create a session and run one prompt.
     #[command(display_order = 10)]
@@ -697,6 +721,24 @@ pub(crate) async fn main() {
             config,
         } => {
             sandbox_command(action, expand(&data_dir), config.map(|c| expand(&c)));
+        }
+        Command::Install {
+            dest,
+            source,
+            data_dir,
+            force,
+            json,
+        } => {
+            let code = install::run(install::InstallRequest {
+                dest: expand(&dest),
+                source: source.map(|path| expand(&path)),
+                data_dir: data_dir.map(|path| expand(&path)),
+                force,
+                json,
+            });
+            if code != 0 {
+                std::process::exit(code);
+            }
         }
         Command::Bootstrap {
             install_root,
