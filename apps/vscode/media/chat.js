@@ -247,6 +247,13 @@
   // (subview re-render source), the bounded history search text, the
   // in-flight row Open identity and the diagnostics popover state.
   var activeView = 'work';
+  function safeSetTimeout(fn, ms) {
+    try {
+      if (typeof setTimeout === 'function') return setTimeout(fn, ms);
+      if (typeof window !== 'undefined' && typeof window.setTimeout === 'function') return window.setTimeout(fn, ms);
+    } catch (e) {}
+    return 0;
+  }
   var activeSubview = 'overview';
   var lastSnapshot = null;
   var historyQuery = '';
@@ -1048,7 +1055,7 @@
     }
     document.body.setAttribute('data-mode', key === 'settings' ? 'settings' : 'chat');
     setOverflowOpen(false);
-    window.setTimeout(function () {
+    safeSetTimeout(function () {
       try {
         vscode.postMessage({
           type: 'uiDomDump',
@@ -6476,7 +6483,7 @@
   });
   // One-shot diagnostic: report the exact rendered DOM to the host so a
   // stale/wrong surface can be identified from evidence instead of guesses.
-  window.setTimeout(function () {
+  safeSetTimeout(function () {
     try {
       vscode.postMessage({
         type: 'uiDomDump',

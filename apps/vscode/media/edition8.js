@@ -390,6 +390,14 @@
       back.dataset.bound = 'true';
       back.addEventListener('click', showSettingsHome);
     }
+    var openChat = document.querySelector('[data-open-chat]');
+    if (openChat && openChat.dataset.bound !== 'true') {
+      openChat.dataset.bound = 'true';
+      openChat.addEventListener('click', function () {
+        if (typeof openView === 'function') openView('work');
+        else vscode.postMessage({ type: 'faktorShowView', view: 'chat' });
+      });
+    }
     var review = document.querySelector('[data-settings-review]');
     if (review && review.dataset.bound !== 'true') {
       review.dataset.bound = 'true';

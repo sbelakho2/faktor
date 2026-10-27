@@ -2576,3 +2576,45 @@ button.intent-option:focus-visible {
   border-bottom: 1px solid var(--faktor-border);
 }
 .settings-nav-title { font-weight: 600; }
+
+/* Settings back bar: always visible at the top of the settings surface,
+   above the E8 app's own header/footer. */
+#settings-nav {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  background: var(--vscode-sideBar-background, var(--vscode-editor-background, #1e1e1e));
+  border-bottom: 1px solid var(--faktor-border);
+}
+#settings-nav .back-to-chat {
+  min-width: 46px;
+  min-height: 32px;
+  padding: 4px 12px;
+  border: 1px solid var(--faktor-border);
+  border-radius: var(--faktor-radius-control);
+  background: var(--vscode-button-background, #0e639c);
+  color: var(--vscode-button-foreground, #fff);
+  font-size: 0.85em;
+  font-weight: 600;
+}
+#settings-nav .back-to-chat:hover {
+  background: var(--vscode-button-hoverBackground, #1177bb);
+}
+.settings-nav-title {
+  font-weight: 600;
+  font-size: 0.95em;
+  color: var(--vscode-foreground);
+}
+/* Hide the E8 app's own header/footer when embedded in settings panel */
+#settings-panel #e8-app .e8-header,
+#settings-panel #e8-app .e8-footer { display: none !important; }
+/* Make the settings panel not overflow 100vh so the nav bar is always
+   the first visible element */
+#settings-panel #e8-app {
+  min-height: auto !important;
+  height: auto !important;
+}

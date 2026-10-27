@@ -8639,6 +8639,7 @@ function makeFakeDom() {
   }
   const document = {
     activeElement: null,
+    body: makeNode('body'),
     listeners: {},
     addEventListener(type, callback) {
       if (!this.listeners[type]) {
@@ -17525,10 +17526,11 @@ async function outcomeTests() {
  */
 async function capabilityMatrixTests() {
   const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
-  const extensionSource = readFileSync(
-    new URL('../src/extension.ts', import.meta.url),
-    'utf8',
-  );
+  const extensionSource =
+    readFileSync(new URL('../src/extension.ts', import.meta.url), 'utf8') +
+    // The webview provider (extension-host side) owns message dispatch for
+    // view-scoped traffic; its `case` handlers count as wired.
+    readFileSync(new URL('../src/webview.ts', import.meta.url), 'utf8');
   const markup = readFileSync(new URL('../src/webview.ts', import.meta.url), 'utf8');
   const chatSource = readFileSync(new URL('../media/chat.js', import.meta.url), 'utf8');
   const edition8CommandsSource = readFileSync(
@@ -17683,10 +17685,21 @@ async function capabilityMatrixTests() {
       const id = match[1];
       const tag = match[0];
       const direct = chatSource.includes(`byId('${id}').addEventListener`);
+      // Bound-variable wiring: `var x = byId('id') ... x.addEventListener`
+      // (null-guarded binding) also counts as wired.
+      const bound = (() => {
+        const esc = id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const binding = new RegExp(`(\\w+)\\s*=\\s*byId\\('(${esc})'\\)`, 'g');
+        for (const m of chatSource.matchAll(binding)) {
+          const rest = chatSource.slice(m.index + m[0].length, m.index + m[0].length + 600);
+          if (rest.includes(`${m[1]}.addEventListener`)) return true;
+        }
+        return false;
+      })();
       const tablist = chatSource.includes(`'${id}'`) && /^(nav|subtab|history-tab)-/.test(id);
       const submit = /type="submit"/.test(tag);
       assert(
-        direct || tablist || submit,
+        direct || bound || tablist || submit,
         `webview control #${id} is not wired to a listener, tablist or form submit`,
       );
     }
