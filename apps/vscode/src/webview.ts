@@ -75,7 +75,7 @@ export type FaktorView = 'work' | 'settings' | 'inspect' | 'history' | 'diagnost
  * panel per surface and never splits an editor column.
  */
 export class ChatViewProvider implements vscode.WebviewViewProvider {
-  public static readonly viewType = 'faktor.launcher';
+  public static readonly viewType = 'faktor.chat';
 
   private view: vscode.WebviewView | null = null;
   private edition8Controller: Edition8Controller | null = null;

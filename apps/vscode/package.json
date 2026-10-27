@@ -2,7 +2,7 @@
   "name": "faktor",
   "displayName": "Faktor",
   "description": "An engineering agent in your editor: describe a task, follow the run, approve what it needs, and land verified changes.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "faktor",
   "license": "SEE LICENSE IN LICENSE.txt",
   "engines": {
@@ -13,7 +13,7 @@
   ],
   "icon": "media/faktor-icon.png",
   "activationEvents": [
-    "onView:faktor.launcher",
+    "onView:faktor.chat",
     "onCommand:faktor.startServer",
     "onCommand:faktor.stopServer",
     "onCommand:faktor.openChat",
@@ -243,7 +243,7 @@
     "views": {
       "faktor": [
         {
-          "id": "faktor.launcher",
+          "id": "faktor.chat",
           "name": "Faktor",
           "type": "webview"
         }
