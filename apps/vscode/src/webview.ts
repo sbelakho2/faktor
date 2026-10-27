@@ -445,6 +445,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 <body data-surface="sidebar">
 <div id="app">
   <header>
+    <button id="btn-back-chat" class="toggle back-to-chat" type="button" title="Back to chat" aria-label="Back to chat" hidden>← Chat</button>
     <span id="brand">Faktor</span>
     <span id="daemon-dot" class="dot dot-stopped" aria-hidden="true"></span>
     <span id="daemon-text" class="header-status">Ready</span>

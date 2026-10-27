@@ -229,6 +229,20 @@ header button {
   display: inline-flex;
   align-items: center;
   gap: var(--space-1);
+  min-width: 36px;
+  min-height: 28px;
+  padding: 2px 10px;
+  border: 1px solid var(--faktor-border);
+  border-radius: var(--faktor-radius-control);
+}
+
+.back-to-chat {
+  min-height: 28px;
+  padding: 2px 10px;
+  border: 1px solid var(--faktor-border);
+  border-radius: var(--faktor-radius-control);
+  background: var(--faktor-surface);
+  color: var(--vscode-foreground);
 }
 
 .control-center-glyph {
@@ -239,8 +253,9 @@ header button {
 
 @media (max-width: 559px) {
   .control-center-toggle {
-    min-width: 28px;
-    padding: 0 6px;
+    min-width: 36px;
+    min-height: 28px;
+    padding: 2px 8px;
     justify-content: center;
   }
   .control-center-label {

@@ -1038,6 +1038,10 @@
         item.setAttribute('aria-current', panelKey === key ? 'page' : 'false');
       }
     }
+    var back = byId('btn-back-chat');
+    if (back) {
+      back.hidden = key === 'work';
+    }
     setOverflowOpen(false);
   }
 
@@ -6401,6 +6405,10 @@
       }
       return;
     }
+    if (activeView !== 'work') {
+      openView('work');
+      return;
+    }
     dismissTransient();
   });
 
@@ -6429,9 +6437,19 @@
   // Diagnostics) and the scoped Stop action. It is NOT a second header:
   // selecting an item swaps the full-window view and closes the menu.
   byId('btn-control-center').addEventListener('click', function () {
+    if (activeView === 'settings') {
+      openView('work');
+      return;
+    }
     openView('settings');
     vscode.postMessage({ type: 'openSettingsView' });
   });
+  var backChat = byId('btn-back-chat');
+  if (backChat) {
+    backChat.addEventListener('click', function () {
+      openView('work');
+    });
+  }
   byId('btn-overflow').addEventListener('click', function () {
     toggleOverflow();
   });
