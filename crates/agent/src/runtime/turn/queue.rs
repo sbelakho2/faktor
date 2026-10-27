@@ -24,7 +24,13 @@ impl AgentRuntime {
         let Some(root) = self.deps.session.get_session(root_id)? else {
             return Ok(None);
         };
-        let revision = root.ledger_ensure_head()?.board_revision;
+        let head = root.ledger_ensure_head()?;
+        let revision = head.board_revision;
+        // The board revision does NOT move when this child records reads
+        // (`BoardRead` rows are append-only markers), so the memo must also
+        // key on the root ledger's fold cursor. Otherwise the boundary keeps
+        // serving a stale "N unread" line after the child already read them.
+        let cursor = head.checkpoint_seq;
         let child = faktor_session::board::ChildId::of_session(handle.id());
         let mut cache = self
             .coordination
@@ -33,11 +39,13 @@ impl AgentRuntime {
         let memo = cache.entry(handle.id()).or_default();
         let mut read_error: Option<String> = None;
         let rendered = memo
-            .notice_for(revision, || match handle.board_unread_counts(child) {
-                Ok(counts) => counts.values().map(|count| u64::from(*count)).sum(),
-                Err(err) => {
-                    read_error = Some(err.message);
-                    0
+            .notice_for(revision, cursor, || {
+                match handle.board_unread_counts(child) {
+                    Ok(counts) => counts.values().map(|count| u64::from(*count)).sum(),
+                    Err(err) => {
+                        read_error = Some(err.message);
+                        0
+                    }
                 }
             })
             .map(str::to_string);
@@ -1234,6 +1242,11 @@ impl AgentRuntime {
                 state
             )));
         }
+        // Re-register the durable turn op in the in-memory registry BEFORE
+        // any replay/permission call: the registry does not survive a
+        // restart, and `request_permission_for_tool` refuses an untracked
+        // op (the live restart failed with "operation ... is not tracked").
+        let resume_token = handle.register_resumed_turn(turn_op);
         // Resolve side effects (existing tool-run recovery; idempotent runs
         // come back as deferred rows and are replayed below).
         self.recover_session(handle)?;
@@ -1268,6 +1281,7 @@ impl AgentRuntime {
                     status,
                     DW_SITE_CONTINUE_RECORD_DONE,
                 );
+                handle.unregister_turn(turn_op);
                 return Ok(TurnOutcome {
                     op_id: turn_op,
                     final_state: state,
@@ -1304,7 +1318,7 @@ impl AgentRuntime {
             .drive_turn(
                 handle,
                 turn_op,
-                CancellationToken::new(),
+                resume_token,
                 Some(record.effective_model.clone()),
             )
             .await;

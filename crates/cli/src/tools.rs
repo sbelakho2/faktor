@@ -1161,6 +1161,101 @@ fn walk_search_dir(
 /// truncated at its cap (audit round 10) — truncation is never silent.
 const ARTIFACT_TRUNCATED_MARK: &str = "\n[artifact truncated at its cap]";
 
+/// The scratch/build environment of a KERNEL read-only shell.
+///
+/// `read_only` promises that the workspace is not mutated, but a real build
+/// must still write its derived state: Cargo's target tree (including
+/// `*.d` dep-info), rustc/build-script temp files, and the Cargo package
+/// cache lock. All of these are confined to explicit derived roots:
+///
+/// - `CARGO_TARGET_DIR` is FORCED to `<workspace>/target` (the same root
+///   the sandbox already grants): a daemon- or operator-supplied external
+///   target would otherwise point outside the workspace and fail with
+///   EACCES on the first dep-info write;
+/// - `TMPDIR`/`TMP`/`TEMP` are anchored at
+///   `<workspace>/.faktor-derived/build-scratch/tmp`;
+/// - the daemon's approved `CARGO_HOME`/`RUSTUP_HOME` stay as read-only
+///   toolchain inputs (see [`read_only_writable_roots`] for the narrow
+///   cache subpaths the sandbox additionally grants).
+fn read_only_command_env(ws: &WorkspaceHandle) -> EnvSpec {
+    let mut env = EnvSpec::toolchain().resolve();
+    let scratch = ws.root().join(".faktor-derived").join("build-scratch");
+    let set =
+        |env: &mut Vec<(std::ffi::OsString, std::ffi::OsString)>, name: &str, value: &Path| {
+            let name = std::ffi::OsString::from(name);
+            match env
+                .iter_mut()
+                .find(|(existing, _)| existing.eq_ignore_ascii_case(&name))
+            {
+                Some(slot) => slot.1 = value.as_os_str().to_os_string(),
+                None => env.push((name, value.as_os_str().to_os_string())),
+            }
+        };
+    set(&mut env, "CARGO_TARGET_DIR", &ws.root().join("target"));
+    set(&mut env, "TMPDIR", &scratch.join("tmp"));
+    set(&mut env, "TMP", &scratch.join("tmp"));
+    set(&mut env, "TEMP", &scratch.join("tmp"));
+    EnvSpec::Explicit(env)
+}
+
+/// The writable roots a KERNEL read-only shell is granted: the workspace
+/// `target/` and `.faktor-derived/` build scratch, plus Cargo's own cache
+/// subpaths when the daemon has an approved `CARGO_HOME`.
+///
+/// The Cargo cache grant is deliberately NARROW: `registry/`, `git/` and
+/// the `.package-cache` lock file are build inputs/outputs, while the
+/// credential-bearing `credentials.toml`/`credentials` stay denied by the
+/// sandbox's credential filter (`safe_roots` drops any overlapping root).
+/// Without the cache grant Cargo fails its package-cache lock under
+/// os_isolated confinement even when the target tree is writable.
+fn read_only_writable_roots(ws: &WorkspaceHandle) -> Vec<PathBuf> {
+    let mut roots = vec![
+        ws.root().join("target"),
+        ws.root().join(".faktor-derived").join("build-scratch"),
+        // A fresh crate has no lockfile; Cargo writes it before compiling.
+        // The lockfile is DERIVED from Cargo.toml, so a verification build
+        // may materialize it without turning the whole workspace writable.
+        ws.root().join("Cargo.lock"),
+    ];
+    roots.extend(cargo_cache_roots());
+    roots
+}
+
+/// The daemon-approved Cargo cache subpaths a confined build may WRITE.
+/// `registry/` and `git/` hold downloaded/build inputs; the lock and SQLite
+/// cache files are Cargo's own bookkeeping. Credential files
+/// (`credentials`, `credentials.toml`) are NEVER granted: the sandbox's
+/// credential deny overlaps and wins, and we only add these exact paths.
+fn cargo_cache_roots() -> Vec<PathBuf> {
+    let cargo_home = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".cargo"))
+        });
+    let Some(cargo_home) = cargo_home else {
+        return Vec::new();
+    };
+    if !cargo_home.is_absolute() || !cargo_home.is_dir() {
+        return Vec::new();
+    }
+    let mut roots = Vec::new();
+    for sub in ["registry", "git"] {
+        let path = cargo_home.join(sub);
+        if path.is_dir() {
+            roots.push(path);
+        }
+    }
+    for file in [".package-cache", ".package-cache-mutate", ".global-cache"] {
+        let path = cargo_home.join(file);
+        if path.exists() {
+            roots.push(path);
+        }
+    }
+    roots
+}
+
 pub fn run_command_tool() -> Tool {
     Tool {
         name: "run_command".into(),
@@ -1252,6 +1347,11 @@ pub fn run_command_tool() -> Tool {
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false)
                     && faktor_sandbox::filesystem_backend_available();
+                let env = if read_only {
+                    read_only_command_env(&ws)
+                } else {
+                    EnvSpec::toolchain()
+                };
                 let filesystem_isolation = if read_only {
                     // P0: provisioning runs through the ROOTED filesystem
                     // authority (anchored, no-follow component walk), never
@@ -1261,17 +1361,19 @@ pub fn run_command_tool() -> Tool {
                     // preparation failure is a typed refusal BEFORE exec —
                     // infrastructure failure never masquerades as user-code
                     // failure.
-                    let mut writable_roots = Vec::new();
-                    for rel in ["target", ".faktor-derived/build-scratch"] {
-                        let path = ws.root().join(rel);
+                    for rel in [
+                        "target",
+                        ".faktor-derived/build-scratch",
+                        ".faktor-derived/build-scratch/tmp",
+                    ] {
                         ws.create_dir_all_no_follow(std::path::Path::new(rel))
                             .map_err(|e| {
                                 Error::permission(format!(
                                     "sandbox preparation failed for {rel:?}: {e}"
                                 ))
                             })?;
-                        writable_roots.push(path);
                     }
+                    let writable_roots = read_only_writable_roots(&ws);
                     let required = match sandbox.spawn_filesystem_requirement() {
                         faktor_terminal::FilesystemIsolationRequirement::Workspace {
                             best_effort,
@@ -1287,9 +1389,13 @@ pub fn run_command_tool() -> Tool {
                         required,
                     }
                 } else {
+                    let mut roots = vec![ws.root().to_path_buf()];
+                    // A mutating build keeps Cargo's cache writable too;
+                    // the credential denies still win over these paths.
+                    roots.extend(cargo_cache_roots());
                     faktor_terminal::FilesystemIsolation::for_requirement(
                         sandbox.spawn_filesystem_requirement(),
-                        vec![ws.root().to_path_buf()],
+                        roots,
                     )
                 };
                 let cfg = SpawnConfig {
@@ -1300,7 +1406,7 @@ pub fn run_command_tool() -> Tool {
                         .map(|a| a.to_string_lossy().into_owned())
                         .collect(),
                     cwd: ws.root().to_path_buf(),
-                    env: EnvSpec::toolchain(),
+                    env,
                     owner: ProcessOwner::Session(ctx.session_id),
                     capture: true,
                     artifact_max: COMMAND_ARTIFACT_MAX,
@@ -2784,6 +2890,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn read_only_shell_env_anchors_build_state_inside_the_workspace() {
+        // Regression: an external/absent CARGO_TARGET_DIR made Cargo write
+        // dep-info outside the kernel-writable roots, and TMPDIR pointed at
+        // the denied scratch home. Both now resolve to derived roots the
+        // read-only confinement grants.
+        let f = fixture(SandboxPolicy::default());
+        let ws =
+            WorkspaceHandle::open_scoped(faktor_core::id::WorkspaceId::new(902), f.root.clone())
+                .unwrap();
+        let resolved = read_only_command_env(&ws).resolve();
+        let value = |name: &str| {
+            resolved
+                .iter()
+                .find(|(key, _)| key.to_string_lossy().eq_ignore_ascii_case(name))
+                .map(|(_, value)| PathBuf::from(value))
+        };
+        assert_eq!(value("CARGO_TARGET_DIR"), Some(ws.root().join("target")));
+        let tmp = ws.root().join(".faktor-derived/build-scratch/tmp");
+        for name in ["TMPDIR", "TMP", "TEMP"] {
+            assert_eq!(value(name), Some(tmp.clone()), "{name}");
+        }
+        let roots = read_only_writable_roots(&ws);
+        assert!(roots.contains(&ws.root().join("target")));
+        assert!(roots.contains(&ws.root().join(".faktor-derived/build-scratch")));
+        assert!(
+            !roots.iter().any(|root| root.ends_with("credentials.toml")),
+            "the credential store is never a writable root: {roots:?}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_command_executes_via_sh() {
         let f = fixture(SandboxPolicy {
@@ -2921,6 +3058,90 @@ mod tests {
         .unwrap();
         assert_eq!(out.exit_code, Some(0), "{out:?}");
         assert!(out.text.contains("inside-ok"), "{:?}", out.text);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_only_cargo_test_builds_a_fresh_crate_without_workspace_write_authority() {
+        // Live regression: the read-only verification build failed because
+        // (a) Cargo had to create Cargo.lock, (b) the dep-info temp and
+        // Cargo's cache lock were outside the granted roots. The build
+        // outputs and the derived lockfile are the ONLY new workspace
+        // writes; authored sources stay untouched.
+        let f = fixture_exact(SandboxPolicy {
+            read_external: Rule::Deny,
+            write_external: Rule::Deny,
+            execute_shell: Rule::Allow,
+            network_guarantee: SandboxGuarantee::Required,
+            shell_execution: ShellExecutionMode::OsIsolated,
+            ..Default::default()
+        });
+        std::fs::create_dir_all(f.root.join("src")).unwrap();
+        std::fs::write(
+            f.root.join("Cargo.toml"),
+            "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            f.root.join("src/lib.rs"),
+            "pub fn ok() -> bool { true }\n#[test]\nfn ok_test() { assert!(ok()); }\n",
+        )
+        .unwrap();
+        let tool = run_command_tool();
+        let out = (tool.execute)(
+            ctx(&f),
+            serde_json::json!({"command": "cargo test --offline", "read_only": true}),
+        )
+        .await
+        .expect("the confined verification build runs");
+        assert_eq!(
+            out.exit_code,
+            Some(0),
+            "cargo test under read-only confinement must pass: {:?}",
+            out.text
+        );
+        assert!(
+            f.root.join("Cargo.lock").exists(),
+            "the derived lockfile is written"
+        );
+        assert_eq!(
+            std::fs::read(f.root.join("src/lib.rs")).unwrap(),
+            b"pub fn ok() -> bool { true }\n#[test]\nfn ok_test() { assert!(ok()); }\n",
+            "authored source is untouched"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn write_command_can_create_build_outputs_under_os_isolation() {
+        // Live regression: a mutating os_isolated shell could create files
+        // at the workspace root but got EPERM on `target/debug/deps/*.d`.
+        // The workspace itself is the write root, so its build subtree must
+        // be writable; nothing outside it may be.
+        let f = fixture_exact(SandboxPolicy {
+            read_external: Rule::Deny,
+            write_external: Rule::Deny,
+            execute_shell: Rule::Allow,
+            network_guarantee: SandboxGuarantee::Required,
+            shell_execution: ShellExecutionMode::OsIsolated,
+            ..Default::default()
+        });
+        let tool = run_command_tool();
+        let out = (tool.execute)(
+            ctx(&f),
+            serde_json::json!({
+                "command": "mkdir -p target/debug/deps && printf dep > target/debug/deps/battery.d && cat target/debug/deps/battery.d",
+                "read_only": false
+            }),
+        )
+        .await
+        .expect("the workspace build subtree is writable");
+        assert_eq!(out.exit_code, Some(0), "{out:?}");
+        assert!(out.text.contains("dep"), "{:?}", out.text);
+        assert_eq!(
+            std::fs::read(f.root.join("target/debug/deps/battery.d")).unwrap(),
+            b"dep"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

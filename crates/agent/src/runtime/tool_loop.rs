@@ -614,14 +614,17 @@ impl AgentRuntime {
             }
             // The page is newest-first: the walk stays newest-first so the
             // tool-cluster stop is exact (nothing older than the first
-            // non-tool message can belong to this turn's tail).
+            // non-tool message can belong to this turn's tail). Parts are
+            // ONE bounded batch for the page (never one read per message).
+            let ids: Vec<i64> = page.iter().map(|row| row.id).collect();
+            let mut parts_by_message = handle.parts_for_messages(&ids)?;
             for row in page.iter() {
                 if scanned >= MAX_SCAN {
                     break 'scan;
                 }
                 scanned += 1;
                 let mut saw_tool_part = false;
-                for part in handle.parts_of(row.id)? {
+                for part in parts_by_message.remove(&row.id).unwrap_or_default() {
                     let Some(call_id) = part
                         .data
                         .get("tool_call_id")
@@ -774,26 +777,50 @@ impl AgentRuntime {
             },
         );
         enforce_child_shell_read_only(handle, &capability, &mut desc.validated_args);
-        let state = handle.state()?;
+        let mut state = handle.state()?;
+        // A crashed BATCH can defer several idempotent rows. Resume replays
+        // them one at a time; after the first replay the machine legitimately
+        // sits at Validating, and the next pending row used to be refused
+        // (`requires ExecutingTool, found Validating`), leaving the turn
+        // active forever. Validating may re-enter ExecutingTool for a pending
+        // replay row (a discovered required tool) via the same ReplayStarted
+        // journal fact — one fact, one transition.
+        let replay_payload = serde_json::json!({
+            "tool": row.tool,
+            "attempt": row.attempt + 1,
+            "turn_op_id": desc.original_turn_op_id.raw(),
+            "reason": "resume_pending_tool",
+        });
+        let mut replay_journaled = false;
+        if state == AgentState::Validating {
+            handle
+                .append_journal_event(
+                    faktor_core::event::EventKind::ReplayStarted,
+                    AgentState::ExecutingTool,
+                    Some(row.op_id),
+                    Some(replay_payload.clone()),
+                )
+                .await?;
+            state = AgentState::ExecutingTool;
+            replay_journaled = true;
+        }
         if state != AgentState::ExecutingTool {
             return Err(Error::conflict(format!(
                 "replay of {} requires the machine at ExecutingTool, found {state:?}",
                 row.op_id
             )));
         }
-        // Journal the replay start (self-transition, exactly once per run).
-        handle
-            .append_journal_event(
-                faktor_core::event::EventKind::ReplayStarted,
-                state,
-                Some(row.op_id),
-                Some(serde_json::json!({
-                    "tool": row.tool,
-                    "attempt": row.attempt + 1,
-                    "turn_op_id": desc.original_turn_op_id.raw(),
-                })),
-            )
-            .await?;
+        if !replay_journaled {
+            // Journal the replay start (self-transition, exactly once per run).
+            handle
+                .append_journal_event(
+                    faktor_core::event::EventKind::ReplayStarted,
+                    state,
+                    Some(row.op_id),
+                    Some(replay_payload),
+                )
+                .await?;
+        }
         let attempt = handle.bump_tool_attempt(row.op_id)?;
         // Reconstruct the original invocation context (the permission hop
         // was already resolved pre-crash; a replay is its continuation).
@@ -885,12 +912,14 @@ impl AgentRuntime {
             if page.is_empty() {
                 break;
             }
+            let ids: Vec<i64> = page.iter().map(|row| row.id).collect();
+            let mut parts_by_message = handle.parts_for_messages(&ids)?;
             for row in page.iter() {
                 if scanned >= MAX_SCAN {
                     break;
                 }
                 scanned += 1;
-                for part in handle.parts_of(row.id)? {
+                for part in parts_by_message.remove(&row.id).unwrap_or_default() {
                     if part.kind == "tool_call"
                         && part.data.get("name").and_then(|n| n.as_str()) == Some(tool)
                         && part.data.get("input") == Some(args)

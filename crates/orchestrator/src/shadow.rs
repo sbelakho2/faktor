@@ -92,19 +92,20 @@ const CHILD_ID: &str = "shadow";
 /// [`crate::runtime::task_executor::TaskExecutor`] applies to run bases:
 /// `owner_before == owner_after == shadow_copied`).
 pub const SHADOW_COPY_ATTEMPTS: usize = 3;
-/// Directories the shadow copy never materializes (VCS bookkeeping is not
-/// content; the root snapshot digest skips exactly these).
+/// Directories the shadow copy never materializes: EXACTLY the canonical
+/// [`faktor_fs::tree_manifest::TREE_MANIFEST_SKIP_DIRS`] set (VCS plumbing
+/// and conventional build/dependency caches such as `target`,
+/// `node_modules`, `.gradle`, `.venv`).
 ///
-/// Generated/build directories (`target`, `node_modules`, `.gradle`, build
-/// dirs, ...) are deliberately NOT in this list: they are part of the
-/// shadowed workspace content. [`faktor_fs::tree_manifest::TREE_MANIFEST_SKIP_DIRS`]
-/// (the run-base/candidate identity the shadow mirrors) skips only VCS
-/// bookkeeping, so the preflight and the copy keep exact parity with it. An
-/// actively built checkout is therefore handled by concurrent-vanish
-/// tolerance in [`bounded_base_preflight`] plus the stable-copy retry
-/// contract — never by silently dropping a build tree from the shadowed
-/// content (a dropped tree would change what the run may observe and land).
-const SHADOW_SKIP_DIRS: &[&str] = &[".git", ".hg", ".svn"];
+/// Build outputs are DERIVED, regenerable state, never authored content:
+/// they are excluded from the canonical tree identity every run-base /
+/// candidate / landing comparison already uses. Copying them (the old
+/// behavior) made a monolithic `target/` fail the 1 GiB shadow cap before
+/// the agent could start, while the copy could never change the verified
+/// delta anyway. Sharing the ONE list keeps preflight, copy and digest in
+/// exact parity — a skipped subtree is invisible to all three, so the
+/// stable-copy equality still proves the shadow is the owner's content.
+const SHADOW_SKIP_DIRS: &[&str] = faktor_fs::tree_manifest::TREE_MANIFEST_SKIP_DIRS;
 
 /// Result of a per-hunk acceptance: the new candidate identity (content
 /// digest of the selected composition) plus the landed paths. Every prior
@@ -307,8 +308,14 @@ fn materialize_shadow_git_view(base: &Path, shadow: &Path) -> std::io::Result<()
         return Ok(());
     }
     let view = shadow.join(".git");
-    if view.exists() {
+    if view.is_dir() {
         std::fs::remove_dir_all(&view)?;
+    } else if view.exists() {
+        // A linked worktree's `.git` is a FILE (gitdir pointer), and the
+        // content copy preserves it as a file. `remove_dir_all` on that
+        // file failed with ENOTDIR, so every shadow of a linked worktree
+        // lost its git view. Remove the file, then materialize the view.
+        std::fs::remove_file(&view)?;
     }
     std::fs::create_dir_all(view.join("objects/info"))?;
     std::fs::create_dir_all(view.join("refs"))?;
@@ -1507,12 +1514,13 @@ fn shadow_copy_error(what: &str, e: faktor_fs::tree_manifest::TreeManifestError)
 /// still absent, skipped. It is no longer part of the tree the stable copy
 /// will materialize, exactly like a deletion that lands a moment later.
 ///
-/// Generated/build directories are deliberately NOT skipped
-/// ([`SHADOW_SKIP_DIRS`] mirrors the canonical manifest: VCS bookkeeping
-/// only), so this vanish tolerance — plus the stable-copy retry contract —
-/// is the churn policy, never a silent drop of build content. A vanished
-/// entry can never hide a cap violation: it is still counted against the
-/// entry cap, and every entry that IS present is measured.
+/// Build/dependency directories are skipped by [`SHADOW_SKIP_DIRS`]
+/// (the canonical manifest set), so an actively built checkout cannot make
+/// a shadow unbeginable through gigabytes of derived output. Within the
+/// copied content this vanish tolerance — plus the stable-copy retry
+/// contract — is the churn policy. A vanished copied entry can never hide a
+/// cap violation: it is still counted against the entry cap, and every
+/// entry that IS present is measured.
 ///
 /// Failures that are genuine drift stay typed: the BASE ROOT itself missing
 /// or unreadable (including a root that vanishes mid-walk), a persistent

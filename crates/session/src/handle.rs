@@ -913,8 +913,11 @@ impl SessionHandle {
                 .map_err(crate::map_store_err)?;
         }
         let mut op_ids = affected;
+        // One set for the dedupe: the historical `op_ids.contains` per queued
+        // row was O(affected · queued) on abort-all over a long session.
+        let mut seen: std::collections::HashSet<OpId> = op_ids.iter().copied().collect();
         for q in queued_ids {
-            if !op_ids.contains(&q) {
+            if seen.insert(q) {
                 op_ids.push(q);
             }
         }
@@ -1023,6 +1026,26 @@ impl SessionHandle {
         op: OpId,
     ) -> Option<faktor_core::cancellation::CancellationToken> {
         self.ops().tracked(op).map(|t| t.token)
+    }
+
+    /// Register a FRESH in-process cancellation token for a durable turn op
+    /// that is being resumed after a restart. The OpRegistry is in-memory
+    /// only; without this, every resumed tool/permission call fails with
+    /// "operation ... is not tracked" even though the durable turn record is
+    /// valid. Idempotent: an already-live token is returned unchanged.
+    /// Remove a resumed turn's in-memory registration after a terminal
+    /// early return (no drive will own it).
+    pub fn unregister_turn(&self, op: OpId) {
+        self.ops().unregister(op);
+    }
+
+    pub fn register_resumed_turn(&self, op: OpId) -> faktor_core::cancellation::CancellationToken {
+        if let Some(t) = self.turn_cancellation(op) {
+            return t;
+        }
+        let token = faktor_core::cancellation::CancellationToken::new();
+        self.ops().register_turn(op, token.clone());
+        token
     }
 
     /// End the session — the ONLY normal route to terminal closure

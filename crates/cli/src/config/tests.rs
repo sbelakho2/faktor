@@ -1086,6 +1086,49 @@ fn billing_origin_matrix_is_strict_and_instance_scoped() {
         custom_openai.billing_origin(),
         BillingOrigin::CustomEndpoint
     );
+    // Endpoint identity, not the wire family: an OpenAI-compatible entry
+    // pointed at the canonical DeepSeek API (either spelling) bills at the
+    // documented DeepSeek origin. This is the live DeepSeek setup that
+    // otherwise arrived as CustomEndpoint/Unknown and was excluded by
+    // Economy/Balanced, surfacing as NoCapableModel on the first call.
+    let official_deepseek_via_openai = ProviderCfg::OpenAi {
+        id: "deepseek".into(),
+        base_url: "https://api.deepseek.com/v1".into(),
+        api_key_env: None,
+        api: Some(OpenAiApi::Chat),
+        models: vec!["deepseek-chat".into()],
+        pricing: None,
+        allow_loopback: true,
+        quality: None,
+    };
+    assert_eq!(
+        official_deepseek_via_openai.billing_origin(),
+        BillingOrigin::OfficialDeepSeek
+    );
+    assert_eq!(
+        ProviderCfg::OpenAi {
+            id: "deepseek-bare".into(),
+            base_url: "https://api.deepseek.com".into(),
+            api_key_env: None,
+            api: Some(OpenAiApi::Chat),
+            models: vec!["deepseek-chat".into()],
+            pricing: None,
+            allow_loopback: true,
+            quality: None,
+        }
+        .billing_origin(),
+        BillingOrigin::OfficialDeepSeek
+    );
+    assert_eq!(
+        official_deepseek_via_openai
+            .build(open_transport())
+            .unwrap()
+            .catalog_entry("deepseek-chat")
+            .pricing
+            .authority(),
+        PriceAuthority::ConservativeCeiling,
+        "the canonical DeepSeek endpoint resolves its documented conservative bound"
+    );
     assert_eq!(
         ProviderCfg::Anthropic {
             id: "anthropic".into(),

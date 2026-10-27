@@ -100,7 +100,8 @@ pub(crate) const SHELL_CHANGE_PATH_MAX_BYTES: usize = 200;
 pub(crate) const SHELL_CHANGE_FACT_MAX_PATHS: usize = 16;
 
 /// Directory names never entered by the shell-attribution walk IN ADDITION
-/// to the canonical manifest's VCS skip set ([`TREE_MANIFEST_SKIP_DIRS`]):
+/// to the canonical manifest's skip set ([`TREE_MANIFEST_SKIP_DIRS`], which
+/// covers VCS plumbing AND regenerable build/dependency trees):
 /// the runtime's existing build/dependency ignore rules (the search walker
 /// skips `node_modules` and `target*`; here the exact names are used) plus
 /// the agent's own tooling state (`.faktor`). A large ignored tree therefore

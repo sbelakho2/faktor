@@ -2980,7 +2980,8 @@ impl Store {
         // Preparation BEFORE enqueueing: the timestamp is captured on the
         // caller's thread (audit item 8) — the writer job executes SQL only.
         let now = now_ms();
-        self.writer.execute("start_turn_record", move |conn| {
+        self.writer
+            .execute_retry_busy("start_turn_record", move |conn| {
         let tx = conn.unchecked_transaction()?;
         tx.execute(
             "UPDATE turn_record SET status = ?3, updated_ms = ?4
@@ -3039,7 +3040,8 @@ impl Store {
         // Preparation BEFORE enqueueing: the timestamp is captured on the
         // caller's thread (audit item 8) — the writer job executes SQL only.
         let now = now_ms();
-        self.writer.execute("set_turn_record_envelope", move |conn| {
+        self.writer
+            .execute_retry_busy("set_turn_record_envelope", move |conn| {
         let n = conn.execute(
             "UPDATE turn_record SET effective_provider = ?3, effective_model = ?4, variant = ?5, tool_mode = ?6, updated_ms = ?7
              WHERE session_id = ?1 AND turn_op_id = ?2 AND status = 'active'",
@@ -3077,19 +3079,20 @@ impl Store {
         // Preparation BEFORE enqueueing: the timestamp is captured on the
         // caller's thread (audit item 8) — the writer job executes SQL only.
         let now = now_ms();
-        self.writer.execute("finish_turn_record", move |conn| {
-            let n = conn.execute(
-                "UPDATE turn_record SET status = ?3, updated_ms = ?4
+        self.writer
+            .execute_retry_busy("finish_turn_record", move |conn| {
+                let n = conn.execute(
+                    "UPDATE turn_record SET status = ?3, updated_ms = ?4
              WHERE session_id = ?1 AND turn_op_id = ?2 AND status = 'active'",
-                params![
-                    session_id.raw() as i64,
-                    turn_op_id.raw() as i64,
-                    status,
-                    now
-                ],
-            )?;
-            Ok(n > 0)
-        })
+                    params![
+                        session_id.raw() as i64,
+                        turn_op_id.raw() as i64,
+                        status,
+                        now
+                    ],
+                )?;
+                Ok(n > 0)
+            })
     }
 
     /// The session's single active logical-turn record (at most one exists).

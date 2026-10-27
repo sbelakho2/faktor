@@ -1832,6 +1832,7 @@ fn parse_chat_chunk(
     pending: &mut std::collections::VecDeque<ProviderChunk>,
 ) -> Result<(Option<ProviderChunk>, bool), ProviderError> {
     let mut terminal = false;
+    let mut chunk: Option<ProviderChunk> = None;
     if let Some(choice) = value
         .get("choices")
         .and_then(|c| c.as_array())
@@ -1840,22 +1841,18 @@ fn parse_chat_chunk(
         if let Some(delta) = choice.get("delta") {
             if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
                 if !text.is_empty() {
-                    return Ok((
-                        Some(ProviderChunk::Text {
-                            text: text.to_string(),
-                        }),
-                        false,
-                    ));
+                    chunk = Some(ProviderChunk::Text {
+                        text: text.to_string(),
+                    });
                 }
             }
-            if let Some(reasoning) = delta.get("reasoning_content").and_then(|c| c.as_str()) {
-                if !reasoning.is_empty() {
-                    return Ok((
-                        Some(ProviderChunk::Reasoning {
+            if chunk.is_none() {
+                if let Some(reasoning) = delta.get("reasoning_content").and_then(|c| c.as_str()) {
+                    if !reasoning.is_empty() {
+                        chunk = Some(ProviderChunk::Reasoning {
                             text: reasoning.to_string(),
-                        }),
-                        false,
-                    ));
+                        });
+                    }
                 }
             }
             if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
@@ -1922,7 +1919,11 @@ fn parse_chat_chunk(
         }
         // A call completes ONLY at a finishing marker — fragments keep
         // accumulating until then (finish_reason may ride a frame that
-        // carries no tool_calls at all, or even no delta).
+        // carries no tool_calls at all, or even no delta). The marker is
+        // evaluated even when the SAME frame carried text/reasoning/tool
+        // fragments: the old early return dropped it (and any usage row),
+        // making a standards-compliant final frame look like a truncated
+        // stream and forcing a spurious retry/stall.
         if let Some(reason) = choice.get("finish_reason").and_then(|r| r.as_str()) {
             if reason == "tool_calls" || reason == "stop" {
                 terminal = true;
@@ -1934,8 +1935,8 @@ fn parse_chat_chunk(
     // `stream_options.include_usage` final frame carries `"choices": []`, and
     // OpenRouter-style gateways attach `usage` to the `finish_reason` frame —
     // both previously dropped the whole usage row. The usage chunk rides
-    // BEHIND any calls the same frame flushed (usage is the last data chunk
-    // before `Done`, mirroring the responses family).
+    // BEHIND any text/tool chunk this frame produced (and behind any calls
+    // the same frame flushed).
     let usage_chunk = match value.get("usage") {
         Some(usage) => {
             // Wire semantics (audit Phase-1 item C): Chat Completions reports
@@ -1992,6 +1993,12 @@ fn parse_chat_chunk(
         }
         None => None,
     };
+    if let Some(chunk) = chunk {
+        if let Some(usage) = usage_chunk {
+            pending.push_back(usage);
+        }
+        return Ok((Some(chunk), terminal));
+    }
     if let Some(first) = pending.pop_front() {
         if let Some(usage) = usage_chunk {
             pending.push_back(usage);

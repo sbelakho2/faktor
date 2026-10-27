@@ -729,28 +729,35 @@ impl Store {
         let state_json = serde_json::to_string(&state).unwrap();
         // Preparation BEFORE enqueueing: the journal diagnostic context.
         let seq_messages = EventSeqMessages::for_session(session_id);
-        self.writer.execute("append_event_v", move |conn| {
-            let tx = conn.unchecked_transaction()?;
-            let seq = Self::insert_event_locked(
-                &tx,
-                session_id,
-                op_id,
-                kind,
-                &state_json,
-                ts_ms,
-                payload_json,
-                payload_ver,
-                &seq_messages,
-            )?;
-            // Durability boundary: crossing `ev_precommit` fires the crash
-            // AFTER the insert executed but BEFORE the COMMIT (the append
-            // rolls back); crossing `ev_committed` fires right after the
-            // COMMIT returned (the append is durable, the ack was lost).
-            seam.trip("ev_precommit");
-            tx.commit()?;
-            seam.trip("ev_committed");
-            Ok(seq)
-        })
+        self.writer
+            .execute_retry_busy("append_event_v", move |conn| {
+                // The retry closure may run more than once: every captured
+                // prepared value is cloned per attempt, never moved. IMMEDIATE
+                // takes the write lock BEFORE the seq read, so a concurrent
+                // writer can never turn this read-then-write into an
+                // immediate SQLITE_BUSY_SNAPSHOT (the live settlement lock).
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let seq = Self::insert_event_locked(
+                    &tx,
+                    session_id,
+                    op_id,
+                    kind,
+                    &state_json.clone(),
+                    ts_ms,
+                    payload_json.clone(),
+                    payload_ver,
+                    &seq_messages.clone(),
+                )?;
+                // Durability boundary: crossing `ev_precommit` fires the crash
+                // AFTER the insert executed but BEFORE the COMMIT (the append
+                // rolls back); crossing `ev_committed` fires right after the
+                // COMMIT returned (the append is durable, the ack was lost).
+                seam.trip("ev_precommit");
+                tx.commit()?;
+                seam.trip("ev_committed");
+                Ok(seq)
+            })
     }
 
     /// The shared gapless-seq event insert path. Runs inside the CALLER'S
@@ -1154,60 +1161,62 @@ impl Store {
         // timestamp (audit item 8).
         let payload_json = payload.to_string();
         let now = now_ms();
-        self.writer.execute("append_ledger_entry", move |conn| {
-            // One transaction: seq allocation and the insert are atomic. The
-            // next seq NEVER rewinds below the head checkpoint (GREATEST of the
-            // entry max and the folded checkpoint), so after a compaction the
-            // "fold entries after checkpoint_seq" cursor keeps advancing even
-            // though pruned rows are gone.
-            let tx = conn.unchecked_transaction()?;
-            let prev: Option<i64> = tx.query_row(
-                "SELECT MAX(seq) FROM ledger_entry WHERE session_id = ?1",
-                params![session_id.raw() as i64],
-                |r| r.get(0),
-            )?;
-            if let Some(prev) = prev {
-                if prev < 1 {
-                    return Err(StoreError::Corrupt(vec![
-                        "typed ledger last sequence is below 1".into(),
-                    ]));
+        self.writer
+            .execute_retry_busy("append_ledger_entry", move |conn| {
+                // One transaction: seq allocation and the insert are atomic. The
+                // next seq NEVER rewinds below the head checkpoint (GREATEST of the
+                // entry max and the folded checkpoint), so after a compaction the
+                // "fold entries after checkpoint_seq" cursor keeps advancing even
+                // though pruned rows are gone.
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let prev: Option<i64> = tx.query_row(
+                    "SELECT MAX(seq) FROM ledger_entry WHERE session_id = ?1",
+                    params![session_id.raw() as i64],
+                    |r| r.get(0),
+                )?;
+                if let Some(prev) = prev {
+                    if prev < 1 {
+                        return Err(StoreError::Corrupt(vec![
+                            "typed ledger last sequence is below 1".into(),
+                        ]));
+                    }
                 }
-            }
-            let checkpoint: i64 = tx.query_row(
+                let checkpoint: i64 = tx.query_row(
                 "SELECT COALESCE(MAX(checkpoint_seq), 0) FROM ledger_head WHERE session_id = ?1",
                 params![session_id.raw() as i64],
                 |r| r.get(0),
             )?;
-            if checkpoint < 0 {
-                return Err(StoreError::Corrupt(vec![
-                    "typed ledger head checkpoint is negative".into(),
-                ]));
-            }
-            let high_water = prev.unwrap_or(0).max(checkpoint);
-            let seq = high_water.checked_add(1).ok_or_else(|| {
-                StoreError::Corrupt(vec![
-                    "typed ledger sequence exhausted SQLite signed range".into()
-                ])
-            })?;
-            tx.execute(
+                if checkpoint < 0 {
+                    return Err(StoreError::Corrupt(vec![
+                        "typed ledger head checkpoint is negative".into(),
+                    ]));
+                }
+                let high_water = prev.unwrap_or(0).max(checkpoint);
+                let seq = high_water.checked_add(1).ok_or_else(|| {
+                    StoreError::Corrupt(vec![
+                        "typed ledger sequence exhausted SQLite signed range".into()
+                    ])
+                })?;
+                tx.execute(
             "INSERT INTO ledger_entry(session_id, seq, entry_type, schema_ver, payload, created_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 session_id.raw() as i64,
                 seq,
-                entry_type,
+                entry_type.clone(),
                 schema_ver,
-                payload_json,
+                payload_json.clone(),
                 now
             ],
         )?;
-            // Durability boundary of one typed-ledger append: crash before the
-            // COMMIT (entry rolls back) or right after it (entry durable).
-            seam.trip("le_precommit");
-            tx.commit()?;
-            seam.trip("le_committed");
-            Ok(seq)
-        })
+                // Durability boundary of one typed-ledger append: crash before the
+                // COMMIT (entry rolls back) or right after it (entry durable).
+                seam.trip("le_precommit");
+                tx.commit()?;
+                seam.trip("le_committed");
+                Ok(seq)
+            })
     }
 
     /// Read ledger entries of one session, ascending by seq. Bounded reads:

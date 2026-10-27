@@ -195,6 +195,23 @@ pub enum StoreError {
     Maintenance(String),
 }
 
+impl StoreError {
+    /// True for a TRANSIENT SQLite lock (`SQLITE_BUSY` / `SQLITE_LOCKED`),
+    /// never for corruption or a permanent failure. Bounded, idempotent
+    /// writes retry on this class instead of surfacing a lock as a dead
+    /// store (the live DeepSeek turn died exactly this way at settlement).
+    pub fn is_busy(&self) -> bool {
+        matches!(
+            self,
+            StoreError::Sqlite(rusqlite::Error::SqliteFailure(code, _))
+                if matches!(
+                    code.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
+        )
+    }
+}
+
 pub type StoreResult<T> = Result<T, StoreError>;
 
 mod connection;

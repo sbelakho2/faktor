@@ -369,7 +369,9 @@ fn preflight_survives_a_concurrent_churn_loop_without_fatal_drift() {
     // preflight. The preflight may skip entries that vanished, but must
     // never surface a fatal drift.
     let fix = open_fix(default_limits());
-    let churn = fix.user.join("target/debug/deps");
+    // Churn under a NON-skipped directory: `target/` is derived output and
+    // is now invisible to the shadow by policy (see the golden test).
+    let churn = fix.user.join("build-churn/deps");
     fs::create_dir_all(&churn).unwrap();
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop_writer = Arc::clone(&stop);
@@ -400,9 +402,9 @@ fn preflight_survives_a_concurrent_churn_loop_without_fatal_drift() {
 fn preflight_golden_unchanged_and_skip_lists_match_the_copy() {
     // (REQUIRED golden) The preflight's traversal is the copy's traversal:
     // `.git` plumbing is skipped (its 4096 bytes are invisible to the byte
-    // cap), while generated/build dirs are INCLUDED and measured (documented
-    // policy: the shadow mirrors the canonical manifest, which skips only
-    // VCS bookkeeping), and the caps still refuse typed.
+    // cap); generated BUILD outputs are skipped too, while other generated-
+    // looking directories remain INCLUDED and measured. The caps still
+    // refuse typed.
     let fix = open_fix(default_limits());
     // Seed tree: sub(dir), sub/b.txt, a.txt, c.txt = 4 entries, 14 bytes.
     let seed_only = ShadowCopyLimits {
@@ -429,24 +431,29 @@ fn preflight_golden_unchanged_and_skip_lists_match_the_copy() {
         "the .git dir entry itself stays charged to the entry cap: {err}"
     );
 
-    // Generated dirs are content: a `target` object (+4 entries, +6 bytes)
-    // pushes both caps over (a skipped build tree could never do this).
+    // Generated/build outputs are DERIVED state and are skipped by BOTH
+    // the canonical digest and the copy: a huge `target/` adds nothing to
+    // either cap and is never materialized into the shadow.
     fs::create_dir_all(fix.user.join("target/debug/deps")).unwrap();
     fs::write(fix.user.join("target/debug/deps/interop-unit.o"), b"object").unwrap();
-    let bytes_ok = ShadowCopyLimits {
+    let same = ShadowCopyLimits {
+        // The skipped directory still contributes its OWN entry (parity with
+        // the canonical walk), but none of its children or bytes.
+        max_entries: 6,
+        max_total_bytes: 14,
+    };
+    assert!(
+        super::bounded_base_preflight(&fix.user, &same, &mut |_| {}).is_ok(),
+        "a build tree's contents are invisible to the shadow copy caps"
+    );
+    // A non-skipped generated-looking directory still counts normally.
+    fs::create_dir_all(fix.user.join("build-artifacts/debug")).unwrap();
+    fs::write(fix.user.join("build-artifacts/debug/unit.o"), b"object").unwrap();
+    let entries_ok = ShadowCopyLimits {
         max_entries: 9,
         max_total_bytes: 20,
     };
-    assert!(super::bounded_base_preflight(&fix.user, &bytes_ok, &mut |_| {}).is_ok());
-    let bytes_over = ShadowCopyLimits {
-        max_entries: 9,
-        max_total_bytes: 19,
-    };
-    let err = super::bounded_base_preflight(&fix.user, &bytes_over, &mut |_| {}).unwrap_err();
-    assert!(
-        matches!(err, crate::runtime::ExecError::Oversized(_)),
-        "a `target` file must count toward the copy caps: {err}"
-    );
+    assert!(super::bounded_base_preflight(&fix.user, &entries_ok, &mut |_| {}).is_ok());
     let entries_over = ShadowCopyLimits {
         max_entries: 8,
         max_total_bytes: 20,
@@ -454,7 +461,74 @@ fn preflight_golden_unchanged_and_skip_lists_match_the_copy() {
     let err = super::bounded_base_preflight(&fix.user, &entries_over, &mut |_| {}).unwrap_err();
     assert!(
         matches!(err, crate::runtime::ExecError::Oversized(_)),
-        "generated-dir entries stay counted: {err}"
+        "non-skipped directory entries stay counted: {err}"
+    );
+}
+
+#[test]
+fn begin_shadow_materializes_git_for_a_linked_worktree_pointer() {
+    // A `git worktree add` checkout has `.git` as a FILE pointing at the
+    // real gitdir. The shadow copied that file and then tried
+    // remove_dir_all on it (ENOTDIR), silently losing the git view.
+    let limits = ShadowCopyLimits {
+        max_entries: 100,
+        max_total_bytes: 64 * 1024,
+    };
+    let fix = open_fix(limits);
+    let gitdir = fix.user.join(".owner-gitdir");
+    std::fs::create_dir_all(gitdir.join("objects")).unwrap();
+    std::fs::write(gitdir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::write(
+        fix.user.join(".git"),
+        format!("gitdir: {}\n", gitdir.display()),
+    )
+    .unwrap();
+    let shadow = fix
+        .shadows
+        .begin_shadow(fix.session, &fix.user)
+        .expect("a linked-worktree pointer must not break the shadow");
+    let view = shadow.root.join(".git");
+    assert!(view.is_dir(), "the shadow has a materialized git view");
+    assert!(view.join("HEAD").is_file());
+    assert!(
+        view.join("objects/info/alternates").is_file(),
+        "objects resolve through the owner"
+    );
+}
+
+#[test]
+fn begin_shadow_ignores_a_build_tree_larger_than_the_copy_cap() {
+    // Regression: a checkout whose `target/` alone exceeds the 1 GiB copy
+    // cap used to refuse begin_shadow as Oversized. Build outputs are
+    // derived, excluded from the canonical identity, and must neither be
+    // copied nor counted.
+    let limits = ShadowCopyLimits {
+        max_entries: 100,
+        max_total_bytes: 64,
+    };
+    let fix = open_fix(limits);
+    fs::create_dir_all(fix.user.join("target/debug/deps")).unwrap();
+    fs::write(
+        fix.user.join("target/debug/deps/huge.rlib"),
+        vec![0u8; 4096],
+    )
+    .unwrap();
+    let shadow = fix
+        .shadows
+        .begin_shadow(fix.session, &fix.user)
+        .expect("a build tree beyond the cap must not block the shadow");
+    assert!(
+        !shadow.root.join("target").exists(),
+        "derived build outputs are never materialized"
+    );
+    assert!(
+        shadow.root.join("a.txt").exists(),
+        "authored content is still copied"
+    );
+    assert_eq!(
+        crate::runtime::task_executor::root_manifest_digest(&shadow.root).unwrap(),
+        owner_digest(&fix),
+        "shadow digest equals the owner digest with target excluded"
     );
 }
 

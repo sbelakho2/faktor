@@ -103,9 +103,12 @@ const MAX_TASK_RUN_ROW_BYTES: usize = 3500;
 const MAX_RUN_BASE_ENTRIES: usize = 100_000;
 /// Total-byte cap of ONE run-base copy.
 const MAX_RUN_BASE_BYTES: u64 = 1024 * 1024 * 1024;
-/// Directories the run base never copies (VCS bookkeeping is not content;
-/// the root snapshot digest skips exactly these).
-const RUN_BASE_SKIP_DIRS: &[&str] = &[".git", ".hg", ".svn"];
+/// Directories the run base never copies: exactly the canonical
+/// [`faktor_fs::tree_manifest::TREE_MANIFEST_SKIP_DIRS`] set (VCS plumbing
+/// plus regenerable build/dependency caches). Sharing the ONE list keeps
+/// the copy, preflight and canonical digest in parity; copying a monolithic
+/// `target/` used to fail the base cap before a run could start.
+const RUN_BASE_SKIP_DIRS: &[&str] = faktor_fs::tree_manifest::TREE_MANIFEST_SKIP_DIRS;
 /// Bounded retries of the stable run-base copy before a typed
 /// [`ExecError::WorkspaceDrift`].
 const RUN_BASE_COPY_ATTEMPTS: usize = 3;

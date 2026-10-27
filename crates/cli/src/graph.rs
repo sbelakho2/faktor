@@ -707,16 +707,63 @@ fn router_candidates(
         // MaximumQuality admits them because no hard cost cap exists at
         // build and quality decides (the admission matrix, exactly).
         RoutingMode::Economy | RoutingMode::MaximumQuality | RoutingMode::Balanced => {
+            let mut configured: Vec<(String, String)> = Vec::new();
+            let mut excluded_unknown_price: Vec<String> = Vec::new();
             for id in providers.ids() {
                 let Some(p) = providers.get(&id) else {
                     continue;
                 };
                 for model in p.known_models() {
                     let entry = p.catalog_entry(&model);
+                    configured.push((id.clone(), model.clone()));
                     if candidate_entry_ok(mode, &entry) {
                         candidates.push(route_candidate_for(&id, &entry));
+                    } else if matches!(
+                        entry.pricing.effective_at(unix_now_ms(), false),
+                        faktor_core::model::EffectivePriceState::Unknown(_)
+                    ) {
+                        excluded_unknown_price.push(format!("{id}/{model}"));
                     }
                 }
+            }
+            // An Economy/Balanced graph with configured models but no
+            // admitted candidate is a DEAD routing configuration: every
+            // first model call would die later as a generic
+            // NoCapableModel with no clue why. Refuse it at build time with
+            // the actual cause (Unknown pricing is the common one for an
+            // OpenAI-compatible entry pointed at a custom/proxy endpoint).
+            if candidates.is_empty()
+                && !configured.is_empty()
+                && !matches!(mode, RoutingMode::MaximumQuality)
+            {
+                let unknown = if excluded_unknown_price.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " Every configured model has Unknown pricing ({}), which {} cannot cost \
+                         or budget. Configure an exact quote or a pricing ceiling for that \
+                         endpoint, point base_url at a canonical official endpoint, or use \
+                         routing_mode maximum_quality/pinned.",
+                        excluded_unknown_price.join(", "),
+                        match mode {
+                            RoutingMode::Economy => "economy",
+                            RoutingMode::Balanced => "balanced",
+                            _ => "this mode",
+                        }
+                    )
+                };
+                return Err(format!(
+                    "routing_mode {:?} admits no candidate for {} configured model(s) ({}); \
+                     a first model call would otherwise fail as NoCapableModel.{}",
+                    mode,
+                    configured.len(),
+                    configured
+                        .iter()
+                        .map(|(p, m)| format!("{p}/{m}"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    unknown
+                ));
             }
         }
         RoutingMode::Pinned { provider, model } => {
@@ -1002,20 +1049,26 @@ mod tests {
                 vec![],
             )))
             .unwrap();
-        let economy = empty_store_service(&registry, &RoutingMode::Economy).unwrap();
-        assert!(
-            economy.router.candidates.is_empty(),
-            "Economy must exclude every Unknown-priced entry"
-        );
+        // Economy excludes them and now REFUSES to boot a graph with
+        // configured models but no admitted candidate: the old silent empty
+        // set surfaced later as a generic NoCapableModel on the first call.
+        let err = match empty_store_service(&registry, &RoutingMode::Economy) {
+            Ok(_) => panic!("Economy over Unknown-only rows must fail at build"),
+            Err(e) => e,
+        };
+        assert!(err.contains("economy"), "{err}");
+        assert!(err.contains("Unknown pricing"), "{err}");
+        assert!(err.contains("openai/default"), "{err}");
+        assert!(err.contains("maximum_quality"), "{err}");
         // Balanced excludes Unknown rows too, and with NO admitted candidate
-        // at its default band the graph build fails with the explanatory
-        // quality-authority error (never a booted always-refusing config).
+        // the graph build fails with the same pricing explanation (never a
+        // booted always-refusing config).
         let err = match empty_store_service(&registry, &RoutingMode::Balanced) {
             Ok(_) => panic!("Balanced over Unknown-only rows must fail at build"),
             Err(e) => e,
         };
         assert!(err.contains("balanced"), "{err}");
-        assert!(err.contains("88"), "{err}");
+        assert!(err.contains("Unknown pricing"), "{err}");
         // MaximumQuality admits Unknown-priced entries while no hard cost
         // cap exists (the admission matrix): quality decides and the spend
         // settles as a documented Unknown amount. The moment a hard cap
@@ -1118,11 +1171,12 @@ mod tests {
         );
         let mut registry = ProviderRegistry::new();
         registry.try_register(expired).unwrap();
-        let economy = empty_store_service(&registry, &RoutingMode::Economy).unwrap();
-        assert!(
-            economy.priced.is_empty(),
-            "expired exact must not enter Economy at its old price"
-        );
+        let err = match empty_store_service(&registry, &RoutingMode::Economy) {
+            Ok(_) => panic!("an expired-only Economy graph must refuse at build"),
+            Err(e) => e,
+        };
+        assert!(err.contains("Unknown pricing"), "{err}");
+        assert!(err.contains("corp/aged"), "{err}");
         let mq = empty_store_service(&registry, &RoutingMode::MaximumQuality).unwrap();
         assert_eq!(mq.priced.len(), 1);
         let req = faktor_router::RouteRequest {

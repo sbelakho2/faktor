@@ -275,6 +275,35 @@ mod tests {
     }
 
     #[test]
+    fn change_receipt_waits_out_a_transient_foreign_write_lock() {
+        // Regression for the live settlement failure: a concurrent
+        // daemon/CLI settlement can hold the SQLite write lock when the
+        // acceptance receipt lands. The receipt write must wait (bounded)
+        // and then commit, not surface "database is locked".
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("foundation.db");
+        let service = SessionSettingsService::new(FoundationDb::open(&path).unwrap());
+        let blocker = rusqlite::Connection::open(&path).unwrap();
+        blocker
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            blocker.execute_batch("COMMIT").unwrap();
+        });
+        let receipt = json!({"accepted": ["a.txt"]});
+        service
+            .put_change_receipt(9, "locked-change-set", "digest", &receipt)
+            .expect("a bounded foreign lock must not fail acceptance");
+        handle.join().unwrap();
+        assert_eq!(
+            service.change_receipt(9, "locked-change-set").unwrap(),
+            Some(("digest".to_string(), receipt))
+        );
+    }
+
+    #[test]
     fn session_settings_validate_and_survive_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("foundation.db");

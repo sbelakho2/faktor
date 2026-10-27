@@ -574,6 +574,75 @@ mod openai_contract_tests {
     }
 
     #[tokio::test]
+    async fn final_frame_with_content_and_finish_reason_is_clean_without_done() {
+        // DeepSeek (and several compatible servers) put the finishing marker
+        // on the SAME frame as the last content delta and may omit `[DONE]`.
+        // The old parser returned early on the content and lost the marker,
+        // so a complete answer was misclassified as a dropped stream and
+        // retried (the live first-turn stall/empty-response shape).
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/chat/completions",
+            MockAction::Respond {
+                status: 200,
+                body: sse_body(&[serde_json::json!({
+                    "choices": [{"delta": {"content": "complete answer"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 11, "completion_tokens": 3}
+                })]),
+            },
+        );
+        let base = server.base_url().await;
+        let provider = OpenAiProvider::permissive_for_tests(OpenAiConfig::chat(base, None));
+        let mut stream = provider.stream(req("m"));
+        let mut text = String::new();
+        let mut usage_seen = false;
+        let mut done = false;
+        while let Some(chunk) = stream.next().await {
+            match chunk.expect("a complete final frame must not error") {
+                ProviderChunk::Text { text: t } => text.push_str(&t),
+                ProviderChunk::Usage(_) => usage_seen = true,
+                ProviderChunk::Done => {
+                    done = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(text, "complete answer");
+        assert!(usage_seen, "same-frame usage must not be dropped");
+        assert!(done, "the finishing marker must produce Done");
+    }
+
+    #[tokio::test]
+    async fn empty_completion_with_finish_reason_is_terminal_not_truncated() {
+        // A clean but EMPTY completion (no text, no tool calls) is a
+        // completed stream, not a dropped connection. The agent layer owns
+        // the typed empty-response retry; the adapter only guarantees the
+        // terminal marker is seen.
+        let server = MockServer::new();
+        server.route(
+            "POST",
+            "/chat/completions",
+            MockAction::Respond {
+                status: 200,
+                body: sse_body(&[serde_json::json!({
+                    "choices": [{"delta": {}, "finish_reason": "stop"}]
+                })]),
+            },
+        );
+        let base = server.base_url().await;
+        let provider = OpenAiProvider::permissive_for_tests(OpenAiConfig::chat(base, None));
+        let mut stream = provider.stream(req("m"));
+        let first = stream.next().await.expect("terminal item");
+        assert!(
+            matches!(first, Ok(ProviderChunk::Done)),
+            "an empty completion is Done, got {first:?}"
+        );
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
     async fn network_death_maps_to_network_error() {
         // No server listening on this port: connect error.
         let provider =

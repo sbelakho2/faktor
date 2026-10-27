@@ -1692,8 +1692,14 @@ where
         }
         // A statically skipped directory is never visited and never
         // descended (its entry is still charged, parity with the historical
-        // walkers).
-        if entry.kind == RootedEntryKind::Directory && skip_dirs.iter().any(|s| entry.name == *s) {
+        // walkers). VCS METADATA can also be a FILE: a linked worktree's
+        // `.git` is a gitdir pointer, and copying/hashing it made the shadow
+        // copy and the canonical digest disagree (`Not a directory`).
+        let vcs_metadata_file = matches!(entry.name.to_str(), Some(".git" | ".hg" | ".svn"));
+        if (entry.kind == RootedEntryKind::Directory
+            || (entry.kind == RootedEntryKind::File && vcs_metadata_file))
+            && skip_dirs.iter().any(|s| entry.name == *s)
+        {
             continue;
         }
         entry_seam(&entry.rel);
@@ -2200,7 +2206,11 @@ where
         if entry.kind == RootedEntryKind::File {
             budget.charge_file_bytes(entry.size)?;
         }
-        if entry.kind == RootedEntryKind::Directory && skip_dirs.iter().any(|s| entry.name == *s) {
+        let vcs_metadata_file = matches!(entry.name.to_str(), Some(".git" | ".hg" | ".svn"));
+        if (entry.kind == RootedEntryKind::Directory
+            || (entry.kind == RootedEntryKind::File && vcs_metadata_file))
+            && skip_dirs.iter().any(|s| entry.name == *s)
+        {
             continue;
         }
         entry_seam(&entry.rel);

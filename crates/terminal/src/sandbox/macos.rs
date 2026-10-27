@@ -201,6 +201,13 @@ fn plan_with_backend(
     let Some(profile) = profile_for(demand)? else {
         return Ok(None);
     };
+    tracing::debug!(
+        target: "faktor_terminal::sandbox",
+        cmd = demand.cmd,
+        cwd = %demand.cwd.display(),
+        profile_bytes = profile.len(),
+        "macOS sandbox profile generated for this spawn"
+    );
     let required = demand.is_required();
     let Some(program) = backend.filter(|path| executable(path)) else {
         if required {
@@ -352,7 +359,14 @@ fn profile_for(demand: &Demand<'_>) -> Result<Option<String>, Error> {
     // Reads: root metadata (required by libc/launchd even before exec),
     // read-only system roots, the real home (toolchains), the workspace
     // roots and the process temp dir.
-    profile.push_str("(allow file-read* (literal \"/\")");
+    // `realpath(3)` (and therefore Rust's `fs::canonicalize`) stats every
+    // ancestor of an ABSOLUTE path. Grants for `/private/tmp` or
+    // `/private/var` do not authorize the `/private` component itself, so a
+    // confined Cargo build could not canonicalize its own absolute workspace
+    // root and failed every dep-info translation with EPERM. The literal
+    // grant is metadata/search for `/private` only, never a read of its
+    // contents.
+    profile.push_str("(allow file-read* (literal \"/\") (literal \"/private\")");
     for root in SYSTEM_READ_ROOTS.iter().map(PathBuf::from) {
         for path in path_aliases(&root) {
             push_subpath(&mut profile, &path)?;
@@ -435,7 +449,12 @@ fn profile_for(demand: &Demand<'_>) -> Result<Option<String>, Error> {
         profile.push_str("(allow file-write*");
         for path in &readonly_writable {
             for alias in path_aliases(path) {
+                // Dirs use a subpath grant; a FILE exception (e.g. the
+                // derived Cargo.lock, which may not exist yet) must also be
+                // a literal: SBPL `subpath` matches directory prefixes, not
+                // the file itself.
                 push_subpath(&mut profile, &alias)?;
+                push_literal(&mut profile, &alias)?;
             }
         }
         profile.push_str(")\n");
@@ -858,6 +877,139 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "BestEffort must fall back honestly when the backend refuses"
+        );
+    }
+
+    #[test]
+    fn a_workspace_profile_allows_writing_build_outputs_and_denies_outside() {
+        // Regression: the live os_isolated shell could not write rustc
+        // dep-info under `<workspace>/target`. The profile must grant the
+        // workspace subtree (build outputs live there) while still denying
+        // an unrelated sibling.
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(ws.join("target/debug/deps")).unwrap();
+        std::fs::write(dir.path().join("outside.txt"), "secret").unwrap();
+        let fs = workspace(vec![ws.clone()], true);
+        let script = format!(
+            "printf x > '{}/target/debug/deps/probe.d' && cat '{}/target/debug/deps/probe.d' && printf pwn > '{}/outside.txt'",
+            ws.display(),
+            ws.display(),
+            dir.path().display()
+        );
+        let args = vec!["-c".to_string(), script];
+        let d = demand(NetworkIsolation::Inherit, &fs, &ws, "/bin/sh", &args);
+        let plan = plan_with_backend(&d, Some(PathBuf::from(SANDBOX_EXEC)), false)
+            .unwrap()
+            .expect("plan");
+        let output = std::process::Command::new(&plan.program)
+            .args(&plan.args)
+            .envs(crate::EnvSpec::Minimal.resolve())
+            .output()
+            .unwrap();
+        assert_eq!(
+            std::fs::read(ws.join("target/debug/deps/probe.d")).unwrap(),
+            b"x",
+            "workspace build output write must succeed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_ne!(
+            output.status.code(),
+            Some(0),
+            "the outside write must fail under the workspace profile"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("outside.txt")).unwrap(),
+            b"secret",
+            "the outside file is untouched"
+        );
+    }
+
+    #[test]
+    fn a_workspace_profile_allows_build_writes_with_a_scratch_home_and_cargo_home() {
+        // The live shape: a 0700 shadow under a deep data tree, a scratch
+        // HOME outside the workspace and the daemon's real CARGO_HOME
+        // (read-only). Build outputs still live in the workspace.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("data/shadows/1");
+        let ws = parent.join("sh-deadbeef");
+        std::fs::create_dir_all(ws.join("target/debug/deps")).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let scratch_home = dir.path().join("agent-home");
+        std::fs::create_dir_all(&scratch_home).unwrap();
+        let cargo_home = std::env::var_os("CARGO_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap()).join(".cargo"));
+        let env = crate::EnvSpec::Explicit(vec![
+            ("HOME".into(), scratch_home.clone().into_os_string()),
+            ("CARGO_HOME".into(), cargo_home.into_os_string()),
+            ("PATH".into(), std::env::var_os("PATH").unwrap()),
+            ("TMPDIR".into(), scratch_home.join("tmp").into_os_string()),
+        ]);
+        let fs = workspace(vec![ws.clone()], true);
+        let script = format!(
+            "mkdir -p '{}/target/debug/deps' && printf x > '{}/target/debug/deps/probe.d' && cat '{}/target/debug/deps/probe.d'",
+            ws.display(),
+            ws.display(),
+            ws.display()
+        );
+        let args = vec!["-c".to_string(), script];
+        let d = Demand {
+            network: NetworkIsolation::Inherit,
+            filesystem: &fs,
+            cwd: &ws,
+            cmd: "/bin/sh",
+            args: &args,
+            env: &env,
+        };
+        let plan = plan_with_backend(&d, Some(PathBuf::from(SANDBOX_EXEC)), false)
+            .unwrap()
+            .expect("plan");
+        let output = std::process::Command::new(&plan.program)
+            .args(&plan.args)
+            .envs(env.resolve())
+            .output()
+            .unwrap();
+        assert_eq!(
+            std::fs::read(ws.join("target/debug/deps/probe.d")).unwrap(),
+            b"x",
+            "workspace build output write must succeed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn absolute_paths_under_private_canonicalize_inside_the_profile() {
+        // Regression: Cargo's dep-info translation canonicalizes absolute
+        // workspace paths. Without the `/private` ancestor metadata grant,
+        // realpath(3) failed with EPERM even though the workspace subtree
+        // itself was readable and writable.
+        let dir = tempfile::Builder::new()
+            .prefix("faktor-realpath-")
+            .tempdir_in("/private/tmp")
+            .unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let fs = workspace(vec![ws.clone()], true);
+        let args = vec![ws.to_string_lossy().into_owned()];
+        let d = demand(NetworkIsolation::Inherit, &fs, &ws, "/bin/realpath", &args);
+        let plan = plan_with_backend(&d, Some(PathBuf::from(SANDBOX_EXEC)), false)
+            .unwrap()
+            .expect("plan");
+        let output = std::process::Command::new(&plan.program)
+            .args(&plan.args)
+            .envs(crate::EnvSpec::Minimal.resolve())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "realpath of an absolute workspace must succeed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(ws.to_string_lossy().as_ref()),
+            "the canonical path is returned"
         );
     }
 

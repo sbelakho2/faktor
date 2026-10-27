@@ -303,6 +303,218 @@ async fn retryable_pre_accept_failure_retries_under_policy() {
     );
 }
 
+/// A provider that emits ONE tool call per model iteration for `steps`
+/// iterations, then a final text. Before the stall fix such a tool-only
+/// loop counted as "no new state" and tripped the 8-iteration detector
+/// even though every call ran.
+struct ToolStormThenText {
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    steps: usize,
+}
+
+impl faktor_provider::Provider for ToolStormThenText {
+    fn id(&self) -> &str {
+        "fake"
+    }
+    fn capabilities(&self, _model: &str) -> faktor_core::model::ModelCapabilities {
+        faktor_core::model::ModelCapabilities {
+            streaming: true,
+            tools: true,
+            context: 128_000,
+            max_output: 16_384,
+            ..Default::default()
+        }
+    }
+    fn known_models(&self) -> Vec<String> {
+        vec!["m".into()]
+    }
+    fn stream(
+        &self,
+        _req: faktor_provider::GenericAgentRequest,
+    ) -> faktor_provider::ProviderStream {
+        use faktor_provider::ProviderChunk;
+        let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let chunks = if n < self.steps {
+            vec![
+                Ok(ProviderChunk::ToolCall {
+                    id: format!("c{n}"),
+                    name: "echo".into(),
+                    input: serde_json::json!({ "step": n }),
+                    complete: true,
+                }),
+                Ok(ProviderChunk::Done),
+            ]
+        } else {
+            vec![
+                Ok(ProviderChunk::Text {
+                    text: "storm complete".into(),
+                }),
+                Ok(ProviderChunk::Done),
+            ]
+        };
+        Box::pin(futures::stream::iter(chunks))
+    }
+}
+
+#[tokio::test]
+async fn tool_only_iterations_count_as_progress_and_never_trip_the_stall_detector() {
+    let (mut deps, _dir) = deps(
+        scripted_provider(vec![ScriptedResponse::End]),
+        vec![echo_tool()],
+    );
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut registry = ProviderRegistry::new();
+    registry
+        .try_register(Arc::new(ToolStormThenText {
+            calls: calls.clone(),
+            steps: 9,
+        }))
+        .unwrap();
+    deps.providers = Arc::new(registry);
+    let runtime = AgentRuntime::new(deps).unwrap();
+    let session = new_session(runtime.deps());
+    let outcome = runtime.run_turn(session, "storm", &[]).await.unwrap();
+    assert_eq!(
+        outcome.final_state,
+        AgentState::ReadyForNextTurn,
+        "a productive tool-only loop must not be a stall: {outcome:?}"
+    );
+    assert!(!outcome.stalled);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 10);
+}
+
+/// A clean-but-EMPTY completion (Done with no text/reasoning/tool calls)
+/// is retried under the bounded policy and, on exhaustion, ends the turn
+/// with a typed failure instead of burning iterations until the stall
+/// watchdog. DeepSeek emits this shape when it drops an SSE payload but
+/// still carries `finish_reason`.
+struct EmptyThenText {
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    always_empty: bool,
+}
+
+impl faktor_provider::Provider for EmptyThenText {
+    fn id(&self) -> &str {
+        "fake"
+    }
+    fn capabilities(&self, _model: &str) -> faktor_core::model::ModelCapabilities {
+        faktor_core::model::ModelCapabilities {
+            streaming: true,
+            tools: true,
+            context: 128_000,
+            max_output: 16_384,
+            ..Default::default()
+        }
+    }
+    fn known_models(&self) -> Vec<String> {
+        vec!["m".into()]
+    }
+    fn stream(
+        &self,
+        _req: faktor_provider::GenericAgentRequest,
+    ) -> faktor_provider::ProviderStream {
+        use faktor_provider::ProviderChunk;
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let empty = self.always_empty || call == 0;
+        let chunks = if empty {
+            // A BILLED empty completion: real dropped-SSE payloads still
+            // report usage. A usage-free clean stream is a normal Done and
+            // must not burn retries (calm-task readiness), so the retry
+            // contract is exercised only by the billed shape.
+            vec![
+                Ok(ProviderChunk::Usage(faktor_provider::CanonicalUsage {
+                    uncached_input_tokens: 1,
+                    ..Default::default()
+                })),
+                Ok(ProviderChunk::Done),
+            ]
+        } else {
+            vec![
+                Ok(ProviderChunk::Text {
+                    text: "recovered".into(),
+                }),
+                Ok(ProviderChunk::Done),
+            ]
+        };
+        Box::pin(futures::stream::iter(chunks))
+    }
+}
+
+#[tokio::test]
+async fn empty_completion_retries_then_succeeds_under_the_bounded_policy() {
+    let (mut deps, _dir) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
+    deps.retry_policy = faktor_core::retry::RetryPolicy {
+        max_attempts: 3,
+        base_delay_ms: 1,
+        max_delay_ms: 5,
+        jitter: 0.0,
+        class: faktor_core::retry::RetryClass::Network,
+    };
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut registry = ProviderRegistry::new();
+    registry
+        .try_register(Arc::new(EmptyThenText {
+            calls: calls.clone(),
+            always_empty: false,
+        }))
+        .unwrap();
+    deps.providers = Arc::new(registry);
+    let runtime = AgentRuntime::new(deps).unwrap();
+    let session = new_session(runtime.deps());
+    let outcome = runtime
+        .run_turn(session, "empty then text", &[])
+        .await
+        .unwrap();
+    assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn persistent_empty_completion_fails_typed_without_stalling() {
+    let (mut deps, _dir) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
+    deps.retry_policy = faktor_core::retry::RetryPolicy {
+        max_attempts: 2,
+        base_delay_ms: 1,
+        max_delay_ms: 5,
+        jitter: 0.0,
+        class: faktor_core::retry::RetryClass::Network,
+    };
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut registry = ProviderRegistry::new();
+    registry
+        .try_register(Arc::new(EmptyThenText {
+            calls: calls.clone(),
+            always_empty: true,
+        }))
+        .unwrap();
+    deps.providers = Arc::new(registry);
+    let runtime = AgentRuntime::new(deps).unwrap();
+    let session = new_session(runtime.deps());
+    let outcome = runtime
+        .run_turn(session, "always empty", &[])
+        .await
+        .unwrap();
+    assert_eq!(outcome.final_state, AgentState::FailedRecoverable);
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "exactly the bounded attempts, never a stall loop"
+    );
+    let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+    let events = handle.events_range(1, None).unwrap();
+    assert!(
+        events.iter().any(|e| {
+            e.kind == faktor_core::event::EventKind::Failed
+                && e.payload.as_ref().is_some_and(|p| {
+                    p.get("message")
+                        .and_then(|m| m.as_str())
+                        .is_some_and(|m| m.contains("empty completion"))
+                })
+        }),
+        "the typed empty-response cause must be durable: {events:?}"
+    );
+}
+
 /// F3 (adversarial): a PERSISTENT queue-head read failure must not be
 /// read as "empty" (which would release the gate immediately) and must
 /// not spin forever. The runner retries a bounded number of passes,

@@ -309,7 +309,7 @@ impl Store {
         // timestamp (audit item 8) — the writer job executes SQL only.
         let data_json = data.to_string();
         let created_ms = now_ms();
-        self.writer.execute("put_message", move |conn| {
+        self.writer.execute_retry_busy("put_message", move |conn| {
             Self::insert_message_on(conn, session_id, seq, &role, &data_json, created_ms)
         })
     }
@@ -344,7 +344,7 @@ impl Store {
         // (audit item 8) — the writer job executes SQL only.
         let data_json = data.to_string();
         let created_ms = now_ms();
-        self.writer.execute("put_part", move |conn| {
+        self.writer.execute_retry_busy("put_part", move |conn| {
             Self::insert_part_on(conn, message_id, &kind, &data_json, created_ms)
         })
     }

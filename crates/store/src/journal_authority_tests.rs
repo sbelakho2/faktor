@@ -11,6 +11,57 @@ pub(crate) fn tmp_store() -> (tempfile::TempDir, Store) {
     (dir, s)
 }
 
+/// A journal append must survive a foreign writer that commits between the
+/// append's seq read and its INSERT. The pre-fix DEFERRED transaction
+/// produced SQLITE_BUSY_SNAPSHOT (surfaced as "database is locked") exactly
+/// during live settlement/acceptance; IMMEDIATE takes the write lock first.
+#[test]
+fn event_and_typed_ledger_appends_wait_out_a_foreign_write_transaction() {
+    use rusqlite::Connection;
+    use std::time::Duration;
+
+    let (dir, store) = tmp_store();
+    let ws = store.create_workspace("/w").unwrap();
+    let session = store.create_session(ws, "lock", "p", "m").unwrap();
+    let db_path = dir.path().join("faktor-plus.db");
+
+    let blocker = Connection::open(&db_path).unwrap();
+    blocker.busy_timeout(Duration::from_secs(5)).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let handle = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(250));
+        blocker.execute_batch("COMMIT").unwrap();
+    });
+    store
+        .append_event(
+            session.id,
+            None,
+            EventKind::ModelStarted,
+            AgentState::Streaming,
+            now_ms(),
+            None,
+        )
+        .expect("a foreign short write must not turn into SQLITE_BUSY_SNAPSHOT");
+    handle.join().unwrap();
+
+    let blocker = Connection::open(&db_path).unwrap();
+    blocker.busy_timeout(Duration::from_secs(5)).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let handle = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(250));
+        blocker.execute_batch("COMMIT").unwrap();
+    });
+    store
+        .append_ledger_entry(
+            session.id,
+            "test_recorded",
+            1,
+            serde_json::json!({"ok": true}),
+        )
+        .expect("a foreign short write must not fail the typed ledger");
+    handle.join().unwrap();
+}
+
 /// The doctor sweep must flag EXACTLY the torn session at scale and never
 /// spill an issue onto a healthy neighbour.
 #[test]

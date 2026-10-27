@@ -106,6 +106,9 @@ impl AgentState {
             Validating => &[
                 UpdatingMemory,
                 ToolRequested,
+                // A resumed batch may still have deferred idempotent tool
+                // rows after the first replay completed at Validating.
+                ExecutingTool,
                 FailedRecoverable,
                 Completed,
                 Cancelled,

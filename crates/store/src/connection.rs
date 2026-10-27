@@ -17,9 +17,10 @@ pub(crate) const READER_RECEIPT_CAPACITY: usize = 4096;
 /// checks): beyond this the scan refuses loudly instead of truncating.
 pub(crate) const MAX_ORCHESTRATOR_FACT_SCAN_ROWS: i64 = 250_000;
 
-/// How long `read()` waits for a permit before failing with `Busy`. Matches
-/// the SQLite `busy_timeout` pragma (5s), so pool-level and engine-level
-/// waits behave consistently.
+/// How long `read()` waits for a permit before failing with `Busy`. The
+/// engine-level writer busy timeout is deliberately LONGER (30s): a second
+/// process settling the same data dir may hold the write lock through its
+/// own durable receipt, and a transient lock must not fail a turn.
 pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// On-disk WAL high-water bound (mirrors `PRAGMA journal_size_limit` in
@@ -729,7 +730,7 @@ pub(crate) fn configure(conn: &Connection) -> StoreResult<()> {
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;
          PRAGMA synchronous = NORMAL;
-         PRAGMA busy_timeout = 5000;
+         PRAGMA busy_timeout = 30000;
          PRAGMA foreign_keys = ON;
          PRAGMA wal_autocheckpoint = 0;
          PRAGMA journal_size_limit = 67108864;",
@@ -2712,7 +2713,7 @@ impl Store {
             .execute_raw("wal_checkpoint_truncate_bounded", move |conn| {
                 conn.execute_batch("PRAGMA busy_timeout = 0;")?;
                 let result = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
-                let restore = conn.execute_batch("PRAGMA busy_timeout = 5000;");
+                let restore = conn.execute_batch("PRAGMA busy_timeout = 30000;");
                 restore?;
                 result
             })?;

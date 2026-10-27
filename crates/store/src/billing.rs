@@ -1301,7 +1301,7 @@ impl Store {
         // caller's thread (audit item 8) — the writer job executes SQL only.
         let ts_ms = now_ms();
         self.writer
-            .execute("record_provider_call_with_prefix_segments", move |conn| {
+            .execute_retry_busy("record_provider_call_with_prefix_segments", move |conn| {
                 Self::insert_provider_call_on(
                     conn,
                     session_id,
@@ -1359,7 +1359,7 @@ impl Store {
         // caller's thread (audit item 8) — the writer job executes SQL only.
         let ts_ms = now_ms();
         self.writer
-            .execute("record_provider_call_attempt", move |conn| {
+            .execute_retry_busy("record_provider_call_attempt", move |conn| {
                 conn.execute(
                     "INSERT INTO provider_call(session_id, op_id, parent_model_call_op_id,
                 attempt_op_id, attempt_ordinal, reservation_id,
@@ -1718,7 +1718,7 @@ impl Store {
                 ],
             )?;
             if n == 0 {
-                return Err(StoreError::Conflict(no_row));
+                return Err(StoreError::Conflict(no_row.clone()));
             }
             Ok(())
         })
@@ -1808,7 +1808,8 @@ impl Store {
         // nothing and never decodes `TaskState`).
         let (permitted_states, forbidden_states, corrupt_state) = provider_operation_gate_terms();
         let no_row = format!("cost reserve: task {task_id} of session {session_id} has no row");
-        self.writer.execute("cost_reserve_inner", move |conn| {
+        self.writer
+            .execute_retry_busy("cost_reserve_inner", move |conn| {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let row_opt: Option<(Option<i64>, String)> = tx
             .query_row(
@@ -1821,7 +1822,7 @@ impl Store {
         // unlimited (distinct states: an unlimited cap is a valid cap).
         let Some((cap, state_json)) = row_opt else {
             tx.rollback()?;
-            return Err(StoreError::Conflict(no_row));
+            return Err(StoreError::Conflict(no_row.clone()));
         };
         // The task-state gate: a reserve while the task is in a
         // completion/final state refuses typed and writes NOTHING (the same
@@ -1835,7 +1836,7 @@ impl Store {
                 .find(|(text, _)| text == &state_json)
             {
                 Some((_, message)) => Err(StoreError::Conflict(message.clone())),
-                None => Err(StoreError::Corrupt(vec![corrupt_state])),
+                None => Err(StoreError::Corrupt(vec![corrupt_state.clone()])),
             };
         }
         let spent: i64 = tx.query_row(
@@ -1930,76 +1931,77 @@ impl Store {
         // nothing and never decodes `TaskState`).
         let (permitted_states, forbidden_states, corrupt_state) = provider_operation_gate_terms();
         let no_row = format!("cost reserve: task {task_id} of session {session_id} has no row");
-        self.writer.execute("cost_reserve_attempt", move |conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let row_opt: Option<(Option<i64>, String)> = tx
+        self.writer
+            .execute_retry_busy("cost_reserve_attempt", move |conn| {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let row_opt: Option<(Option<i64>, String)> = tx
                 .query_row(
                     "SELECT max_cost_micro, state FROM task WHERE session_id = ?1 AND task_id = ?2",
                     params![session_id.raw() as i64, task_id.raw() as i64],
                     |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, String>(1)?)),
                 )
                 .optional()?;
-            let Some((cap, state_json)) = row_opt else {
-                tx.rollback()?;
-                return Err(StoreError::Conflict(no_row));
-            };
-            // The task-state gate: the raw state text is matched against the
-            // caller-prepared vocabulary (no decode on the writer owner).
-            if !permitted_states.iter().any(|text| text == &state_json) {
-                tx.rollback()?;
-                return match forbidden_states
-                    .iter()
-                    .find(|(text, _)| text == &state_json)
-                {
-                    Some((_, message)) => Err(StoreError::Conflict(message.clone())),
-                    None => Err(StoreError::Corrupt(vec![corrupt_state])),
+                let Some((cap, state_json)) = row_opt else {
+                    tx.rollback()?;
+                    return Err(StoreError::Conflict(no_row.clone()));
                 };
-            }
-            let spent: i64 = tx.query_row(
-                "SELECT spent_cost_micro FROM task WHERE session_id = ?1 AND task_id = ?2",
-                params![session_id.raw() as i64, task_id.raw() as i64],
-                |r| r.get(0),
-            )?;
-            let open_sum: i64 = tx.query_row(
-                "SELECT COALESCE(SUM(predicted_micro), 0) FROM cost_reservation
+                // The task-state gate: the raw state text is matched against the
+                // caller-prepared vocabulary (no decode on the writer owner).
+                if !permitted_states.iter().any(|text| text == &state_json) {
+                    tx.rollback()?;
+                    return match forbidden_states
+                        .iter()
+                        .find(|(text, _)| text == &state_json)
+                    {
+                        Some((_, message)) => Err(StoreError::Conflict(message.clone())),
+                        None => Err(StoreError::Corrupt(vec![corrupt_state.clone()])),
+                    };
+                }
+                let spent: i64 = tx.query_row(
+                    "SELECT spent_cost_micro FROM task WHERE session_id = ?1 AND task_id = ?2",
+                    params![session_id.raw() as i64, task_id.raw() as i64],
+                    |r| r.get(0),
+                )?;
+                let open_sum: i64 = tx.query_row(
+                    "SELECT COALESCE(SUM(predicted_micro), 0) FROM cost_reservation
              WHERE session_id = ?1 AND task_id = ?2
                AND status IN ('reserved', 'dispatched', 'uncertain')",
-                params![session_id.raw() as i64, task_id.raw() as i64],
-                |r| r.get(0),
-            )?;
-            let cap_limit = cap.unwrap_or(0);
-            let free = cap_limit
-                .max(0)
-                .saturating_sub(spent.max(0))
-                .saturating_sub(open_sum.max(0))
-                .max(0);
-            if cap_limit > 0 && i64::try_from(predicted_micro).unwrap_or(i64::MAX) > free {
-                tx.rollback()?;
-                return Ok(CostReserveOutcome::Exceeded { free: free as u64 });
-            }
-            let predicted = predicted_micro.min(i64::MAX as u64) as i64;
-            let id = tx.query_row(
-                "INSERT INTO cost_reservation
+                    params![session_id.raw() as i64, task_id.raw() as i64],
+                    |r| r.get(0),
+                )?;
+                let cap_limit = cap.unwrap_or(0);
+                let free = cap_limit
+                    .max(0)
+                    .saturating_sub(spent.max(0))
+                    .saturating_sub(open_sum.max(0))
+                    .max(0);
+                if cap_limit > 0 && i64::try_from(predicted_micro).unwrap_or(i64::MAX) > free {
+                    tx.rollback()?;
+                    return Ok(CostReserveOutcome::Exceeded { free: free as u64 });
+                }
+                let predicted = predicted_micro.min(i64::MAX as u64) as i64;
+                let id = tx.query_row(
+                    "INSERT INTO cost_reservation
                 (session_id, task_id, op_id, attempt_op_id, parent_op_id,
                  predicted_micro, status, created_ms, pricing_snapshot_json,
                  estimated_cost_micro, execution_class)
              VALUES (?1, ?2, ?3, ?3, ?4, ?5, 'reserved', ?6, ?7, ?5, ?8)
              RETURNING reservation_id",
-                params![
-                    session_id.raw() as i64,
-                    task_id.raw() as i64,
-                    attempt.attempt_op_id.raw() as i64,
-                    attempt.logical_op_id.raw() as i64,
-                    predicted,
-                    created_ms,
-                    pricing_snapshot_json,
-                    execution_class_db
-                ],
-                |r| r.get(0),
-            )?;
-            tx.commit()?;
-            Ok(CostReserveOutcome::Granted(id))
-        })
+                    params![
+                        session_id.raw() as i64,
+                        task_id.raw() as i64,
+                        attempt.attempt_op_id.raw() as i64,
+                        attempt.logical_op_id.raw() as i64,
+                        predicted,
+                        created_ms,
+                        pricing_snapshot_json,
+                        execution_class_db
+                    ],
+                    |r| r.get(0),
+                )?;
+                tx.commit()?;
+                Ok(CostReserveOutcome::Granted(id))
+            })
     }
 
     /// The current state of one reservation row (attempt-accounting
@@ -2073,7 +2075,7 @@ impl Store {
         // are read inside the transaction, so the message is static).
         let task_missing =
             "cost settle: task has no row; the task machine owns creation".to_owned();
-        self.writer.execute("cost_settle", move |conn| {
+        self.writer.execute_retry_busy("cost_settle", move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let row: Option<(i64, i64, String)> = tx
                 .query_row(
@@ -2123,7 +2125,7 @@ impl Store {
             )?;
             if n == 0 {
                 tx.rollback()?;
-                return Err(StoreError::Conflict(task_missing));
+                return Err(StoreError::Conflict(task_missing.clone()));
             }
             let fact = BillingOutboxFact {
                 reservation_id,
@@ -2235,154 +2237,155 @@ impl Store {
         let snapshot_context = format!("reservation {reservation_id} pricing_snapshot_json");
         let task_missing =
             "cost settle: task has no row; the task machine owns creation".to_owned();
-        self.writer.execute("cost_settle_usage", move |conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let row: Option<CostReservationRow> = tx
-                .query_row(
-                    "SELECT session_id, task_id, status, pricing_snapshot_json
+        self.writer
+            .execute_retry_busy("cost_settle_usage", move |conn| {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let row: Option<CostReservationRow> = tx
+                    .query_row(
+                        "SELECT session_id, task_id, status, pricing_snapshot_json
                      FROM cost_reservation WHERE reservation_id = ?1",
-                    params![reservation_id],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-                )
-                .optional()?;
-            let Some((session_id, task_id, status, snapshot_json)) = row else {
-                tx.rollback()?;
-                return Ok(CostSettleOutcome::Missing);
-            };
-            let outbox_fact = |cost_micro: u64| BillingOutboxFact {
-                reservation_id,
-                session_id: SessionId::new(session_id as u64),
-                task_id: TaskId::new(task_id as u64),
-                attempt_id: prepared_attempt.clone(),
-                provider: provider.clone(),
-                model: model.clone(),
-                uncached_input_tokens,
-                cache_read_tokens,
-                cache_write_tokens,
-                output_tokens,
-                reasoning_tokens: 0,
-                provider_cost_micro: cost_micro,
-                provider_reported_micro,
-                occurred_at_ms: settled_ms,
-                source_operation: source_operation.clone(),
-            };
-            if status != "reserved" && status != "dispatched" {
-                tx.rollback()?;
-                return Ok(CostSettleOutcome::NotOpen { current: status });
-            }
-            let snapshot = match snapshot_json {
-                Some(json) => Some(parse_json::<PricingSnapshot>(&snapshot_context, &json)?),
-                None => None,
-            };
-            // The locally calculated actual: categories x the frozen snapshot.
-            // Unknown/absent snapshot => no honest number exists.
-            let local = snapshot.and_then(|s| {
-                s.settle_cost(
+                        params![reservation_id],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    )
+                    .optional()?;
+                let Some((session_id, task_id, status, snapshot_json)) = row else {
+                    tx.rollback()?;
+                    return Ok(CostSettleOutcome::Missing);
+                };
+                let outbox_fact = |cost_micro: u64| BillingOutboxFact {
+                    reservation_id,
+                    session_id: SessionId::new(session_id as u64),
+                    task_id: TaskId::new(task_id as u64),
+                    attempt_id: prepared_attempt.clone(),
+                    provider: provider.clone(),
+                    model: model.clone(),
                     uncached_input_tokens,
                     cache_read_tokens,
                     cache_write_tokens,
                     output_tokens,
-                )
-            });
-            let (local_i64, reported_i64) = (
-                local.map(|m| m.min(i64::MAX as u64) as i64),
-                provider_reported_micro.map(|m| m.min(i64::MAX as u64) as i64),
-            );
-            // The chosen actual: the HIGHER of the provider-reported cost and
-            // the locally calculated categories x snapshot. A provider report
-            // may raise an invoice above the local price lines, but it can
-            // never LOWER the amount below what its own reported token
-            // categories price at the frozen snapshot — a hostile/buggy
-            // provider reporting cost 0 (or any under-report) must not make a
-            // paid call free and bypass the task budget. Unknown price + no
-            // reported cost: with a hard cap this is a typed refusal (the cap
-            // was protected by the reservation's prediction, but a fabricated
-            // actual must never land); with no cap the row closes as a
-            // documented Unknown spend.
-            let chosen_i64: i64 = match (reported_i64, local_i64) {
-                (Some(reported), Some(local)) => reported.max(local),
-                (Some(reported), None) => reported,
-                (None, Some(local)) => local,
-                (None, None) => {
-                    let has_cap: bool = tx
-                        .query_row(
-                            "SELECT max_cost_micro > 0 FROM task
+                    reasoning_tokens: 0,
+                    provider_cost_micro: cost_micro,
+                    provider_reported_micro,
+                    occurred_at_ms: settled_ms,
+                    source_operation: source_operation.clone(),
+                };
+                if status != "reserved" && status != "dispatched" {
+                    tx.rollback()?;
+                    return Ok(CostSettleOutcome::NotOpen { current: status });
+                }
+                let snapshot = match snapshot_json {
+                    Some(json) => Some(parse_json::<PricingSnapshot>(&snapshot_context, &json)?),
+                    None => None,
+                };
+                // The locally calculated actual: categories x the frozen snapshot.
+                // Unknown/absent snapshot => no honest number exists.
+                let local = snapshot.and_then(|s| {
+                    s.settle_cost(
+                        uncached_input_tokens,
+                        cache_read_tokens,
+                        cache_write_tokens,
+                        output_tokens,
+                    )
+                });
+                let (local_i64, reported_i64) = (
+                    local.map(|m| m.min(i64::MAX as u64) as i64),
+                    provider_reported_micro.map(|m| m.min(i64::MAX as u64) as i64),
+                );
+                // The chosen actual: the HIGHER of the provider-reported cost and
+                // the locally calculated categories x snapshot. A provider report
+                // may raise an invoice above the local price lines, but it can
+                // never LOWER the amount below what its own reported token
+                // categories price at the frozen snapshot — a hostile/buggy
+                // provider reporting cost 0 (or any under-report) must not make a
+                // paid call free and bypass the task budget. Unknown price + no
+                // reported cost: with a hard cap this is a typed refusal (the cap
+                // was protected by the reservation's prediction, but a fabricated
+                // actual must never land); with no cap the row closes as a
+                // documented Unknown spend.
+                let chosen_i64: i64 = match (reported_i64, local_i64) {
+                    (Some(reported), Some(local)) => reported.max(local),
+                    (Some(reported), None) => reported,
+                    (None, Some(local)) => local,
+                    (None, None) => {
+                        let has_cap: bool = tx
+                            .query_row(
+                                "SELECT max_cost_micro > 0 FROM task
                              WHERE session_id = ?1 AND task_id = ?2",
-                            params![session_id, task_id],
-                            |r| r.get(0),
-                        )
-                        .unwrap_or(false);
-                    if has_cap {
-                        tx.rollback()?;
-                        return Ok(CostSettleOutcome::UnknownPrice {
-                            reservation: reservation_id,
-                        });
-                    }
-                    // No cap: record the Unknown spend honestly — status
-                    // settled, both amount columns NULL, nothing folded,
-                    // cost_basis Unknown.
-                    tx.execute(
-                        "UPDATE cost_reservation
+                                params![session_id, task_id],
+                                |r| r.get(0),
+                            )
+                            .unwrap_or(false);
+                        if has_cap {
+                            tx.rollback()?;
+                            return Ok(CostSettleOutcome::UnknownPrice {
+                                reservation: reservation_id,
+                            });
+                        }
+                        // No cap: record the Unknown spend honestly — status
+                        // settled, both amount columns NULL, nothing folded,
+                        // cost_basis Unknown.
+                        tx.execute(
+                            "UPDATE cost_reservation
                          SET status = 'settled', settled_ms = ?1, delivery_state = ?3,
                              provider_cost_micro = NULL, provider_reported_micro = NULL,
                              provider_reported_cost_micro = NULL, settled_cost_micro = NULL,
                              cost_basis = ?4,
                              route_decision_json = ?2
                          WHERE reservation_id = ?5",
-                        params![
-                            settled_ms,
-                            route_decision_json,
-                            DELIVERY_COMPLETED,
-                            COST_BASIS_UNKNOWN,
-                            reservation_id
-                        ],
-                    )?;
-                    insert_billing_outbox_tx(&tx, &outbox_fact(0))?;
-                    tx.commit()?;
-                    return Ok(CostSettleOutcome::AppliedUnknown);
-                }
-            };
-            // The basis names the authority behind the FOLDED amount: a
-            // provider report that won, otherwise the local price lines.
-            let basis = if reported_i64 == Some(chosen_i64) {
-                COST_BASIS_PROVIDER_REPORTED
-            } else {
-                COST_BASIS_ROUTE_SNAPSHOT_ESTIMATE
-            };
-            tx.execute(
-                "UPDATE cost_reservation
+                            params![
+                                settled_ms,
+                                route_decision_json,
+                                DELIVERY_COMPLETED,
+                                COST_BASIS_UNKNOWN,
+                                reservation_id
+                            ],
+                        )?;
+                        insert_billing_outbox_tx(&tx, &outbox_fact(0))?;
+                        tx.commit()?;
+                        return Ok(CostSettleOutcome::AppliedUnknown);
+                    }
+                };
+                // The basis names the authority behind the FOLDED amount: a
+                // provider report that won, otherwise the local price lines.
+                let basis = if reported_i64 == Some(chosen_i64) {
+                    COST_BASIS_PROVIDER_REPORTED
+                } else {
+                    COST_BASIS_ROUTE_SNAPSHOT_ESTIMATE
+                };
+                tx.execute(
+                    "UPDATE cost_reservation
              SET status = 'settled', settled_ms = ?1, delivery_state = ?6,
                  provider_cost_micro = ?2, provider_reported_micro = ?3,
                  provider_reported_cost_micro = ?3, settled_cost_micro = ?7,
                  cost_basis = ?8,
                  route_decision_json = ?4
              WHERE reservation_id = ?5",
-                params![
-                    settled_ms,
-                    local_i64,
-                    reported_i64,
-                    route_decision_json,
-                    reservation_id,
-                    DELIVERY_COMPLETED,
-                    chosen_i64,
-                    basis
-                ],
-            )?;
-            let n = tx.execute(
-                "UPDATE task SET spent_cost_micro = spent_cost_micro + ?1
+                    params![
+                        settled_ms,
+                        local_i64,
+                        reported_i64,
+                        route_decision_json,
+                        reservation_id,
+                        DELIVERY_COMPLETED,
+                        chosen_i64,
+                        basis
+                    ],
+                )?;
+                let n = tx.execute(
+                    "UPDATE task SET spent_cost_micro = spent_cost_micro + ?1
              WHERE session_id = ?2 AND task_id = ?3",
-                params![chosen_i64, session_id, task_id],
-            )?;
-            if n == 0 {
-                tx.rollback()?;
-                return Err(StoreError::Conflict(task_missing));
-            }
-            insert_billing_outbox_tx(&tx, &outbox_fact(chosen_i64.max(0) as u64))?;
-            tx.commit()?;
-            Ok(CostSettleOutcome::Applied {
-                actual_micro: chosen_i64.max(0) as u64,
+                    params![chosen_i64, session_id, task_id],
+                )?;
+                if n == 0 {
+                    tx.rollback()?;
+                    return Err(StoreError::Conflict(task_missing.clone()));
+                }
+                insert_billing_outbox_tx(&tx, &outbox_fact(chosen_i64.max(0) as u64))?;
+                tx.commit()?;
+                Ok(CostSettleOutcome::Applied {
+                    actual_micro: chosen_i64.max(0) as u64,
+                })
             })
-        })
     }
 
     /// Mark one RESERVED reservation as DISPATCHED (P0-2 + attempt-identity

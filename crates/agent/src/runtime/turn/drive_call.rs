@@ -54,14 +54,13 @@ impl AgentRuntime {
         // ran or assistant content was flushed, never replay.
         // Phase boundary: the drive is reasoning (paid provider call).
         self.note_execution_phase(st.handle, ExecutionPhase::Reasoning);
-        st.handle
-            .append_journal_event(
-                faktor_core::event::EventKind::ModelStarted,
-                AgentState::WaitingForModel,
-                Some(st.op_id),
-                None,
-            )
-            .await?;
+        // A daemon may still be settling its startup backup/index while the
+        // first turn starts; SQLite can briefly return "database is locked".
+        // This append is idempotent under a lock failure (nothing committed),
+        // so retry it with a bounded backoff instead of failing the turn.
+        // The live DeepSeek first-turn failure was exactly this transient
+        // lock on ModelStarted.
+        append_model_started_retrying(st.handle, st.op_id, AgentState::WaitingForModel).await?;
         // Attempt-accounting audit: the policy is read ONCE per logical
         // call (an override installed mid-flight never changes the retry
         // shape of an in-flight turn).
@@ -145,6 +144,47 @@ impl AgentRuntime {
                 &mut debits,
             )
             .await?;
+            // A clean stream that produced NOTHING durable (no text, no
+            // reasoning, no tool call) is an EMPTY completion, not a
+            // successful turn. DeepSeek/compatible endpoints occasionally
+            // emit one (a dropped SSE payload that still carries
+            // finish_reason); the old loop treated it as progress and spent
+            // up to eight more paid iterations until the stall watchdog.
+            // Retry it under the SAME bounded policy as a pre-content
+            // failure (the empty attempt settled at its real usage), and on
+            // exhaustion surface the typed failure instead of stalling.
+            // A clean stream with usage but no content is the real
+            // dropped-payload shape: the provider billed the attempt yet
+            // delivered nothing. A usage-free clean stream (the scripted
+            // provider's End, or a legitimate "nothing to add" answer) is a
+            // normal empty completion and must stay Done, not burn retries.
+            let saw_billed_attempt =
+                st.tokens_in > 0 || st.tokens_out > 0 || st.provider_reported_cost.is_some();
+            let produced_nothing = saw_billed_attempt
+                && st.assistant_message.is_none()
+                && st.tool_calls.is_empty()
+                && st.text_buf.is_empty()
+                && st.reasoning_buf.is_empty();
+            if produced_nothing {
+                if attempt + 1 < max_attempts {
+                    tracing::warn!(
+                        session = %st.handle.id(),
+                        attempt = attempt + 1,
+                        max_attempts,
+                        "provider returned an empty completion; retrying under the bounded policy"
+                    );
+                    continue 'attempts;
+                }
+                let error = ProviderError::new(
+                    ProviderErrorKind::Malformed,
+                    format!(
+                        "provider returned an empty completion (no text, reasoning or tool calls) on all {max_attempts} attempt(s)"
+                    ),
+                );
+                self.handle_provider_failure(st.handle, st.op_id, error, &mut st.outcome)
+                    .await?;
+                return Ok(PhaseFlow::End);
+            }
             break 'attempts;
         }
         if let Some(mid) = st.assistant_message {
@@ -419,14 +459,7 @@ impl AgentRuntime {
         // receive a resolved FileData part (defense in depth
         // behind the injection gate).
         CapabilityValidator::validate_documents(&request, st.provider.document_capable(&st.model))?;
-        st.handle
-            .append_journal_event(
-                faktor_core::event::EventKind::ModelStarted,
-                AgentState::Streaming,
-                Some(st.op_id),
-                None,
-            )
-            .await?;
+        append_model_started_retrying(st.handle, st.op_id, AgentState::Streaming).await?;
 
         // Durable budget gate (P0-6/12): reserve BEFORE reaching the
         // provider. The prediction is the conservative payload
@@ -842,6 +875,14 @@ impl AgentRuntime {
                                 format!("{name}\n{input_json}"),
                             );
                             st.tool_calls.push((id, name, input));
+                            // A tool call IS progress: it becomes a durable
+                            // call part and drives a real side effect. The
+                            // stall detector used to count a tool-only
+                            // iteration as "no new state" and failed a
+                            // productive 8-step verification loop (the live
+                            // DeepSeek turn) while the model was still
+                            // working.
+                            st.iteration_progress = true;
                         }
                         Ok(ProviderChunk::Usage(usage)) => {
                             // Canonical usage (audit Phase-1 item C):
@@ -1272,5 +1313,52 @@ impl AgentRuntime {
             None => debits.close_uncertain(),
         }
         Ok(())
+    }
+}
+
+/// True for a TRANSIENT store lock surfaced through the session error layer.
+/// Only the "database is locked"/"busy" shape is retried; corruption and
+/// illegal transitions are never replayed.
+fn transient_store_lock(err: &faktor_core::Error) -> bool {
+    err.kind == faktor_core::ErrorKind::Store
+        && (err.message.contains("database is locked")
+            || err.message.contains("database table is locked")
+            || err.message.contains("busy"))
+}
+
+/// Journal ModelStarted with a bounded retry over a transient store lock.
+/// The append is idempotent under a lock failure (nothing commits); a
+/// daemon's startup backup/index can briefly hold the session DB when the
+/// first turn begins (the live first-turn failure).
+async fn append_model_started_retrying(
+    handle: &faktor_session::SessionHandle,
+    op_id: faktor_core::id::OpId,
+    state: AgentState,
+) -> faktor_core::Result<()> {
+    let mut attempt = 0u32;
+    loop {
+        match handle
+            .append_journal_event(
+                faktor_core::event::EventKind::ModelStarted,
+                state,
+                Some(op_id),
+                None,
+            )
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(e) if transient_store_lock(&e) && attempt < 4 => {
+                attempt += 1;
+                let delay = std::time::Duration::from_millis(100u64 << (attempt - 1));
+                tracing::warn!(
+                    session = %handle.id(),
+                    attempt,
+                    backoff_ms = delay.as_millis() as u64,
+                    "transient store lock on ModelStarted; retrying"
+                );
+                tokio::time::sleep(delay).await;
+            }
+            Err(e) => return Err(e),
+        }
     }
 }

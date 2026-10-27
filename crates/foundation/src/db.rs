@@ -13,7 +13,12 @@ use rusqlite::Connection;
 
 use crate::FoundationError;
 
-/// Current foundation schema generation. Bump with every migration.
+/// Shared busy-handler wait for every foundation connection: long enough to
+/// cover a concurrent CLI/daemon settlement or acceptance receipt, still
+/// bounded (the foundation writes are small single statements).
+const FOUNDATION_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Current foundation schema generation. Bump with every migration./// Current foundation schema generation. Bump with every migration.
 pub const SCHEMA_VERSION: i64 = 3;
 
 /// One migration per generation: index 0 upgrades 0 -> 1.
@@ -435,7 +440,10 @@ impl FoundationDb {
         }
         let mut conn = Connection::open(&path)
             .map_err(|e| FoundationError::Store(format!("open {}: {e}", path.display())))?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))
+        // A daemon and a headless CLI may settle/accept the same data dir:
+        // wait through the peer's short transaction instead of turning a
+        // transient lock into a failed turn receipt.
+        conn.busy_timeout(FOUNDATION_BUSY_TIMEOUT)
             .map_err(|e| FoundationError::Store(format!("busy_timeout: {e}")))?;
         let _ = conn.pragma_update(None, "journal_mode", "WAL");
         let _ = conn.pragma_update(None, "synchronous", "NORMAL");
@@ -456,7 +464,7 @@ impl FoundationDb {
         let conn = Connection::open(&self.path).map_err(|e| {
             FoundationError::Store(format!("open reader {}: {e}", self.path.display()))
         })?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))
+        conn.busy_timeout(FOUNDATION_BUSY_TIMEOUT)
             .map_err(|e| FoundationError::Store(format!("busy_timeout: {e}")))?;
         Ok(conn)
     }

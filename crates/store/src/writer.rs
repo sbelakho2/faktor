@@ -70,6 +70,14 @@ pub const DEFAULT_WRITER_QUEUE_DEPTH: usize = 256;
 /// queue-level and SQLite-level backpressure agree.
 pub const DEFAULT_WRITER_ENQUEUE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Bounded retries of an IDEMPOTENT write that fails on a transient SQLite
+/// lock. The engine busy handler waits first; these cover a second process
+/// holding the write lock across its own settlement. 6 attempts with
+/// 50,100,...1600 ms backoff (3.15 s total) on top of the engine wait.
+pub(crate) const BUSY_RETRY_ATTEMPTS: u32 = 6;
+/// Base delay of the bounded busy retry (doubled per attempt, capped).
+pub(crate) const BUSY_RETRY_BASE_DELAY: Duration = Duration::from_millis(50);
+
 /// A job whose transaction duration exceeds this is instrumented as slow
 /// (telemetry + `tracing` warning).
 pub const SLOW_TRANSACTION_THRESHOLD: Duration = Duration::from_millis(250);
@@ -470,7 +478,10 @@ impl WriterService {
         F: FnOnce(&mut Connection) -> crate::StoreResult<R> + Send + 'static,
     {
         self.inner.check_available(label)?;
-        self.inner.admit_storage(label)?;
+        // The admission guard must outlive the write: a concurrent
+        // maintenance scan may only discount bytes whose write completed
+        // before the scan started.
+        let _storage_admission = self.inner.admit_storage(label)?;
         let (result_tx, result_rx) = mpsc::sync_channel::<crate::StoreResult<R>>(1);
         let job_inner = Arc::clone(&self.inner);
         let job = Job {
@@ -499,6 +510,46 @@ impl WriterService {
             Ok(result) => result,
             Err(_) => Err(StoreError::WriterUnavailable(self.inner.reason_or_dead())),
         }
+    }
+
+    /// [`WriterService::execute`] with a bounded retry/backoff over
+    /// TRANSIENT SQLite locks (`SQLITE_BUSY` / `SQLITE_LOCKED`).
+    ///
+    /// This is ONLY for a closure that is safe to replay: it must open its
+    /// own transaction (or run one idempotent statement) so a lock failure
+    /// rolls back before the retry. The engine's busy handler already waits
+    /// 30s per attempt; these retries cover the remaining multi-process
+    /// hand-off window (a second daemon/CLI settling the same data dir).
+    pub(crate) fn execute_retry_busy<R, F>(
+        &self,
+        label: &'static str,
+        mut f: F,
+    ) -> crate::StoreResult<R>
+    where
+        R: Send + 'static,
+        F: FnMut(&mut Connection) -> crate::StoreResult<R> + Send + 'static,
+    {
+        self.execute(label, move |conn| {
+            let mut attempt = 0u32;
+            loop {
+                match f(conn) {
+                    Err(e) if e.is_busy() && attempt < BUSY_RETRY_ATTEMPTS => {
+                        attempt += 1;
+                        let backoff = BUSY_RETRY_BASE_DELAY
+                            .saturating_mul(1u32 << attempt.saturating_sub(1).min(6));
+                        tracing::warn!(
+                            target: "faktor_store::writer",
+                            operation = label,
+                            attempt,
+                            backoff_ms = backoff.as_millis() as u64,
+                            "transient SQLite lock; retrying the idempotent write"
+                        );
+                        std::thread::sleep(backoff);
+                    }
+                    other => return other,
+                }
+            }
+        })
     }
 
     /// [`WriterService::execute`] for jobs returning a plain value (test
@@ -617,17 +668,21 @@ impl WriterInner {
     /// quota or aggregate budget cannot hold it. The estimate is a fixed
     /// per-statement bound; the exact usage is reconciled by WAL maintenance
     /// on the same hot path.
-    fn admit_storage(&self, label: &'static str) -> crate::StoreResult<()> {
+    fn admit_storage(
+        &self,
+        label: &'static str,
+    ) -> crate::StoreResult<Option<faktor_storage::SqliteAdmission>> {
         let governor = self
             .storage_governor
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
         let Some(governor) = governor else {
-            return Ok(());
+            return Ok(None);
         };
         governor
-            .admit_sqlite_growth(STORAGE_APPEND_ESTIMATE_BYTES)
+            .admit_sqlite_growth_tracked(STORAGE_APPEND_ESTIMATE_BYTES)
+            .map(Some)
             .map_err(|error| StoreError::StorageRefused(format!("`{label}`: {error}")))
     }
 
@@ -888,5 +943,67 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
         s.clone()
     } else {
         "non-string panic payload".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::ffi;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+
+    /// A transient lock is replayed by `execute_retry_busy`; a non-lock is
+    /// returned immediately (never retried) and the retry is bounded.
+    #[test]
+    fn execute_retry_busy_replays_only_transient_locks() {
+        let conn = Connection::open_in_memory().unwrap();
+        let service = WriterService::spawn(conn).unwrap();
+        let mut calls = 0u32;
+        let value = service
+            .execute_retry_busy("test_retry", move |_| {
+                calls += 1;
+                if calls < 3 {
+                    Err(StoreError::Sqlite(rusqlite::Error::SqliteFailure(
+                        ffi::Error::new(5), // SQLITE_BUSY
+                        None,
+                    )))
+                } else {
+                    Ok(calls)
+                }
+            })
+            .unwrap();
+        assert_eq!(value, 3, "two locks then success");
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_in = Arc::clone(&calls);
+        let err = service
+            .execute_retry_busy("test_no_retry", move |_| {
+                calls_in.fetch_add(1, Ordering::SeqCst);
+                Err::<u32, StoreError>(StoreError::Malformed("not a lock".into()))
+            })
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Malformed(_)));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "permanent errors are never replayed"
+        );
+    }
+
+    #[test]
+    fn is_busy_recognizes_busy_and_locked_only() {
+        for code in [5, 6] {
+            let err =
+                StoreError::Sqlite(rusqlite::Error::SqliteFailure(ffi::Error::new(code), None));
+            assert!(err.is_busy(), "SQLite code {code} is transient");
+        }
+        assert!(!StoreError::Sqlite(rusqlite::Error::SqliteFailure(
+            ffi::Error::new(19), // constraint violation
+            None
+        ))
+        .is_busy());
+        assert!(!StoreError::Malformed("x".into()).is_busy());
+        assert!(!StoreError::Busy("reader pool".into()).is_busy());
     }
 }

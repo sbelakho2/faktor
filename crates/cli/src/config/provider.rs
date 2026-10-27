@@ -534,6 +534,17 @@ impl ProviderCfg {
                     || same_endpoint(base_url, "https://api.openai.com")
                 {
                     BillingOrigin::OfficialOpenAi
+                } else if same_endpoint(base_url, DEEPSEEK_OFFICIAL_BASE_URL)
+                    || same_endpoint(base_url, "https://api.deepseek.com/v1")
+                {
+                    // Endpoint identity decides billing, never the wire
+                    // family: an OpenAI-compatible entry pointed at the
+                    // canonical DeepSeek API bills at DeepSeek's documented
+                    // origin (its catalog price/prior), not as an unknown
+                    // custom endpoint. Without this, Economy/Balanced
+                    // excluded the row as Unknown-priced and the first
+                    // model call died as NoCapableModel.
+                    BillingOrigin::OfficialDeepSeek
                 } else {
                     BillingOrigin::CustomEndpoint
                 }
