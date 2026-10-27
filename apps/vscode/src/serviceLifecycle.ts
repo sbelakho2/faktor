@@ -501,6 +501,60 @@ export class ServiceLifecycle<C extends ServiceConnection> {
     await this.start('explicit', { allowUnverified });
   }
 
+  /**
+   * Force a fresh supervised connection after a live request failed at the
+   * transport layer (a stale loopback port/address or a reset connection).
+   * Unlike the background crash probe this is AWAITED: the caller's one
+   * retry runs against the replaced connection, and the restart counts
+   * against the same bounded restart budget.
+   */
+  async reconnectNow(): Promise<void> {
+    if (this.disposed) {
+      return;
+    }
+    if (this.launching !== null) {
+      try {
+        await this.launching;
+      } catch {
+        // The failed attempt already published its authority/restart state.
+      }
+      if (this.disposed) {
+        return;
+      }
+    }
+    this.stoppedByUser = false;
+    this.clearAllTimers();
+    this.authority = null;
+    this.lastFailure = null;
+    const connection = this.connection;
+    this.connection = null;
+    this.phase = 'reconnecting';
+    this.notice = 'reconnecting';
+    this.readinessDetail = null;
+    this.publish();
+    if (connection !== null) {
+      try {
+        await this.deps.shutdown(connection, 'crash');
+      } catch {
+        // The process is already gone; refresh still proceeds.
+      }
+    }
+    if (this.disposed || this.stoppedByUser) {
+      return;
+    }
+    const inWindow = this.restartTimes();
+    if (inWindow.length >= this.config.maxRestarts) {
+      this.block(
+        'startup_budget_exhausted',
+        `the service restarted ${inWindow.length} times within ${this.config.restartWindowMs}ms`,
+        false,
+      );
+      return;
+    }
+    this.restarts.push(this.now());
+    await this.start('restart', { allowUnverified: false });
+  }
+
   /** Diagnostics "Stop service": auto-start/restart stays off until explicit. */
   async stopExplicit(): Promise<void> {
     this.stoppedByUser = true;

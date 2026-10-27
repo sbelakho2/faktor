@@ -2645,21 +2645,40 @@
   }
 
   /**
-   * The empty/onboarding state. It exists only while the conversation is
-   * empty: the first rendered entry puts it out of the way for good, and the
-   * example chips feed the composer (fill + focus), never submit.
+   * The empty state is ONE compact line. It exists only while the
+   * conversation is empty: the first rendered entry removes it for good.
+   * There is no welcome wall, card or suggestion list above the transcript.
    */
   function renderWelcome(entries) {
     var node = byId('welcome');
     if (!node) {
       return;
     }
-    var title = byId('transcript-title');
     var empty = !entries || entries.length === 0;
     node.hidden = !empty;
-    if (title) {
-      title.hidden = empty;
+  }
+
+  var GOAL_MIN_HEIGHT = 36;
+  var GOAL_MAX_HEIGHT = 120;
+
+  /**
+   * ONE auto-growing input: measure the scroll height, clamp it to 36-120px
+   * and let the textarea scroll only after the cap. Called on every input and
+   * after a programmatic draft update; the CSS max-height is the hard bound.
+   */
+  function autoGrowGoal() {
+    var node = byId('goal');
+    if (!node || !node.style) {
+      return;
     }
+    node.style.height = 'auto';
+    var measured = typeof node.scrollHeight === 'number' ? node.scrollHeight : 0;
+    if (!(measured > 0)) {
+      measured = GOAL_MIN_HEIGHT;
+    }
+    var height = Math.max(GOAL_MIN_HEIGHT, Math.min(GOAL_MAX_HEIGHT, measured));
+    node.style.height = height + 'px';
+    node.style.overflowY = height >= GOAL_MAX_HEIGHT ? 'auto' : 'hidden';
   }
 
   /**
@@ -5981,6 +6000,7 @@
       var goalNode = byId('goal');
       if (goalNode) {
         goalNode.value = composerPolicy.afterStart(goalNode.value, message.goal, ok);
+        autoGrowGoal();
       }
       if (ok) {
         // Durable acceptance: the host cleared its store, the panel drops
@@ -6252,6 +6272,7 @@
     setComposerIntent('task');
   });
   setComposerIntent('ask');
+  autoGrowGoal();
 
   byId('composer').addEventListener('submit', function (event) {
     event.preventDefault();
@@ -6304,6 +6325,8 @@
       composing = false;
     });
   }
+
+  byId('goal').addEventListener('input', autoGrowGoal);
 
   byId('goal').addEventListener('keydown', function (event) {
     if (
@@ -6556,32 +6579,6 @@
   }
   byId('btn-change-recheck').addEventListener('click', recheckChangesFromGesture);
   byId('btn-changes-recheck-unavailable').addEventListener('click', recheckChangesFromGesture);
-
-  // Onboarding prompt chips: fill the composer and focus it (feed, never
-  // submit). They live in the empty-state markup, so the static markup pin
-  // covers their labels and their data-prompt payloads.
-  var welcomeChips =
-    typeof document.querySelectorAll === 'function'
-      ? document.querySelectorAll('.welcome-chip')
-      : [];
-  for (var welcomeIndex = 0; welcomeIndex < welcomeChips.length; welcomeIndex++) {
-    (function (chip) {
-      chip.addEventListener('click', function () {
-        var prompt = chip.getAttribute ? chip.getAttribute('data-prompt') : null;
-        if (!prompt) {
-          return;
-        }
-        var goalNode = byId('goal');
-        if (!goalNode) {
-          return;
-        }
-        goalNode.value = prompt;
-        if (typeof goalNode.focus === 'function') {
-          goalNode.focus();
-        }
-      });
-    })(welcomeChips[welcomeIndex]);
-  }
 
   vscode.postMessage({ type: 'ready' });
 })();

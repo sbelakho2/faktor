@@ -775,8 +775,6 @@ button.toggle[aria-expanded='true'] {
 
 .transcript-card > #welcome {
   flex: none;
-  max-height: 100%;
-  overflow-y: auto;
 }
 
 .run-strip {
@@ -1289,71 +1287,20 @@ details summary {
   border-color: var(--vscode-inputValidation-errorBorder, rgba(248, 81, 73, 0.4));
 }
 
-/* ------------------------------------------------- welcome / onboarding */
-
-.welcome {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: var(--space-1);
-  padding: var(--space-3);
-  border: 1px solid var(--faktor-border-quiet);
-  border-radius: var(--faktor-radius);
-  background: var(--faktor-surface);
-  min-width: 0;
-}
-
-.welcome-mark {
-  color: var(--faktor-accent);
-  margin-bottom: var(--space-1);
-}
-
-.welcome-mark .pixel-body {
-  fill: currentColor;
-}
-
-.welcome-mark .pixel-eye {
-  fill: var(--vscode-sideBar-background, currentColor);
-}
-
-.welcome-lead {
+/* ------------------------------------------------------ empty state line
+   The empty conversation is ONE compact muted line in normal flow. There is
+   no welcome card, no illustration, no suggestion list and no button wall:
+   the transcript owns the remaining height from the first paint. */
+.welcome-line {
+  flex: none;
   margin: 0;
-  color: var(--vscode-descriptionForeground);
-  font-size: 0.95em;
-  line-height: 1.5;
-}
-
-.welcome-hint {
-  margin: var(--space-1) 0 0;
-  font-size: 0.85em;
-}
-
-.welcome-prompts {
-  list-style: none;
-  margin: var(--space-1) 0 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  width: 100%;
-}
-
-.welcome-chip {
-  width: 100%;
-  text-align: left;
+  padding: 0 0 var(--space-1);
+  border: none;
   background: transparent;
-  color: var(--vscode-foreground);
-  border: 1px solid var(--faktor-border);
-  border-radius: var(--faktor-radius-control);
-  min-height: 32px;
-  padding: var(--space-1) 10px;
   font-size: 0.9em;
-}
-
-.welcome-chip:hover:not(:disabled) {
-  background: var(--faktor-hover);
-  border-color: var(--faktor-accent);
-  color: var(--faktor-accent);
+  line-height: 1.4;
+  min-width: 0;
+  overflow-wrap: break-word;
 }
 
 /* ------------------------------------------------------------- composer */
@@ -1362,16 +1309,13 @@ details summary {
   display: flex;
   flex-direction: column;
   flex: none;
-  gap: var(--space-2);
+  gap: 4px;
   min-width: 0;
-  margin-bottom: var(--space-2);
-  padding: var(--space-3);
-  /* Safe-area padding keeps the send action reachable above host chrome. */
-  padding-bottom: max(var(--space-3), env(safe-area-inset-bottom));
+  margin-bottom: 0;
+  padding: 6px 8px;
   border: 1px solid var(--faktor-border);
   border-radius: var(--faktor-radius);
   background: var(--faktor-surface);
-  box-shadow: 0 1px 3px var(--faktor-shadow);
 }
 
 .composer-label {
@@ -1395,31 +1339,60 @@ details summary {
   resize: vertical;
 }
 
+/* ONE auto-growing input: 36px at rest, capped at 120px before it scrolls.
+   The host keeps the draft, the webview only sizes the box. */
 #goal {
-  min-height: 72px;
+  flex: none;
+  min-height: 36px;
+  max-height: 120px;
+  line-height: 1.35;
+  resize: none;
+  overflow-y: auto;
 }
 
-.composer-chips {
+.composer-toolbar {
   display: flex;
   align-items: center;
-  gap: var(--space-2);
-  flex-wrap: wrap;
+  gap: 4px;
+  flex-wrap: nowrap;
   min-width: 0;
 }
 
-button.chip-action {
+.composer-icon {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  min-width: 28px;
+  height: 28px;
+  min-height: 28px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--faktor-radius-control);
   background: transparent;
   color: var(--vscode-foreground);
-  border: 1px solid var(--faktor-border);
-  min-height: 28px;
-  padding: 2px 10px;
-  font-size: 0.85em;
 }
 
-button.chip-action:hover:not(:disabled) {
+.composer-icon:hover:not(:disabled) {
   background: var(--faktor-hover);
-  border-color: var(--faktor-accent);
-  color: var(--faktor-accent);
+  border-color: var(--faktor-border);
+}
+
+.composer-icon svg {
+  display: block;
+}
+
+.composer-spacer {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.composer-toolbar .primary-action {
+  flex: none;
+  min-height: 28px;
+  padding: 2px 12px;
+  font-size: 0.9em;
 }
 
 .chip-model {
@@ -1428,10 +1401,19 @@ button.chip-action:hover:not(:disabled) {
   font-weight: 600;
 }
 
-.chip-hint {
-  border: none;
-  padding: 0;
-  font-size: 0.8em;
+/* The model identity is a single quiet token; it ellipsizes instead of
+   forcing the toolbar to wrap at sidebar widths. */
+.composer-toolbar .chip-model {
+  display: inline-block;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
+  padding: 1px 6px;
+  font-size: 0.78em;
+  line-height: 18px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .finish-options {
@@ -1711,20 +1693,19 @@ button.attachment-remove {
 /* ------------------------------------------------ intent and task options
    ONE composer with one explicit intent (Ask | Task). Task options are a
    single disclosure: no second composer, no separate Task button. */
-.composer-intent-row {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  flex-wrap: wrap;
-  min-width: 0;
-}
-
 .composer-intent {
   display: inline-flex;
   border: 1px solid var(--faktor-border);
   border-radius: var(--faktor-radius-control);
   overflow: hidden;
   flex: none;
+}
+
+/* Ask is a plain conversation: its compact composer carries no Task options
+   row at all. Selecting Task reveals the one disclosure; an explicitly
+   opened disclosure is never hidden. */
+#composer[data-intent='ask'] .task-options:not([open]) {
+  display: none;
 }
 
 button.intent-option {
@@ -2420,7 +2401,6 @@ button.intent-option:focus-visible {
 @media (max-width: 420px) {
   .run-strip,
   .composer-actions,
-  .composer-chips,
   .criterion-head,
   .evidence,
   .agent-head {
@@ -2445,6 +2425,18 @@ button.intent-option:focus-visible {
   }
 }
 
+/* Extreme zoom budget (<= 219 CSS px): the toolbar wraps once so Send never
+   leaves the viewport. At the real 240-480 sidebar widths it stays one row. */
+@media (max-width: 219px) {
+  .composer-toolbar {
+    flex-wrap: wrap;
+  }
+  .composer-toolbar .chip-model,
+  .composer-spacer {
+    display: none;
+  }
+}
+
 /* The narrowest sidebar range (240-319px): ONE compact header row (brand,
    ellipsized status, `⋯`, gear); everything is one column and the primary
    decisions stay visible. No view tabs exist in the chat body. */
@@ -2465,17 +2457,17 @@ button.intent-option:focus-visible {
   .attention-card {
     padding: var(--space-1);
   }
-  /* Ask|Task stays visible at the 120px effective zoom budget: the segmented
-     control takes its own full row and the two options share it. */
-  .composer-intent-row {
-    gap: var(--space-1);
+  /* The toolbar stays ONE row at the 120px effective zoom budget: the model
+     token ellipsizes and the intent control keeps its intrinsic width. */
+  .composer-toolbar {
+    gap: 2px;
   }
   .composer-intent {
-    flex: 1 1 100%;
+    flex: none;
   }
   button.intent-option {
-    flex: 1 1 50%;
     padding: 2px 6px;
+    font-size: 0.82em;
   }
   /* Labels above their fields. */
   .meta-row,

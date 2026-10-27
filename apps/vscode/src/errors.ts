@@ -14,6 +14,7 @@
 
 export type UserErrorKind =
   | 'daemon_down'
+  | 'daemon_unreachable'
   | 'daemon_start_failed'
   | 'service_not_ready'
   | 'service_binary_missing'
@@ -24,6 +25,7 @@ export type UserErrorKind =
   | 'service_untrusted_install'
   | 'stream_gap'
   | 'run_failure'
+  | 'conversation_missing'
   | 'permission_expired'
   | 'attachment_refused'
   | 'unexpected';
@@ -87,6 +89,11 @@ const KIND_COPY: Record<UserErrorKind, KindCopy> = {
     hint: 'Start it to review the run and keep your work.',
     action: { key: 'startService', label: 'Start Faktor' },
   },
+  daemon_unreachable: {
+    summary: 'The Faktor service could not be reached',
+    hint: 'It may have restarted on a different port. Reconnect to the service; your draft was kept.',
+    action: { key: 'startService', label: 'Reconnect' },
+  },
   daemon_start_failed: {
     summary: 'The Faktor service could not start',
     hint: 'Check the technical details; the service is not running yet.',
@@ -137,6 +144,11 @@ const KIND_COPY: Record<UserErrorKind, KindCopy> = {
     hint: 'Your draft and attachments were kept. Review the message and try again.',
     action: { key: 'focusComposer', label: 'Review and retry' },
   },
+  conversation_missing: {
+    summary: 'That conversation is no longer available',
+    hint: 'It was removed or belongs to a previous service. A fresh conversation will be created for this workspace.',
+    action: { key: 'focusComposer', label: 'Review and retry' },
+  },
   permission_expired: {
     summary: 'That permission request is no longer live',
     hint: 'It was resolved elsewhere or expired. Refresh to see the current requests.',
@@ -160,6 +172,7 @@ function kindCopyOf(kind: unknown): KindCopy {
 
 function kindOf(kind: unknown): UserErrorKind {
   return kind === 'daemon_down' ||
+    kind === 'daemon_unreachable' ||
     kind === 'daemon_start_failed' ||
     kind === 'service_not_ready' ||
     kind === 'service_binary_missing' ||
@@ -170,6 +183,7 @@ function kindOf(kind: unknown): UserErrorKind {
     kind === 'service_untrusted_install' ||
     kind === 'stream_gap' ||
     kind === 'run_failure' ||
+    kind === 'conversation_missing' ||
     kind === 'permission_expired' ||
     kind === 'attachment_refused'
     ? kind

@@ -61,6 +61,7 @@ import {
 import {
   FetchLike,
   NativeApiError,
+  NativeTransportError,
   NativeBillingOverview,
   NativeBillingUsage,
   NativeClient,
@@ -116,7 +117,12 @@ import {
   unavailableBoardState,
 } from './state';
 import { CockpitTaskVerification, CockpitUsagePanel, buildUsagePanel, projectCockpit, tournamentViewOf } from './cockpit';
-import { loadConversation, sendAskTurn } from './askFlow.ts';
+import { loadConversation } from './askFlow.ts';
+import {
+  classifyAskFailure,
+  sendAskTurnWithRecovery,
+  type AskRecoveryConnection,
+} from './askRecovery.ts';
 import { composerIntentOf } from './uxState.ts';
 import { refreshReadPlan } from './refreshReads.ts';
 import { Edition8Client } from './edition8/client.ts';
@@ -213,7 +219,7 @@ import {
   storeControlPlaneToken,
   watchControlPlaneSecretChanges,
 } from './controlPlaneAuth';
-import { ChatMessage, ChatViewProvider, LauncherViewProvider } from './webview';
+import { ChatMessage, ChatViewProvider } from './webview';
 
 const HISTORY_PAGE_LIMIT = 100;
 const MAX_EVIDENCE_PREVIEW_BYTES = 256 * 1024;
@@ -891,7 +897,18 @@ function recordError(projection: UserErrorProjection, toast = false): void {
 }
 
 function projectOf(error: unknown, kind: UserErrorKind = 'unexpected'): UserErrorProjection {
-  return projectError({ kind, message: messageOf(error), code: errorCodeOf(error) });
+  let resolved = kind;
+  if (resolved === 'unexpected') {
+    const cause = classifyAskFailure(error);
+    resolved =
+      cause === 'transport'
+        ? 'daemon_unreachable'
+        : cause === 'stale_session'
+          ? 'conversation_missing'
+          : resolved;
+  }
+  const code = error instanceof NativeTransportError ? error.code : errorCodeOf(error);
+  return projectError({ kind: resolved, message: messageOf(error), code });
 }
 
 /** A background read failure: panel-visible, no IDE toast (no user gesture). */
@@ -1549,9 +1566,18 @@ async function createBoundSession(
 async function ensureSession(
   client: NativeClient,
   context: vscode.ExtensionContext,
+  options: { readonly force?: boolean } = {},
 ): Promise<string> {
-  if (active.sessionId) {
+  const force = options.force === true;
+  if (active.sessionId && !force) {
     return active.sessionId;
+  }
+  if (force) {
+    // The cached id was just proven missing (a typed 404 from the daemon) or
+    // belongs to a previous service: fence in-flight work and re-resolve the
+    // workspace binding from the listing instead of reusing it.
+    active.sessionId = null;
+    bumpLifecycle();
   }
   const previousSessionId = active.sessionId;
   const workspace = canonicalWorkspace(context);
@@ -1578,9 +1604,16 @@ async function ensureSession(
     active.sessionId = boundId;
     bumpLifecycle();
     store.patch({ session: boundSummary });
-  } else if (boundId === null && !listed && workspace.key !== null && bindings[workspace.key]) {
+  } else if (
+    !force &&
+    boundId === null &&
+    !listed &&
+    workspace.key !== null &&
+    bindings[workspace.key]
+  ) {
     // The listing failed; trust the durable binding for this exact
-    // workspace rather than minting a duplicate session.
+    // workspace rather than minting a duplicate session. A forced rebind
+    // never takes this path: the old id was already proven missing.
     active.sessionId = bindings[workspace.key] as string;
     bumpLifecycle();
   } else {
@@ -2878,11 +2911,77 @@ function recoverEventStream(): void {
   scheduleRefresh(0);
 }
 
+/** The cause-specific attention kind for a failed Ask turn. */
+function askErrorKind(error: unknown): UserErrorKind {
+  const cause = classifyAskFailure(error);
+  if (cause === 'transport') {
+    return 'daemon_unreachable';
+  }
+  if (cause === 'stale_session') {
+    return 'conversation_missing';
+  }
+  return 'run_failure';
+}
+
+/**
+ * The live Ask connection: service auto-start is AWAITED, then the workspace
+ * session is resolved/created. A missing client after a successful start is
+ * itself a transport failure, never a generic error.
+ */
+async function ensureAskConnection(
+  context: vscode.ExtensionContext,
+): Promise<AskRecoveryConnection> {
+  if (!active.client || !active.sessionId) {
+    await startServer(context);
+  }
+  const client = active.client;
+  if (!client) {
+    throw new NativeTransportError(
+      'POST /native/session/{id}/prompt',
+      'the Faktor service is not running; the message was kept',
+    );
+  }
+  const sessionId = await ensureSession(client, context);
+  return { client, sessionId };
+}
+
+/**
+ * A transport failure means the supervised connection's base URL/port may be
+ * stale. Reconnect NOW (the supervisor replaces the client and refreshes the
+ * address), then resolve the session on the new connection.
+ */
+async function recoverAskTransport(
+  context: vscode.ExtensionContext,
+): Promise<AskRecoveryConnection> {
+  await ensureServiceLifecycle(context).reconnectNow();
+  const client = active.client;
+  if (!client) {
+    throw new NativeTransportError(
+      'POST /native/session/{id}/prompt',
+      'the Faktor service could not be reconnected; the message was kept',
+    );
+  }
+  const sessionId = await ensureSession(client, context);
+  return { client, sessionId };
+}
+
+/** A typed 404 rebinds/creates the workspace session on the same client. */
+async function rebindAskSession(
+  connection: AskRecoveryConnection,
+  context: vscode.ExtensionContext,
+): Promise<AskRecoveryConnection> {
+  const sessionId = await ensureSession(connection.client as NativeClient, context, {
+    force: true,
+  });
+  return { client: connection.client, sessionId };
+}
+
 /**
  * ONE plain conversational turn. Ask is not a task: this path posts only the
  * ordinary prompt (plus workspace-relative files) and reads conversation
  * data. It never mints a contract, task-run object, proof read, verification
- * gate or billing/control-plane request.
+ * gate or billing/control-plane request. The host retries at most once after
+ * refreshing a stale connection or rebinding a stale session.
  */
 async function sendAskTurnFromComposer(
   message: ChatMessage,
@@ -2904,20 +3003,21 @@ async function sendAskTurnFromComposer(
   }
   active.conversationInFlight = true;
   try {
-    if (!active.client || !active.sessionId) {
-      await startServer(context);
-    }
-    const client = active.client;
-    const sessionId = active.sessionId;
-    if (!client || !sessionId) {
-      throw new Error('the Faktor service is not running; the message was kept');
-    }
-    await sendAskTurn(client, {
-      sessionId,
-      prompt: goal,
-      files,
-      submissionId: randomUUID(),
-    });
+    const outcome = await sendAskTurnWithRecovery(
+      {
+        ensureConnection: () => ensureAskConnection(context),
+        recoverTransport: () => recoverAskTransport(context),
+        rebindSession: (connection) => rebindAskSession(connection, context),
+      },
+      {
+        prompt: goal,
+        files,
+        // Stable across the one retry: the daemon's prompt admission replays
+        // an accepted receipt byte-for-byte instead of duplicating the turn.
+        submissionId: randomUUID(),
+      },
+    );
+    active.sessionId = outcome.connection.sessionId;
     // Ask owns the conversation from here: subsequent stream-driven
     // refreshes read conversation state only until an explicit Task start.
     active.askOnly = true;
@@ -2930,7 +3030,7 @@ async function sendAskTurnFromComposer(
     const retryable = error instanceof NativeApiError ? error.retryable : true;
     const reason = messageOf(error);
     store.patch({ lastError: reason });
-    reportError(error, 'run_failure');
+    reportError(error, askErrorKind(error));
     chatProvider?.postStartResult(goal, false, retryable);
   } finally {
     active.conversationInFlight = false;
@@ -4418,9 +4518,9 @@ async function handleWebviewMessage(
 // ---------------------------------------------------------- Settings surface
 
 /**
- * Settings renders INSIDE the one Faktor editor panel. There is no settings
- * tab, no editor split and no sidebar duplicate: the panel's internal view
- * router swaps Chat / Settings / Inspect / History / Diagnostics.
+ * Settings renders INSIDE the one Faktor sidebar view. There is no settings
+ * tab, no editor split and no second surface: the view's internal router
+ * swaps Chat / Settings / Inspect / History / Diagnostics in place.
  */
 function openControlCenter(_context: vscode.ExtensionContext, screen = 'S29'): void {
   chatProvider?.showSettings(screen, screen === 'S29');
@@ -4592,7 +4692,7 @@ export function activate(context: vscode.ExtensionContext): void {
       session: () => active.sessionId,
       workspaceRoot: () => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? null,
     }),
-    vscode.window.registerWebviewViewProvider(LauncherViewProvider.viewType, new LauncherViewProvider(), {
+    vscode.window.registerWebviewViewProvider(ChatViewProvider.viewType, chatProvider, {
       webviewOptions: { retainContextWhenHidden: true },
     }),
     (() => {

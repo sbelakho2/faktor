@@ -683,7 +683,7 @@ export function buildHarnessHtml(
   if (typeof options.headScript === 'string' && options.headScript.length > 0) {
     html = html.replace('</head>', `<script>${options.headScript}</script></head>`);
   }
-  html = html.replace('<body>', `<body>${apiStub}`);
+  html = html.replace(/<body([^>]*)>/, `<body$1>${apiStub}`);
   html = html.replace('</body>', `${snapshotScript}</body>`);
   return html;
 }

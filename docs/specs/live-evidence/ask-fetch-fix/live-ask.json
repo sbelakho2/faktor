@@ -1,0 +1,42 @@
+{
+  "schema": "faktor-live-ask-evidence/v1",
+  "capturedAt": "2026-10-27T18:50:02.746Z",
+  "repoRoot": "/Users/sabelakhoua/IdeaProjects/Kilo+",
+  "liveHome": "/Users/sabelakhoua/.faktor-live",
+  "dataDir": "/var/folders/z1/b8gks6rd3vg16f9nrld50bj80000gn/T/faktor-live-ask-eF47ar",
+  "binary": "/Users/sabelakhoua/.faktor-live/bin/faktor",
+  "provider": "deepseek",
+  "model": "deepseek-chat",
+  "ok": true,
+  "steps": {
+    "start": {
+      "oldBaseUrl": "http://127.0.0.1:53260",
+      "sessionId": "1",
+      "ready": true
+    },
+    "staleTransport": {
+      "newBaseUrl": "http://127.0.0.1:53263",
+      "errorName": "NativeTransportError",
+      "errorCode": "ECONNREFUSED",
+      "message": "native transport failure at GET /native/health: fetch failed (ECONNREFUSED)",
+      "retryable": true
+    },
+    "prompt": {
+      "attempts": 2,
+      "recovered": "transport",
+      "receipt": {
+        "op_id": "1880229940056555520",
+        "run_id": "tx-1a17eb2b29200000",
+        "accepted": true,
+        "queued": false
+      },
+      "sessionId": "1"
+    },
+    "assistant": {
+      "messageId": 2,
+      "seq": 3,
+      "role": "assistant",
+      "text": "ASK-LIVE-OK"
+    }
+  }
+}

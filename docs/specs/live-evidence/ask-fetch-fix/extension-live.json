@@ -1,0 +1,186 @@
+{
+  "schema": "faktor-live-ask-extension/v1",
+  "capturedAt": "2026-10-27T18:47:39.264Z",
+  "repoRoot": "/Users/sabelakhoua/IdeaProjects/Kilo+",
+  "installedExtension": {
+    "path": "/Users/sabelakhoua/.vscode/extensions/faktor.faktor-0.1.0",
+    "name": "faktor",
+    "version": "0.1.0",
+    "askRecoverySha256": "80efb521327af0c5f80a107268ef74e043195c3c15ed81b749cfeff0b8a4e57e"
+  },
+  "daemon": {
+    "binaryPath": "/Users/sabelakhoua/.faktor-live/bin/faktor",
+    "binarySha256": "ddb8a7f4a06a857054e5f41240b7de7f948fa3018c89dffe13598f11a5b0431c",
+    "checksumFile": "ddb8a7f4a06a857054e5f41240b7de7f948fa3018c89dffe13598f11a5b0431c",
+    "dataDir": "/var/folders/z1/b8gks6rd3vg16f9nrld50bj80000gn/T/faktor-live-ext-DttxqO/data",
+    "configCopiedFrom": "/Users/sabelakhoua/.faktor-live/data/faktor-plus.json",
+    "provider": "deepseek",
+    "model": "deepseek-chat"
+  },
+  "workspace": "/var/folders/z1/b8gks6rd3vg16f9nrld50bj80000gn/T/faktor-live-ext-DttxqO/workspace",
+  "profile": "/var/folders/z1/b8gks6rd3vg16f9nrld50bj80000gn/T/faktor-live-ext-DttxqO/user-data",
+  "cdpPort": 52771,
+  "marker": "ASK-LIVE-2F39B2DD",
+  "ok": true,
+  "steps": {
+    "openSidebar": {
+      "label": "Faktor",
+      "atMs": 2598
+    },
+    "webview": {
+      "url": "vscode-webview://0a3ls38a86o7k8dic4khalofovkvoojtr0lkvu63ocotp1nf2cmn/index.html?id=61e4cac9-59d7-4bdb-a189-f6140110d65c&parentId=1&origin=50607e44-8ed7-4d68-aaf7-41907ace83b5&swVersion=5&extensionId=faktor.faktor&platform=electron&vscode-resource-base-authority=vscode-resource.vscode-cdn.net&parentOrigin=vscode-file%3A%2F%2Fvscode-app&purpose=webviewView",
+      "atMs": 3231
+    },
+    "autoStart": {
+      "firstSeenAtMs": 3352,
+      "atMs": 3918,
+      "pid": 61563,
+      "listeningPort": 52784,
+      "daemonText": "Ready · deepseek-chat",
+      "composerState": "Ready",
+      "sendDisabled": false
+    },
+    "ask": {
+      "prompt": "Reply with exactly this token and nothing else: ASK-LIVE-2F39B2DD",
+      "sentAtMs": 3921
+    },
+    "postTurn": {
+      "daemon": "Ready · deepseek-chat",
+      "composer": "Ready",
+      "bodyTail": "Faktor\nReady · deepseek-chat\n⋯\n⚙\nuser #2\nReply with exactly this token and nothing else: ASK-LIVE-2F39B2DD\nassistant #3\nASK-LIVE-2F39B2DD\nAsk\nTask\ndeepseek / deepseek-chat\nSend\nTask options\n✓\nReady\nDescribe a task or ask a question."
+    }
+  },
+  "assistant": {
+    "marker": "ASK-LIVE-2F39B2DD",
+    "text": "assistant #3\nASK-LIVE-2F39B2DD",
+    "transcriptAssistantRows": 1,
+    "deliveredAtMs": 5956
+  },
+  "error": null,
+  "domDiagnostics": {
+    "iframes": [
+      {
+        "id": "",
+        "src": "vscode-webview://0a3ls38a86o7k8dic4khalofovkvoojtr0lkvu63ocotp1nf2cmn/index.html?id=61e4cac9-59d7-4bdb-a189-f6140110d65c&parentId=1&origin=50607e44-8ed7-4d68-aaf7-41907ace83b5&swVersion=5&extensionId=faktor.faktor&platfo",
+        "x": 48,
+        "y": 70,
+        "width": 299,
+        "height": 778,
+        "visible": true
+      }
+    ],
+    "overlays": [
+      "chat-welcome-view-container",
+      "chat-welcome-view",
+      "chat-welcome-view-icon",
+      "chat-welcome-view-title",
+      "chat-welcome-view-message",
+      "chat-welcome-view-disclaimer",
+      "onboarding-a-card",
+      "onboarding-a-close-btn",
+      "onboarding-a-header",
+      "onboarding-a-progress",
+      "onboarding-a-progress-dot active",
+      "onboarding-a-progress-dot",
+      "onboarding-a-progress-dot",
+      "onboarding-a-step-label",
+      "onboarding-a-body",
+      "onboarding-a-step-content",
+      "onboarding-a-signin",
+      "onboarding-a-signin-brand",
+      "onboarding-a-signin-brand-icon",
+      "onboarding-a-signin-content"
+    ]
+  },
+  "webviewScreenshotError": "Page.captureScreenshot: Command can only be executed on top-level targets",
+  "screenshot": "/Users/sabelakhoua/IdeaProjects/Kilo+/docs/specs/live-evidence/ask-fetch-fix/extension-live.png",
+  "workbenchScreenshot": "/Users/sabelakhoua/IdeaProjects/Kilo+/docs/specs/live-evidence/ask-fetch-fix/extension-live-workbench.png",
+  "sidebarRect": {
+    "x": 48,
+    "y": 70,
+    "width": 299,
+    "height": 778
+  },
+  "logs": [
+    {
+      "file": "<profile>/logs/20261027T194740/terminal.log",
+      "tail": ""
+    },
+    {
+      "file": "<profile>/logs/20261027T194740/tunnelHostService.log",
+      "tail": ""
+    },
+    {
+      "file": "<profile>/logs/20261027T194740/userDataSync.log",
+      "tail": "2026-10-27 19:47:41.908 [info] [AutoSync] Using settings sync service https://vscode-sync.trafficmanager.net/\n2026-10-27 19:47:41.910 [info] [AutoSync] Disabled.\n"
+    },
+    {
+      "file": "<profile>/logs/20261027T194740/window1/exthost/extHostTelemetry.log",
+      "tail": ""
+    },
+    {
+      "file": "<profile>/logs/20261027T194740/window1/exthost/exthost.log",
+      "tail": "2026-10-27 19:47:42.435 [info] ExtensionService#_doActivateExtension vscode.git-base, startup: true, activationEvent: '*', root cause: vscode.git\n2026-10-27 19:47:42.442 [info] ExtensionService#_doActivateExtension vscode.git, startup: true, activationEvent: '*'\n2026-10-27 19:47:42.490 [info] ExtensionService#_doActivateExtension vscode.github, startup: true, activationEvent: '*'\n2026-10-27 19:47:42.622 [info] Eager extensions activated\n2026-10-27 19:47:42.625 [info] ExtensionService#_doActivateExtension vscode.debug-auto-launch, startup: false, activationEvent: 'onStartupFinished'\n2026-10-27 19:47:42.626 [info] ExtensionService#_doActivateExtension vscode.merge-conflict, startup: false, activationEvent: 'onStartupFinished'\n2026-10-27 19:47:42.636 [info] ExtensionService#_doActivateExtension cweijan.vscode-office, startup: false, activationEvent: 'onStartupFinished'\n2026-10-27 19:47:42.766 [info] ExtensionService#_doActivateExtension kilocode.kilo-code, startup: false, activationEvent: 'onStartupFinished'\n2026-10-27 19:47:43.225 [info] ExtensionService#_doActivateExtension vscode.configuration-editing, startup: false, activationEvent: 'onLanguage:jsonc'\n2026-10-27 19:47:43.230 [info] ExtensionService#_doActivateExtension vscode.json-language-features, startup: false, activationEvent: 'onLanguage:jsonc'\n2026-10-27 19:47:43.273 [info] ExtensionService#_doActivateExtension vscode.typescript-language-features, startup: false, activationEvent: 'onLanguage:jsonc'\n"
+    },
+    {
+      "file": "<profile>/logs/20261027T194740/window1/exthost/output_logging_20261027T194742/1-Faktor Revision 8.log",
+      "tail": ""
+    },
+    {
+      "file": "<profile>/logs/20261027T194740/window1/exthost/output_logging_20261027T194742/2-Office Http Request.log",
+      "tail": ""
+    },
+    {
+      "file": "<profile>/logs/20261027T194740/window1/exthost/output_logging_20261027T194742/3-Kilo Agent Manager.log",
+      "tail": "\tat Pn.handleTaskData (/Users/sabelakhoua/.vscode/extensions/kilocode.kilo-code-7.8.18-darwin-arm64/dist/extension.js:215:5826)\n\tat Pn.attemptRemoteTask (/Users/sabelakhoua/.vscode/extensions/kilocode.kilo-code-7.8.18-darwin-arm64/dist/extension.js:215:5466)\n\tat async Pn.attemptTask (/Users/sabelakhoua/.vscode/extensions/kilocode.kilo-code-7.8.18-darwin-arm64/dist/extension.js:215:4898)\n[WorktreeManager] registeredPaths: worktree list failed: Error: fatal: not a git repository (or any of the parent directories): .git\n\n2026-10-27T18:47:45.186Z worktree health: could not list git worktrees, skipping reconcile\n2026-10-27T18:47:45.186Z worktree health: orphans=0 degraded\n[WorktreeManager] defaultBranch: currentBranch failed: Error: Failed to determine current branch\n[WorktreeManager] defaultBranch: branchLocal failed: Error: fatal: not a git repository (or any of the parent directories): .git\n\n[WorktreeManager] worktree pool: warm failed: Error: This repository has no commits yet. Create an initial commit before using worktrees.\n"
+    },
+    {
+      "file": "<profile>/logs/20261027T194740/window1/exthost/output_logging_20261027T194742/4-Kilo Diff Panel.log",
+      "tail": ""
+    },
+    {
+      "file": "<profile>/logs/20261027T194740/window1/exthost/output_logging_20261027T194742/5-Kilo Diff Virtual.log",
+      "tail": ""
+    },
+    {
+      "file": "<profile>/logs/20261027T194740/window1/exthost/vscode.git/Git.log",
+      "tail": "2026-10-27 19:47:42.546 [info] [main] Log level: Info\n2026-10-27 19:47:42.564 [info] [main] Validating found git in: \"/usr/bin/git\"\n2026-10-27 19:47:42.620 [info] [main] Using git \"2.50.1 (Apple Git-155)\" from \"/usr/bin/git\"\n2026-10-27 19:47:42.620 [info] [Model][doInitialScan] Initial repository scan started\n2026-10-27 19:47:43.195 [info] > git rev-parse --show-toplevel [47ms]\n2026-10-27 19:47:43.195 [info] fatal: not a git repository (or any of the parent directories): .git\n2026-10-27 19:47:43.196 [info] [Model][doInitialScan] Initial repository scan completed - repositories (0), closed repositories (0), parent repositories (0), unsafe repositories (0)\n2026-10-27 19:47:43.362 [info] > git rev-parse --show-toplevel [32ms]\n2026-10-27 19:47:43.362 [info] fatal: not a git repository (or any of the parent directories): .git\n2026-10-27 19:47:44.250 [info] > git rev-parse --show-toplevel [30ms]\n2026-10-27 19:47:44.250 [info] fatal: not a git repository (or any of the parent directories): .git\n"
+    },
+    {
+      "file": "<profile>/logs/20261027T194740/window1/exthost/vscode.github/GitHub.log",
+      "tail": "2026-10-27 19:47:42.550 [info] Log level: Info\n"
+    },
+    {
+      "file": "<profile>/logs/20261027T194740/window1/exthost/vscode.github-authentication/GitHub Authentication.log",
+      "tail": "2026-10-27 19:47:42.523 [info] Got 0 sessions for ...\n2026-10-27 19:47:42.523 [info] Getting sessions for all scopes...\n2026-10-27 19:47:42.523 [info] Got 0 sessions for ...\n2026-10-27 19:47:42.523 [info] Getting sessions for all scopes...\n2026-10-27 19:47:42.523 [info] Got 0 sessions for ...\n2026-10-27 19:47:42.523 [info] Getting sessions for all scopes...\n2026-10-27 19:47:42.523 [info] Got 0 sessions for ...\n2026-10-27 19:47:42.523 [info] Getting sessions for all scopes...\n2026-10-27 19:47:42.524 [info] Got 0 sessions for ...\n2026-10-27 19:47:44.245 [info] Getting sessions for all scopes...\n2026-10-27 19:47:44.245 [info] Got 0 sessions for ...\n"
+    },
+    {
+      "file": "<profile>/logs/20261027T194740/window1/exthost/vscode.json-language-features/JSON Language Server.log",
+      "tail": ""
+    },
+    {
+      "file": "<profile>/logs/20261027T194740/window1/network.log",
+      "tail": ""
+    },
+    {
+      "file": "<profile>/logs/20261027T194740/window1/notebook.rendering.log",
+      "tail": ""
+    },
+    {
+      "file": "<profile>/logs/20261027T194740/window1/output_20261027T194741/agentSessionsOutput.log",
+      "tail": ""
+    },
+    {
+      "file": "<profile>/logs/20261027T194740/window1/output_20261027T194741/tasks.log",
+      "tail": ""
+    },
+    {
+      "file": "<profile>/logs/20261027T194740/window1/renderer.log",
+      "tail": "2026-10-27 19:47:41.709 [info] Started local extension host with pid 61529.\n2026-10-27 19:47:41.972 [info] [AccountPolicyGate] apply: state=inactive, reason=undefined, isRestricted=false\n2026-10-27 19:47:42.038 [info] Settings Sync: Account status changed from uninitialized to unavailable\n2026-10-27 19:47:44.840 [info] [perf] Render performance baseline is 14ms\n"
+    },
+    {
+      "file": "<profile>/logs/20261027T194740/window1/views.log",
+      "tail": ""
+    }
+  ]
+}

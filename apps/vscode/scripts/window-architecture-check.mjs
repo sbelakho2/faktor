@@ -1,19 +1,25 @@
 #!/usr/bin/env node
 // TEST-SEPARATION: oracle=external-fixture isolation=isolated-browser-profile,read-only-artifacts
-// Change-scoped verification for the ONE Faktor window.
+// Change-scoped verification for the ONE Faktor surface.
 //
-// 1. Static architecture: exactly one editor-area createWebviewPanel, one
-//    launcher view, no per-surface panel/view classes, and no sidebar chat
-//    or settings view.
-// 2. Host idempotence: the extension command opens the panel once, then only
-//    reveals it; every internal view move reuses the same panel.
-// 3. Real DOM (headless Chrome): Chat is one full-height column, the
-//    transcript owns scroll, the composer is in flow, Settings/Inspect/
-//    History/Diagnostics cross-fade inside the same document, one visible
-//    header, and Ask/Intent survive view switches. Captures at 480/1440.
+// 1. Static architecture: ChatViewProvider is the primary activity-bar
+//    webview view (`faktor.launcher`); no editor-area panel is created by
+//    default; Settings/Inspect/History/Diagnostics remain internal views.
+// 2. Host idempotence: focusing re-shows the same view; internal view moves
+//    reuse the same document; a disposed view re-focuses the sidebar view.
+// 3. Real DOM (headless Chrome): at 240/320/480 the conversation transcript
+//    fills the sidebar and is visible above the fold, the empty state is at
+//    most ONE compact line, no suggestion wall exists, and the composer sits
+//    in flow without overlapping the transcript.
+// 4. Mutation witnesses for no-suggestion-wall, sidebar-default and
+//    conversation-visible, plus before/after screenshots.
 
 import { createRequire } from 'node:module';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+} from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
@@ -28,6 +34,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, '..', '..', '..');
 const SRC = resolve(HERE, '..', 'src');
 const OUT = join(ROOT, 'target/certification/window');
+const WIDTHS = [240, 320, 480];
 const require = createRequire(import.meta.url);
 
 function fail(message) {
@@ -57,73 +64,76 @@ function staticChecks() {
   const files = [];
   walk(SRC, (path) => files.push(path));
   const sources = new Map(files.map((path) => [path, read(path)]));
-  const panelCalls = [...sources.entries()].filter(([, text]) => text.includes('createWebviewPanel('));
-  assert(panelCalls.length === 1, `exactly one createWebviewPanel call, found ${panelCalls.length}`);
-  assert(
-    panelCalls[0][0].endsWith(join('src', 'webview.ts')),
-    'the only webview panel lives in src/webview.ts',
-  );
   for (const [path, text] of sources) {
+    assert(
+      !text.includes('createWebviewPanel('),
+      `${path} must not create an editor-area webview panel`,
+    );
     assert(!text.includes('class Edition8Panel'), `${path} must not define a second editor panel`);
     assert(!text.includes('class Edition8ViewProvider'), `${path} must not define a sidebar settings view`);
-    assert(!text.includes('registerWebviewViewProvider(ChatViewProvider.viewType'), `${path} must not host chat in the sidebar`);
   }
   const webview = read(join(SRC, 'webview.ts'));
-  assert(webview.includes("viewType = 'faktor.panel'"), 'the panel id is faktor.panel');
-  assert(webview.includes('this.panel !== null'), 'the panel is a singleton (reuse, never recreate)');
-  assert(webview.includes('this.panel.reveal(undefined, false)'), 'focus only reveals the existing panel');
-  assert(!webview.includes('ViewColumn.Two'), 'no editor column split is created');
-  assert(webview.includes('id="settings-panel"'), 'Settings is an internal view of the same panel');
-  assert(webview.includes('renderEdition8AppMarkup'), 'Settings markup renders inside the panel document');
+  assert(webview.includes("viewType = 'faktor.launcher'"), 'the primary surface is faktor.launcher');
+  assert(webview.includes('implements vscode.WebviewViewProvider'), 'the chat is a webview view');
+  assert(webview.includes('resolveWebviewView('), 'the view resolves into the activity bar');
+  assert(webview.includes('view.show(true)'), 'focus reveals the existing sidebar view');
+  assert(webview.includes('`${ChatViewProvider.viewType}.focus`'), 'an unresolved view focuses the sidebar view id');
+  assert(webview.includes('data-surface="sidebar"'), 'the document marks the sidebar surface');
+  assert(webview.includes('id="settings-panel"'), 'Settings is an internal view of the same document');
+  assert(webview.includes('renderEdition8AppMarkup'), 'Settings markup renders inside the one document');
   assert(webview.includes('id="menu-settings"'), 'the overflow exposes Settings');
   assert(webview.includes('faktorShowView'), 'the host can switch internal views');
+  assert(!webview.includes('welcome-chip'), 'no suggestion chips remain in the markup');
+  assert(!webview.includes('welcome-prompts'), 'no suggestion list remains in the markup');
+  assert(!webview.includes('welcome-lead'), 'no welcome wall copy remains in the markup');
+  assert(webview.includes('class="composer-toolbar"'), 'the composer is one compact toolbar row');
+  assert(!webview.includes('composer-chips'), 'the composer chip row is gone');
+  assert(!webview.includes('attachment-hint'), 'the attach hint is gone');
+  assert(!webview.includes('Ask Faktor…</label>'), 'the big composer label is gone');
 
   const chat = read(join(SRC, '..', 'media', 'chat.js'));
   assert(chat.includes("settings: 'settings-panel'"), 'chat.js routes Settings locally');
   assert(chat.includes("byId('menu-settings')"), 'the overflow Settings item switches internally');
   assert(chat.includes("byId('btn-control-center')"), 'the gear switches internally');
   assert(chat.includes("message.type === 'faktorShowView'"), 'the host view switch is handled locally');
-  assert(!chat.includes("type: 'openControlCenter'"), 'the gear no longer asks the host for another panel');
-  const gearStart = chat.indexOf("byId('btn-control-center')");
-  const gearEnd = chat.indexOf("byId('btn-overflow')", gearStart);
-  assert(gearStart >= 0 && gearEnd > gearStart, 'the gear listener exists');
-  assert(chat.slice(gearStart, gearEnd).includes("openView('settings')"), 'the gear calls the local view router');
-
-  const controller = read(join(SRC, 'edition8', 'panel.ts'));
-  const selectCase = controller.slice(
-    controller.indexOf("case 'e8SelectScreen'"),
-    controller.indexOf("case 'e8OpenScreen'"),
-  );
-  assert(selectCase.length > 0 && !selectCase.includes('.post('), 'the settings selection is never echoed back (no host<->webview loop)');
+  assert(!chat.includes('welcome-chip'), 'chat.js ships no suggestion-chip behavior');
+  assert(!chat.includes("type: 'openControlCenter'"), 'the gear never asks the host for another panel');
 
   const extension = read(join(SRC, 'extension.ts'));
-  assert(extension.includes('LauncherViewProvider'), 'the activity bar is only a launcher');
+  assert(
+    extension.includes('registerWebviewViewProvider(ChatViewProvider.viewType, chatProvider'),
+    'the extension registers the chat as the primary activity-bar view',
+  );
+  assert(!extension.includes('LauncherViewProvider'), 'the obsolete launcher card is gone');
   assert(!extension.includes('Edition8Panel.createOrShow'), 'no command creates a settings panel');
   assert(extension.includes('showEdition8Screen'), 'Edition 8 commands target internal views');
 
   const pkg = JSON.parse(read(join(SRC, '..', 'package.json')));
+  const viewContainers = Object.keys(pkg.contributes.viewsContainers ?? {});
+  assert(viewContainers.includes('activitybar'), 'the primary container is the activity bar');
+  const container = pkg.contributes.viewsContainers.activitybar.find((entry) => entry.id === 'faktor');
+  assert(container !== undefined, 'the Faktor activity-bar container is contributed');
   const views = Object.values(pkg.contributes.views).flat();
   assert(views.length === 1, `one activity-bar view, found ${views.length}`);
-  assert(views[0].id === 'faktor.launcher', 'the activity-bar entry is the launcher');
+  assert(views[0].id === 'faktor.launcher', 'the activity-bar entry hosts the chat view');
+  assert(views[0].type === 'webview', 'the activity-bar entry is a webview view');
   assert(
     !views.some((entry) => entry.id === 'faktor.chat' || entry.id === 'faktor.edition8'),
     'no duplicate chat/settings sidebar views remain',
   );
   assert(
-    pkg.activationEvents.includes('onView:faktor.launcher') &&
-      !pkg.activationEvents.includes('onView:faktor.chat') &&
-      !pkg.activationEvents.includes('onView:faktor.edition8'),
-    'activation follows the single launcher view',
+    pkg.activationEvents.includes('onView:faktor.launcher'),
+    'activation follows the primary sidebar view',
   );
   if (process.exitCode !== 1) {
-    console.log('PASS  one editor panel, one launcher view, internal Settings/Inspect/History/Diagnostics');
+    console.log('PASS  sidebar-default: one activity-bar webview view, no editor panel, internal Settings/Inspect/History/Diagnostics');
   }
 }
 
 // ----------------------------------------------------- host idempotence test
 
 async function hostChecks() {
-  const created = [];
+  const panels = [];
   const commands = [];
   const originalLoad = require('node:module')._load;
   class FakeUri {
@@ -141,46 +151,43 @@ async function hostChecks() {
       return `file://${this.fsPath}`;
     }
   }
+  function fakeView(label) {
+    const view = {
+      label,
+      shown: [],
+      posted: [],
+      disposed: false,
+      webview: {
+        cspSource: 'vscode-resource:',
+        html: '',
+        options: null,
+        asWebviewUri: (uri) => uri,
+        postMessage: async (message) => {
+          view.posted.push(message);
+          return true;
+        },
+        onDidReceiveMessage: (listener) => {
+          view.listener = listener;
+          return { dispose() {} };
+        },
+      },
+      show(preserveFocus) {
+        view.shown.push({ preserveFocus });
+      },
+      onDidDispose: (listener) => {
+        view.disposeListener = listener;
+        return { dispose() {} };
+      },
+    };
+    return view;
+  }
   const vscode = {
     Uri: FakeUri,
     ViewColumn: { Active: -1, One: 1, Two: 2 },
     window: {
-      createWebviewPanel(type, title, column, options) {
-        const panel = {
-          type,
-          title,
-          column,
-          options,
-          revealed: [],
-          posted: [],
-          disposed: false,
-          webview: {
-            cspSource: 'vscode-resource:',
-            html: '',
-            asWebviewUri: (uri) => uri,
-            postMessage: async (message) => {
-              panel.posted.push(message);
-              return true;
-            },
-            onDidReceiveMessage: (listener) => {
-              panel.listener = listener;
-              return { dispose() {} };
-            },
-          },
-          reveal(viewColumn, preserveFocus) {
-            panel.revealed.push({ viewColumn, preserveFocus });
-          },
-          onDidDispose: (listener) => {
-            panel.disposeListener = listener;
-            return { dispose() {} };
-          },
-          dispose() {
-            panel.disposed = true;
-            panel.disposeListener?.();
-          },
-        };
-        created.push(panel);
-        return panel;
+      createWebviewPanel() {
+        panels.push(true);
+        throw new Error('the chat must never create an editor-area panel');
       },
       createOutputChannel: () => ({ appendLine() {}, dispose() {} }),
     },
@@ -196,20 +203,37 @@ async function hostChecks() {
     return originalLoad.call(this, request, parent, isMain);
   };
   try {
-    const { ChatViewProvider, LauncherViewProvider } = require('../out/webview.js');
+    const { ChatViewProvider } = require('../out/webview.js');
     const host = { handle: () => {}, onViewResolved: () => {} };
     const provider = new ChatViewProvider(
       { extensionUri: new FakeUri('/extension'), subscriptions: [] },
       host,
     );
     provider.focus();
-    provider.focus();
-    assert(created.length === 1, `command focus creates one panel, found ${created.length}`);
-    assert(created[0].column === -1, 'the panel opens in the active editor column');
-    assert(created[0].revealed.length === 1, 'the second command only reveals the panel');
-    assert(created[0].revealed[0].viewColumn === undefined, 'reveal never moves/splits columns');
-    assert(created[0].options.enableScripts && created[0].options.retainContextWhenHidden, 'panel state is retained');
+    assert(panels.length === 0, 'the default surface never creates an editor panel');
+    assert(
+      commands.includes('faktor.launcher.focus'),
+      'focus before resolution reveals the activity-bar view',
+    );
 
+    const view = fakeView('first');
+    provider.resolveWebviewView(view);
+    assert(view.webview.html.includes('data-surface="sidebar"'), 'the resolved view renders the sidebar surface');
+    assert(view.webview.html.includes('id="goal"'), 'the resolved view includes the composer');
+    assert(!view.webview.html.includes('welcome-prompts'), 'the resolved view has no suggestion wall');
+    assert(view.show.length >= 0, 'the view exposes show()');
+
+    view.posted.length = 0;
+    provider.focus();
+    provider.focus();
+    assert(view.shown.length === 2, `focus re-shows the same view (shown ${view.shown.length})`);
+    assert(panels.length === 0, 'focus never creates a panel');
+    assert(
+      view.posted.some((message) => message.type === 'faktorShowView' && message.view === 'work'),
+      'Chat is the default internal destination',
+    );
+
+    view.posted.length = 0;
     provider.showSettings('S03', false);
     provider.showView('inspect');
     provider.showView('history');
@@ -219,46 +243,51 @@ async function hostChecks() {
     provider.showEdition8Screen('S41');
     provider.showEdition8Screen('S26');
     provider.showEdition8Screen('S03');
-    assert(created.length === 1, 'every gear/overflow/command view switch reuses the one panel');
-    const posted = created[0].posted;
-    assert(posted.some((message) => message.type === 'faktorShowView' && message.view === 'settings'), 'Settings switch is posted locally');
-    assert(posted.some((message) => message.type === 'e8SelectScreen' && message.screen === 'S03'), 'a settings detail is selected in place');
-    assert(posted.some((message) => message.type === 'faktorShowView' && message.view === 'work'), 'Chat is an internal destination');
-    created[0].listener?.({ type: 'openSettingsView' });
-    assert(created.length === 1, 'the gear message never creates a second panel');
-    created[0].posted.length = 0;
-    provider.showSettings('S03', false);
-    created[0].listener?.({ type: 'ready' });
+    assert(panels.length === 0, 'every gear/overflow/command view switch reuses the one view');
     assert(
-      created[0].posted.some((message) => message.type === 'faktorShowView' && message.view === 'settings'),
+      view.posted.some((message) => message.type === 'faktorShowView' && message.view === 'settings'),
+      'Settings switch is posted locally',
+    );
+    assert(
+      view.posted.some((message) => message.type === 'e8SelectScreen' && message.screen === 'S03'),
+      'a settings detail is selected in place',
+    );
+    assert(
+      view.posted.some((message) => message.type === 'faktorShowView' && message.view === 'work'),
+      'Chat is an internal destination',
+    );
+
+    view.listener?.({ type: 'openSettingsView' });
+    assert(panels.length === 0, 'the gear message never creates a panel');
+    view.posted.length = 0;
+    provider.showSettings('S03', false);
+    view.listener?.({ type: 'ready' });
+    assert(
+      view.posted.some((message) => message.type === 'faktorShowView' && message.view === 'settings'),
       'a first-action Settings command is replayed after the webview handshake',
     );
     assert(
-      created[0].posted.some((message) => message.type === 'e8SelectScreen' && message.screen === 'S03'),
+      view.posted.some((message) => message.type === 'e8SelectScreen' && message.screen === 'S03'),
       'a first-action settings detail is replayed after the webview handshake',
     );
 
-    const launcher = new LauncherViewProvider();
-    let launcherListener = null;
-    const view = {
-      webview: {
-        cspSource: 'vscode-resource:',
-        html: '',
-        options: null,
-        onDidReceiveMessage(listener) {
-          launcherListener = listener;
-          return { dispose() {} };
-        },
-      },
-    };
-    launcher.resolveWebviewView(view);
-    assert(view.webview.html.includes('Open Faktor'), 'the activity bar renders only the launcher');
-    assert(!view.webview.html.includes('id="goal"'), 'the sidebar does not duplicate chat');
-    launcherListener?.({ type: 'open' });
-    await sleep(0);
-    assert(commands.includes('faktor.openChat'), 'the launcher opens the same panel command');
+    // A hidden view may be disposed; the next command must focus the same
+    // sidebar view id, never fall back to an editor tab.
+    view.disposeListener?.();
+    commands.length = 0;
+    provider.focus();
+    assert(panels.length === 0, 'a disposed view still never creates an editor panel');
+    assert(
+      commands.includes('faktor.launcher.focus'),
+      'a disposed view re-focuses the primary activity-bar view',
+    );
+
+    const second = fakeView('second');
+    provider.resolveWebviewView(second);
+    assert(second.webview.html.includes('data-surface="sidebar"'), 'a re-resolved view keeps the sidebar surface');
+    assert(panels.length === 0, 're-resolution never creates an editor panel');
     if (process.exitCode !== 1) {
-      console.log('PASS  idempotent panel: one create, reveal-only focus, internal view switches, launcher opens same command');
+      console.log('PASS  idempotent sidebar view: re-show only, internal switches, no editor panel');
     }
   } finally {
     require('node:module')._load = originalLoad;
@@ -266,6 +295,185 @@ async function hostChecks() {
 }
 
 // ------------------------------------------------------------- real DOM test
+
+const PROBE = `(function () {
+  var rect = function (node) {
+    var r = node.getBoundingClientRect();
+    return { top: r.top, bottom: r.bottom, left: r.left, right: r.right, width: r.width, height: r.height };
+  };
+  var visible = function (node) {
+    return !!node && !node.hidden && node.getClientRects().length > 0 && getComputedStyle(node).display !== 'none';
+  };
+  var work = document.getElementById('work-panel');
+  var header = document.querySelector('#app > header');
+  var transcript = document.getElementById('transcript-card');
+  var entries = document.getElementById('entries');
+  var composer = document.getElementById('composer');
+  var goal = document.getElementById('goal');
+  var welcome = document.getElementById('welcome');
+  var entryNodes = entries ? Array.prototype.slice.call(entries.children) : [];
+  var entriesRect = entries ? rect(entries) : null;
+  var topmostVisible = null;
+  var bestVisibleOverlap = 0;
+  if (entries) {
+    for (var i = 0; i < entryNodes.length; i += 1) {
+      var entryRect = rect(entryNodes[i]);
+      var overlap =
+        Math.min(entryRect.bottom, entriesRect.bottom) -
+        Math.max(entryRect.top, entriesRect.top);
+      if (overlap > 0 && topmostVisible === null) {
+        topmostVisible = entryRect;
+      }
+      if (overlap > bestVisibleOverlap) {
+        bestVisibleOverlap = overlap;
+      }
+    }
+  }
+  var transcriptRect = transcript ? rect(transcript) : null;
+  var composerRect = composer ? rect(composer) : null;
+  var workRect = work ? rect(work) : null;
+  var welcomeRect = welcome && visible(welcome) ? rect(welcome) : null;
+  var welcomeButtons = welcome ? welcome.querySelectorAll('button') : [];
+  return {
+    surface: document.body.getAttribute('data-surface'),
+    overflow: document.documentElement.scrollWidth - window.innerWidth,
+    innerHeight: window.innerHeight,
+    header: header && visible(header) ? rect(header) : null,
+    work: workRect,
+    transcript: transcriptRect,
+    entries: entriesRect,
+    composer: composerRect,
+    composerPosition: composer ? getComputedStyle(composer).position : null,
+    goal: goal ? rect(goal) : null,
+    entryCount: entryNodes.length,
+    topmostVisibleEntry: topmostVisible,
+    bestVisibleOverlap: bestVisibleOverlap,
+    welcome: welcome
+      ? {
+          visible: visible(welcome),
+          hidden: welcome.hidden,
+          height: welcomeRect ? welcomeRect.height : 0,
+          text: String(welcome.textContent || '').trim(),
+          buttons: welcomeButtons.length,
+        }
+      : null,
+    suggestionWall: document.querySelectorAll(
+      '.welcome-chip, .welcome-prompts, .welcome-lead, .welcome-mark, .suggestion, [data-suggestion]',
+    ).length,
+    chatTabs: work
+      ? work.querySelectorAll('[role="tab"], .nav-tab, #nav-switcher, [id^="nav-"]').length
+      : 0,
+  };
+})()`;
+
+function conversationVisible(probe) {
+  if (
+    probe.transcript === null ||
+    probe.entries === null ||
+    probe.transcript.height <= 40 ||
+    probe.entries.height <= 40 ||
+    probe.entryCount === 0 ||
+    probe.topmostVisibleEntry === null
+  ) {
+    return false;
+  }
+  // The transcript follows the newest turn (initial load pins to the bottom),
+  // so the top message may be clipped at a 240-320px width. The surface is
+  // conversation-first when a real turn occupies a readable slice of the
+  // visible transcript above the composer.
+  return probe.bestVisibleOverlap >= 24;
+}
+
+function assertLayout(probe, context) {
+  assert(probe.surface === 'sidebar', `${context}: surface is ${probe.surface}, expected sidebar`);
+  assert(probe.overflow <= 1, `${context}: no horizontal overflow (${probe.overflow}px)`);
+  assert(probe.header !== null, `${context}: the product header is visible`);
+  assert(probe.header.height <= 64, `${context}: the header stays compact (${probe.header.height}px)`);
+  assert(probe.chatTabs === 0, `${context}: the chat body has no tabs (${probe.chatTabs})`);
+  assert(probe.suggestionWall === 0, `${context}: no suggestion wall is present (${probe.suggestionWall})`);
+  assert(probe.transcript !== null && probe.transcript.height > 80, `${context}: transcript fills the sidebar`);
+  assert(probe.entries !== null && probe.entries.height > 40, `${context}: transcript content area is visible`);
+  assert(probe.transcript.top >= probe.header.bottom - 0.5, `${context}: transcript overlaps the header`);
+  assert(probe.composerPosition !== 'fixed' && probe.composerPosition !== 'absolute' && probe.composerPosition !== 'sticky', `${context}: composer is in flow (${probe.composerPosition})`);
+  assert(probe.composer.top >= probe.transcript.bottom - 1, `${context}: composer overlaps the transcript`);
+  assert(probe.composer.bottom <= probe.innerHeight + 1, `${context}: composer leaves the viewport`);
+  assert(
+    probe.composer.height <= 140,
+    `${context}: composer stays compact (${probe.composer.height}px > 140px)`,
+  );
+  assert(
+    probe.goal !== null && probe.goal.height >= 34 && probe.goal.height <= 122,
+    `${context}: the one input is 36-120px (${probe.goal ? probe.goal.height : 'missing'}px)`,
+  );
+  assert(conversationVisible(probe), `${context}: conversation content is not visible above the fold`);
+}
+
+function screenshot(cdp, path) {
+  return cdp.send('Page.captureScreenshot', { format: 'png' }).then((shot) => {
+    writeFileSync(path, Buffer.from(shot.data, 'base64'));
+  });
+}
+
+async function measure(cdp, url, width, height = 900) {
+  await cdp.send('Emulation.setDeviceMetricsOverride', {
+    width,
+    height,
+    deviceScaleFactor: 1,
+    mobile: false,
+  });
+  const loaded = cdp.waitFor('Page.loadEventFired');
+  await cdp.send('Page.navigate', { url });
+  await loaded;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const ready = await cdp.evaluate('window.__ready === true');
+    if (ready) break;
+    await sleep(50);
+  }
+  await cdp.evaluate('new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)))');
+  return cdp.evaluate(PROBE);
+}
+
+function writePage(html, prefix) {
+  const dir = require('node:fs').mkdtempSync(join(require('node:os').tmpdir(), prefix));
+  const path = join(dir, 'index.html');
+  writeFileSync(path, html);
+  return pathToFileURL(path).href;
+}
+
+function injectSuggestionWall(html) {
+  const point = html.indexOf('<div id="entries"');
+  if (point < 0) throw new Error('could not find the transcript in the harness HTML');
+  return (
+    html.slice(0, point) +
+    '<div class="welcome-prompts"><button class="welcome-chip">Find and fix the failing tests</button></div>' +
+    html.slice(point)
+  );
+}
+
+function injectConversationHidingWall(html) {
+  const point = html.indexOf('<section id="transcript-card"');
+  if (point < 0) throw new Error('could not find the transcript card in the harness HTML');
+  return (
+    html.slice(0, point) +
+    '<div class="mutated-suggestion-wall" style="flex:none;height:900px">suggestion wall</div>' +
+    html.slice(point)
+  );
+}
+
+function mutateEditorSurface(html) {
+  return html.replace('data-surface="sidebar"', 'data-surface="editor"');
+}
+
+function injectBloatedComposer(html) {
+  const point = html.indexOf('<form id="composer"');
+  if (point < 0) throw new Error('could not find the composer in the harness HTML');
+  const open = html.indexOf('>', point) + 1;
+  return (
+    html.slice(0, open) +
+    '<div class="mutated-composer-wall" style="flex:none;height:220px">composer wall</div>' +
+    html.slice(open)
+  );
+}
 
 async function domChecks() {
   const chrome = findChrome();
@@ -278,119 +486,131 @@ async function domChecks() {
   const cdp = await connect(child.pageWs);
   await cdp.send('Page.enable');
   await cdp.send('Runtime.enable');
-  const html = buildHarnessHtml(false);
-  const pagePath = join(OUT, 'harness.html');
-  writeFileSync(pagePath, html);
-  const url = pathToFileURL(pagePath).href;
+  const populated = buildHarnessHtml(false);
+  const empty = buildHarnessHtml(true);
+  const populatedUrl = writePage(populated, 'faktor-window-populated-');
+  const emptyUrl = writePage(empty, 'faktor-window-empty-');
   try {
-    for (const width of [480, 1440]) {
-      await cdp.send('Emulation.setDeviceMetricsOverride', {
-        width,
-        height: 900,
-        deviceScaleFactor: 1,
-        mobile: false,
-      });
-      await cdp.send('Page.navigate', { url });
-      await sleep(350);
-      await cdp.evaluate('document.getElementById("goal").value = "ask survives the switch"');
-      await cdp.evaluate('document.getElementById("btn-intent-task").click()');
-      await cdp.evaluate('document.getElementById("btn-intent-ask").click()');
-      const chat = await cdp.evaluate(`(function () {
-        var work = document.getElementById('work-panel');
-        var transcript = document.getElementById('transcript-card');
-        var entries = document.getElementById('entries');
-        var composer = document.getElementById('composer');
-        function rect(node) { return node.getBoundingClientRect(); }
-        var parts = [document.getElementById('attention-card'), document.getElementById('permission-card'), transcript, composer]
-          .filter(function (node) { return node && !node.hidden; })
-          .map(rect);
-        var workRect = rect(work);
-        var transcriptRect = rect(transcript);
-        var composerRect = rect(composer);
-        var visibleHeaders = Array.prototype.filter.call(document.querySelectorAll('#app > header, .e8-header'), function (node) {
-          return node.getBoundingClientRect().height > 0 && getComputedStyle(node).display !== 'none';
-        });
-        return {
-          overflow: document.documentElement.scrollWidth - window.innerWidth,
-          widths: parts.map(function (part) { return Math.round(part.width); }),
-          lefts: parts.map(function (part) { return Math.round(part.left); }),
-          workHeight: Math.round(workRect.height),
-          workBottom: Math.round(workRect.bottom),
-          transcriptBottom: Math.round(transcriptRect.bottom),
-          composerTop: Math.round(composerRect.top),
-          composerBottom: Math.round(composerRect.bottom),
-          flexGrow: getComputedStyle(transcript).flexGrow,
-          entriesOverflow: getComputedStyle(entries).overflowY,
-          entriesScrolls: entries.scrollHeight > entries.clientHeight,
-          visibleHeaders: visibleHeaders.length,
-          goal: document.getElementById('goal').value,
-          intent: document.getElementById('btn-intent-ask').getAttribute('aria-checked'),
-          settingsHidden: document.getElementById('settings-panel').hidden,
-          settingsHeadersVisible: Array.prototype.filter.call(
-            document.querySelectorAll('#settings-panel .e8-header'),
-            function (node) { return node.getBoundingClientRect().height > 0; },
-          ).length,
-        };
-      })()`);
-      assert(chat.overflow <= 1, `${width}px: no horizontal overflow (${chat.overflow}px)`);
-      assert(new Set(chat.widths).size === 1, `${width}px: every chat region spans one column (${chat.widths})`);
-      assert(new Set(chat.lefts).size === 1, `${width}px: no side-by-side chat regions (${chat.lefts})`);
-      assert(chat.workHeight > 300, `${width}px: chat fills the window height`);
-      assert(chat.flexGrow === '1', `${width}px: the transcript owns the flexible height`);
-      assert(chat.entriesOverflow === 'auto' || chat.entriesOverflow === 'scroll', `${width}px: transcript has its own scroll`);
-      assert(chat.composerTop >= chat.transcriptBottom - 1, `${width}px: composer follows the transcript in flow`);
-      assert(chat.composerBottom <= chat.workBottom + 1, `${width}px: composer never overlaps/clips the work surface`);
-      assert(chat.visibleHeaders === 1, `${width}px: exactly one visible header (found ${chat.visibleHeaders})`);
-      assert(chat.settingsHeadersVisible === 0, `${width}px: no duplicate Settings header`);
-      assert(chat.settingsHidden, `${width}px: Settings is an internal hidden view initially`);
-      assert(chat.goal === 'ask survives the switch', `${width}px: draft survives internal switches`);
-      assert(chat.intent === 'true', `${width}px: Ask intent survives internal switches`);
+    for (const width of WIDTHS) {
+      const probe = await measure(cdp, populatedUrl, width);
+      assertLayout(probe, `sidebar@${width}px`);
+      assert(probe.welcome !== null && probe.welcome.hidden, `${width}px: the empty line disappears after the first message`);
+      assert(conversationVisible(probe), `${width}px: conversation-visible`);
+      await screenshot(cdp, join(OUT, `sidebar-${width}.png`));
+      console.log(`PASS  ${width}px: conversation visible above the fold (${join(OUT, `sidebar-${width}.png`)})`);
 
-      const shot = await cdp.send('Page.captureScreenshot', { format: 'png' });
-      writeFileSync(join(OUT, `chat-${width}.png`), Buffer.from(shot.data, 'base64'));
-
-      // Gear: switch to Settings inside the SAME document.
-      await cdp.evaluate('document.getElementById("btn-control-center").click()');
-      await sleep(120);
-      const settings = await cdp.evaluate(`(function () {
-        var visibleHeaders = Array.prototype.filter.call(document.querySelectorAll('#app > header, .e8-header'), function (node) {
-          return node.getBoundingClientRect().height > 0 && getComputedStyle(node).display !== 'none';
-        });
-        return {
-          workHidden: document.getElementById('work-panel').hidden,
-          settingsHidden: document.getElementById('settings-panel').hidden,
-          headerCount: visibleHeaders.length,
-          e8HeaderVisible: Array.prototype.some.call(
-            document.querySelectorAll('#settings-panel .e8-header'),
-            function (node) { return node.getBoundingClientRect().height > 0; },
-          ),
-          overflow: document.documentElement.scrollWidth - window.innerWidth,
-          settingsWidth: Math.round(document.getElementById('settings-panel').getBoundingClientRect().width),
-        };
-      })()`);
-      assert(settings.workHidden && settings.settingsHidden === false, `${width}px: gear swaps to Settings in place`);
-      assert(settings.headerCount === 1, `${width}px: Settings keeps the one header (found ${settings.headerCount})`);
-      assert(!settings.e8HeaderVisible, `${width}px: the embedded settings header is hidden`);
-      assert(settings.overflow <= 1, `${width}px: Settings has no horizontal overflow`);
-      assert(settings.settingsWidth > 300, `${width}px: Settings fills the same surface`);
-      const settingsShot = await cdp.send('Page.captureScreenshot', { format: 'png' });
-      writeFileSync(join(OUT, `settings-${width}.png`), Buffer.from(settingsShot.data, 'base64'));
-
-      // Host/internal switch back to Chat; the document (and its state) stays.
-      await cdp.evaluate('window.postMessage({ type: "faktorShowView", view: "work" }, "*")');
-      await sleep(80);
-      const restored = await cdp.evaluate(`(function () {
-        return {
-          workHidden: document.getElementById('work-panel').hidden,
-          settingsHidden: document.getElementById('settings-panel').hidden,
-          goal: document.getElementById('goal').value,
-          intent: document.getElementById('btn-intent-ask').getAttribute('aria-checked'),
-        };
-      })()`);
-      assert(restored.workHidden === false && restored.settingsHidden === true, `${width}px: Chat returns without a new document`);
-      assert(restored.goal === 'ask survives the switch' && restored.intent === 'true', `${width}px: Ask/Intent preserved across the return`);
-      console.log(`PASS  ${width}px: one column, transcript scroll, composer in flow, one header, state preserved (${join(OUT, `chat-${width}.png`)})`);
+      const emptyProbe = await measure(cdp, emptyUrl, width);
+      assert(emptyProbe.surface === 'sidebar', `${width}px empty: sidebar surface`);
+      assert(emptyProbe.overflow <= 1, `${width}px empty: no horizontal overflow`);
+      assert(emptyProbe.suggestionWall === 0, `${width}px empty: no suggestion wall`);
+      assert(
+        emptyProbe.welcome !== null && emptyProbe.welcome.visible,
+        `${width}px empty: the compact empty line is visible`,
+      );
+      assert(
+        emptyProbe.welcome.height <= 28,
+        `${width}px empty: the empty state is at most one compact line (${emptyProbe.welcome.height}px)`,
+      );
+      assert(
+        emptyProbe.welcome.buttons === 0,
+        `${width}px empty: the empty state has no buttons or prompt chips`,
+      );
+      assert(
+        emptyProbe.transcript !== null && emptyProbe.transcript.height > 80,
+        `${width}px empty: the transcript still fills the sidebar`,
+      );
+      assert(
+        emptyProbe.composer !== null && emptyProbe.composer.bottom <= emptyProbe.innerHeight + 1,
+        `${width}px empty: the composer stays in the viewport`,
+      );
+      assert(
+        emptyProbe.composer !== null && emptyProbe.composer.height <= 140,
+        `${width}px empty: the composer stays compact (${emptyProbe.composer ? emptyProbe.composer.height : 'missing'}px)`,
+      );
+      await screenshot(cdp, join(OUT, `sidebar-empty-${width}.png`));
+      console.log(`PASS  ${width}px: compact empty line, no suggestion wall (${join(OUT, `sidebar-empty-${width}.png`)})`);
     }
+
+    // Every Settings/Inspect/History/Diagnostics destination is an internal
+    // view of the SAME sidebar document: no editor tab, no split and no new
+    // webview. Chat stays the default destination and its draft survives.
+    const internalViews = {
+      inspect: 'inspect-panel',
+      history: 'history-panel',
+      diagnostics: 'diagnostics',
+      settings: 'settings-panel',
+    };
+    await measure(cdp, populatedUrl, 320);
+    await cdp.evaluate('document.getElementById("goal").value = "draft survives"');
+    for (const [key, panelId] of Object.entries(internalViews)) {
+      await cdp.evaluate(`document.getElementById('menu-${key}').click()`);
+      await sleep(80);
+      const state = await cdp.evaluate(`(function () {
+        var panels = ['work-panel', 'inspect-panel', 'history-panel', 'diagnostics', 'settings-panel'];
+        var visible = panels.filter(function (id) { var node = document.getElementById(id); return node && !node.hidden; });
+        return {
+          visible: visible,
+          targetHidden: document.getElementById('${panelId}').hidden,
+          workHidden: document.getElementById('work-panel').hidden,
+          overflow: document.documentElement.scrollWidth - window.innerWidth,
+          headers: Array.prototype.filter.call(document.querySelectorAll('#app > header, .e8-header'), function (node) {
+            return node.getBoundingClientRect().height > 0 && getComputedStyle(node).display !== 'none';
+          }).length,
+        };
+      })()`);
+      assert(state.targetHidden === false, `internal ${key}: destination is visible`);
+      assert(state.workHidden === true, `internal ${key}: chat is not the active destination`);
+      assert(state.visible.length === 1, `internal ${key}: exactly one destination is visible (${state.visible.join(',')})`);
+      assert(state.overflow <= 1, `internal ${key}: no horizontal overflow`);
+      assert(state.headers === 1, `internal ${key}: exactly one header (found ${state.headers})`);
+      await screenshot(cdp, join(OUT, `sidebar-${key}-320.png`));
+    }
+    await cdp.evaluate('document.getElementById("menu-chat").click()');
+    await sleep(80);
+    const restored = await cdp.evaluate(`(function () {
+      return {
+        workHidden: document.getElementById('work-panel').hidden,
+        otherHidden: ['inspect-panel', 'history-panel', 'diagnostics', 'settings-panel']
+          .every(function (id) { return document.getElementById(id).hidden; }),
+        draft: document.getElementById('goal').value,
+      };
+    })()`);
+    assert(restored.workHidden === false && restored.otherHidden === true, 'internal views return to Chat in place');
+    assert(restored.draft === 'draft survives', 'the Chat draft survives internal view switches');
+    console.log('PASS  Settings/Inspect/History/Diagnostics are internal sidebar views (no editor tab)');
+
+    // Mutation witness 1: a suggestion wall must be observed by the same probe.
+    const wallUrl = writePage(injectSuggestionWall(populated), 'faktor-window-wall-');
+    const wallProbe = await measure(cdp, wallUrl, 320);
+    assert(wallProbe.suggestionWall > 0, 'no-suggestion-wall witness did not detect an injected wall');
+    console.log(`PASS  no-suggestion-wall witness observed ${wallProbe.suggestionWall} suggestion element(s)`);
+
+    // Mutation witness 2: an editor-tab surface marker must flip sidebar-default.
+    const editorUrl = writePage(mutateEditorSurface(populated), 'faktor-window-editor-');
+    const editorProbe = await measure(cdp, editorUrl, 320);
+    assert(editorProbe.surface !== 'sidebar', 'sidebar-default witness did not detect an editor surface');
+    console.log(`PASS  sidebar-default witness observed surface ${editorProbe.surface}`);
+
+    // Mutation witness 3: a wall that pushes the conversation down must flip
+    // conversation-visible.
+    const hideUrl = writePage(injectConversationHidingWall(populated), 'faktor-window-hidden-');
+    const hideProbe = await measure(cdp, hideUrl, 320);
+    assert(
+      !conversationVisible(hideProbe),
+      'conversation-visible witness still reported the hidden conversation as visible',
+    );
+    console.log('PASS  conversation-visible witness detected the conversation pushed below the fold');
+
+    // Mutation witness 4: a bloated composer must exceed the compact bound.
+    const bloatedUrl = writePage(injectBloatedComposer(populated), 'faktor-window-bloated-');
+    const bloatedProbe = await measure(cdp, bloatedUrl, 320);
+    assert(
+      bloatedProbe.composer !== null && bloatedProbe.composer.height > 140,
+      `compact-composer witness did not detect the bloated composer (${bloatedProbe.composer ? bloatedProbe.composer.height : 'missing'}px)`,
+    );
+    console.log(
+      `PASS  compact-composer witness observed a ${Math.round(bloatedProbe.composer.height)}px composer`,
+    );
   } finally {
     cdp.ws.close();
     child.child.kill('SIGKILL');

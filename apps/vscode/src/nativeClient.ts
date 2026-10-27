@@ -145,6 +145,55 @@ export class NativeApiError extends Error {
   }
 }
 
+/**
+ * A request that never produced an HTTP exchange: the daemon is unreachable,
+ * the loopback port is stale, the connection was reset, or the request
+ * deadline elapsed. This is DELIBERATELY distinct from
+ * [`NativeProtocolError`]: an unreachable service is not a protocol
+ * violation, and callers can safely restart/refresh the connection and retry
+ * instead of presenting a raw "native protocol violation" to the operator.
+ * `code` carries the transport cause code when the runtime exposes one
+ * (`ECONNREFUSED`, `ECONNRESET`, `ENOTFOUND`, ...), never a secret.
+ */
+export class NativeTransportError extends Error {
+  readonly path: string;
+  readonly detail: string;
+  readonly code: string | null;
+  readonly retryable: boolean;
+
+  constructor(path: string, detail: string, code: string | null = null, retryable = true) {
+    const suffix = code !== null && !detail.includes(code) ? ` (${code})` : '';
+    super(`native transport failure at ${path}: ${detail}${suffix}`);
+    this.name = 'NativeTransportError';
+    this.path = path;
+    this.detail = detail;
+    this.code = code;
+    this.retryable = retryable;
+  }
+}
+
+/** First bounded transport cause code in the Error `cause` chain. */
+function transportCodeOf(error: unknown): string | null {
+  let current: unknown = error;
+  for (let depth = 0; depth < 5 && current !== null && current !== undefined; depth += 1) {
+    const code = (current as { code?: unknown }).code;
+    if (typeof code === 'string' && code.length > 0 && code.length <= 64) {
+      return code;
+    }
+    current = (current as { cause?: unknown }).cause;
+  }
+  return null;
+}
+
+function transportFailure(label: string, error: unknown): NativeTransportError {
+  const detail = error instanceof Error ? error.message : String(error);
+  return new NativeTransportError(
+    label,
+    detail.length > 0 ? detail : 'transport failed without a message',
+    transportCodeOf(error),
+  );
+}
+
 // ---------------------------------------------------------------- validation
 
 type JsonObject = { [key: string]: Json };
@@ -4214,10 +4263,7 @@ export class NativeClient {
         if (controller.signal.aborted) {
           throw timeoutError(`${method} ${path}`, timeout);
         }
-        throw new NativeProtocolError(
-          `${method} ${path}`,
-          `fetch failed: ${error instanceof Error ? error.message : String(error)}`,
-        );
+        throw transportFailure(`${method} ${path}`, error);
       }
       const label = `${method} ${path}`;
       if (!response.ok) {
@@ -4271,10 +4317,7 @@ export class NativeClient {
         if (controller.signal.aborted) {
           throw timeoutError(`${method} ${path}`, timeout);
         }
-        throw new NativeProtocolError(
-          `${method} ${path}`,
-          `fetch failed: ${error instanceof Error ? error.message : String(error)}`,
-        );
+        throw transportFailure(`${method} ${path}`, error);
       }
       const label = `${method} ${path}`;
       if (!response.ok) {
@@ -5099,8 +5142,8 @@ interface BodyReadDeadline {
   readonly timeoutMs: number;
 }
 
-function timeoutError(label: string, timeoutMs: number): NativeProtocolError {
-  return new NativeProtocolError(label, `request timed out after ${timeoutMs}ms`);
+function timeoutError(label: string, timeoutMs: number): NativeTransportError {
+  return new NativeTransportError(label, `request timed out after ${timeoutMs}ms`);
 }
 
 /**

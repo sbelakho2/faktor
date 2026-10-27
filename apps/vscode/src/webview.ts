@@ -68,16 +68,16 @@ export interface ChatHost {
 export type FaktorView = 'work' | 'settings' | 'inspect' | 'history' | 'diagnostics';
 
 /**
- * The ONE Faktor window. It is an editor-area WebviewPanel (opened like a
- * document), not a sidebar view and not a second settings panel. Chat,
- * Settings, Inspect, History and Diagnostics are internal destinations of
- * this same webview: the host never creates a panel per surface and never
- * splits an editor column.
+ * The ONE Faktor surface. It is the primary activity-bar webview view
+ * (`faktor.launcher`): a full-height sidebar conversation, never an editor
+ * tab by default. Chat, Settings, Inspect, History and Diagnostics are
+ * internal destinations of this same webview: the host never creates a
+ * panel per surface and never splits an editor column.
  */
-export class ChatViewProvider {
-  public static readonly viewType = 'faktor.panel';
+export class ChatViewProvider implements vscode.WebviewViewProvider {
+  public static readonly viewType = 'faktor.launcher';
 
-  private panel: vscode.WebviewPanel | null = null;
+  private view: vscode.WebviewView | null = null;
   private edition8Controller: Edition8Controller | null = null;
   private snapshot: FaktorSnapshot | null = null;
   private initialScreen = 'S29';
@@ -104,59 +104,30 @@ export class ChatViewProvider {
     return this.context.extensionUri;
   }
 
-  /** Create the one panel or focus the existing one without moving columns. */
-  private openPanel(): vscode.WebviewPanel {
-    if (this.panel !== null) {
-      this.panel.reveal(undefined, false);
-      return this.panel;
-    }
-    const panel = vscode.window.createWebviewPanel(
-      ChatViewProvider.viewType,
-      'Faktor',
-      vscode.ViewColumn.Active,
-      {
-        enableScripts: true,
-        retainContextWhenHidden: true,
-        localResourceRoots: [vscode.Uri.joinPath(this.extensionUri, 'media')],
-      },
-    );
-    this.panel = panel;
+  /**
+   * VS Code resolves the activity-bar view here. The view is the primary
+   * surface: it renders the chat document and owns its message transport.
+   * A hidden/re-created view re-posts the last snapshot and replays any
+   * pending internal destination after the webview's `ready` handshake.
+   */
+  public resolveWebviewView(view: vscode.WebviewView): void {
+    this.view = view;
+    view.webview.options = {
+      enableScripts: true,
+      localResourceRoots: [vscode.Uri.joinPath(this.extensionUri, 'media')],
+    };
+    this.edition8Controller?.dispose();
     const deps = this.edition8 === null ? null : this.edition8();
-    if (deps !== null) {
-      this.edition8Controller = new Edition8Controller(deps, (message) => this.post(message));
-    }
+    this.edition8Controller =
+      deps === null ? null : new Edition8Controller(deps, (message) => this.post(message));
     // Register the handler before the document so the `ready`/`e8Ready`
     // handshakes cannot fall into a gap.
-    panel.webview.onDidReceiveMessage((message: unknown) => {
-      if (!validChatMessage(message)) return;
-      if (message.type.startsWith('e8')) {
-        if (message.type === 'e8Ready' && this.pendingSettings !== null) {
-          this.post(
-            this.pendingSettings.home
-              ? { type: 'e8SettingsHome' }
-              : { type: 'e8SelectScreen', screen: this.pendingSettings.screen },
-          );
-        }
-        void this.edition8Controller?.handle(message as PanelMessage);
-        return;
-      }
-      if (message.type === 'openSettingsView') {
-        this.showSettings('S29');
-        return;
-      }
-      if (message.type === 'ready') {
-        if (this.pendingView !== null) {
-          this.post({ type: 'faktorShowView', view: this.pendingView });
-        }
-        void this.host.onViewResolved?.();
-      }
-      void this.host.handle(message);
-    });
-    panel.webview.html = this.render(panel.webview);
-    panel.onDidDispose(() => {
+    view.webview.onDidReceiveMessage((message: unknown) => this.handleMessage(message));
+    view.webview.html = this.render(view.webview);
+    view.onDidDispose(() => {
       this.edition8Controller?.dispose();
       this.edition8Controller = null;
-      this.panel = null;
+      this.view = null;
       if (this.flushTimer !== null) {
         clearTimeout(this.flushTimer);
         this.flushTimer = null;
@@ -167,21 +138,56 @@ export class ChatViewProvider {
       this.post({ type: 'snapshot', snapshot: this.snapshot });
     }
     void this.host.onViewResolved?.();
-    return panel;
+    if (this.pendingView === 'settings') this.refreshSettings();
   }
 
-  /** `Open` and the activity-bar launcher focus the one panel on Chat. */
+  private handleMessage(message: unknown): void {
+    if (!validChatMessage(message)) return;
+    if (message.type.startsWith('e8')) {
+      if (message.type === 'e8Ready' && this.pendingSettings !== null) {
+        this.post(
+          this.pendingSettings.home
+            ? { type: 'e8SettingsHome' }
+            : { type: 'e8SelectScreen', screen: this.pendingSettings.screen },
+        );
+      }
+      void this.edition8Controller?.handle(message as PanelMessage);
+      return;
+    }
+    if (message.type === 'openSettingsView') {
+      this.showSettings('S29');
+      return;
+    }
+    if (message.type === 'ready') {
+      if (this.pendingView !== null) {
+        this.post({ type: 'faktorShowView', view: this.pendingView });
+      }
+      void this.host.onViewResolved?.();
+    }
+    void this.host.handle(message);
+  }
+
+  /** Reveal the primary sidebar view; never create an editor tab. */
+  private reveal(): void {
+    if (this.view !== null) {
+      this.view.show(true);
+      return;
+    }
+    void vscode.commands.executeCommand(`${ChatViewProvider.viewType}.focus`);
+  }
+
+  /** `Open` and the activity bar focus the one view on Chat. */
   focus(): void {
     this.pendingView = 'work';
-    this.openPanel();
+    this.reveal();
     this.post({ type: 'faktorShowView', view: 'work' });
     void this.host.onViewResolved?.();
   }
 
-  /** Switch an already-open (or newly-created) panel to an internal view. */
+  /** Switch the one view to an internal destination. */
   showView(view: FaktorView): void {
     this.pendingView = view;
-    this.openPanel();
+    this.reveal();
     if (view === 'settings') {
       this.pendingSettings = { screen: 'S29', home: true };
       this.post({ type: 'e8SettingsHome' });
@@ -191,13 +197,13 @@ export class ChatViewProvider {
   }
 
   /**
-   * Open Settings inside the same panel. `home` selects the one settings
+   * Open Settings inside the same view. `home` selects the one settings
    * descriptor surface; otherwise the requested registry screen is selected.
    */
   showSettings(screen = 'S29', home = true): void {
     this.pendingView = 'settings';
     this.pendingSettings = { screen, home };
-    this.openPanel();
+    this.reveal();
     this.post({ type: 'faktorShowView', view: 'settings' });
     if (home) {
       this.post({ type: 'e8SettingsHome' });
@@ -249,7 +255,7 @@ export class ChatViewProvider {
     const next = this.pendingSnapshot;
     this.pendingSnapshot = null;
     if (next !== null) {
-      void this.panel?.webview.postMessage({ type: 'snapshot', snapshot: next });
+      void this.view?.webview.postMessage({ type: 'snapshot', snapshot: next });
     }
   }
 
@@ -383,7 +389,7 @@ export class ChatViewProvider {
     ) {
       this.flushPendingSnapshot();
     }
-    void this.panel?.webview.postMessage(message);
+    void this.view?.webview.postMessage(message);
   }
 
   private render(webview: vscode.Webview): string {
@@ -436,7 +442,7 @@ export class ChatViewProvider {
 <link href="${styleUri}" rel="stylesheet">
 <title>Faktor</title>
 </head>
-<body>
+<body data-surface="sidebar">
 <div id="app">
   <header>
     <span id="brand">Faktor</span>
@@ -538,45 +544,25 @@ export class ChatViewProvider {
     <ul id="permission-list" class="permission-list" aria-label="Pending permission requests"></ul>
   </section>
   <section id="transcript-card" class="card transcript-card">
-    <h2 id="transcript-title">Conversation</h2>
-    <section id="welcome" class="welcome">
-      <div class="welcome-mark" aria-hidden="true">
-        <svg viewBox="0 0 5 5" width="36" height="36" class="pixel pixel-done">
-          <rect class="pixel-body" x="1" y="0" width="3" height="5"></rect>
-          <rect class="pixel-body" x="0" y="1" width="5" height="3"></rect>
-          <rect class="pixel-body" x="0" y="4" width="1" height="1"></rect>
-          <rect class="pixel-body" x="4" y="4" width="1" height="1"></rect>
-          <rect class="pixel-eye" x="1" y="1" width="1" height="1"></rect>
-          <rect class="pixel-eye" x="3" y="1" width="1" height="1"></rect>
-        </svg>
-      </div>
-      <p class="welcome-lead">Describe a task below. Faktor plans it, works in an isolated candidate workspace, and runs the checks.</p>
-      <p class="welcome-lead">Follow the run as it works — every edit, test and verification result lands in the conversation.</p>
-      <p class="welcome-lead">Changes only land after verification passes; you stay in control of the final step.</p>
-      <p class="welcome-hint muted">Start with one of these:</p>
-      <ul class="welcome-prompts" aria-label="Example prompts">
-        <li><button type="button" class="welcome-chip" data-prompt="Find and fix the failing tests">Find and fix the failing tests</button></li>
-        <li><button type="button" class="welcome-chip" data-prompt="Review this change for correctness and edge cases">Review this change for correctness and edge cases</button></li>
-        <li><button type="button" class="welcome-chip" data-prompt="Implement the next item in the plan">Implement the next item in the plan</button></li>
-      </ul>
-    </section>
+    <p id="welcome" class="welcome-line muted">Ask Faktor to start a conversation.</p>
     <div id="entries" role="log" aria-live="polite" aria-relevant="additions" aria-label="Conversation transcript" tabindex="-1"></div>
   </section>
-  <form id="composer">
-    <div class="composer-intent-row">
-      <span class="composer-label" id="composer-intent-label">Intent</span>
-      <div id="composer-intent" class="composer-intent" role="radiogroup" aria-labelledby="composer-intent-label">
+  <form id="composer" data-intent="ask">
+    <textarea id="goal" rows="1" aria-label="Ask Faktor" placeholder="Ask anything…"></textarea>
+    <div class="composer-toolbar">
+      <button id="btn-attach" class="composer-icon" type="button" title="Attach files" aria-label="Attach files">
+        <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false"><path d="M10.5 4.5 5.6 9.4a1.7 1.7 0 0 0 2.4 2.4l5.2-5.2a3.2 3.2 0 0 0-4.5-4.5L3.2 7.6a4.7 4.7 0 0 0 6.6 6.6l4.1-4.1" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+      <button id="btn-clear-attachments" class="composer-icon" type="button" title="Clear attachments" aria-label="Clear attachments" hidden>
+        <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false"><path d="m4 4 8 8M12 4l-8 8" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+      </button>
+      <div id="composer-intent" class="composer-intent" role="radiogroup" aria-label="Intent">
         <button id="btn-intent-ask" class="intent-option" type="button" role="radio" aria-checked="true" data-intent="ask" title="Ask a question without starting a task">Ask</button>
         <button id="btn-intent-task" class="intent-option" type="button" role="radio" aria-checked="false" data-intent="task" title="Start a task run with the options below">Task</button>
       </div>
       <span id="composer-model" class="chip chip-model" hidden></span>
-    </div>
-    <label for="goal" class="composer-label">Ask Faktor…</label>
-    <textarea id="goal" rows="3" placeholder="Ask anything, or switch to Task for a full run."></textarea>
-    <div class="composer-chips">
-      <button id="btn-attach" class="chip chip-action" type="button" title="Attach files through the host file picker">Attach files…</button>
-      <button id="btn-clear-attachments" class="chip chip-action" type="button" hidden>Clear all</button>
-      <span id="attachment-hint" class="chip-hint muted">Drop files here or paste an image (Ctrl/Cmd+V).</span>
+      <span class="composer-spacer" aria-hidden="true"></span>
+      <button id="btn-send" class="primary-action" type="submit">Send</button>
     </div>
     <ul id="attachment-list" aria-label="Attached files"></ul>
     <div id="attachment-notice" class="muted" hidden role="status"></div>
@@ -608,9 +594,6 @@ export class ChatViewProvider {
       <span id="composer-state-glyph" class="state-strip-glyph" aria-hidden="true"></span>
       <span id="composer-state-label" class="state-strip-label"></span>
       <span id="composer-state-copy" class="state-strip-copy muted"></span>
-    </div>
-    <div class="composer-actions">
-      <button id="btn-send" class="primary-action" type="submit">Send</button>
     </div>
   </form>
   </main>
@@ -788,46 +771,5 @@ ${settingsMarkup}
 <script nonce="${nonce}" src="${scriptUri}"></script>
 </body>
 </html>`;
-  }
-}
-
-/**
- * The activity-bar entry is ONLY a launcher. Resolving it opens (or focuses)
- * the one editor panel; the sidebar never hosts a second chat or settings
- * surface. The small launcher card remains usable for a second click.
- */
-export class LauncherViewProvider implements vscode.WebviewViewProvider {
-  public static readonly viewType = 'faktor.launcher';
-
-  resolveWebviewView(view: vscode.WebviewView): void {
-    const nonce = randomBytes(16).toString('hex');
-    view.webview.options = { enableScripts: true };
-    view.webview.html = `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8" />
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${view.webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}'; base-uri 'none'; form-action 'none';" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Faktor</title>
-</head>
-<body>
-<main style="font-family: var(--vscode-font-family); color: var(--vscode-foreground); padding: 12px; display: grid; gap: 8px;">
-  <p style="margin: 0;">Faktor opens in the editor, as one window.</p>
-  <button type="button" data-faktor-open="true" style="min-height: 28px;">Open Faktor</button>
-</main>
-<script nonce="${nonce}">
-  const vscode = acquireVsCodeApi();
-  document.querySelector('[data-faktor-open]').addEventListener('click', function () {
-    vscode.postMessage({ type: 'open' });
-  });
-  vscode.postMessage({ type: 'open' });
-</script>
-</body>
-</html>`;
-    view.webview.onDidReceiveMessage((message: { type?: unknown }) => {
-      if (message !== null && typeof message === 'object' && message.type === 'open') {
-        void vscode.commands.executeCommand('faktor.openChat');
-      }
-    });
   }
 }

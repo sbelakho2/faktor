@@ -42,6 +42,7 @@ import * as e8approval from '../src/edition8/approval.ts';
 import * as oc from '../src/outcomes.ts';
 import * as ux from '../src/uxState.ts';
 import * as rr from '../src/refreshReads.ts';
+import * as ar from '../src/askRecovery.ts';
 import { renderEdition8Html, scriptJson } from '../src/edition8/html.ts';
 import { descriptorMap, loadEdition8Snapshot } from '../src/edition8/source.ts';
 import { controlView, screenView } from '../src/edition8/view.ts';
@@ -1882,8 +1883,31 @@ async function clientRejects() {
     });
     await assertRejects(
       () => hanging.health(),
-      (error) => error instanceof nc.NativeProtocolError && /timed out/.test(error.message),
+      (error) => error instanceof nc.NativeTransportError && /timed out/.test(error.message),
       'request timeout',
+    );
+  });
+
+  await test('a fetch rejection is a typed transport failure, never a protocol violation', async () => {
+    const cause = Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:65534'), {
+      code: 'ECONNREFUSED',
+    });
+    const refused = new nc.NativeClient({
+      baseUrl: 'http://127.0.0.1:65534',
+      bearerToken: 't',
+      fetch: async () => {
+        throw new TypeError('fetch failed', { cause });
+      },
+    });
+    await assertRejects(
+      () => refused.prompt('5', 'hello', { submissionId: '11111111-1111-4111-8111-111111111111' }),
+      (error) =>
+        error instanceof nc.NativeTransportError &&
+        !(error instanceof nc.NativeProtocolError) &&
+        error.code === 'ECONNREFUSED' &&
+        error.retryable === true &&
+        !/protocol violation/.test(error.message),
+      'typed fetch failure',
     );
   });
 
@@ -1919,7 +1943,7 @@ async function clientRejects() {
       { timeoutMs },
     );
     const deadlineError = (error) =>
-      error instanceof nc.NativeProtocolError &&
+      error instanceof nc.NativeTransportError &&
       error.message.includes(`request timed out after ${timeoutMs}ms`);
     // readBounded (JSON 2xx) must settle at the deadline, cancel the reader,
     // and not wait for the body to finish.
@@ -3895,6 +3919,59 @@ async function serviceLifecycleTests() {
     } finally {
       await harness.lifecycle.dispose();
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  await test('reconnectNow replaces a stale loopback address before the one Ask retry', async () => {
+    let launches = 0;
+    let resumes = 0;
+    const generations = [];
+    const connectionFor = () => {
+      launches += 1;
+      const port = 21000 + launches;
+      return fakeService({
+        port,
+        baseUrl: `http://127.0.0.1:${port}`,
+      });
+    };
+    const lifecycle = new sl.ServiceLifecycle({
+      prepare: async () => ({ ok: true, plan: servicePlan('/fake/faktor-cli') }),
+      launch: async () => connectionFor(),
+      probe: async (connection) => connection.alive(),
+      shutdown: async (connection) => {
+        connection.crash();
+      },
+      resume: async (_connection, generation) => {
+        resumes += 1;
+        generations.push(generation);
+      },
+      publish: () => {},
+      onAuthority: () => {},
+      config: {
+        connectingNoticeMs: 5,
+        probeIntervalMs: 20,
+        backoffBaseMs: 5,
+        maxRestarts: 4,
+        jitter: () => 0,
+      },
+    });
+    try {
+      await lifecycle.open();
+      await waitFor(() => resumes === 1, 5_000, 'the first connection');
+      const staleBaseUrl = lifecycle.view().diagnostics.baseUrl;
+      assertEqual(staleBaseUrl, 'http://127.0.0.1:21001');
+      // A prompt just failed at the transport layer: the AWAITED reconnect
+      // must return a replaced connection with a refreshed loopback address.
+      await lifecycle.reconnectNow();
+      await waitFor(() => resumes === 2, 5_000, 'the refreshed connection');
+      const freshBaseUrl = lifecycle.view().diagnostics.baseUrl;
+      assertEqual(freshBaseUrl, 'http://127.0.0.1:21002');
+      assert(staleBaseUrl !== freshBaseUrl, 'reconnectNow refreshes the address');
+      assertDeepEqual(generations, [1, 2], 'one resume per connection generation');
+      assertEqual(launches, 2, 'exactly one replacement launch');
+      assertEqual(lifecycle.view().phase, 'running');
+    } finally {
+      await lifecycle.dispose();
     }
   });
 
@@ -8666,7 +8743,8 @@ function canonicalDomDigest(nodesById) {
 
 /** Static-markup digest: nonces/URIs/CSP normalized, whitespace folded. */
 function webviewMarkupDigest(markup) {
-  const bodyStart = markup.indexOf('<body>');
+  const bodyOpen = /<body\b[^>]*>/.exec(markup);
+  const bodyStart = bodyOpen === null ? -1 : bodyOpen.index;
   const bodyEnd = markup.indexOf('</body>');
   assert(bodyStart >= 0 && bodyEnd > bodyStart, 'the webview markup must carry a body');
   const normalized = markup
@@ -9617,8 +9695,11 @@ async function composerAttachmentTests() {
     ]) {
       assert(markup.includes(`id="${id}"`), `the markup must carry #${id}`);
     }
-    assert(/<label for="goal"/.test(markup), 'the goal textarea must have a real <label for>');
-    assert(markup.includes('>Ask Faktor…</label>'), 'the accessible name must be the visible label text');
+    assert(
+      /<textarea id="goal"[^>]*aria-label="Ask Faktor"/.test(markup),
+      'the goal textarea has an accessible name without a big visible label',
+    );
+    assert(!markup.includes('>Ask Faktor…</label>'), 'the big composer label is gone');
     assert(
       /<main id="work-panel"[^>]*role="region"[^>]*aria-label="Chat"/.test(markup),
       'Chat is the default full-window region',
@@ -9686,7 +9767,7 @@ async function composerAttachmentTests() {
     // The slice must end at the composer's OWN closing tag: another form
     // (the board composer) earlier in the markup made a file-wide first
     // `</form>` search slice the wrong region.
-    const composerStart = markup.indexOf('<form id="composer">');
+    const composerStart = markup.indexOf('<form id="composer"');
     const composerEnd = markup.indexOf('</form>', composerStart);
     assert(composerStart >= 0 && composerEnd > composerStart, 'the composer form must be present');
     const composer = markup.slice(composerStart, composerEnd);
@@ -9694,10 +9775,13 @@ async function composerAttachmentTests() {
       'id="goal"',
       'id="btn-attach"',
       'id="btn-clear-attachments"',
+      'id="btn-intent-ask"',
+      'id="btn-intent-task"',
+      'id="composer-model"',
+      'id="btn-send"',
       'id="contract-commit"',
       'id="contract-push"',
       'id="contract-pr"',
-      'id="btn-send"',
     ].map((needle) => composer.indexOf(needle));
     for (let i = 0; i < order.length; i += 1) {
       assert(order[i] >= 0, `composer control ${i} must exist in the markup`);
@@ -15726,7 +15810,7 @@ async function askFirstUxTests() {
     assert(/id="btn-intent-ask"[^>]*aria-checked="true"/.test(markup), 'Ask is the default intent');
     assert(/id="btn-intent-task"[^>]*aria-checked="false"/.test(markup), 'Task is explicit, not default');
     assert(markup.includes('<summary>Task options</summary>'), 'one Task options disclosure');
-    const composerStart = markup.indexOf('<form id="composer">');
+    const composerStart = markup.indexOf('<form id="composer"');
     const composerEnd = markup.indexOf('</form>', composerStart);
     const composerMarkup = markup.slice(composerStart, composerEnd);
     assertEqual((composerMarkup.match(/<details /g) || []).length, 1, 'the composer has one disclosure');
@@ -15930,7 +16014,10 @@ async function askFirstUxTests() {
     for (const forbidden of ['billingPanelFor(', 'taskStartGate', 'proofFor(', 'startTask(']) {
       assert(!askBody.includes(forbidden), `Ask must not reach ${forbidden}`);
     }
-    assert(askBody.includes('sendAskTurn('), 'Ask posts the plain prompt helper');
+    assert(
+      askBody.includes('sendAskTurnWithRecovery('),
+      'Ask posts through the plain prompt helper with one bounded recovery',
+    );
     assert(askBody.includes('refreshConversation('), 'Ask refreshes conversation data only');
     for (const askOnly of [true, false]) {
       const plan = rr.refreshReadPlan({ askOnly });
@@ -15965,7 +16052,7 @@ async function askFirstUxTests() {
       const rule = ruleOf(source, '#composer');
       return (
         /flex:\s*none/.test(rule) &&
-        /safe-area-inset-bottom/.test(rule) &&
+        !/safe-area-inset-bottom/.test(rule) &&
         !/position:\s*(fixed|absolute|sticky)/.test(rule)
       );
     };
@@ -15976,7 +16063,7 @@ async function askFirstUxTests() {
       return source.replace(rule, rule.replace(needle, replacement));
     };
     assert(transcriptFills(css), 'the transcript owns the remaining height');
-    assert(composerInFlow(css), 'the composer stays in normal flow with safe-area padding');
+    assert(composerInFlow(css), 'the composer stays in normal flow without safe-area bloat');
     assert(entriesScroll(css), 'the transcript owns scrolling');
     // Mutations that restore the reported overlap must fail the same predicate.
     assert(
@@ -16095,6 +16182,212 @@ async function askFirstUxTests() {
     );
     const markup = readFileSync(new URL('../src/webview.ts', import.meta.url), 'utf8');
     assert(!markup.includes('overview-advanced'), 'no advanced machine-state block remains in chat/inspect');
+  });
+}
+
+// ---------------------------------------- Ask transport/session recovery
+
+async function askRecoveryTests() {
+  const receipt = { op_id: 'op-1', run_id: 'run-1', accepted: true, queued: false };
+  const request = {
+    prompt: 'hello',
+    files: [],
+    submissionId: '11111111-1111-4111-8111-111111111111',
+  };
+  function askFake(sessionId, outcomes) {
+    const calls = [];
+    let index = 0;
+    return {
+      connection: {
+        sessionId,
+        client: {
+          async prompt(id, prompt, options) {
+            calls.push({ sessionId: id, prompt, options });
+            const outcome = outcomes[Math.min(index, outcomes.length - 1)];
+            index += 1;
+            if (outcome instanceof Error) {
+              throw outcome;
+            }
+            return outcome;
+          },
+        },
+      },
+      calls,
+    };
+  }
+
+  await test('stale session (typed 404) rebinds the workspace session and retries once', async () => {
+    const first = askFake('5', [new nc.NativeApiError(404, 'not_found', 'session 5')]);
+    const second = askFake('9', [receipt]);
+    let rebounds = 0;
+    const outcome = await ar.sendAskTurnWithRecovery(
+      {
+        ensureConnection: async () => first.connection,
+        recoverTransport: async () => {
+          throw new Error('a missing session must not restart the daemon');
+        },
+        rebindSession: async (connection) => {
+          rebounds += 1;
+          assertEqual(connection.sessionId, '5', 'the stale id is the rebound input');
+          return second.connection;
+        },
+      },
+      request,
+    );
+    assertEqual(outcome.attempts, 2, 'exactly one retry');
+    assertEqual(outcome.recovered, 'stale_session');
+    assertEqual(outcome.connection.sessionId, '9');
+    assertEqual(rebounds, 1, 'the session is rebound exactly once');
+    assertEqual(first.calls.length, 1, 'the stale session is attempted once');
+    assertEqual(second.calls.length, 1, 'the rebound session is attempted once');
+    assertEqual(first.calls[0].sessionId, '5');
+    assertEqual(second.calls[0].sessionId, '9');
+    assertEqual(first.calls[0].options.submissionId, request.submissionId);
+    assertEqual(
+      second.calls[0].options.submissionId,
+      request.submissionId,
+      'the retry keeps the logical submission id',
+    );
+  });
+
+  await test('a plain 404 that does not name a session is not treated as stale', () => {
+    const notStale = new nc.NativeApiError(404, 'http_error', 'no such route');
+    assertEqual(ar.classifyAskFailure(notStale), null);
+    assertEqual(
+      ar.classifyAskFailure(new nc.NativeApiError(404, 'not_found', 'session 5')),
+      'stale_session',
+    );
+    assertEqual(
+      ar.classifyAskFailure(new nc.NativeApiError(400, 'not_found', 'session 5')),
+      null,
+    );
+  });
+
+  await test('daemon not running: auto-start is awaited, transport retry runs once', async () => {
+    const first = askFake('5', [
+      new nc.NativeTransportError(
+        'POST /native/session/5/prompt',
+        'fetch failed',
+        'ECONNREFUSED',
+      ),
+    ]);
+    const second = askFake('5', [receipt]);
+    let started = false;
+    let recoveredWith = null;
+    const outcome = await ar.sendAskTurnWithRecovery(
+      {
+        ensureConnection: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          started = true;
+          return first.connection;
+        },
+        recoverTransport: async (connection) => {
+          assert(started, 'the retry only runs after service auto-start resolved');
+          recoveredWith = connection;
+          return second.connection;
+        },
+        rebindSession: async () => {
+          throw new Error('a transport failure must not rebind the session');
+        },
+      },
+      request,
+    );
+    assertEqual(outcome.attempts, 2);
+    assertEqual(outcome.recovered, 'transport');
+    assertEqual(recoveredWith, first.connection, 'recovery receives the failed connection');
+    assertEqual(first.calls.length, 1);
+    assertEqual(second.calls.length, 1);
+  });
+
+  await test('stale port/address: the client is replaced and the retry uses the new one', async () => {
+    const stale = askFake('5', [
+      new nc.NativeTransportError(
+        'POST /native/session/5/prompt',
+        'fetch failed',
+        'ECONNREFUSED',
+      ),
+    ]);
+    stale.connection.baseUrl = 'http://127.0.0.1:1111';
+    const fresh = askFake('5', [receipt]);
+    fresh.connection.baseUrl = 'http://127.0.0.1:2222';
+    const outcome = await ar.sendAskTurnWithRecovery(
+      {
+        ensureConnection: async () => stale.connection,
+        recoverTransport: async () => fresh.connection,
+        rebindSession: async () => {
+          throw new Error('a stale address must reconnect, not rebind');
+        },
+      },
+      request,
+    );
+    assertEqual(outcome.attempts, 2);
+    assertEqual(outcome.connection.baseUrl, 'http://127.0.0.1:2222');
+    assertEqual(stale.calls.length, 1, 'the stale address is never retried directly');
+    assertEqual(fresh.calls.length, 1, 'the refreshed client carries the retry');
+  });
+
+  await test('a second failure is final: Ask never retries more than once', async () => {
+    const first = askFake('5', [
+      new nc.NativeTransportError('POST /native/session/5/prompt', 'fetch failed', 'ECONNRESET'),
+    ]);
+    const second = askFake('5', [
+      new nc.NativeTransportError('POST /native/session/5/prompt', 'fetch failed', 'ECONNRESET'),
+    ]);
+    await assertRejects(
+      () =>
+        ar.sendAskTurnWithRecovery(
+          {
+            ensureConnection: async () => first.connection,
+            recoverTransport: async () => second.connection,
+            rebindSession: async () => second.connection,
+          },
+          request,
+        ),
+      (error) => error instanceof nc.NativeTransportError && error.code === 'ECONNRESET',
+      'the second transport failure surfaces',
+    );
+    assertEqual(first.calls.length, 1);
+    assertEqual(second.calls.length, 1);
+  });
+
+  await test('cause-specific attention: unreachable service and missing conversation, no raw protocol text', () => {
+    const transport = new nc.NativeTransportError(
+      'POST /native/session/5/prompt',
+      'fetch failed',
+      'ECONNREFUSED',
+    );
+    const unreachable = ue.projectError({
+      kind: 'daemon_unreachable',
+      message: transport.message,
+      code: transport.code,
+    });
+    assertEqual(unreachable.summary, 'The Faktor service could not be reached');
+    assertEqual(unreachable.action.key, 'startService');
+    assert(!unreachable.summary.includes('protocol violation'), unreachable.summary);
+    assert(!unreachable.hint.includes('fetch failed'), unreachable.hint);
+    assert(unreachable.technical.includes('native transport failure'), unreachable.technical);
+    const missing = ue.projectError({
+      kind: 'conversation_missing',
+      message: new nc.NativeApiError(404, 'not_found', 'session 5').message,
+      code: 'not_found',
+    });
+    assertEqual(missing.summary, 'That conversation is no longer available');
+    assertEqual(missing.action.key, 'focusComposer');
+    assert(!missing.summary.includes('native API error'), missing.summary);
+  });
+
+  await test('Ask stays on the host bridge: the webview has no direct daemon transport', () => {
+    for (const file of ['chat.js', 'composer-state.js', 'board-state.js', 'history-state.js']) {
+      const source = readFileSync(new URL(`../media/${file}`, import.meta.url), 'utf8');
+      assert(!/\bfetch\s*\(/.test(source), `${file} must not call fetch`);
+      assert(!/XMLHttpRequest/.test(source), `${file} must not use XMLHttpRequest`);
+      assert(!/new\s+WebSocket/.test(source), `${file} must not open a WebSocket`);
+    }
+    const webviewSource = readFileSync(new URL('../src/webview.ts', import.meta.url), 'utf8');
+    assert(
+      webviewSource.includes("connect-src 'none'"),
+      'the webview CSP keeps connect-src none; Ask goes through the host',
+    );
   });
 }
 
@@ -17720,6 +18013,7 @@ async function main() {
   await navigationWebviewTests();
   await composerAttachmentTests();
   await askFirstUxTests();
+  await askRecoveryTests();
   await submissionSingleFlightTests();
   await runBudgetTests();
   await changeReviewTests();
