@@ -1,0 +1,19 @@
+{
+  "id": "INV-BILLING-EXPORT-CURSOR-TRUTH",
+  "surface": "payments.billing",
+  "file": "crates/payments/src/service.rs",
+  "find": "        let page = self.invoices(organization, cursor, limit)?;\n",
+  "replace": "        let page = self.invoices(organization, None, limit)?;\n",
+  "gate": "cargo test -p faktor-payments --test lifecycle invoices_cover_inclusive_tax_credits_discounts_and_exports",
+  "expect": "FAILED",
+  "note": "Ignoring the cursor relabels the first bounded page as a continued export.",
+  "capabilities": [
+    "payments.export_truth"
+  ],
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

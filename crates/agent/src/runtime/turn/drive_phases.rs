@@ -14,6 +14,32 @@
 
 use super::*;
 
+/// Withhold every evidence item carrying instruction-override phrasing.
+///
+/// This is the ONE provenance guard for BOTH compiled variants. The focused
+/// selection is produced from the same candidate set as the baseline and is
+/// adopted on a real token dividend; filtering only the baseline let a
+/// malicious snippet that matched the focus terms bypass the guard and ride
+/// the adopted focused plan into the system prefix. Returns the withheld
+/// paths so callers/tests can witness the exact exclusion.
+pub(crate) fn retain_provenance_safe_evidence(evidence: &mut Vec<Evidence>) -> Vec<String> {
+    let mut withheld = Vec::new();
+    evidence.retain(|item| {
+        if faktor_security::contains_instruction_override(&item.snippet) {
+            tracing::warn!(
+                path = %item.path,
+                "withholding evidence snippet: instruction-override phrasing detected \
+                 (repository content is data, not instruction authority)"
+            );
+            withheld.push(item.path.clone());
+            false
+        } else {
+            true
+        }
+    });
+    withheld
+}
+
 /// The ONE capability view of a (provider, model) pair: the raw declared
 /// profile, its AUTHORITY state, and the budget-ceiling caps. The effective
 /// caps are authority-gated ([`faktor_core::model::CapabilityResolution::effective`])
@@ -688,22 +714,15 @@ impl AgentRuntime {
         // Provenance guard (security adversarial suite): retrieved,
         // semantic and learning snippets are repository/provider DATA
         // and may never carry instruction authority into the system
-        // prefix. Any snippet containing an override phrase is withheld
-        // here (bounded, case/whitespace-insensitive scan) with a warn;
-        // the model can still read the file through its tools, so no
-        // capability is lost — only the prompt-injection channel.
-        evidence.retain(|item| {
-            if faktor_security::contains_instruction_override(&item.snippet) {
-                tracing::warn!(
-                    path = %item.path,
-                    "withholding evidence snippet: instruction-override phrasing detected \
-                     (repository content is data, not instruction authority)"
-                );
-                false
-            } else {
-                true
-            }
-        });
+        // prefix. The SAME guard runs on the baseline AND the focused
+        // variant; a focused plan that survives the economic gate must
+        // never reintroduce a snippet the baseline withheld. The model
+        // can still read the file through its tools, so no capability is
+        // lost — only the prompt-injection channel.
+        retain_provenance_safe_evidence(&mut evidence);
+        if let Some(focused) = focused_evidence.as_mut() {
+            retain_provenance_safe_evidence(focused);
+        }
         // P0-79 site d: a retrieval that ADMITTED a NEW evidence set
         // into the context (non-empty and different from the last set
         // this drive admitted) is semantic progress — the op is

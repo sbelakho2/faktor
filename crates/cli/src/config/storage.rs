@@ -115,6 +115,16 @@ impl StorageCfg {
 
     /// Open the EXISTING governor read-only (doctor). Never creates state.
     pub fn existing_governor(data_dir: &Path) -> Option<Arc<StorageGovernor>> {
-        StorageGovernor::open_existing(data_dir).map(Arc::new)
+        Self::existing_governor_result(data_dir).ok().flatten()
+    }
+
+    /// Fallible doctor form: a corrupt/unreadable governor ledger is named,
+    /// never reported as "not initialized".
+    pub fn existing_governor_result(
+        data_dir: &Path,
+    ) -> Result<Option<Arc<StorageGovernor>>, String> {
+        StorageGovernor::open_existing_result(data_dir)
+            .map(|governor| governor.map(Arc::new))
+            .map_err(|error| format!("storage governor unreadable: {error}"))
     }
 }

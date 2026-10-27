@@ -428,6 +428,11 @@ pub(crate) async fn native_transcript_search(
             // actually matched, not an empty assistant envelope. Part reads
             // are bounded to this page (never the whole transcript) and a
             // read failure fails the page loudly instead of guessing text.
+            let ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
+            let mut parts_by_message = match state.deps.session.store().parts_for_messages(&ids) {
+                Ok(parts) => parts,
+                Err(e) => return api_err(&store_err_to_core(e)),
+            };
             let mut matches: Vec<serde_json::Value> = Vec::with_capacity(rows.len());
             for row in &rows {
                 let mut text = row
@@ -437,10 +442,7 @@ pub(crate) async fn native_transcript_search(
                     .unwrap_or_default()
                     .to_string();
                 if !text.to_ascii_lowercase().contains(&needle) {
-                    let parts = match state.deps.session.store().parts_of(row.id) {
-                        Ok(parts) => parts,
-                        Err(e) => return api_err(&store_err_to_core(e)),
-                    };
+                    let parts = parts_by_message.remove(&row.id).unwrap_or_default();
                     text = parts
                         .iter()
                         .filter_map(|part| {

@@ -1,0 +1,18 @@
+{
+  "id": "INV-STORAGE-WATERMARK-HYSTERESIS",
+  "file": "crates/storage/src/governor.rs",
+  "find": "const WATERMARK_HYSTERESIS_PERMILLE: u64 = 50;",
+  "replace": "const WATERMARK_HYSTERESIS_PERMILLE: u64 = 0;",
+  "gate": "cargo test -p faktor-storage --lib watermark_eviction_uses_hysteresis_not_per_write_thrash",
+  "expect": "FAILED",
+  "note": "Removes watermark headroom: every write above the watermark evicts exactly its own size (eviction thrash).",
+  "capabilities": [
+    "storage.governor"
+  ],
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

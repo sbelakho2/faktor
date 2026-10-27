@@ -1604,17 +1604,27 @@ impl SessionManager {
             }
             cursor = newest_first.last().map(|r| r.seq);
         }
-        for m in newest_first.into_iter().rev() {
-            let new_message_id = self
+        // Copy ascending in bounded pages. Parts are fetched ONE batch per
+        // page (the historical per-message `parts_of` was 10k round trips
+        // for a 10k-message fork) and dropped with the page.
+        for chunk in newest_first.rchunks(FORK_PAGE_SIZE as usize) {
+            let ids: Vec<i64> = chunk.iter().map(|m| m.id).collect();
+            let mut parts_by_message = self
                 .store
-                .put_message(fork.id(), m.seq, &m.role, m.data.clone())
+                .parts_for_messages(&ids)
                 .map_err(crate::map_store_err)?;
-            for p in self.store.parts_of(m.id).map_err(crate::map_store_err)? {
-                // Part payloads were validated when the source row was
-                // written; the copy preserves them verbatim.
-                self.store
-                    .put_part(new_message_id, &p.kind, p.data.clone())
+            for m in chunk.iter().rev() {
+                let new_message_id = self
+                    .store
+                    .put_message(fork.id(), m.seq, &m.role, m.data.clone())
                     .map_err(crate::map_store_err)?;
+                for p in parts_by_message.remove(&m.id).unwrap_or_default() {
+                    // Part payloads were validated when the source row was
+                    // written; the copy preserves them verbatim.
+                    self.store
+                        .put_part(new_message_id, &p.kind, p.data.clone())
+                        .map_err(crate::map_store_err)?;
+                }
             }
         }
         // Durable lineage (F073): the fork row itself is a plain session;

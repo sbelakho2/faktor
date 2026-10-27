@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! Dedicated bounded database-writer service (audit item 7).
 //!
 //! The store used to serialize every mutation behind a process-wide

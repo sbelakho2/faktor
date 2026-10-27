@@ -28,6 +28,9 @@ pub struct AccountQuery {
     pub updated: String,
     #[serde(default)]
     pub format: String,
+    /// Exclusive invoice cursor for a continued bounded export.
+    #[serde(default)]
+    pub since: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -88,7 +91,10 @@ pub async fn overview_get(
 ) -> SiteResult<Response> {
     let auth = state.require_auth(&headers)?;
     let org = org_id(&auth)?;
-    let _ = state.payments.tick(&org);
+    match state.payments.tick(&org) {
+        Ok(_) | Err(faktor_payments::PaymentError::NotFound(_)) => {}
+        Err(error) => return Err(error.into()),
+    }
     let payments_overview = state.payments.overview(&org)?;
     let invoices = state.payments.invoices(&org, None, 10)?.items;
     let memberships = {
@@ -390,15 +396,21 @@ pub async fn revoke_other_sessions(
 pub async fn invoices_get(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Query(query): Query<AccountQuery>,
 ) -> SiteResult<Response> {
     let auth = state.require_auth(&headers)?;
     let org = org_id(&auth)?;
-    let _ = state.payments.tick(&org);
-    let invoices = state.payments.invoices(&org, None, 100)?.items;
+    match state.payments.tick(&org) {
+        Ok(_) | Err(faktor_payments::PaymentError::NotFound(_)) => {}
+        Err(error) => return Err(error.into()),
+    }
+    let page = state.payments.invoices(&org, query.since.as_deref(), 100)?;
     Ok(account_pages::invoices_page(
         &auth,
         &auth.csrf,
-        &invoices,
+        &page.items,
+        page.next_cursor.as_deref(),
+        query.since.as_deref(),
         &[],
     ))
 }
@@ -412,6 +424,9 @@ pub async fn invoice_get(
     let auth = state.require_auth(&headers)?;
     let org = org_id(&auth)?;
     let invoice = state.payments.invoice(&org, &id)?;
+    if !query.format.is_empty() {
+        return invoice_attachment(&state.payments, &invoice, &query.format);
+    }
     let notice = query.updated.as_str();
     let message = match notice {
         "paid" => Some("The invoice is paid in the local billing record."),
@@ -425,6 +440,65 @@ pub async fn invoice_get(
         message,
         &[],
     ))
+}
+
+/// `GET /account/invoices/{id}/download/?format=csv|json` — the bounded
+/// per-invoice download. Authentication and the organization-scoped invoice
+/// read happen before any byte is returned (a foreign id is the same 404 as a
+/// missing one).
+pub async fn invoice_download(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(query): Query<AccountQuery>,
+) -> SiteResult<Response> {
+    let auth = state.require_auth(&headers)?;
+    let org = org_id(&auth)?;
+    let invoice = state.payments.invoice(&org, &id)?;
+    invoice_attachment(&state.payments, &invoice, &query.format)
+}
+
+fn invoice_attachment(
+    payments: &faktor_payments::PaymentService,
+    invoice: &faktor_payments::Invoice,
+    format: &str,
+) -> SiteResult<Response> {
+    let format = if format.is_empty() { "csv" } else { format };
+    let (content_type, text, extension) = match format {
+        "csv" => (
+            "text/csv; charset=utf-8",
+            payments.export_invoice_csv(invoice),
+            "csv",
+        ),
+        "json" => (
+            "application/json; charset=utf-8",
+            serde_json::to_string_pretty(invoice).map_err(SiteError::internal)?,
+            "json",
+        ),
+        _ => {
+            return Err(SiteError::BadRequest(
+                "Invoice download format must be csv or json.",
+            ))
+        }
+    };
+    let filename: String = invoice
+        .number
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let mut response = web::text_response(axum::http::StatusCode::OK, content_type, text);
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        header::HeaderValue::from_str(&format!("attachment; filename=\"{filename}.{extension}\""))
+            .map_err(SiteError::internal)?,
+    );
+    Ok(response)
 }
 
 pub async fn receipt_get(
@@ -455,7 +529,9 @@ pub async fn invoices_export(
     } else {
         "csv"
     };
-    let text = state.payments.export_invoices(&org, format, 1_000)?;
+    let text = state
+        .payments
+        .export_invoices_page(&org, format, query.since.as_deref(), 1_000)?;
     let content_type = if format == "json" {
         "application/json; charset=utf-8"
     } else {
@@ -480,7 +556,10 @@ pub async fn usage_get(
 ) -> SiteResult<Response> {
     let auth = state.require_auth(&headers)?;
     let org = org_id(&auth)?;
-    let _ = state.payments.tick(&org);
+    match state.payments.tick(&org) {
+        Ok(_) | Err(faktor_payments::PaymentError::NotFound(_)) => {}
+        Err(error) => return Err(error.into()),
+    }
     let overview = state.payments.overview(&org)?;
     let invoices = state.payments.invoices(&org, None, 200)?.items;
     let mut aggregated: BTreeMap<String, (i64, i64)> = BTreeMap::new();
@@ -510,6 +589,7 @@ pub async fn usage_get(
             descriptions,
             invoices: invoice_count,
             seats,
+            scanned_invoices: invoices.len(),
         },
         &[],
     ))

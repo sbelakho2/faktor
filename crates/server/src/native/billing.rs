@@ -761,18 +761,32 @@ pub(crate) async fn native_billing_overview(
             // state. Without it the pre-payment overview remains byte-shape
             // identical (the five unavailable causes are kept).
             if let Some(payments) = state.deps.payments.as_ref() {
-                if let Ok(real) = payments.overview(&principal.organization) {
-                    if let Some(billing) = value["billing"].as_object_mut() {
-                        billing.insert("payment".into(), serde_json::json!(real.payment));
-                        billing.insert("invoices".into(), serde_json::json!(real.invoices));
-                        billing.insert("seats".into(), serde_json::json!(real.seats_capability));
-                        billing.insert("tax".into(), serde_json::json!(real.tax_capability));
-                        billing.insert(
-                            "currency".into(),
-                            serde_json::json!(real.currency_capability),
-                        );
-                        billing.insert("payments".into(), serde_json::json!(real));
-                    }
+                // A read must observe lifecycle truth, not yesterday's row:
+                // run the same durable tick the site/CLI use so an expired
+                // trial, a period-end cancellation or a grace expiry is not
+                // reported as live. No subscription is the ordinary zero
+                // state, not a read failure.
+                match payments.tick(&principal.organization) {
+                    Ok(_) | Err(faktor_payments::PaymentError::NotFound(_)) => {}
+                    Err(error) => return wire_status(crate::native::payments_err(error)),
+                }
+                // A wired payment plane whose store cannot be read is a
+                // failure, never a silent fallback to the honest-unavailable
+                // pre-payment shape (that would report a stale capability).
+                let real = match payments.overview(&principal.organization) {
+                    Ok(real) => real,
+                    Err(error) => return wire_status(crate::native::payments_err(error)),
+                };
+                if let Some(billing) = value["billing"].as_object_mut() {
+                    billing.insert("payment".into(), serde_json::json!(real.payment));
+                    billing.insert("invoices".into(), serde_json::json!(real.invoices));
+                    billing.insert("seats".into(), serde_json::json!(real.seats_capability));
+                    billing.insert("tax".into(), serde_json::json!(real.tax_capability));
+                    billing.insert(
+                        "currency".into(),
+                        serde_json::json!(real.currency_capability),
+                    );
+                    billing.insert("payments".into(), serde_json::json!(real));
                 }
             }
             money_json(value)

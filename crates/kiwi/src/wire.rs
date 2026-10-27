@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! @authority-collapse: authority-bearing
 //!
 //! The bounded Kiwi wire contract.

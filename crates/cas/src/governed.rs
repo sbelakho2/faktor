@@ -35,18 +35,20 @@ impl StorageBackend for CasStorageBackend {
     }
 
     fn scan(&self, governor: &StorageGovernor) -> GovernorResult<Vec<StorageObject>> {
+        // ONE index load for the whole physical family, then classify in
+        // memory. The old scan issued two point queries per stored blob, which
+        // made reconciliation O(2n) round trips at 100k objects.
+        let index = governor.family_index(self.default_class.family())?;
         let mut out = Vec::new();
         for (hex, bytes) in self.cas.stored_digests() {
-            let class = governor
-                .object_class_of_digest_in_family(&hex, self.default_class.family())?
-                .unwrap_or(self.default_class);
+            let (class, last_used_ms) = index.get(&hex).copied().unwrap_or((self.default_class, 0));
             if class != self.class {
                 continue;
             }
             out.push(StorageObject {
                 key: hex.clone(),
                 bytes,
-                last_used_ms: governor.object_last_used(self.class, &hex)?.unwrap_or(0),
+                last_used_ms,
                 digest: Some(hex),
                 required: false,
             });

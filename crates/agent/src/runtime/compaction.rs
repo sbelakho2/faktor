@@ -364,6 +364,209 @@ pub(crate) fn collect_tool_summary(
     }
 }
 
+/// True only when the archive manifest exists AND declares a non-empty,
+/// internally consistent chunk set whose chunk blobs are all still present.
+/// `Cas::has(manifest)` alone is not "retrievable": the governor may evict a
+/// chunk while the small manifest survives (per-object eviction), and a
+/// truncated/corrupt manifest is not a pointer either. The manifest is
+/// bounded (one small JSON row per chunk), so this check is a single bounded
+/// read plus one stat per referenced chunk.
+pub(crate) fn archive_manifest_is_retrievable(
+    cas: &faktor_cas::Cas,
+    manifest: faktor_core::hash::FileHash,
+) -> bool {
+    const MANIFEST_MAX_BYTES: usize = 256 * 1024;
+    let Ok(Some(bytes)) = cas.get_bounded(manifest, MANIFEST_MAX_BYTES) else {
+        return false;
+    };
+    let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    if parsed.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
+        return false;
+    }
+    let Some(chunks) = parsed.get("chunks").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    if chunks.is_empty() {
+        return false;
+    }
+    let mut total = 0u64;
+    for chunk in chunks {
+        let Some(hex) = chunk.get("hash").and_then(serde_json::Value::as_str) else {
+            return false;
+        };
+        let Some(hash) = faktor_core::hash::FileHash::from_hex(hex) else {
+            return false;
+        };
+        if !cas.has(hash) {
+            return false;
+        }
+        let Some(size) = chunk.get("size").and_then(serde_json::Value::as_u64) else {
+            return false;
+        };
+        total = total.saturating_add(size);
+    }
+    parsed
+        .get("total_bytes")
+        .and_then(serde_json::Value::as_u64)
+        .is_none_or(|declared| declared == total)
+}
+
+/// The compactor's digest turn is the ONE wire carrier of a compaction
+/// archive pointer. Other `artifact://` refs (tool-log artifacts) are single
+/// blobs with different semantics and must never be interpreted as a
+/// compaction manifest.
+fn is_archive_digest_turn(turn: &RecentTurn) -> bool {
+    turn.role == "assistant" && turn.text.starts_with("[Earlier context archived:")
+}
+
+/// Replace a carried archive artifact ref that is no longer fully
+/// retrievable (the storage governor evicted the archive class or one of its
+/// chunks) with an explicit "archive evicted" marker. Without this the next
+/// compaction keeps claiming that evicted context is retrievable at
+/// `artifact://<hash>`, and the model spends turns trying to recover it. The
+/// durable transcript rows remain the fallback authority; only the wire text
+/// changes. Scans every digest turn (the pointer is normally first, but the
+/// marker must never be missed because of plan ordering). Returns the number
+/// of refs marked.
+pub fn mark_evicted_compaction_archives(
+    cas: Option<&faktor_cas::Cas>,
+    plan: &mut faktor_context::compactor::CompactionPlan,
+) -> usize {
+    let Some(cas) = cas else {
+        return 0;
+    };
+    let mut marked = 0usize;
+    for turn in &mut plan.kept_recent {
+        // Fast path: only a compaction digest carries a manifest pointer;
+        // other artifact refs (tool logs) are not manifest-backed.
+        if !is_archive_digest_turn(turn) || !turn.text.contains("artifact://") {
+            continue;
+        }
+        let text = std::mem::take(&mut turn.text);
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text.as_str();
+        let mut turn_marked = 0usize;
+        while let Some(index) = rest.find("artifact://") {
+            out.push_str(&rest[..index]);
+            let tail = &rest[index + "artifact://".len()..];
+            let digest_len = tail
+                .bytes()
+                .take_while(|byte| byte.is_ascii_hexdigit())
+                .count()
+                .min(64);
+            let digest = &tail[..digest_len];
+            match faktor_core::hash::FileHash::from_hex(digest) {
+                Some(hash) if !archive_manifest_is_retrievable(cas, hash) => {
+                    out.push_str("[archive evicted: ");
+                    out.push_str(digest);
+                    out.push(']');
+                    turn_marked += 1;
+                    rest = &tail[digest_len..];
+                }
+                _ => {
+                    out.push_str("artifact://");
+                    rest = tail;
+                }
+            }
+        }
+        out.push_str(rest);
+        if turn_marked > 0 {
+            turn.text = out;
+            marked += turn_marked;
+        } else {
+            // Byte-identical when nothing moved (no allocation retained).
+            turn.text = text;
+        }
+    }
+    if marked > 0 {
+        tracing::warn!(
+            refs = marked,
+            "compaction archive was evicted; the wire now names the loss instead of a dead artifact ref"
+        );
+    }
+    marked
+}
+
+/// Replace the compactor's archive placeholder with the TRUTH for this turn:
+/// the real manifest artifact ref when the archive was published, or an
+/// explicit "archive unavailable" marker when the CAS is absent/refusing.
+/// The former left the literal `<artifact://hash>` placeholder on the wire,
+/// a dangling artifact reference that invited the model to spend turns
+/// re-deriving context that was never retrievable. The evicted rows remain in
+/// the durable transcript either way; only the wire marker changes.
+///
+/// An archive is published ONLY when the plan actually carries a wire
+/// pointer for it. When the digest marker could not fit under the hard cap,
+/// storing the chunks would create an unreachable artifact (pure storage
+/// growth under pressure), so the archive is skipped and the durable
+/// transcript remains the authority.
+pub fn attach_compaction_archive(
+    cas: Option<&faktor_cas::Cas>,
+    plan: &mut faktor_context::compactor::CompactionPlan,
+) -> Option<faktor_core::hash::FileHash> {
+    if plan.archive_chunks.is_empty() {
+        return None;
+    }
+    let archived_bytes: usize = plan.archive_chunks.iter().map(String::len).sum();
+    if !plan
+        .kept_recent
+        .iter()
+        .any(|turn| is_archive_digest_turn(turn) && turn.text.contains("<artifact://hash>"))
+    {
+        tracing::warn!(
+            chunks = plan.archive_chunks.len(),
+            bytes = archived_bytes,
+            "compaction archive not published: the plan carries no wire archive pointer (the marker did not fit the hard cap)"
+        );
+        return None;
+    }
+    let Some(cas) = cas else {
+        annotate_archive_unavailable(plan, archived_bytes);
+        tracing::warn!(
+            chunks = plan.archive_chunks.len(),
+            bytes = archived_bytes,
+            "compaction archive skipped: no content store; the wire carries an explicit unavailable marker"
+        );
+        return None;
+    };
+    match store_compaction_archive(cas, &plan.archive_chunks) {
+        Some(hash) => {
+            let marker = format!("artifact://{hash}");
+            for turn in &mut plan.kept_recent {
+                if is_archive_digest_turn(turn) && turn.text.contains("<artifact://hash>") {
+                    turn.text = turn.text.replace("<artifact://hash>", &marker);
+                }
+            }
+            Some(hash)
+        }
+        None => {
+            annotate_archive_unavailable(plan, archived_bytes);
+            tracing::warn!(
+                chunks = plan.archive_chunks.len(),
+                bytes = archived_bytes,
+                "compaction archive publish failed; the wire carries an explicit unavailable marker"
+            );
+            None
+        }
+    }
+}
+
+fn annotate_archive_unavailable(
+    plan: &mut faktor_context::compactor::CompactionPlan,
+    archived_bytes: usize,
+) {
+    let marker = format!(
+        "[archive unavailable: {archived_bytes} bytes omitted from the wire; the original rows remain in the durable transcript]"
+    );
+    for turn in &mut plan.kept_recent {
+        if is_archive_digest_turn(turn) && turn.text.contains("<artifact://hash>") {
+            turn.text = turn.text.replace("<artifact://hash>", &marker);
+        }
+    }
+}
+
 /// Store the eviction archive (ordered chunks + JSON manifest) in the main
 /// CAS under the `CompactionArchive` class. Returns the manifest digest, or
 /// `None` when nothing could be published (best-effort: the turn continues
@@ -732,13 +935,15 @@ impl AgentRuntime {
         } else {
             faktor_context::ledger::TaskContextProjection::from_task_ledger(ledger)
         };
+        // ONE configured invariant: the same minimum reduction drives the
+        // request's hard cap AND the durable acceptance policy. A daemon
+        // setting (or a host-installed seam) can no longer be silently
+        // relaxed to the 25% default on the proactive path.
+        let min_reduction = self.compaction_min_reduction();
+        let mut request = CompactionRequest::new(before, target);
+        request.min_reduction_ratio = min_reduction;
         let mut plan = compactor
-            .compact_projected(
-                recent,
-                &projection,
-                ledger,
-                &CompactionRequest::new(before, target),
-            )
+            .compact_projected(recent, &projection, ledger, &request)
             .await;
         // Reservation terminal state moves through the attempt machine
         // exactly once: accepted => settle; dispatched-but-unsettled =>
@@ -939,28 +1144,6 @@ impl AgentRuntime {
             );
             return Ok(None);
         }
-        // Durable archiving (P0: no more 1 MiB cap losing history): evicted
-        // turns arrive as ORDERED chunks (oldest first, each bounded) — each
-        // chunk is written to the CAS, then a small JSON manifest
-        // {version:1, chunks:[{index,size,hash}], total_bytes} is written
-        // and its content address replaces the digest placeholder — the
-        // digest rides the wire with the archive behind ONE artifact ref.
-        // Best-effort: an unwritable CAS leaves the digest text without a
-        // hash (never breaks the turn).
-        //
-        // Runs BEFORE the durable checkpoint is written: the checkpoint must
-        // persist the SAME final marker text the in-memory history carries,
-        // or a restart would reproduce a different context digest.
-        if !plan.archive_chunks.is_empty() {
-            if let Some(cas) = &self.deps.cas {
-                if let Some(hash) = store_compaction_archive(cas, &plan.archive_chunks) {
-                    let marker = format!("artifact://{hash}");
-                    if let Some(first) = plan.kept_recent.first_mut() {
-                        first.text = first.text.replace("<artifact://hash>", &marker);
-                    }
-                }
-            }
-        }
         let strategy = match plan.strategy {
             faktor_context::CompactionStrategy::LlmSummary => "llm_summary",
             faktor_context::CompactionStrategy::DeterministicPruning => "deterministic",
@@ -973,6 +1156,23 @@ impl AgentRuntime {
         // replacement context with no compaction authority; a crash at any
         // seam now reopens on exactly the old world or exactly the new one.
         if accepted {
+            // Durable archiving belongs to an ACCEPTED plan only. Rejected
+            // plans have no checkpoint that can ever point at their chunks;
+            // publishing them would add unreachable artifacts on every
+            // rejected compaction under storage pressure (and a sentinel
+            // threshold can reject many times in a row). Runs BEFORE the
+            // durable checkpoint is written so the checkpoint persists the
+            // SAME final marker text the in-memory history carries.
+            //
+            // Evicted turns arrive as ORDERED chunks (oldest first, each
+            // bounded): each chunk is written to the CAS, then a small JSON
+            // manifest {version:1, chunks:[{index,size,hash}], total_bytes}
+            // is written and its content address replaces the digest
+            // placeholder — the digest rides the wire with the archive
+            // behind ONE artifact ref. Best-effort: an unwritable CAS leaves
+            // an explicit unavailable marker (never breaks the turn).
+            mark_evicted_compaction_archives(self.deps.cas.as_deref(), &mut plan);
+            attach_compaction_archive(self.deps.cas.as_deref(), &mut plan);
             let Some(through_seq) = head_seq else {
                 // No durable source window was supplied (direct callers and
                 // unit tests pass a synthetic history). There is nothing to
@@ -983,11 +1183,14 @@ impl AgentRuntime {
                     session = %handle.id(),
                     "compaction had no source high-water seq; durable checkpoint skipped"
                 );
-                handle.record_compaction_defaults(
+                handle.record_compaction(
                     plan.before_tokens as i64,
                     plan.after_tokens as i64,
                     plan.target_tokens as i64,
                     strategy,
+                    &faktor_session::compaction::CompactionPolicy {
+                        min_reduction_ratio: min_reduction,
+                    },
                 )?;
                 return Ok(Some(plan));
             };
@@ -999,7 +1202,9 @@ impl AgentRuntime {
                 plan.target_tokens as i64,
                 plan.accepted,
                 strategy,
-                &faktor_session::compaction::CompactionPolicy::default(),
+                &faktor_session::compaction::CompactionPolicy {
+                    min_reduction_ratio: min_reduction,
+                },
                 through_seq,
                 &digest,
                 &payload,
@@ -1012,11 +1217,20 @@ impl AgentRuntime {
                 return Ok(None);
             }
         } else {
-            handle.record_compaction_defaults(
+            // The compactor's verdict is authoritative AND the SAME
+            // configured minimum is the durable acceptance policy. Using
+            // the 25% default or numbers alone here could journal
+            // `ContextCompacted` for a plan the compactor rejected (a
+            // tiny digest-only `after`, or a 40% configured minimum with a
+            // 30% reduction): the journal would contradict the turn.
+            handle.record_compaction_rejected(
                 plan.before_tokens as i64,
                 plan.after_tokens as i64,
                 plan.target_tokens as i64,
                 strategy,
+                &faktor_session::compaction::CompactionPolicy {
+                    min_reduction_ratio: min_reduction,
+                },
             )?;
             // CompactRejected is journaled by record_compaction.
             return Ok(None);

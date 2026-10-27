@@ -1,0 +1,18 @@
+{
+  "id": "INV-STORAGE-MAINTENANCE-TICK",
+  "file": "crates/storage/src/governor.rs",
+  "find": "        if !reconcile_due && !enforce_due {\n            return Ok(false);\n        }",
+  "replace": "        if true {\n            return Ok(false);\n        }",
+  "gate": "cargo test -p faktor-storage --lib maintenance_tick_reindexes_and_evicts_ungoverned_directory_growth",
+  "expect": "FAILED",
+  "note": "Disables the always-on maintenance tick so classes that grow outside reservations are never re-indexed or enforced.",
+  "capabilities": [
+    "storage.governor"
+  ],
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

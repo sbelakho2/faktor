@@ -2741,6 +2741,78 @@ release_critical = true
 platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
+id = "INV-EDITION8-STORED-ONLY-TRUTH"
+statement = "A locked stored-only setting is reported as having no runtime consumer, never as a user or organization lock."
+owner = "apps/vscode edition8"
+authority = "apps/vscode/src/edition8/view.ts controlView runtimeConsumer"
+script_check = "edition8: settings descriptors drive human labels and truthful stored-only locks"
+mutation_witness = "edition8: settings descriptors drive human labels and truthful stored-only locks"
+mutation_command = "node scripts/mutation-run.mjs INV-EDITION8-STORED-ONLY-TRUTH"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-EDITION8-APPROVAL-DISPLAY-NO-SHELL-WRITE"
+statement = "File/command matcher and command-approval display controls read the served policy instead of writing faktor.sandbox.shell."
+owner = "apps/vscode edition8 + jetbrains frontend"
+authority = "apps/vscode/src/edition8/routes.ts Q-03/Q-04/X-12; Edition8RouteMap.kt"
+script_check = "edition8: config controls commit the descriptor JSON type and do not fake actions"
+mutation_witness = "edition8: config controls commit the descriptor JSON type and do not fake actions"
+mutation_command = "node scripts/mutation-run.mjs INV-EDITION8-APPROVAL-DISPLAY-NO-SHELL-WRITE"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-EDITION8-CONFIG-TYPE-WIRING"
+statement = "Every settings control that writes a typed config key stages the descriptor JSON type; list keys are never toggles or free text."
+owner = "apps/vscode edition8 + jetbrains frontend"
+authority = "apps/vscode/src/edition8/bindings.ts INPUT_OVERRIDES; apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/Edition8Daemon.kt coerce"
+script_check = "edition8: config controls commit the descriptor JSON type and do not fake actions"
+mutation_witness = "edition8: config controls commit the descriptor JSON type and do not fake actions"
+mutation_command = "node scripts/mutation-run.mjs INV-EDITION8-CONFIG-TYPE-WIRING"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-EDITION8-SETTINGS-WIRING"
+statement = "The one settings surface is actually wired: boot installs its search, row navigation and review action, and each row opens the owning screen."
+owner = "apps/vscode edition8 webview"
+authority = "apps/vscode/media/edition8.js installSettingsHome"
+script_check = "edition8: settings is one searchable domain surface with one apply and human values"
+mutation_witness = "edition8: settings is one searchable domain surface with one apply and human values"
+mutation_command = "node scripts/mutation-run.mjs INV-EDITION8-SETTINGS-WIRING"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-CHAT-BOARD-NOT-IN-WORK"
+statement = "The coordination board never takes over the Work conversation: it is an explicit collapsed drawer inside Inspect, not persistent chat chrome."
+owner = "apps/vscode webview + jetbrains tool window"
+authority = "apps/vscode/src/webview.ts board-card drawer inside inspect-subpanel-agents"
+script_check = "the Work status row carries state, run, exact tokens and approval count only"
+mutation_witness = "the real composer markup ships the attachment surface, the a11y log and recovery affordances"
+mutation_command = "node scripts/mutation-run.mjs INV-CHAT-BOARD-NOT-IN-WORK"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-EDITION8-ONE-SETTINGS-SURFACE"
+statement = "Persistent settings render as one searchable, domain-grouped surface with descriptor labels, no raw JSON values, one footer Apply and an explicit save model."
+owner = "apps/vscode edition8 + jetbrains frontend"
+authority = "apps/vscode/src/edition8/html.ts settingsHomeMarkup; Edition8Panels.kt Edition8SettingsHomePanel"
+script_check = "edition8: settings is one searchable domain surface with one apply and human values"
+mutation_witness = "edition8: settings is one searchable domain surface with one apply and human values"
+mutation_command = "node scripts/mutation-run.mjs INV-EDITION8-ONE-SETTINGS-SURFACE"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
 id = "INV-EDITION8-READONLY-COMMERCIAL-PROVENANCE"
 statement = "Read-only commercial screens lead with served state and keep their control cards behind one provenance disclosure."
 owner = "apps/vscode edition8"
@@ -2748,6 +2820,18 @@ authority = "apps/vscode/src/edition8/html.ts rowsFirst/controlsMarkup"
 script_check = "edition8: read-only commercial screens lead with served state and collapse provenance"
 mutation_witness = "edition8: read-only commercial screens lead with served state and collapse provenance"
 mutation_command = "node scripts/mutation-run.mjs INV-EDITION8-READONLY-COMMERCIAL-PROVENANCE"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-SITE-BILLING-DISCLOSURE"
+statement = "Billing plan cards disclose the annual price before submit, cancellation copy names the chosen boundary, and invoice tax basis names jurisdiction and basis."
+owner = "crates/site billing"
+authority = "crates/site/src/web/billing_pages.rs plan-alt-price; account_pages.rs tax_jurisdiction"
+script_check = "site billing cancellation requires the explicit confirmation field"
+mutation_witness = "site billing cancellation requires the explicit confirmation field"
+mutation_command = "node scripts/mutation-run.mjs INV-SITE-BILLING-DISCLOSURE"
 mutation_debt = ""
 release_critical = true
 platforms = ["linux", "macos", "windows"]
@@ -3080,6 +3164,104 @@ platforms = ["linux", "macos", "windows"]
 
 
 [[invariant]]
+id = "INV-STORAGE-CANONICAL-DIRECTORY-KEY"
+statement = "A writer publishing into a governed directory class reserves and commits under the backend's canonical key (root index plus relative path); a bare root-relative key is never indexed because scan would never report it."
+owner = "crates/storage + crates/browser keys"
+authority = "crates/storage/src/directory.rs DirectoryBackend::canonical_directory_key; crates/browser/src/download.rs DownloadManager::reservation_key"
+unit_test = "directory_key_is_canonical_and_survives_reconcile_and_eviction"
+production_wiring = "reservation_key_uses_the_backend_scan_key_for_multi_root_storage"
+fault = ""
+mutation_witness = "directory_key_is_canonical_and_survives_reconcile_and_eviction"
+mutation_command = "node scripts/mutation-run.mjs INV-STORAGE-CANONICAL-DIRECTORY-KEY"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-STORAGE-WAL-TRUNCATION-TRUTH"
+statement = "A WAL checkpoint that is busy or leaves the sidecar unchanged is a typed refusal, never an eviction; the WAL's bytes remain indexed and the post-checkpoint disk-truth scan keeps the class usage at the real size."
+owner = "crates/storage WAL"
+authority = "crates/storage/src/directory.rs SqliteBackend::evict; crates/storage/src/governor.rs sqlite_maintenance"
+unit_test = "wal_checkpoint_busy_never_fakes_reclaimed_bytes"
+production_wiring = "storage_governor_bounds_wal_growth_and_refuses_over_budget"
+fault = ""
+mutation_witness = "wal_checkpoint_busy_never_fakes_reclaimed_bytes"
+mutation_command = "node scripts/mutation-run.mjs INV-STORAGE-WAL-TRUNCATION-TRUTH"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-STORAGE-SQLITE-DEBT-SHARED"
+statement = "SQLite/WAL admission debt is shared by every governor instance opening one ledger, and an in-flight tracked write is never discounted by a concurrent scan."
+owner = "crates/storage SQLite admission"
+authority = "crates/storage/src/governor.rs shared_wal_debt/admit_sqlite_growth_tracked/finish_wal_scan"
+unit_test = "sqlite_admission_debt_is_shared_and_inflight_safe"
+production_wiring = "storage_governor_bounds_wal_growth_and_refuses_over_budget"
+fault = ""
+mutation_witness = "sqlite_admission_debt_is_shared_and_inflight_safe"
+mutation_command = "node scripts/mutation-run.mjs INV-STORAGE-SQLITE-DEBT-SHARED"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-STORAGE-DIRECTORY-ROOT-PERSISTENCE"
+statement = "Directory roots are durable class state: a root registered by one governor instance is merged into every instance scanning the same ledger, so browser downloads/profiles under a non-default root are never admitted but left unindexed."
+owner = "crates/storage + crates/browser roots"
+authority = "crates/storage/src/governor.rs add_directory_root/sync_directory_roots; crates/browser/src/download.rs DownloadManager::new"
+unit_test = "directory_roots_persist_across_governor_instances"
+production_wiring = "download_manager_registers_its_profile_root_with_the_governor"
+fault = ""
+mutation_witness = "directory_roots_persist_across_governor_instances"
+mutation_command = "node scripts/mutation-run.mjs INV-STORAGE-DIRECTORY-ROOT-PERSISTENCE"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-STORAGE-PROMOTION-PIN-MOVE"
+statement = "A dedup promotion moves the object's pin and pinned accounting to the stronger owner class; the old class can never leave the new owner permanently required."
+owner = "crates/storage dedup"
+authority = "crates/storage/src/ledger.rs promote_object_on"
+unit_test = "dedup_promotion_moves_the_pin_to_the_new_owner_class"
+production_wiring = "dedup_hit_promotes_to_the_strongest_retention_class"
+fault = ""
+mutation_witness = "dedup_promotion_moves_the_pin_to_the_new_owner_class"
+mutation_command = "node scripts/mutation-run.mjs INV-STORAGE-PROMOTION-PIN-MOVE"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-STORAGE-EVIDENCE-PIN-RELEASE"
+statement = "A required-evidence backing pin created before the CAS publish is released when the publish is refused; a failed insert never pins unrelated content forever."
+owner = "crates/evidence backing pin"
+authority = "crates/evidence/src/store.rs DurableEvidenceStore::persist_backing"
+unit_test = "evidence_backing_is_admitted_and_pinned_before_the_row_commits"
+production_wiring = "evidence_backing_is_admitted_and_pinned_before_the_row_commits"
+fault = ""
+mutation_witness = "evidence_backing_is_admitted_and_pinned_before_the_row_commits"
+mutation_command = "node scripts/mutation-run.mjs INV-STORAGE-EVIDENCE-PIN-RELEASE"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-BROWSER-STORAGE-ROOT-GOVERNED"
+statement = "A browser download manager registers its concrete profile root as a governed browser-storage backend root, so downloads admitted against the class are scanned, reconciled and enforced."
+owner = "crates/browser downloads + crates/storage"
+authority = "crates/browser/src/download.rs DownloadManager::new"
+unit_test = "download_manager_registers_its_profile_root_with_the_governor"
+production_wiring = "download_manager_registers_its_profile_root_with_the_governor"
+fault = ""
+mutation_witness = "download_manager_registers_its_profile_root_with_the_governor"
+mutation_command = "node scripts/mutation-run.mjs INV-BROWSER-STORAGE-ROOT-GOVERNED"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
 id = "INV-STORAGE-AGGREGATE-BUDGET"
 statement = "One hard aggregate budget plus per-class quotas refuse an over-budget object before any bytes or reservation are published; the refusal is durable and typed."
 owner = "crates/storage"
@@ -3103,6 +3285,342 @@ production_wiring = "archive_cas_eviction_records_a_durable_loss_marker_with_ver
 fault = ""
 mutation_witness = "archive_loss_marker_guard_is_pinned_against_mutation"
 mutation_command = "node scripts/mutation-run.mjs INV-STORAGE-ARCHIVE-LOSS-MARKER"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-BILLING-PAYMENT-FAILURE-SETTLED-NO-DUNNING"
+statement = "A decline callback for an invoice that another attempt already settled never duns, increments attempts, or regresses an active subscription; a late decline is not evidence of non-payment."
+owner = "crates/payments dunning"
+authority = "crates/payments/src/service.rs record_payment_failure settled-invoice guard"
+unit_test = "payment_failure_after_settlement_never_regresses_an_active_subscription"
+production_wiring = "payment_failure_after_settlement_never_regresses_an_active_subscription"
+fault = ""
+mutation_witness = "payment_failure_after_settlement_never_regresses_an_active_subscription"
+mutation_command = "node scripts/mutation-run.mjs INV-BILLING-PAYMENT-FAILURE-SETTLED-NO-DUNNING"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-BILLING-PRORATION-SEAT-TRUTH"
+statement = "A plan-change proration compares the full recurring amount (plan price plus per-seat price times quantity) on both sides, so a seat-price difference is credited or charged exactly once."
+owner = "crates/payments proration"
+authority = "crates/payments/src/service.rs compute_plan_proration plan+seat amounts"
+unit_test = "plan_and_seat_proration_use_real_prices_and_exact_integer_math"
+production_wiring = "plan_and_seat_proration_use_real_prices_and_exact_integer_math"
+fault = ""
+mutation_witness = "plan_and_seat_proration_use_real_prices_and_exact_integer_math"
+mutation_command = "node scripts/mutation-run.mjs INV-BILLING-PRORATION-SEAT-TRUTH"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-BILLING-WEBHOOK-SEAT-BOUND"
+statement = "A subscription webhook quantity is accepted only inside 1..=MAX_SEATS; zero or overflowing quantities are typed malformed events and never overwrite the durable seat count."
+owner = "crates/payments webhooks"
+authority = "crates/payments/src/service/webhook_effects.rs subscription quantity bound"
+unit_test = "subscription_webhook_quantity_outside_the_seat_bound_is_refused"
+production_wiring = "subscription_webhook_quantity_outside_the_seat_bound_is_refused"
+fault = ""
+mutation_witness = "subscription_webhook_quantity_outside_the_seat_bound_is_refused"
+mutation_command = "node scripts/mutation-run.mjs INV-BILLING-WEBHOOK-SEAT-BOUND"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-BILLING-RECONCILE-ROTATION"
+statement = "Bounded reconciliation passes visit invoices least-recently-observed first, so repeated passes reach the whole ledger instead of re-reading the same issue-time prefix forever."
+owner = "crates/payments reconciliation"
+authority = "crates/payments/src/store.rs invoices_for_reconciliation observed-at ordering"
+unit_test = "bounded_reconciliation_passes_rotate_across_the_whole_ledger"
+production_wiring = "bounded_reconciliation_passes_rotate_across_the_whole_ledger"
+fault = ""
+mutation_witness = "bounded_reconciliation_passes_rotate_across_the_whole_ledger"
+mutation_command = "node scripts/mutation-run.mjs INV-BILLING-RECONCILE-ROTATION"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-BILLING-EXPORT-CURSOR-TRUTH"
+statement = "A continued CSV/JSON invoice export uses the supplied cursor; it never relabels the first bounded page as the whole ledger."
+owner = "crates/payments export"
+authority = "crates/payments/src/service.rs export_invoices_page cursor plumbing"
+unit_test = "invoices_cover_inclusive_tax_credits_discounts_and_exports"
+production_wiring = "invoices_cover_inclusive_tax_credits_discounts_and_exports"
+fault = ""
+mutation_witness = "invoices_cover_inclusive_tax_credits_discounts_and_exports"
+mutation_command = "node scripts/mutation-run.mjs INV-BILLING-EXPORT-CURSOR-TRUTH"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-BILLING-OVERVIEW-TICK-TRUTH"
+statement = "The native billing overview applies the durable lifecycle tick before reporting subscription/payment state, so an expired trial or period-end cancellation is never reported as live; a payment-store read failure is typed rather than a stale unavailable fallback."
+owner = "crates/server billing overview"
+authority = "crates/server/src/native/billing.rs native_billing_overview payments tick"
+unit_test = "payment_overview_ticks_lifecycle_before_reporting_state"
+production_wiring = "payment_overview_ticks_lifecycle_before_reporting_state"
+fault = ""
+mutation_witness = "payment_overview_ticks_lifecycle_before_reporting_state"
+mutation_command = "node scripts/mutation-run.mjs INV-BILLING-OVERVIEW-TICK-TRUTH"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-SITE-BILLING-INVOICE-DOWNLOAD"
+statement = "The site per-invoice download is authentication-first and organization-scoped: an own invoice returns a bounded attachment, a foreign id is the same 404 as missing, and an unknown format is a typed refusal."
+owner = "crates/site billing downloads"
+authority = "crates/site/src/routes/account.rs invoice_download/invoice_attachment"
+unit_test = "invoice_download_is_attachment_bounded_and_tenant_scoped"
+production_wiring = "invoice_download_is_attachment_bounded_and_tenant_scoped"
+fault = ""
+mutation_witness = "invoice_download_is_attachment_bounded_and_tenant_scoped"
+mutation_command = "node scripts/mutation-run.mjs INV-SITE-BILLING-INVOICE-DOWNLOAD"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-BILLING-CROSS-EVENT-SETTLED-ONCE"
+statement = "A provider payment already recorded as settled is credited at most once: a later event with a different event id is recorded but returns no ledger effect, so invoice amount_paid never exceeds its total."
+owner = "crates/payments billing"
+authority = "crates/payments/src/service/webhook_effects.rs settled-payment early return"
+unit_test = "cross_event_settlement_never_credits_twice_and_partial_paid_total_is_exact"
+production_wiring = "cross_event_settlement_never_credits_twice_and_partial_paid_total_is_exact"
+fault = ""
+mutation_witness = "cross_event_settlement_never_credits_twice_and_partial_paid_total_is_exact"
+mutation_command = "node scripts/mutation-run.mjs INV-BILLING-CROSS-EVENT-SETTLED-ONCE"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-BILLING-DUNNING-ATTEMPT-IDENTITY"
+statement = "One failed provider attempt fanned out into a payment event and an invoice event advances dunning exactly once, while a genuinely new provider payment identity advances the counter."
+owner = "crates/payments billing"
+authority = "crates/payments/src/service/webhook_effects.rs last_dunning_payment_id"
+unit_test = "one_failed_attempt_fanned_out_into_two_events_advances_dunning_once"
+production_wiring = "one_failed_attempt_fanned_out_into_two_events_advances_dunning_once"
+fault = ""
+mutation_witness = "one_failed_attempt_fanned_out_into_two_events_advances_dunning_once"
+mutation_command = "node scripts/mutation-run.mjs INV-BILLING-DUNNING-ATTEMPT-IDENTITY"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-BILLING-RECONCILE-SEAT-FENCE"
+statement = "Reconciliation applies the same exact quantity fence as the live path: zero falls back to the fenced request, and a different or oversize provider quantity leaves the claim unresolved instead of writing seat drift."
+owner = "crates/payments billing"
+authority = "crates/payments/src/service.rs apply_reconciled_claim provider_quantity_exact"
+unit_test = "reconciliation_never_writes_provider_seat_drift_over_the_fenced_request"
+production_wiring = "reconciliation_never_writes_provider_seat_drift_over_the_fenced_request"
+fault = ""
+mutation_witness = "reconciliation_never_writes_provider_seat_drift_over_the_fenced_request"
+mutation_command = "node scripts/mutation-run.mjs INV-BILLING-RECONCILE-SEAT-FENCE"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-BILLING-PARTIAL-PAID-TOTAL"
+statement = "Overview paid total sums money actually collected on every invoice, including partially settled open invoices; a partial settlement is never reported as zero collected."
+owner = "crates/payments billing"
+authority = "crates/payments/src/store.rs invoice_stats paid sum"
+unit_test = "cross_event_settlement_never_credits_twice_and_partial_paid_total_is_exact"
+production_wiring = "cross_event_settlement_never_credits_twice_and_partial_paid_total_is_exact"
+fault = ""
+mutation_witness = "cross_event_settlement_never_credits_twice_and_partial_paid_total_is_exact"
+mutation_command = "node scripts/mutation-run.mjs INV-BILLING-PARTIAL-PAID-TOTAL"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-SITE-BILLING-INVOICE-PAGE-CURSOR"
+statement = "The site invoice list continues with the service's exclusive cursor, shows the older bounded page, and never repeats or relabels the newest page."
+owner = "crates/payments billing"
+authority = "crates/site/src/routes/account.rs invoices_get since cursor"
+unit_test = "invoice_list_paginates_with_an_exclusive_cursor_and_truthful_bounds"
+production_wiring = "invoice_list_paginates_with_an_exclusive_cursor_and_truthful_bounds"
+fault = ""
+mutation_witness = "invoice_list_paginates_with_an_exclusive_cursor_and_truthful_bounds"
+mutation_command = "node scripts/mutation-run.mjs INV-SITE-BILLING-INVOICE-PAGE-CURSOR"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-PAYMENTS-METHOD-BOUND"
+statement = "Stored payment methods are bounded per organization, and overview counts them with an indexed COUNT instead of loading every sealed payload."
+owner = "crates/payments tokens"
+authority = "crates/payments/src/service/tokens.rs add_payment_method bound; store.rs payment_method_count"
+unit_test = "stored_payment_methods_are_bounded_and_overview_counts_without_payloads"
+production_wiring = "stored_payment_methods_are_bounded_and_overview_counts_without_payloads"
+fault = ""
+mutation_witness = "stored_payment_methods_are_bounded_and_overview_counts_without_payloads"
+mutation_command = "node scripts/mutation-run.mjs INV-PAYMENTS-METHOD-BOUND"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-STORAGE-RESERVATION-ATOMIC"
+statement = "Admission is one BEGIN IMMEDIATE transaction over durable usage and in-flight reservations, so concurrent governor instances, CAS roots and processes sharing a data directory cannot over-admit the hard aggregate or class budget."
+owner = "crates/storage"
+authority = "crates/storage/src/ledger.rs Ledger::try_reserve_atomic"
+unit_test = "concurrent_governor_instances_cannot_over_admit_the_hard_budget"
+production_wiring = "cas_put_refuses_before_publishing_over_budget"
+fault = ""
+mutation_witness = "concurrent_governor_instances_cannot_over_admit_the_hard_budget"
+mutation_command = "node scripts/mutation-run.mjs INV-STORAGE-RESERVATION-ATOMIC"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-STORAGE-CLASS-EVICTION-SCOPE"
+statement = "A pure class-quota deficit is satisfied only from that class; aggregate eviction runs only for aggregate pressure, so a pinned class refusal never destroys another class's cold data."
+owner = "crates/storage"
+authority = "crates/storage/src/governor.rs StorageGovernor::reserve/evict_class_for"
+unit_test = "class_quota_pressure_never_evicts_another_class"
+production_wiring = "flood_each_class_stays_within_aggregate_and_class_quotas"
+fault = ""
+mutation_witness = "class_quota_pressure_never_evicts_another_class"
+mutation_command = "node scripts/mutation-run.mjs INV-STORAGE-CLASS-EVICTION-SCOPE"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-STORAGE-LRU-EVICTION-ORDER"
+statement = "Eviction is oldest-first (LRU) inside a class and globally, and walks bounded keyset pages so 100k objects cost O(candidates), never a full sort per object."
+owner = "crates/storage"
+authority = "crates/storage/src/ledger.rs Ledger::candidates_page/global_candidates_page"
+unit_test = "eviction_at_100k_is_lru_ordered_and_bounded"
+production_wiring = "eviction_at_100k_objects_uses_bounded_keyset_queries_not_quadratic_scans"
+fault = ""
+mutation_witness = "eviction_at_100k_is_lru_ordered_and_bounded"
+mutation_command = "node scripts/mutation-run.mjs INV-STORAGE-LRU-EVICTION-ORDER"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-STORAGE-WAL-GROWTH-DEBT"
+statement = "SQLite growth is admitted against durable inventory plus admitted-but-unsettled bytes with a conservative on-disk bound; a flood cannot push WAL/database growth past the class quota between scans, and small appends never trigger a scan."
+owner = "crates/storage + crates/store"
+authority = "crates/storage/src/governor.rs StorageGovernor::admit_sqlite_growth"
+unit_test = "sqlite_wal_flood_cannot_exceed_the_class_quota_between_scans"
+production_wiring = "small_append_admission_has_no_scan_overhead"
+fault = ""
+mutation_witness = "sqlite_wal_flood_cannot_exceed_the_class_quota_between_scans"
+mutation_command = "node scripts/mutation-run.mjs INV-STORAGE-WAL-GROWTH-DEBT"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-STORAGE-MAINTENANCE-TICK"
+statement = "Classes that grow outside reservations (profiles, caches, agent homes, updater remnants) are re-indexed and enforced on a bounded, non-blocking maintenance cadence, so the aggregate budget is not only checked at process start."
+owner = "crates/storage"
+authority = "crates/storage/src/governor.rs StorageGovernor::maintain_if_due/reconcile"
+unit_test = "maintenance_tick_reindexes_and_evicts_ungoverned_directory_growth"
+production_wiring = "concurrent_governor_instances_cannot_over_admit_the_hard_budget"
+fault = ""
+mutation_witness = "maintenance_tick_reindexes_and_evicts_ungoverned_directory_growth"
+mutation_command = "node scripts/mutation-run.mjs INV-STORAGE-MAINTENANCE-TICK"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-STORAGE-PINNED-DELTA"
+statement = "When a required/pinned object's indexed size changes, the durable pinned-byte counter moves with it, so required pressure is never under-counted."
+owner = "crates/storage"
+authority = "crates/storage/src/ledger.rs adjust_pinned_on"
+unit_test = "required_object_growth_moves_the_pinned_counter"
+production_wiring = "pinned_and_required_objects_are_never_evicted"
+fault = ""
+mutation_witness = "required_object_growth_moves_the_pinned_counter"
+mutation_command = "node scripts/mutation-run.mjs INV-STORAGE-PINNED-DELTA"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-STORAGE-RESERVATION-RELEASE"
+statement = "Dropping or aborting a reservation deletes its durable row immediately; a never-published reservation cannot leak budget until lease expiry."
+owner = "crates/storage"
+authority = "crates/storage/src/governor.rs Reservation::drop/abort"
+unit_test = "dropped_reservation_is_released_immediately"
+production_wiring = "crash_safe_reservation_survives_reopen_and_then_expires"
+fault = ""
+mutation_witness = "dropped_reservation_is_released_immediately"
+mutation_command = "node scripts/mutation-run.mjs INV-STORAGE-RESERVATION-RELEASE"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-STORAGE-DEDUP-PROMOTION"
+statement = "A CAS dedup hit claims the blob for its logical class: archive/checkpoint/capture references promote the durable owner, so archive bytes later evicted still leave a durable loss marker instead of being silently deleted as main-CAS content."
+owner = "crates/storage + crates/cas"
+authority = "crates/storage/src/ledger.rs upsert_object_on/promote_object_on; crates/cas/src/lib.rs Cas::note_class_claim"
+unit_test = "dedup_hit_promotes_to_the_strongest_retention_class"
+production_wiring = "archive_cas_eviction_records_a_durable_loss_marker_with_verified_integrity"
+fault = ""
+mutation_witness = "dedup_hit_promotes_to_the_strongest_retention_class"
+mutation_command = "node scripts/mutation-run.mjs INV-STORAGE-DEDUP-PROMOTION"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-STORAGE-LEASE-EXPIRED-COMMIT"
+statement = "A publish that completes after its reservation lease expired is adopted into durable accounting (and evicted/degraded if over budget), never dropped as vanished while its bytes remain on disk."
+owner = "crates/storage"
+authority = "crates/storage/src/governor.rs Reservation::commit"
+unit_test = "commit_after_lease_expiry_adopts_published_bytes"
+production_wiring = "crash_safe_reservation_survives_reopen_and_then_expires"
+fault = ""
+mutation_witness = "commit_after_lease_expiry_adopts_published_bytes"
+mutation_command = "node scripts/mutation-run.mjs INV-STORAGE-LEASE-EXPIRED-COMMIT"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-STORAGE-FOREIGN-RESERVATION-SWEEP"
+statement = "A reservation left by a DEAD process that crashed between reserve and publish is swept on the next open, while reservations of any still-live process sharing the data directory survive."
+owner = "crates/storage"
+authority = "crates/storage/src/ledger.rs Ledger::expire_foreign_reservations/process_boot_id"
+unit_test = "restart_sweeps_reservations_from_a_previous_process"
+production_wiring = "crash_safe_reservation_survives_reopen_and_then_expires"
+fault = ""
+mutation_witness = "restart_sweeps_reservations_from_a_previous_process"
+mutation_command = "node scripts/mutation-run.mjs INV-STORAGE-FOREIGN-RESERVATION-SWEEP"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-STORAGE-WATERMARK-HYSTERESIS"
+statement = "Crossing the aggregate watermark evicts a cold batch with headroom below the watermark, so sustained writes do not evict one object per write (eviction thrash)."
+owner = "crates/storage"
+authority = "crates/storage/src/governor.rs StorageGovernor::maintain_watermark"
+unit_test = "watermark_eviction_uses_hysteresis_not_per_write_thrash"
+production_wiring = "flood_each_class_stays_within_aggregate_and_class_quotas"
+fault = ""
+mutation_witness = "watermark_eviction_uses_hysteresis_not_per_write_thrash"
+mutation_command = "node scripts/mutation-run.mjs INV-STORAGE-WATERMARK-HYSTERESIS"
 mutation_debt = ""
 release_critical = true
 platforms = ["linux", "macos", "windows"]

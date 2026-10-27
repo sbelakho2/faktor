@@ -409,6 +409,7 @@ pre.command code { font-family: inherit; }
 .plan-card h2 { font-size: 32px; font-weight: 600; letter-spacing: -.02em; }
 .plan-card .price { font-family: var(--display); font-size: 58px; line-height: 1; letter-spacing: -.03em; margin: 24px 0 4px; }
 .plan-card .price small { font-family: var(--mono); font-size: 11px; letter-spacing: 0; color: var(--ink-64); }
+.plan-card .plan-alt-price { font-family: var(--mono); font-size: 12px; color: var(--ink-64); margin: 0 0 4px; }
 .plan-card .plan-desc { font-size: 16px; color: var(--ink-64); margin: 12px 0 20px; }
 .plan-card ul { list-style: none; border-top: var(--line); margin-top: 1px; }
 .plan-card li { padding: 10px 0; border-bottom: 1px solid var(--ink-12); font-size: 15px; }

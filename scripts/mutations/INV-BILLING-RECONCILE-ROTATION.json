@@ -1,0 +1,19 @@
+{
+  "id": "INV-BILLING-RECONCILE-ROTATION",
+  "surface": "payments.billing",
+  "file": "crates/payments/src/store.rs",
+  "find": "                 ORDER BY (SELECT COALESCE(MAX(p.observed_ms), 0) \\\n                           FROM payment_provider_invoice p \\\n                           WHERE p.organization_id = i.organization_id \\\n                             AND p.invoice_id = i.id), \\\n                          i.issued_ms, i.id LIMIT ?2\",\n",
+  "replace": "                 ORDER BY i.issued_ms, i.id LIMIT ?2\",\n",
+  "gate": "cargo test -p faktor-payments --test invoice_authority bounded_reconciliation_passes_rotate_across_the_whole_ledger",
+  "expect": "FAILED",
+  "note": "Issue-time-only ordering makes every bounded pass re-check the same prefix, so invoices past the bound are never reconciled.",
+  "capabilities": [
+    "payments.reconciliation_truth"
+  ],
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

@@ -36,6 +36,33 @@ impl AgentRuntime {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Install the daemon's `faktor.context.compactionMinReduction` on this
+    /// runtime. The value is validated here as well (hostile/NaN values are
+    /// clamped into `[0, 1)`) so the SAME ratio reaches both the compactor's
+    /// `CompactionRequest` and the durable `CompactionPolicy` acceptance
+    /// check.
+    pub fn set_compaction_min_reduction(&self, ratio: f64) {
+        let ratio = if ratio.is_finite() {
+            ratio.clamp(0.0, 0.999_999)
+        } else {
+            DEFAULT_COMPACTION_MIN_REDUCTION
+        };
+        self.compaction_min_reduction_bits
+            .store(ratio.to_bits(), std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn compaction_min_reduction(&self) -> f64 {
+        let ratio = f64::from_bits(
+            self.compaction_min_reduction_bits
+                .load(std::sync::atomic::Ordering::SeqCst),
+        );
+        if ratio.is_finite() {
+            ratio.clamp(0.0, 0.999_999)
+        } else {
+            DEFAULT_COMPACTION_MIN_REDUCTION
+        }
+    }
+
     /// Drop a session's progress record (bounded: only live sessions hold
     /// records).
     pub(crate) fn drop_progress(&self, session: SessionId) {

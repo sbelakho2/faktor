@@ -35,9 +35,12 @@ pub(crate) fn handoff_watermark(revision: u64) -> String {
 enum DeliveredWatermark {
     /// A post-migration revision watermark.
     Revision(u64),
-    /// A pre-migration `updated_ms` watermark: it can only be trusted to
-    /// cover the unmigrated generation 0.
-    LegacyTimestamp,
+    /// A pre-migration `updated_ms` watermark. Old writers stamped the
+    /// child row's `updated_ms` at delivery and did NOT bump a revision, so
+    /// a legacy timestamp covers generation 0 only up to that timestamp: a
+    /// later state change (even one that still decodes as revision 0) must
+    /// reach the parent instead of being suppressed forever.
+    LegacyTimestamp(i64),
     /// Hostile/corrupt durable bytes: fail closed (never re-deliver).
     Malformed,
 }
@@ -50,28 +53,77 @@ impl DeliveredWatermark {
                 Err(_) => Self::Malformed,
             },
             None => match raw.parse::<i64>() {
-                Ok(_) => Self::LegacyTimestamp,
+                Ok(timestamp) => Self::LegacyTimestamp(timestamp),
                 Err(_) => Self::Malformed,
             },
         }
     }
 
-    /// True when this delivery already covers `revision` (a no-op).
-    ///
-    /// A legacy timestamp covers only generation 0: a row that transitioned
-    /// after the upgrade carries a newer revision, so its newer terminal
-    /// result is delivered. A malformed value covers everything (fail
-    /// closed — a duplicate is worse than a healing retry).
-    fn covers(self, revision: u64) -> bool {
+    /// True when this delivery already covers the child's durable state (a
+    /// no-op). A malformed value covers everything (fail closed — a
+    /// duplicate is worse than a healing retry).
+    fn covers(self, child: &ChildRuntime) -> bool {
         match self {
-            Self::Revision(delivered) => delivered >= revision,
-            Self::LegacyTimestamp => revision == 0,
+            Self::Revision(delivered) => delivered >= child.revision,
+            Self::LegacyTimestamp(delivered) => {
+                child.revision == 0 && delivered >= child.updated_ms
+            }
             Self::Malformed => true,
         }
     }
 
     fn is_malformed(self) -> bool {
         matches!(self, Self::Malformed)
+    }
+
+    fn is_legacy(self) -> bool {
+        matches!(self, Self::LegacyTimestamp(_))
+    }
+}
+
+/// True when a rendered handoff section names a DIFFERENT terminal outcome
+/// than the durable child row. The renderer emits one `outcome: <state>`
+/// line (sanitized child text can never forge the line prefix); this lets
+/// the upgrade path refresh a same-millisecond legacy transition that has no
+/// revision to distinguish it. A section whose outcome line was dropped by
+/// the budget is treated as unknown (never re-delivered on that alone).
+fn section_reports_other_outcome(section: &str, state: ChildState) -> bool {
+    let expected = match state {
+        ChildState::Done => "done",
+        ChildState::Failed => "failed",
+        ChildState::Cancelled => "cancelled",
+        _ => return false,
+    };
+    section
+        .lines()
+        .take(64)
+        .find_map(|line| line.strip_prefix("outcome: "))
+        .is_some_and(|outcome| outcome.trim() != expected)
+}
+
+/// True when the durable watermark plus the pending section already represent
+/// the child's CURRENT durable state. A legacy timestamp additionally checks
+/// the rendered outcome so an in-place, same-millisecond state change is not
+/// suppressed by the old clock stamp.
+fn delivery_is_current(
+    handle: &faktor_session::SessionHandle,
+    key: &str,
+    delivered: DeliveredWatermark,
+    child: &ChildRuntime,
+) -> bool {
+    if !delivered.covers(child) {
+        return false;
+    }
+    if !delivered.is_legacy() {
+        return true;
+    }
+    match handle.memory_fact_get(PENDING_INTERNAL_CONTEXT_KIND, key) {
+        Ok(Some(section)) if !section.is_empty() => {
+            !section_reports_other_outcome(&section, child.state)
+        }
+        // An empty section is a consumed ack (never resurrected on an
+        // ambiguous same-millisecond state); a read error fails closed.
+        _ => true,
     }
 }
 
@@ -182,7 +234,7 @@ impl OrchestratorRuntime {
                         );
                         return;
                     }
-                    if delivered.covers(child.revision) {
+                    if delivery_is_current(&handle, &key, delivered, child) {
                         return;
                     }
                 }
@@ -269,7 +321,7 @@ impl OrchestratorRuntime {
                                 );
                                     return;
                                 }
-                                if delivered.covers(child.revision) {
+                                if delivery_is_current(&handle, &key, delivered, child) {
                                     return;
                                 }
                             }
@@ -372,7 +424,7 @@ impl OrchestratorRuntime {
                             watermark_key,
                             "child handoff watermark is malformed; refusing to re-deliver (no duplicate)"
                         );
-                    } else if !delivered.covers(child.revision) {
+                    } else if !delivery_is_current(&handle, &key, delivered, child) {
                         self.deliver_child_handoff(parent, run_id, child);
                     }
                 }
@@ -380,8 +432,8 @@ impl OrchestratorRuntime {
                 // generation 0 as delivered (a consumed ack must never be
                 // resurrected). A transition after the upgrade carries a
                 // newer revision and must still reach the parent.
-                (Ok(Some(_)), Ok(None)) => {
-                    if child.revision > 0 {
+                (Ok(Some(section)), Ok(None)) => {
+                    if child.revision > 0 || section_reports_other_outcome(&section, child.state) {
                         self.deliver_child_handoff(parent, run_id, child);
                     }
                 }
@@ -396,7 +448,7 @@ impl OrchestratorRuntime {
                             watermark_key,
                             "child handoff watermark is malformed; refusing to re-deliver (no duplicate)"
                         );
-                    } else if !delivered.covers(child.revision) {
+                    } else if !delivered.covers(child) {
                         self.deliver_child_handoff(parent, run_id, child);
                     }
                 }

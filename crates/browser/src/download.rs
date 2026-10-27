@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! Downloads (spec §9): **disabled by default, and native downloads are
 //! always denied** — an enabled policy means "capture under a hard cap",
 //! never "let Chromium write wherever it likes".
@@ -251,6 +252,18 @@ impl DownloadManager {
             .unwrap_or_else(|| PathBuf::from("downloads"));
         let dir_rel = base.join(&subdir);
         let discovered = faktor_storage::StorageGovernor::discover(root.root());
+        if let Some(governor) = &discovered {
+            // The browser surface may root profiles under `<data>/store/...`,
+            // which is not one of the governor's historical default roots.
+            // Register the concrete profile root (durably, so every governor
+            // instance scanning this ledger sees it) before any download can
+            // be reserved against a class whose backend would not index it.
+            let _ = governor.add_directory_root(
+                faktor_storage::StorageClass::BrowserStorage,
+                root.root().to_path_buf(),
+                0,
+            );
+        }
         let manager = Arc::new(Self {
             policy,
             root,
@@ -289,11 +302,33 @@ impl DownloadManager {
     /// Attach the daemon's always-on storage governor (browser storage
     /// class). Idempotent; the manager may exist before the governor.
     pub fn attach_governor(&self, governor: Arc<faktor_storage::StorageGovernor>) {
+        // The attached instance must know THIS manager's profile root, or a
+        // multi-root reservation would fall back to a bare key scan never
+        // reports.
+        let _ = governor.add_directory_root(
+            faktor_storage::StorageClass::BrowserStorage,
+            self.root.root().to_path_buf(),
+            0,
+        );
         *faktor_core::lock::recover(&self.governor) = Some(governor);
     }
 
     fn governor(&self) -> Option<Arc<faktor_storage::StorageGovernor>> {
         faktor_core::lock::recover(&self.governor).clone()
+    }
+
+    fn reservation_key(&self, dest_rel: &Path) -> String {
+        let fallback = dest_rel.to_string_lossy().replace('\\', "/");
+        match self.governor() {
+            Some(governor) => governor
+                .directory_key(
+                    faktor_storage::StorageClass::BrowserStorage,
+                    self.root.root(),
+                    dest_rel,
+                )
+                .unwrap_or(fallback),
+            None => fallback,
+        }
     }
 
     /// The policy this manager enforces.
@@ -543,22 +578,25 @@ impl DownloadManager {
         let dest_rel = self.dir_rel.join(&filename);
         // Reserve browser-storage admission BEFORE the temp file exists: a
         // refused reservation starts no stream and leaves no partial file.
+        let reservation_key = self.reservation_key(&dest_rel);
         let reservation = match self.governor() {
-            Some(governor) => match governor.reserve(
-                faktor_storage::StorageClass::BrowserStorage,
-                &dest_rel.to_string_lossy().replace('\\', "/"),
-                self.policy.max_bytes,
-            ) {
-                Ok(reservation) => Some(reservation),
-                Err(error) => {
-                    let detail = format!("storage admission refused: {error}");
-                    self.reject(&request_id, &url, &detail, false);
-                    let _ = self
-                        .deny(client, session, &request_id, deadline, cancel)
-                        .await;
-                    return Err(BrowserError::StorageRefused { detail });
+            Some(governor) => {
+                match governor.reserve(
+                    faktor_storage::StorageClass::BrowserStorage,
+                    &reservation_key,
+                    self.policy.max_bytes,
+                ) {
+                    Ok(reservation) => Some(reservation),
+                    Err(error) => {
+                        let detail = format!("storage admission refused: {error}");
+                        self.reject(&request_id, &url, &detail, false);
+                        let _ = self
+                            .deny(client, session, &request_id, deadline, cancel)
+                            .await;
+                        return Err(BrowserError::StorageRefused { detail });
+                    }
                 }
-            },
+            }
             None => None,
         };
         let tmp_rel = self.dir_rel.join(format!(
@@ -1138,6 +1176,107 @@ mod tests {
         let root = RootedDir::create(&tmp.path().join("profiles")).unwrap();
         root.create_dir_all(Path::new(base)).unwrap();
         (root, PathBuf::from(base))
+    }
+
+    #[test]
+    fn reservation_key_uses_the_backend_scan_key_for_multi_root_storage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let governor = faktor_storage::StorageGovernor::open(
+            tmp.path(),
+            faktor_storage::StorageGovernorConfig::default(),
+        )
+        .unwrap();
+        let root = RootedDir::create(&tmp.path().join("commerce").join("profiles")).unwrap();
+        root.create_dir_all(Path::new("p1")).unwrap();
+        let policy = DownloadPolicy {
+            enabled: true,
+            directory: Some("downloads".to_string()),
+            max_bytes: 1024,
+        };
+        let manager = DownloadManager::new(policy, root, Path::new("p1")).unwrap();
+        manager.attach_governor(Arc::new(governor));
+        assert_eq!(
+            manager.reservation_key(&Path::new("p1").join("downloads").join("file.pdf")),
+            "0:p1/downloads/file.pdf"
+        );
+    }
+
+    #[test]
+    fn download_manager_registers_its_profile_root_with_the_governor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, base) = rooted(&tmp, "p1");
+        let config = faktor_storage::StorageGovernorConfig {
+            total_budget_bytes: 10_000_000,
+            watermark_permille: 900,
+            reservation_lease_ms: 60_000,
+            quotas: faktor_storage::StorageClass::ALL
+                .into_iter()
+                .map(|class| (class, 1_000_000))
+                .collect(),
+        }
+        .validated()
+        .unwrap();
+        let governor = faktor_storage::StorageGovernor::open(tmp.path(), config).unwrap();
+        let policy = DownloadPolicy {
+            enabled: true,
+            directory: Some("downloads".to_string()),
+            max_bytes: 4_096,
+        };
+        let manager = DownloadManager::new(policy, root, &base).unwrap();
+        assert!(manager.policy().enabled);
+        let discovered =
+            faktor_storage::StorageGovernor::discover(&tmp.path().join("profiles/p1")).unwrap();
+        let roots = discovered
+            .backend(faktor_storage::StorageClass::BrowserStorage)
+            .unwrap()
+            .directory_roots()
+            .expect("directory backend")
+            .0
+            .to_vec();
+        let profile_root = tmp.path().join("profiles");
+        assert!(
+            roots.iter().any(|root| root == &profile_root),
+            "the concrete profile root must be a governed backend root: {roots:?}"
+        );
+        let key = discovered
+            .directory_key(
+                faktor_storage::StorageClass::BrowserStorage,
+                &profile_root,
+                Path::new("p1/downloads/file.bin"),
+            )
+            .expect("registered profile root must have a canonical key");
+        assert!(
+            key.ends_with("p1/downloads/file.bin") && key.contains(':'),
+            "a mulit-root key must carry the same index a scan would use: {key}"
+        );
+        let file = profile_root.join("p1/downloads/file.bin");
+        std::fs::write(&file, vec![4u8; 2_048]).unwrap();
+        discovered.reconcile().unwrap();
+        let usage = discovered.metrics().unwrap().per_class["browser_storage"].clone();
+        assert!(usage.bytes >= 2_048, "{usage:?}");
+        assert!(usage.objects >= 1, "{usage:?}");
+        let scan_keys: Vec<String> = discovered
+            .backend(faktor_storage::StorageClass::BrowserStorage)
+            .unwrap()
+            .scan(&discovered)
+            .unwrap()
+            .into_iter()
+            .map(|object| object.key)
+            .collect();
+        assert!(
+            scan_keys.contains(&key),
+            "reservation key {key} must be exactly the key scan reports: {scan_keys:?}"
+        );
+        // The first governor instance must see the durable root too.
+        governor.sync_directory_roots().unwrap();
+        let roots = governor
+            .backend(faktor_storage::StorageClass::BrowserStorage)
+            .unwrap()
+            .directory_roots()
+            .unwrap()
+            .0
+            .to_vec();
+        assert!(roots.iter().any(|root| root == &profile_root));
     }
 
     #[test]

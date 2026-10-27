@@ -1,8 +1,8 @@
 {
   "schema": "faktor-test-programme-registry/v1",
-  "generated_at": "2026-10-26T17:21:48.151Z",
-  "commit": "a60ba5a506a2ab73aaa255a2280b2da97efc78f1",
-  "tree": "a3270aae4bfdb9363569ebb4a894340814547e81",
+  "generated_at": "2026-10-27T02:23:05.529Z",
+  "commit": "4c437030341a8a575e2ff58a8c22399d5d232bf7",
+  "tree": "c0c5690cd95ca9620902ddd06ded784c7d5c6643",
   "layers": [
     "structural",
     "unit",
@@ -19,7 +19,7 @@
     "release"
   ],
   "counts": {
-    "rows": 1034,
+    "rows": 1073,
     "by_kind": {
       "acceptance-scenario": 40,
       "act-now": 8,
@@ -28,7 +28,7 @@
       "cli-command": 49,
       "config-key": 53,
       "control": 200,
-      "invariant": 212,
+      "invariant": 251,
       "jetbrains-contribution": 1,
       "native-route": 299,
       "provider-adapter": 6,
@@ -38,22 +38,23 @@
       "workflow": 16
     },
     "by_status": {
-      "deferred": 890,
-      "proven": 76,
+      "deferred": 950,
+      "failed": 1,
+      "proven": 54,
       "stub": 68
     },
     "by_lane": {
-      "nightly": 566,
-      "pull": 703,
-      "trusted": 1033,
+      "nightly": 605,
+      "pull": 742,
+      "trusted": 1072,
       "weekly-live": 342
     },
     "by_layer": {
       "agent-evals": 1,
       "contracts": 436,
       "ide-screen-readers": 385,
-      "state-model-crash": 310,
-      "unit-property": 295
+      "state-model-crash": 349,
+      "unit-property": 334
     }
   },
   "rows": [
@@ -1240,7 +1241,7 @@
       ],
       "evidence_kind": "state-model",
       "oracle": "Overflow/negative/malformed cursors and duplicate concurrent streams are typed and bounded; no 5xx, no panic, no event duplication across one session.",
-      "status": "proven",
+      "status": "failed",
       "meta": {
         "report_row": "widen-ordering"
       },
@@ -1250,56 +1251,8 @@
         "corruption"
       ],
       "evidence": {
-        "passed": true,
-        "cases": [
-          {
-            "name": "cursor-18446744073709551616",
-            "passed": true,
-            "observed": {
-              "status": 400,
-              "aborted": false
-            }
-          },
-          {
-            "name": "cursor--1",
-            "passed": true,
-            "observed": {
-              "status": 400,
-              "aborted": false
-            }
-          },
-          {
-            "name": "cursor-abc",
-            "passed": true,
-            "observed": {
-              "status": 400,
-              "aborted": false
-            }
-          },
-          {
-            "name": "cursor-1&after=2",
-            "passed": true,
-            "observed": {
-              "status": 400,
-              "aborted": false
-            }
-          },
-          {
-            "name": "two-concurrent-streams",
-            "passed": true,
-            "observed": {
-              "first": "bounded",
-              "second": "bounded"
-            }
-          },
-          {
-            "name": "stream-auth-before-data",
-            "passed": true,
-            "observed": {
-              "status": 401
-            }
-          }
-        ]
+        "passed": false,
+        "reason": "Error: route probe daemon did not start: \u001b[2m2026-10-27T02:23:04.225894Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mfaktor_cli::daemon::serve\u001b[0m\u001b[2m:\u001b[0m daemon build failed: routing_mode Economy admits no candidate for 2 configured model(s) (p1/default, p1/m); a first model call would otherwise fail as NoCapableModel. Every configured model has Unknown pricing (p1/default, p1/m), which economy cannot cost or budget. Configure an exact quote or a pricing ceiling for that endpoint, point base_url at a canonical official endpoint, or use routing_mode maximum_quality/pinned.\n"
       }
     },
     {
@@ -1874,7 +1827,7 @@
         "passed": true,
         "observed": {
           "command": "billing",
-          "help_bytes": 1584,
+          "help_bytes": 1877,
           "unknown_flag_exit": 2
         }
       }
@@ -13064,6 +13017,66 @@
       "evidence": null
     },
     {
+      "id": "invariant.INV-BILLING-CROSS-EVENT-SETTLED-ONCE",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "cross_event_settlement_never_credits_twice_and_partial_paid_total_is_exact"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-BILLING-CROSS-EVENT-SETTLED-ONCE",
+        "unit_test": "cross_event_settlement_never_credits_twice_and_partial_paid_total_is_exact",
+        "wiring_test": "cross_event_settlement_never_credits_twice_and_partial_paid_total_is_exact"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-BILLING-DUNNING-ATTEMPT-IDENTITY",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "one_failed_attempt_fanned_out_into_two_events_advances_dunning_once"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-BILLING-DUNNING-ATTEMPT-IDENTITY",
+        "unit_test": "one_failed_attempt_fanned_out_into_two_events_advances_dunning_once",
+        "wiring_test": "one_failed_attempt_fanned_out_into_two_events_advances_dunning_once"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
       "id": "invariant.INV-BILLING-DUNNING-INVOICE-MONOTONIC",
       "kind": "invariant",
       "path": "tests/invariants.toml",
@@ -13116,6 +13129,36 @@
         "mutation": "node scripts/mutation-run.mjs INV-BILLING-DUNNING-SUBSCRIPTION-TERMINAL",
         "unit_test": "payment_failure_cannot_regress_a_paid_invoice_or_canceled_subscription",
         "wiring_test": "payment_failure_cannot_regress_a_paid_invoice_or_canceled_subscription"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-BILLING-EXPORT-CURSOR-TRUTH",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "invoices_cover_inclusive_tax_credits_discounts_and_exports"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-BILLING-EXPORT-CURSOR-TRUTH",
+        "unit_test": "invoices_cover_inclusive_tax_credits_discounts_and_exports",
+        "wiring_test": "invoices_cover_inclusive_tax_credits_discounts_and_exports"
       },
       "adversarial": [
         "planted-mutation",
@@ -13185,6 +13228,66 @@
       "evidence": null
     },
     {
+      "id": "invariant.INV-BILLING-OVERVIEW-TICK-TRUTH",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "payment_overview_ticks_lifecycle_before_reporting_state"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-BILLING-OVERVIEW-TICK-TRUTH",
+        "unit_test": "payment_overview_ticks_lifecycle_before_reporting_state",
+        "wiring_test": "payment_overview_ticks_lifecycle_before_reporting_state"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-BILLING-PARTIAL-PAID-TOTAL",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "cross_event_settlement_never_credits_twice_and_partial_paid_total_is_exact"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-BILLING-PARTIAL-PAID-TOTAL",
+        "unit_test": "cross_event_settlement_never_credits_twice_and_partial_paid_total_is_exact",
+        "wiring_test": "cross_event_settlement_never_credits_twice_and_partial_paid_total_is_exact"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
       "id": "invariant.INV-BILLING-PAYMENT-FAILED-DUNNING-FENCE",
       "kind": "invariant",
       "path": "tests/invariants.toml",
@@ -13237,6 +13340,126 @@
         "mutation": "node scripts/mutation-run.mjs INV-BILLING-PAYMENT-FAILURE-FENCE",
         "unit_test": "failed_payment_webhook_fails_the_pending_payment_and_releases_the_fence",
         "wiring_test": "failed_payment_webhook_fails_the_pending_payment_and_releases_the_fence"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-BILLING-PAYMENT-FAILURE-SETTLED-NO-DUNNING",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "payment_failure_after_settlement_never_regresses_an_active_subscription"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-BILLING-PAYMENT-FAILURE-SETTLED-NO-DUNNING",
+        "unit_test": "payment_failure_after_settlement_never_regresses_an_active_subscription",
+        "wiring_test": "payment_failure_after_settlement_never_regresses_an_active_subscription"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-BILLING-PRORATION-SEAT-TRUTH",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "plan_and_seat_proration_use_real_prices_and_exact_integer_math"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-BILLING-PRORATION-SEAT-TRUTH",
+        "unit_test": "plan_and_seat_proration_use_real_prices_and_exact_integer_math",
+        "wiring_test": "plan_and_seat_proration_use_real_prices_and_exact_integer_math"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-BILLING-RECONCILE-ROTATION",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "bounded_reconciliation_passes_rotate_across_the_whole_ledger"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-BILLING-RECONCILE-ROTATION",
+        "unit_test": "bounded_reconciliation_passes_rotate_across_the_whole_ledger",
+        "wiring_test": "bounded_reconciliation_passes_rotate_across_the_whole_ledger"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-BILLING-RECONCILE-SEAT-FENCE",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "reconciliation_never_writes_provider_seat_drift_over_the_fenced_request"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-BILLING-RECONCILE-SEAT-FENCE",
+        "unit_test": "reconciliation_never_writes_provider_seat_drift_over_the_fenced_request",
+        "wiring_test": "reconciliation_never_writes_provider_seat_drift_over_the_fenced_request"
       },
       "adversarial": [
         "planted-mutation",
@@ -13477,6 +13700,36 @@
         "mutation": "node scripts/mutation-run.mjs INV-BILLING-WEBHOOK-PAYMENT-TRUTH",
         "unit_test": "webhook_payment_truth_mismatch_for_a_recorded_payment_is_refused",
         "wiring_test": "webhook_payment_truth_mismatch_for_a_recorded_payment_is_refused"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-BILLING-WEBHOOK-SEAT-BOUND",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "subscription_webhook_quantity_outside_the_seat_bound_is_refused"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-BILLING-WEBHOOK-SEAT-BOUND",
+        "unit_test": "subscription_webhook_quantity_outside_the_seat_bound_is_refused",
+        "wiring_test": "subscription_webhook_quantity_outside_the_seat_bound_is_refused"
       },
       "adversarial": [
         "planted-mutation",
@@ -13748,6 +14001,36 @@
         "mutation": "node scripts/mutation-run.mjs INV-BROWSER-SHUTDOWN-ORPHANS",
         "unit_test": "shutdown_instance_kills_the_child_and_leaves_no_orphan",
         "wiring_test": "shutdown_instance_kills_the_child_and_leaves_no_orphan"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-BROWSER-STORAGE-ROOT-GOVERNED",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "download_manager_registers_its_profile_root_with_the_governor"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-BROWSER-STORAGE-ROOT-GOVERNED",
+        "unit_test": "download_manager_registers_its_profile_root_with_the_governor",
+        "wiring_test": "download_manager_registers_its_profile_root_with_the_governor"
       },
       "adversarial": [
         "planted-mutation",
@@ -14918,6 +15201,67 @@
       "evidence": null
     },
     {
+      "id": "invariant.INV-DESIGN-FOCUS-LAZY",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "lazy_focus_does_zero_work_without_an_active_step_or_under_two_kib"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-DESIGN-FOCUS-LAZY",
+        "unit_test": "lazy_focus_does_zero_work_without_an_active_step_or_under_two_kib",
+        "wiring_test": "lazy_focus_does_zero_work_without_an_active_step_or_under_two_kib"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-DESIGN-FOCUS-RANKING",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "priority_rank_orders_binding_selector_component_invariant_risk_then_generic",
+        "runtime_focus_policy_preserves_priority_ranked_terms"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-DESIGN-FOCUS-RANKING",
+        "unit_test": "priority_rank_orders_binding_selector_component_invariant_risk_then_generic",
+        "wiring_test": "runtime_focus_policy_preserves_priority_ranked_terms"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
       "id": "invariant.INV-DESIGN-FOCUS-SANITIZATION",
       "kind": "invariant",
       "path": "tests/invariants.toml",
@@ -15195,6 +15539,66 @@
       "evidence": null
     },
     {
+      "id": "invariant.INV-EDITION8-APPROVAL-DISPLAY-NO-SHELL-WRITE",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "script.INV-EDITION8-APPROVAL-DISPLAY-NO-SHELL-WRITE"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-EDITION8-APPROVAL-DISPLAY-NO-SHELL-WRITE",
+        "unit_test": "",
+        "wiring_test": ""
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-EDITION8-CONFIG-TYPE-WIRING",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "script.INV-EDITION8-CONFIG-TYPE-WIRING"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-EDITION8-CONFIG-TYPE-WIRING",
+        "unit_test": "",
+        "wiring_test": ""
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
       "id": "invariant.INV-EDITION8-ORG-SCOPED-COMMERCIAL-READS",
       "kind": "invariant",
       "path": "tests/invariants.toml",
@@ -15275,6 +15679,36 @@
       "status": "deferred",
       "meta": {
         "mutation": "node scripts/mutation-run.mjs INV-EDITION8-S55-CONNECT-PRIMARY",
+        "unit_test": "",
+        "wiring_test": ""
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-EDITION8-STORED-ONLY-TRUTH",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "script.INV-EDITION8-STORED-ONLY-TRUTH"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-EDITION8-STORED-ONLY-TRUTH",
         "unit_test": "",
         "wiring_test": ""
       },
@@ -16658,6 +17092,36 @@
         "mutation": "node scripts/mutation-run.mjs INV-PAYMENTS-LEASE-FENCE",
         "unit_test": "fence_release_is_refused_until_terminal_or_no_effect",
         "wiring_test": "crash_after_fence_keeps_the_fence_and_reconciles_without_a_second_effect"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-PAYMENTS-METHOD-BOUND",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "stored_payment_methods_are_bounded_and_overview_counts_without_payloads"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-PAYMENTS-METHOD-BOUND",
+        "unit_test": "stored_payment_methods_are_bounded_and_overview_counts_without_payloads",
+        "wiring_test": "stored_payment_methods_are_bounded_and_overview_counts_without_payloads"
       },
       "adversarial": [
         "planted-mutation",
@@ -18079,6 +18543,96 @@
       "evidence": null
     },
     {
+      "id": "invariant.INV-SITE-BILLING-DISCLOSURE",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "script.INV-SITE-BILLING-DISCLOSURE"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-SITE-BILLING-DISCLOSURE",
+        "unit_test": "",
+        "wiring_test": ""
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-SITE-BILLING-INVOICE-DOWNLOAD",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "invoice_download_is_attachment_bounded_and_tenant_scoped"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-SITE-BILLING-INVOICE-DOWNLOAD",
+        "unit_test": "invoice_download_is_attachment_bounded_and_tenant_scoped",
+        "wiring_test": "invoice_download_is_attachment_bounded_and_tenant_scoped"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-SITE-BILLING-INVOICE-PAGE-CURSOR",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "invoice_list_paginates_with_an_exclusive_cursor_and_truthful_bounds"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-SITE-BILLING-INVOICE-PAGE-CURSOR",
+        "unit_test": "invoice_list_paginates_with_an_exclusive_cursor_and_truthful_bounds",
+        "wiring_test": "invoice_list_paginates_with_an_exclusive_cursor_and_truthful_bounds"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
       "id": "invariant.INV-SITE-BILLING-PROVIDER-AVAILABILITY",
       "kind": "invariant",
       "path": "tests/invariants.toml",
@@ -18194,6 +18748,594 @@
         "mutation": "node scripts/mutation-run.mjs INV-SNAPSHOT-IDENTITY-NO-SYNTHETIC",
         "unit_test": "unprovable_root_has_no_snapshot_identity_only_none",
         "wiring_test": "environment_fingerprint_is_stable_and_manifest_sensitive"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-STORAGE-AGGREGATE-BUDGET",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "budget_refusal_is_enforced_before_publish",
+        "cas_put_refuses_before_publishing_over_budget"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-STORAGE-AGGREGATE-BUDGET",
+        "unit_test": "budget_refusal_is_enforced_before_publish",
+        "wiring_test": "cas_put_refuses_before_publishing_over_budget"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-STORAGE-ARCHIVE-LOSS-MARKER",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "archive_cas_eviction_records_a_durable_loss_marker_with_verified_integrity",
+        "archive_eviction_writes_a_durable_loss_marker"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-STORAGE-ARCHIVE-LOSS-MARKER",
+        "unit_test": "archive_eviction_writes_a_durable_loss_marker",
+        "wiring_test": "archive_cas_eviction_records_a_durable_loss_marker_with_verified_integrity"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-STORAGE-CANONICAL-DIRECTORY-KEY",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "directory_key_is_canonical_and_survives_reconcile_and_eviction",
+        "reservation_key_uses_the_backend_scan_key_for_multi_root_storage"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-STORAGE-CANONICAL-DIRECTORY-KEY",
+        "unit_test": "directory_key_is_canonical_and_survives_reconcile_and_eviction",
+        "wiring_test": "reservation_key_uses_the_backend_scan_key_for_multi_root_storage"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-STORAGE-CLASS-EVICTION-SCOPE",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "class_quota_pressure_never_evicts_another_class",
+        "flood_each_class_stays_within_aggregate_and_class_quotas"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-STORAGE-CLASS-EVICTION-SCOPE",
+        "unit_test": "class_quota_pressure_never_evicts_another_class",
+        "wiring_test": "flood_each_class_stays_within_aggregate_and_class_quotas"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-STORAGE-DEDUP-PROMOTION",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "archive_cas_eviction_records_a_durable_loss_marker_with_verified_integrity",
+        "dedup_hit_promotes_to_the_strongest_retention_class"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-STORAGE-DEDUP-PROMOTION",
+        "unit_test": "dedup_hit_promotes_to_the_strongest_retention_class",
+        "wiring_test": "archive_cas_eviction_records_a_durable_loss_marker_with_verified_integrity"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-STORAGE-DIRECTORY-ROOT-PERSISTENCE",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "directory_roots_persist_across_governor_instances",
+        "download_manager_registers_its_profile_root_with_the_governor"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-STORAGE-DIRECTORY-ROOT-PERSISTENCE",
+        "unit_test": "directory_roots_persist_across_governor_instances",
+        "wiring_test": "download_manager_registers_its_profile_root_with_the_governor"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-STORAGE-EVIDENCE-PIN-RELEASE",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "evidence_backing_is_admitted_and_pinned_before_the_row_commits"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-STORAGE-EVIDENCE-PIN-RELEASE",
+        "unit_test": "evidence_backing_is_admitted_and_pinned_before_the_row_commits",
+        "wiring_test": "evidence_backing_is_admitted_and_pinned_before_the_row_commits"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-STORAGE-FOREIGN-RESERVATION-SWEEP",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "crash_safe_reservation_survives_reopen_and_then_expires",
+        "restart_sweeps_reservations_from_a_previous_process"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-STORAGE-FOREIGN-RESERVATION-SWEEP",
+        "unit_test": "restart_sweeps_reservations_from_a_previous_process",
+        "wiring_test": "crash_safe_reservation_survives_reopen_and_then_expires"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-STORAGE-LEASE-EXPIRED-COMMIT",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "commit_after_lease_expiry_adopts_published_bytes",
+        "crash_safe_reservation_survives_reopen_and_then_expires"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-STORAGE-LEASE-EXPIRED-COMMIT",
+        "unit_test": "commit_after_lease_expiry_adopts_published_bytes",
+        "wiring_test": "crash_safe_reservation_survives_reopen_and_then_expires"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-STORAGE-LRU-EVICTION-ORDER",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "eviction_at_100k_is_lru_ordered_and_bounded",
+        "eviction_at_100k_objects_uses_bounded_keyset_queries_not_quadratic_scans"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-STORAGE-LRU-EVICTION-ORDER",
+        "unit_test": "eviction_at_100k_is_lru_ordered_and_bounded",
+        "wiring_test": "eviction_at_100k_objects_uses_bounded_keyset_queries_not_quadratic_scans"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-STORAGE-MAINTENANCE-TICK",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "concurrent_governor_instances_cannot_over_admit_the_hard_budget",
+        "maintenance_tick_reindexes_and_evicts_ungoverned_directory_growth"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-STORAGE-MAINTENANCE-TICK",
+        "unit_test": "maintenance_tick_reindexes_and_evicts_ungoverned_directory_growth",
+        "wiring_test": "concurrent_governor_instances_cannot_over_admit_the_hard_budget"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-STORAGE-PINNED-DELTA",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "pinned_and_required_objects_are_never_evicted",
+        "required_object_growth_moves_the_pinned_counter"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-STORAGE-PINNED-DELTA",
+        "unit_test": "required_object_growth_moves_the_pinned_counter",
+        "wiring_test": "pinned_and_required_objects_are_never_evicted"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-STORAGE-PROMOTION-PIN-MOVE",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "dedup_hit_promotes_to_the_strongest_retention_class",
+        "dedup_promotion_moves_the_pin_to_the_new_owner_class"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-STORAGE-PROMOTION-PIN-MOVE",
+        "unit_test": "dedup_promotion_moves_the_pin_to_the_new_owner_class",
+        "wiring_test": "dedup_hit_promotes_to_the_strongest_retention_class"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-STORAGE-RESERVATION-ATOMIC",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "cas_put_refuses_before_publishing_over_budget",
+        "concurrent_governor_instances_cannot_over_admit_the_hard_budget"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-STORAGE-RESERVATION-ATOMIC",
+        "unit_test": "concurrent_governor_instances_cannot_over_admit_the_hard_budget",
+        "wiring_test": "cas_put_refuses_before_publishing_over_budget"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-STORAGE-RESERVATION-RELEASE",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "crash_safe_reservation_survives_reopen_and_then_expires",
+        "dropped_reservation_is_released_immediately"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-STORAGE-RESERVATION-RELEASE",
+        "unit_test": "dropped_reservation_is_released_immediately",
+        "wiring_test": "crash_safe_reservation_survives_reopen_and_then_expires"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-STORAGE-SQLITE-DEBT-SHARED",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "sqlite_admission_debt_is_shared_and_inflight_safe",
+        "storage_governor_bounds_wal_growth_and_refuses_over_budget"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-STORAGE-SQLITE-DEBT-SHARED",
+        "unit_test": "sqlite_admission_debt_is_shared_and_inflight_safe",
+        "wiring_test": "storage_governor_bounds_wal_growth_and_refuses_over_budget"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-STORAGE-WAL-GROWTH-DEBT",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "small_append_admission_has_no_scan_overhead",
+        "sqlite_wal_flood_cannot_exceed_the_class_quota_between_scans"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-STORAGE-WAL-GROWTH-DEBT",
+        "unit_test": "sqlite_wal_flood_cannot_exceed_the_class_quota_between_scans",
+        "wiring_test": "small_append_admission_has_no_scan_overhead"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-STORAGE-WAL-TRUNCATION-TRUTH",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "storage_governor_bounds_wal_growth_and_refuses_over_budget",
+        "wal_checkpoint_busy_never_fakes_reclaimed_bytes"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-STORAGE-WAL-TRUNCATION-TRUTH",
+        "unit_test": "wal_checkpoint_busy_never_fakes_reclaimed_bytes",
+        "wiring_test": "storage_governor_bounds_wal_growth_and_refuses_over_budget"
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-STORAGE-WATERMARK-HYSTERESIS",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "flood_each_class_stays_within_aggregate_and_class_quotas",
+        "watermark_eviction_uses_hysteresis_not_per_write_thrash"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-STORAGE-WATERMARK-HYSTERESIS",
+        "unit_test": "watermark_eviction_uses_hysteresis_not_per_write_thrash",
+        "wiring_test": "flood_each_class_stays_within_aggregate_and_class_quotas"
       },
       "adversarial": [
         "planted-mutation",
@@ -19267,7 +20409,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "rev8": false,
         "credential": true,
@@ -19284,18 +20426,7 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": {
-        "passed": true,
-        "cases": [
-          {
-            "name": "deletes locally and reports remoteRevoked=false",
-            "passed": true,
-            "observed": {
-              "status": 200
-            }
-          }
-        ]
-      }
+      "evidence": null
     },
     {
       "id": "native.delete.native.session.id",
@@ -19316,7 +20447,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -19333,25 +20464,7 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": {
-        "passed": true,
-        "cases": [
-          {
-            "name": "deletes with a tombstone",
-            "passed": true,
-            "observed": {
-              "status": 200
-            }
-          },
-          {
-            "name": "replay is idempotent",
-            "passed": true,
-            "observed": {
-              "status": 200
-            }
-          }
-        ]
-      }
+      "evidence": null
     },
     {
       "id": "native.delete.native.session.id.context.pins",
@@ -19477,7 +20590,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -19494,18 +20607,7 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": {
-        "passed": true,
-        "cases": [
-          {
-            "name": "deletes only the matching revision",
-            "passed": true,
-            "observed": {
-              "status": 200
-            }
-          }
-        ]
-      }
+      "evidence": null
     },
     {
       "id": "native.delete.native.session.id.worktrees.worktree-id",
@@ -21416,7 +22518,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -21433,18 +22535,7 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": {
-        "passed": true,
-        "cases": [
-          {
-            "name": "reports hasToken without the token",
-            "passed": true,
-            "observed": {
-              "status": 200
-            }
-          }
-        ]
-      }
+      "evidence": null
     },
     {
       "id": "native.get.native.mcp.servers.id.oauth.callback.flow-id",
@@ -22200,7 +23291,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -22217,26 +23308,7 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": {
-        "passed": true,
-        "cases": [
-          {
-            "name": "returns the ordered chain with served status",
-            "passed": true,
-            "observed": {
-              "write": 200,
-              "read": 200
-            }
-          },
-          {
-            "name": "unknown preset is typed 404",
-            "passed": true,
-            "observed": {
-              "status": 404
-            }
-          }
-        ]
-      }
+      "evidence": null
     },
     {
       "id": "native.get.native.presets.id.roles",
@@ -22257,7 +23329,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -22274,25 +23346,7 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": {
-        "passed": true,
-        "cases": [
-          {
-            "name": "reports served=true for the served binding",
-            "passed": true,
-            "observed": {
-              "status": 200
-            }
-          },
-          {
-            "name": "unknown preset is typed 404",
-            "passed": true,
-            "observed": {
-              "status": 404
-            }
-          }
-        ]
-      }
+      "evidence": null
     },
     {
       "id": "native.get.native.providers",
@@ -22418,7 +23472,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "rev8": false,
         "credential": true,
@@ -22435,19 +23489,7 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": {
-        "passed": true,
-        "cases": [
-          {
-            "name": "lists references only",
-            "passed": true,
-            "observed": {
-              "status": 200,
-              "count": 1
-            }
-          }
-        ]
-      }
+      "evidence": null
     },
     {
       "id": "native.get.native.ready",
@@ -23308,7 +24350,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -23325,25 +24367,7 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": {
-        "passed": true,
-        "cases": [
-          {
-            "name": "lists the created comment with change staleness",
-            "passed": true,
-            "observed": {
-              "status": 200
-            }
-          },
-          {
-            "name": "a foreign session is typed 404",
-            "passed": true,
-            "observed": {
-              "status": 404
-            }
-          }
-        ]
-      }
+      "evidence": null
     },
     {
       "id": "native.get.native.session.id.settings",
@@ -23364,7 +24388,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -23381,18 +24405,7 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": {
-        "passed": true,
-        "cases": [
-          {
-            "name": "reads the durable settings with apply timing",
-            "passed": true,
-            "observed": {
-              "status": 200
-            }
-          }
-        ]
-      }
+      "evidence": null
     },
     {
       "id": "native.get.native.session.id.task-runs",
@@ -24498,7 +25511,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -24515,25 +25528,7 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": {
-        "passed": true,
-        "cases": [
-          {
-            "name": "updates with expectedRevision",
-            "passed": true,
-            "observed": {
-              "status": 200
-            }
-          },
-          {
-            "name": "a stale revision is typed 409",
-            "passed": true,
-            "observed": {
-              "status": 409
-            }
-          }
-        ]
-      }
+      "evidence": null
     },
     {
       "id": "native.post.native.agents.child-id.budget",
@@ -25464,7 +26459,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -25481,27 +26476,7 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": {
-        "passed": true,
-        "cases": [
-          {
-            "name": "observes a dead endpoint as failed, never ready",
-            "passed": true,
-            "observed": {
-              "connection": 200,
-              "status": 200,
-              "state": "failed"
-            }
-          },
-          {
-            "name": "unknown connection is typed 404",
-            "passed": true,
-            "observed": {
-              "status": 404
-            }
-          }
-        ]
-      }
+      "evidence": null
     },
     {
       "id": "native.post.native.config.commit",
@@ -26432,7 +27407,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -26449,26 +27424,7 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": {
-        "passed": true,
-        "cases": [
-          {
-            "name": "connects without round-tripping the token",
-            "passed": true,
-            "observed": {
-              "mcp": 200,
-              "status": 200
-            }
-          },
-          {
-            "name": "double connect is idempotent and still discloses no token",
-            "passed": true,
-            "observed": {
-              "status": 200
-            }
-          }
-        ]
-      }
+      "evidence": null
     },
     {
       "id": "native.post.native.mcp.servers.id.connect",
@@ -27259,7 +28215,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -27276,18 +28232,7 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": {
-        "passed": true,
-        "cases": [
-          {
-            "name": "refuses a duplicate chain before persistence",
-            "passed": true,
-            "observed": {
-              "status": 400
-            }
-          }
-        ]
-      }
+      "evidence": null
     },
     {
       "id": "native.post.native.presets.id.roles",
@@ -27308,7 +28253,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -27325,26 +28270,7 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": {
-        "passed": true,
-        "cases": [
-          {
-            "name": "round-trips a served role map",
-            "passed": true,
-            "observed": {
-              "preset": 200,
-              "status": 200
-            }
-          },
-          {
-            "name": "refuses an unserved binding typed 409",
-            "passed": true,
-            "observed": {
-              "status": 409
-            }
-          }
-        ]
-      }
+      "evidence": null
     },
     {
       "id": "native.post.native.providers.connections",
@@ -27435,7 +28361,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "rev8": false,
         "credential": true,
@@ -27452,26 +28378,7 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": {
-        "passed": true,
-        "cases": [
-          {
-            "name": "stores without echoing the secret",
-            "passed": true,
-            "observed": {
-              "status": 200,
-              "handle": "vault://provider_key/054737c25c0132639a8d9a39b1466921"
-            }
-          },
-          {
-            "name": "malformed body is typed 400",
-            "passed": true,
-            "observed": {
-              "status": 400
-            }
-          }
-        ]
-      }
+      "evidence": null
     },
     {
       "id": "native.post.native.providers.credentials.rotate",
@@ -27492,7 +28399,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "rev8": false,
         "credential": true,
@@ -27509,19 +28416,7 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": {
-        "passed": true,
-        "cases": [
-          {
-            "name": "rotates a generation without disclosing either secret",
-            "passed": true,
-            "observed": {
-              "status": 200,
-              "generation": 2
-            }
-          }
-        ]
-      }
+      "evidence": null
     },
     {
       "id": "native.post.native.runtime.trust",
@@ -27822,7 +28717,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -27839,19 +28734,7 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": {
-        "passed": true,
-        "cases": [
-          {
-            "name": "without a staged shadow accepts nothing (typed 503/404)",
-            "passed": true,
-            "observed": {
-              "status": 404,
-              "code": "not_found"
-            }
-          }
-        ]
-      }
+      "evidence": null
     },
     {
       "id": "native.post.native.session.id.changes.accept-hunks",
@@ -27942,7 +28825,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -27959,19 +28842,7 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": {
-        "passed": true,
-        "cases": [
-          {
-            "name": "a missing checkpoint/authority is typed 503/404, never a fake plan",
-            "passed": true,
-            "observed": {
-              "status": 404,
-              "code": "not_found"
-            }
-          }
-        ]
-      }
+      "evidence": null
     },
     {
       "id": "native.post.native.session.id.context.compact",
@@ -28202,7 +29073,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -28219,26 +29090,7 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": {
-        "passed": true,
-        "cases": [
-          {
-            "name": "exports a bounded bundle with a digest",
-            "passed": true,
-            "observed": {
-              "status": 200
-            }
-          },
-          {
-            "name": "deleted content refuses export with the tombstone",
-            "passed": true,
-            "observed": {
-              "status": 409,
-              "code": "session_deleted"
-            }
-          }
-        ]
-      }
+      "evidence": null
     },
     {
       "id": "native.post.native.session.id.fork",
@@ -28434,7 +29286,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -28451,25 +29303,7 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": {
-        "passed": true,
-        "cases": [
-          {
-            "name": "creates a scoped, revisioned comment",
-            "passed": true,
-            "observed": {
-              "status": 200
-            }
-          },
-          {
-            "name": "path traversal is refused",
-            "passed": true,
-            "observed": {
-              "status": 400
-            }
-          }
-        ]
-      }
+      "evidence": null
     },
     {
       "id": "native.post.native.session.id.task-runs",
@@ -29750,7 +30584,7 @@
       ],
       "evidence_kind": "exact-value",
       "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
-      "status": "proven",
+      "status": "deferred",
       "meta": {
         "rev8": true,
         "credential": false,
@@ -29767,37 +30601,7 @@
         "isolation",
         "no-secret"
       ],
-      "evidence": {
-        "passed": true,
-        "cases": [
-          {
-            "name": "applies a validated settings patch",
-            "passed": true,
-            "observed": {
-              "status": 200,
-              "applied": [
-                "compactionModel",
-                "maxTurns",
-                "maxConsecutiveFailures"
-              ]
-            }
-          },
-          {
-            "name": "out-of-range value is typed 400",
-            "passed": true,
-            "observed": {
-              "status": 400
-            }
-          },
-          {
-            "name": "unserved compaction model is typed 409",
-            "passed": true,
-            "observed": {
-              "status": 409
-            }
-          }
-        ]
-      }
+      "evidence": null
     },
     {
       "id": "provider.anthropic",

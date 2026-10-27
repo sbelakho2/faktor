@@ -116,18 +116,21 @@ fn recent_invoices(invoices: &[Invoice]) -> String {
         .iter()
         .take(6)
         .map(|invoice| {
+            let id = html_escape(invoice.id.as_str());
+            let primary = if invoice.status == faktor_payments::InvoiceStatus::Paid {
+                format!("<a href=\"/account/invoices/{id}/receipt/\">Receipt</a>")
+            } else {
+                format!("<a href=\"/account/invoices/{id}/\">Open</a>")
+            };
+            let action = format!(
+                "{primary} · <a href=\"/account/invoices/{id}/download/?format=csv\">CSV</a>"
+            );
             format!(
-                "<tr><td><a href=\"/account/invoices/{}/\">{}</a></td><td>{}</td><td>{}</td><td class=\"num\">{}</td><td>{}</td></tr>",
-                html_escape(invoice.id.as_str()),
+                "<tr><td><a href=\"/account/invoices/{id}/\">{}</a></td><td>{}</td><td>{}</td><td class=\"num\">{}</td><td>{action}</td></tr>",
                 html_escape(invoice.number.as_str()),
                 date(invoice.issued_ms),
                 money(invoice.total_minor, &invoice.currency),
-                status_badge(invoice.status.as_str()),
-                if invoice.status == faktor_payments::InvoiceStatus::Paid {
-                    format!("<a href=\"/account/invoices/{}/receipt/\">Receipt</a>", html_escape(invoice.id.as_str()))
-                } else {
-                    format!("<a href=\"/account/invoices/{}/\">Open</a>", html_escape(invoice.id.as_str()))
-                }
+                status_badge(invoice.status.as_str())
             )
         })
         .collect::<String>();
@@ -343,6 +346,8 @@ pub fn invoices_page(
     auth: &AuthSession,
     csrf: &str,
     invoices: &[Invoice],
+    next_cursor: Option<&str>,
+    since: Option<&str>,
     cookies: &[String],
 ) -> Response {
     let rows = invoices
@@ -364,13 +369,28 @@ pub fn invoices_page(
             )
         })
         .collect::<String>();
-    let bound_note = if invoices.len() >= 100 {
-        " Showing the most recent 100 invoices; export the ledger for the full record."
+    let bound_note = if next_cursor.is_some() {
+        " Showing the latest 100 invoices on this page; continue with the older-invoice link."
+    } else if since.is_some() {
+        " Showing the oldest 100 invoices in this cursor page."
     } else {
         ""
     };
+    let mut pager = String::new();
+    if since.is_some() {
+        pager.push_str(
+            "<a class=\"btn btn-outline btn-small\" href=\"/account/invoices/\">Newest invoices</a>",
+        );
+    }
+    if let Some(cursor) = next_cursor {
+        pager.push_str(&format!(
+            "<a class=\"btn btn-outline btn-small\" href=\"/account/invoices/?since={}\">Older invoices</a>",
+            html_escape(cursor)
+        ));
+    }
     let content = format!(
-        "<div class=\"actions no-print\"><a class=\"btn btn-outline btn-small\" href=\"/account/invoices/export/?format=csv\">Export CSV</a><a class=\"btn btn-outline btn-small\" href=\"/account/invoices/export/?format=json\">Export JSON</a></div><div class=\"panel span-12 mt-22\"><div class=\"panel-head\"><div><h2>Invoices and receipts</h2><p class=\"panel-sub\">Every amount is the recorded exact minor-unit value.{}.</p></div></div>{}</div>",
+        "<div class=\"actions no-print\"><a class=\"btn btn-outline btn-small\" href=\"/account/invoices/export/?format=csv\">Export CSV</a><a class=\"btn btn-outline btn-small\" href=\"/account/invoices/export/?format=json\">Export JSON</a>{}</div><div class=\"panel span-12 mt-22\"><div class=\"panel-head\"><div><h2>Invoices and receipts</h2><p class=\"panel-sub\">Every amount is the recorded exact minor-unit value.{}.</p></div></div>{}</div>",
+        pager,
         bound_note,
         if rows.is_empty() {
             "<div class=\"empty\"><strong>No invoices.</strong>Start a plan checkout to create an invoice.</div>".to_string()
@@ -403,20 +423,26 @@ pub fn invoice_detail(
             )
         })
         .collect::<String>();
+    let download = format!(
+        "<a class=\"btn btn-outline\" href=\"/account/invoices/{}/download/?format=csv\">Download CSV</a>",
+        html_escape(invoice.id.as_str())
+    );
     let actions = if invoice.status == faktor_payments::InvoiceStatus::Open {
         format!(
-            "<div class=\"actions no-print\"><form method=\"post\" action=\"/account/billing/invoices/{}/pay/\">{}<button class=\"btn btn-ink\" type=\"submit\">Pay {}</button></form></div>",
+            "<div class=\"actions no-print\"><form method=\"post\" action=\"/account/billing/invoices/{}/pay/\">{}<button class=\"btn btn-ink\" type=\"submit\">Pay {}</button></form>{}</div>",
             html_escape(invoice.id.as_str()),
             csrf_input(csrf),
-            money(invoice.balance_minor(), &invoice.currency)
+            money(invoice.balance_minor(), &invoice.currency),
+            download
         )
     } else if invoice.status == faktor_payments::InvoiceStatus::Paid {
         format!(
-            "<div class=\"actions no-print\"><a class=\"btn btn-outline\" href=\"/account/invoices/{}/receipt/\">Open receipt</a></div>",
-            html_escape(invoice.id.as_str())
+            "<div class=\"actions no-print\"><a class=\"btn btn-outline\" href=\"/account/invoices/{}/receipt/\">Open receipt</a>{}</div>",
+            html_escape(invoice.id.as_str()),
+            download
         )
     } else {
-        String::new()
+        format!("<div class=\"actions no-print\">{download}</div>")
     };
     let content = format!(
         "{}<div class=\"app-grid\"><article class=\"panel span-8\"><div class=\"panel-head\"><div><h2>{}</h2><p class=\"panel-sub\">Issued {} / due {}</p></div>{}</div><div class=\"table-wrap\"><table class=\"app-table\"><caption class=\"sr-only\">Invoice lines</caption><thead><tr><th scope=\"col\">Description</th><th scope=\"col\" class=\"num\">Qty</th><th scope=\"col\" class=\"num\">Unit</th><th scope=\"col\" class=\"num\">Amount</th></tr></thead><tbody>{}</tbody></table></div><div class=\"invoice-total\"><div><span>Subtotal</span><span>{}</span></div><div><span>Tax</span><span>{}</span></div><div><span>Paid</span><span>{}</span></div><div><span>Refunded</span><span>{}</span></div><div class=\"total\"><span>Total</span><span>{}</span></div></div>{}</article><aside class=\"panel span-4\"><div class=\"panel-head\"><div><h2>Record state</h2></div></div><dl class=\"kv\"><dt>Status</dt><dd>{}</dd><dt>Invoice</dt><dd class=\"mono\">{}</dd><dt>Subscription</dt><dd class=\"mono\">{}</dd><dt>Tax basis</dt><dd>{}</dd><dt>Payment basis</dt><dd>{}</dd></dl></aside></div>",
@@ -435,7 +461,23 @@ pub fn invoice_detail(
         status_badge(invoice.status.as_str()),
         html_escape(invoice.id.as_str()),
         html_escape(invoice.subscription_id.as_deref().unwrap_or("unattached")),
-        if invoice.tax_inclusive { "inclusive" } else { "exclusive" },
+        match invoice.tax_jurisdiction.as_deref() {
+            Some(jurisdiction) => format!(
+                "{} · {}",
+                html_escape(jurisdiction),
+                if invoice.tax_inclusive {
+                    "inclusive"
+                } else {
+                    "exclusive"
+                }
+            ),
+            None => (if invoice.tax_inclusive {
+                "inclusive"
+            } else {
+                "exclusive"
+            })
+            .to_string(),
+        },
         if invoice.amount_paid_minor > 0 { "Provider webhook recorded" } else { "Awaiting verified payment" }
     );
     account_page("Invoice", "invoices", auth, &content, cookies)
@@ -481,6 +523,8 @@ pub struct UsageSummary {
     pub descriptions: Vec<(String, i64, i64)>,
     pub invoices: usize,
     pub seats: u32,
+    /// Number of invoices the page sampled (the source is bounded).
+    pub scanned_invoices: usize,
 }
 
 pub fn usage_page(auth: &AuthSession, summary: &UsageSummary, cookies: &[String]) -> Response {
@@ -501,8 +545,14 @@ pub fn usage_page(auth: &AuthSession, summary: &UsageSummary, cookies: &[String]
             .collect::<String>();
         format!("<div class=\"table-wrap\"><table class=\"app-table\"><caption class=\"sr-only\">Usage lines</caption><thead><tr><th scope=\"col\">Metric</th><th scope=\"col\" class=\"num\">Quantity</th><th scope=\"col\" class=\"num\">Amount</th></tr></thead><tbody>{rows}</tbody></table></div>")
     };
+    let source_note = if summary.scanned_invoices >= 200 {
+        "Aggregated from the newest 200 invoices (the same bound as the ledger page). Older invoice rows remain available through the bounded exports."
+    } else {
+        "Aggregated from every issued invoice in this organization. No unbounded meter is kept on the website."
+    };
     let content = format!(
-        "<div class=\"app-grid\"><article class=\"panel span-12\"><div class=\"panel-head\"><div><h2>Recorded usage</h2><p class=\"panel-sub\">Aggregated from issued invoice lines. No unbounded meter is kept on the website.</p></div></div><dl class=\"kv\"><dt>Seats</dt><dd>{}</dd><dt>Invoices with usage</dt><dd>{}</dd><dt>Source</dt><dd>Invoice line items of kind usage</dd></dl>{}</article></div>",
+        "<div class=\"app-grid\"><article class=\"panel span-12\"><div class=\"panel-head\"><div><h2>Recorded usage</h2><p class=\"panel-sub\">{}</p></div></div><dl class=\"kv\"><dt>Seats</dt><dd>{}</dd><dt>Invoices with usage</dt><dd>{}</dd><dt>Source</dt><dd>Invoice line items of kind usage</dd></dl>{}</article></div>",
+        source_note,
         summary.seats,
         summary.invoices,
         rows

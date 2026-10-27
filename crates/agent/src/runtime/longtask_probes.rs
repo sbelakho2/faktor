@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! Deterministic RUNTIME long-task probes (mandated mid-wave quality task).
 //!
 //! Not the standing suite: these prove (a) an accepted compaction's durable
@@ -249,4 +250,137 @@ fn mid_history_orphan_tool_pairs_are_removed_from_the_wire() {
         .filter_map(|p| p.tool_call_id.as_deref())
         .collect();
     assert_eq!(results, vec!["call-known"], "ghost result is dropped");
+}
+
+/// A provider that answers EVERY stream with one text chunk and a clean
+/// Done. The probe needs no per-turn script (one script entry per logical
+/// turn would make the measurement depend on test plumbing); this keeps the
+/// one-runtime/one-session shape real for the full run.
+pub(crate) struct AckProvider;
+
+impl faktor_provider::Provider for AckProvider {
+    fn id(&self) -> &str {
+        "fake"
+    }
+
+    fn capabilities(&self, _model: &str) -> ModelCapabilities {
+        ModelCapabilities {
+            tools: true,
+            context: 200_000,
+            ..Default::default()
+        }
+    }
+
+    fn capability_resolution(&self, model: &str) -> faktor_core::model::CapabilityResolution {
+        faktor_core::model::CapabilityResolution::known(self.capabilities(model))
+    }
+
+    fn stream(&self, _req: GenericAgentRequest) -> faktor_provider::ProviderStream {
+        Box::pin(futures::stream::iter(vec![
+            Ok(ProviderChunk::Text { text: "ack".into() }),
+            Ok(ProviderChunk::Done),
+        ]))
+    }
+}
+
+/// MEASURED long-run effectiveness: 120 real logical turns with repeated
+/// threshold compaction. Captures the ACTUAL wire prompt size at every
+/// provider call, so the report can state tokens/turn, the compaction
+/// dividend, and the bounded steady state rather than asserting a proxy.
+#[tokio::test]
+async fn repeated_compaction_keeps_prompt_tokens_bounded_and_linear_in_new_content() {
+    const TURNS: usize = 120;
+    let measured: Arc<std::sync::Mutex<Vec<usize>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = measured.clone();
+    let provider = Arc::new(AckProvider);
+    let inspected = Arc::new(InspectingProvider::new(provider, move |_n, req| {
+        let prompt = format!("{}\n{}", req.system, request_text(req));
+        sink.lock()
+            .unwrap()
+            .push(faktor_context::Estimator.estimate_tokens(&prompt));
+        Ok(())
+    }));
+    let (mut deps, _dir) = deps_with(inspected, vec![]);
+    // 35% of the effective window: the prompt crosses it every few turns,
+    // so compaction runs repeatedly with a real, measurable dividend
+    // instead of thrashing on a deliberately tiny threshold.
+    deps.compact_at_usage = 0.35;
+    let runtime = AgentRuntime::new(deps).unwrap();
+    let (manager, session) = shared_session(runtime.deps());
+    let handle = manager.get_session(session).unwrap().unwrap();
+
+    let mut compactions = 0usize;
+    let mut last_history_turns = 0usize;
+    for turn in 0..TURNS {
+        let prompt = format!("TURN-{turn:03} keep going {}", "x".repeat(5_000));
+        let receipt = handle.submit_prompt(&prompt, &[]).unwrap();
+        let outcome = runtime
+            .drive_turn(
+                &handle,
+                receipt.op_id,
+                receipt.op_meta.cancellation.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.final_state,
+            AgentState::ReadyForNextTurn,
+            "turn {turn}: stop_reason={:?} events={:?}",
+            outcome.stop_reason,
+            handle
+                .events_range(1, None)
+                .unwrap()
+                .into_iter()
+                .rev()
+                .take(4)
+                .map(|event| (event.kind, event.payload))
+                .collect::<Vec<_>>()
+        );
+        if outcome.compacted {
+            compactions += 1;
+        }
+        let (recent, _) = runtime
+            .recent_turns_with_head(&handle, &ContextBudget::default())
+            .await
+            .unwrap();
+        last_history_turns = recent.len();
+    }
+    let prompts = measured.lock().unwrap().clone();
+    assert_eq!(prompts.len(), TURNS, "one provider call per turn");
+    let total: usize = prompts.iter().sum();
+    let avg = total / prompts.len();
+    let max = *prompts.iter().max().unwrap();
+    let saved: usize = prompts
+        .windows(2)
+        .map(|pair| pair[0].saturating_sub(pair[1]))
+        .sum();
+    let checkpoint_bytes = handle
+        .context_checkpoint()
+        .unwrap()
+        .map(|checkpoint| checkpoint.payload.len())
+        .unwrap_or(0);
+    eprintln!(
+        "PERF repeated_compaction turns={TURNS} compactions={compactions} \
+avg_prompt_tokens={avg} max_prompt_tokens={max} total_prompt_tokens={total} \
+positive_drop_tokens={saved} final_history_turns={last_history_turns} \
+checkpoint_bytes={checkpoint_bytes}"
+    );
+
+    assert!(
+        compactions >= 3,
+        "threshold must compact repeatedly: {compactions}"
+    );
+    assert!(
+        max < 50_000,
+        "repeated compaction must keep the wire near the 35% threshold, max={max}"
+    );
+    assert!(
+        last_history_turns < 64,
+        "post-checkpoint assembly is bounded, not linear in the 120-turn transcript: {last_history_turns}"
+    );
+    assert!(
+        saved > 0,
+        "repeated compaction must show real prompt-token drops: {saved}"
+    );
 }

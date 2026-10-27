@@ -309,6 +309,13 @@ pub struct Invoice {
     pub reconciliation: InvoiceReconciliationState,
     pub currency: String,
     pub status: InvoiceStatus,
+    /// Identity of the provider payment whose failure last advanced the
+    /// dunning attempt counter. Provider retries usually fan one failed
+    /// attempt out into both a payment-intent event and an invoice event;
+    /// comparing this identity keeps the attempt counter exact while a new
+    /// payment identity still advances it.
+    #[serde(default)]
+    pub last_dunning_payment_id: Option<String>,
     pub lines: Vec<InvoiceLine>,
     /// plan + seat + proration + usage (before credits/discounts).
     pub subtotal_minor: i64,

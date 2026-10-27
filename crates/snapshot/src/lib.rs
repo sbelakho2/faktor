@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! faktor-snapshot — native content-addressed checkpoints (spec §16).
 //!
 //! Snapshots are NOT git repositories pretending to be undo history. Before

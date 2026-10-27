@@ -10374,9 +10374,9 @@
       "config_key_note": "Current repository keys unless marked proposed; proposed keys have no authority until a descriptor/snapshot contract exists.",
       "runtime_endpoints": [
         {
-          "declared": "config faktor.permissions.allowedTools",
+          "declared": "GET /native/permissions/policy",
           "state": "exists",
-          "actual": "faktor.permissions.allowedTools",
+          "actual": "/native/permissions/policy",
           "line": 773
         }
       ],
@@ -10482,9 +10482,9 @@
       "config_key_note": "Current repository keys unless marked proposed; proposed keys have no authority until a descriptor/snapshot contract exists.",
       "runtime_endpoints": [
         {
-          "declared": "config faktor.sandbox.shell",
+          "declared": "GET /native/permissions/policy",
           "state": "exists",
-          "actual": "faktor.sandbox.shell",
+          "actual": "/native/permissions/policy",
           "line": 773
         }
       ],
@@ -10590,9 +10590,9 @@
       "config_key_note": "Current repository keys unless marked proposed; proposed keys have no authority until a descriptor/snapshot contract exists.",
       "runtime_endpoints": [
         {
-          "declared": "config faktor.sandbox.shell",
+          "declared": "GET /native/permissions/policy",
           "state": "exists",
-          "actual": "faktor.sandbox.shell",
+          "actual": "/native/permissions/policy",
           "line": 773
         }
       ],
@@ -16119,9 +16119,9 @@
       "config_key_note": "Current repository keys unless marked proposed; proposed keys have no authority until a descriptor/snapshot contract exists.",
       "runtime_endpoints": [
         {
-          "declared": "config faktor.sandbox.shell",
+          "declared": "GET /native/permissions/policy",
           "state": "exists",
-          "actual": "faktor.sandbox.shell",
+          "actual": "/native/permissions/policy",
           "line": 773
         }
       ],
@@ -16153,7 +16153,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 224,
+          "line": 226,
           "note": "VS Code route binding (cfg). Live: control.exercise.X-12 (effective: POST /native/config/commit faktor.sandbox.shell -> revision 8)."
         },
         {
@@ -16272,7 +16272,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 225,
+          "line": 227,
           "note": "VS Code route binding (read). Live: control.exercise.X-13 (effective: Acknowledged GET /native/runtime/status.)."
         },
         {
@@ -16398,7 +16398,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 228,
+          "line": 230,
           "note": "VS Code route binding (cfg). Live: control.exercise.B-01 (effective: POST /native/config/commit faktor.budget.maxTokens -> revision 8)."
         },
         {
@@ -16524,7 +16524,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 229,
+          "line": 231,
           "note": "VS Code route binding (cfg). Live: control.exercise.B-02 (effective: POST /native/config/commit faktor.budget.maxCostMicro -> revision 8)."
         },
         {
@@ -16627,7 +16627,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 230,
+          "line": 232,
           "note": "VS Code route binding (cfg). Live: control.exercise.B-03 (effective: POST /native/config/commit faktor.budget.warnAtPercent -> revision 8)."
         },
         {
@@ -16766,7 +16766,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 231,
+          "line": 233,
           "note": "VS Code route binding (read). Live: control.exercise.B-04 (effective: Acknowledged GET /native/session/:session/usage.)."
         },
         {
@@ -16878,7 +16878,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 232,
+          "line": 234,
           "note": "VS Code route binding (act). Live: control.exercise.B-05 (effective: Acknowledged PUT /native/session/:session/budget.)."
         },
         {
@@ -16987,7 +16987,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 233,
+          "line": 235,
           "note": "VS Code route binding (cfg). Live: control.exercise.B-06 (effective: POST /native/config/commit faktor.retry.maxAttempts -> revision 8)."
         },
         {
@@ -17096,7 +17096,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 234,
+          "line": 236,
           "note": "VS Code route binding (cfg). Live: control.exercise.B-07 (effective: POST /native/config/commit faktor.retry.baseDelayMs -> revision 8)."
         },
         {
@@ -17203,7 +17203,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 235,
+          "line": 237,
           "note": "VS Code route binding (read). Live: control.exercise.B-08 (effective: Acknowledged GET /native/session/:session/efficiency.)."
         },
         {
@@ -17279,9 +17279,9 @@
       "config_key_note": "Current repository keys unless marked proposed; proposed keys have no authority until a descriptor/snapshot contract exists.",
       "runtime_endpoints": [
         {
-          "declared": "POST /native/config/commit",
+          "declared": "GET /native/config/snapshot",
           "state": "exists",
-          "actual": "/native/config/commit",
+          "actual": "/native/config/snapshot",
           "line": 773
         }
       ],
@@ -17314,7 +17314,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 236,
+          "line": 240,
           "note": "VS Code route binding (act). Live: control.exercise.B-09 (effective: Acknowledged POST /native/config/commit.)."
         },
         {
@@ -17395,9 +17395,9 @@
       "config_key_note": "Current repository keys unless marked proposed; proposed keys have no authority until a descriptor/snapshot contract exists.",
       "runtime_endpoints": [
         {
-          "declared": "GET /native/config/descriptors",
+          "declared": "GET /native/session/:session/task-runs",
           "state": "exists",
-          "actual": "/native/config/descriptors",
+          "actual": "/native/session/:session/task-runs",
           "line": 761
         }
       ],
@@ -17430,7 +17430,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 237,
+          "line": 243,
           "note": "VS Code route binding (read). Live: control.exercise.B-10 (effective: Acknowledged GET /native/config/descriptors.)."
         },
         {
@@ -17543,7 +17543,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 238,
+          "line": 244,
           "note": "VS Code route binding (read). Live: control.exercise.B-11 (effective: Acknowledged GET /native/health.)."
         },
         {
@@ -17633,9 +17633,9 @@
       "config_key_note": "Current repository keys unless marked proposed; proposed keys have no authority until a descriptor/snapshot contract exists.",
       "runtime_endpoints": [
         {
-          "declared": "GET /native/outcomes?limit=50",
+          "declared": "GET /native/session/:session/tasks",
           "state": "exists",
-          "actual": "/native/outcomes?limit=50",
+          "actual": "/native/session/:session/tasks",
           "line": 569
         }
       ],
@@ -17662,7 +17662,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 239,
+          "line": 247,
           "note": "VS Code route binding (read). Live: control.exercise.B-12 (effective: Acknowledged GET /native/outcomes?limit=50.)."
         },
         {
@@ -17782,7 +17782,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 242,
+          "line": 250,
           "note": "VS Code route binding (read). Live: control.exercise.V-01 (effective: Acknowledged GET /native/session/:session/verification.)."
         },
         {
@@ -17890,7 +17890,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 243,
+          "line": 251,
           "note": "VS Code route binding (act). Live: control.exercise.V-02 (effective: Acknowledged POST /native/session/:session/review/comments.)."
         },
         {
@@ -18004,7 +18004,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 244,
+          "line": 252,
           "note": "VS Code route binding (act). Live: control.exercise.V-03 (effective: Acknowledged POST /native/session/:session/changes/accept.)."
         },
         {
@@ -18118,7 +18118,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 245,
+          "line": 253,
           "note": "VS Code route binding (read). Live: control.exercise.V-04 (effective: Acknowledged GET /native/session/:session/checkpoints.)."
         },
         {
@@ -18219,7 +18219,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 246,
+          "line": 254,
           "note": "VS Code route binding (act). Live: control.exercise.V-05 (effective: Acknowledged POST /native/session/:session/checkpoints/:sequence/restore/preview.)."
         },
         {
@@ -18321,7 +18321,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 247,
+          "line": 255,
           "note": "VS Code route binding (act). Live: control.exercise.V-06 (effective: Acknowledged POST /native/session/:session/fork.)."
         },
         {
@@ -18496,7 +18496,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 248,
+          "line": 256,
           "note": "VS Code route binding (act). Live: control.exercise.V-07 (effective: Acknowledged POST /native/session/:session/task-runs.)."
         },
         {
@@ -18632,7 +18632,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 249,
+          "line": 257,
           "note": "VS Code route binding (read). Live: control.exercise.V-08 (effective: Acknowledged GET /native/session/:session/verification.)."
         },
         {
@@ -18779,7 +18779,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 250,
+          "line": 258,
           "note": "VS Code route binding (read). Live: control.exercise.V-09 (effective: Acknowledged GET /native/tasks/:task/proof?session=:session.)."
         },
         {
@@ -18919,7 +18919,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 251,
+          "line": 259,
           "note": "VS Code route binding (act). Live: control.exercise.V-10 (effective: Acknowledged POST /native/session/:session/task-runs.)."
         },
         {
@@ -19042,7 +19042,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 252,
+          "line": 260,
           "note": "VS Code route binding (read). Live: control.exercise.V-11 (effective: Acknowledged GET /native/repositories.)."
         },
         {
@@ -19169,7 +19169,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 253,
+          "line": 261,
           "note": "VS Code route binding (act). Live: control.exercise.V-12 (effective: Acknowledged POST /native/session/:session/checkpoints/:sequence/restore.)."
         },
         {
@@ -19295,7 +19295,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 256,
+          "line": 264,
           "note": "VS Code route binding (read). Live: control.exercise.D-01 (effective: Acknowledged GET /native/sessions?limit=200.)."
         },
         {
@@ -19409,7 +19409,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 257,
+          "line": 265,
           "note": "VS Code route binding (read). Live: control.exercise.D-02 (effective: Acknowledged GET /native/sessions?query=:query&limit=200.)."
         },
         {
@@ -19517,7 +19517,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 258,
+          "line": 266,
           "note": "VS Code route binding (read). Live: control.exercise.D-03 (effective: Acknowledged GET /native/transcript/search?session=:session&q=:query&regex=false&case=false.)."
         },
         {
@@ -19629,7 +19629,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 259,
+          "line": 267,
           "note": "VS Code route binding (act). Live: control.exercise.D-04 (effective: Acknowledged POST /native/sessions/:session/meta.)."
         },
         {
@@ -19764,7 +19764,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 260,
+          "line": 268,
           "note": "VS Code route binding (act). Live: control.exercise.D-05 (effective: Acknowledged POST /native/session/:session/prompt.)."
         },
         {
@@ -19882,7 +19882,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 261,
+          "line": 269,
           "note": "VS Code route binding (act). Live: control.exercise.D-06 (effective: Acknowledged POST /native/session/:session/export.)."
         },
         {
@@ -20032,7 +20032,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 263,
+          "line": 271,
           "note": "VS Code route binding (read). Live: control.exercise.D-07 (effective: Acknowledged GET /native/session/:session/events.)."
         },
         {
@@ -20541,16 +20541,14 @@
         "UI02",
         "UI03"
       ],
-      "config_keys": [
-        "faktor.telemetry.categories"
-      ],
+      "config_keys": [],
       "config_key_note": "Current repository keys unless marked proposed; proposed keys have no authority until a descriptor/snapshot contract exists.",
       "runtime_endpoints": [
         {
-          "declared": "config faktor.telemetry.categories",
-          "state": "exists",
-          "actual": "faktor.telemetry.categories",
-          "line": 773
+          "declared": "host action",
+          "state": "host",
+          "actual": "host action",
+          "line": 276
         }
       ],
       "runtime_contracts_required": [
@@ -20583,7 +20581,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 268,
+          "line": 276,
           "note": "VS Code route binding (cfg). Live: control.exercise.D-12 (effective: POST /native/config/commit faktor.telemetry.categories -> revision 8)."
         },
         {
@@ -20705,7 +20703,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 269,
+          "line": 277,
           "note": "VS Code route binding (read). Live: control.exercise.D-13 (effective: Acknowledged GET /native/session/:session/events.)."
         },
         {
@@ -20932,7 +20930,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 271,
+          "line": 279,
           "note": "VS Code route binding (read). Live: control.exercise.D-15 (effective: Acknowledged GET /native/sessions/parallel.)."
         },
         {
@@ -21058,7 +21056,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 274,
+          "line": 282,
           "note": "VS Code route binding (read). Live: control.exercise.O-01 (effective: Acknowledged GET /native/config/search?q=:query.)."
         },
         {
@@ -21170,7 +21168,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 275,
+          "line": 283,
           "note": "VS Code route binding (read). Live: control.exercise.O-02 (effective: Acknowledged GET /native/runtime/status.)."
         },
         {
@@ -21283,7 +21281,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 276,
+          "line": 284,
           "note": "VS Code route binding (act). Live: control.exercise.O-03 (effective: Acknowledged POST /native/diagnostics/export.)."
         },
         {
@@ -21420,7 +21418,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 277,
+          "line": 285,
           "note": "VS Code route binding (read). Live: control.exercise.O-04 (effective: Acknowledged GET /native/runtime/status.)."
         },
         {
@@ -21543,7 +21541,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 278,
+          "line": 286,
           "note": "VS Code route binding (act). Live: control.exercise.O-05 (effective: Acknowledged POST /native/updater/check.)."
         },
         {
@@ -21672,7 +21670,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 279,
+          "line": 287,
           "note": "VS Code route binding (read). Live: control.exercise.O-06 (effective: Acknowledged GET /native/usage.)."
         },
         {
@@ -21808,7 +21806,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 280,
+          "line": 288,
           "note": "VS Code route binding (read). Live: control.exercise.O-07 (effective: Acknowledged GET /native/identity.)."
         },
         {
@@ -21919,7 +21917,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 281,
+          "line": 289,
           "note": "VS Code route binding (act). Live: control.exercise.O-08 (unavailable: Enterprise features are disabled in this daemon configuration.)."
         },
         {
@@ -22038,7 +22036,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 282,
+          "line": 290,
           "note": "VS Code route binding (act). Live: control.exercise.O-09 (effective: Acknowledged POST /native/memory/records/retention.)."
         },
         {
@@ -22149,7 +22147,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 283,
+          "line": 291,
           "note": "VS Code route binding (cfg). Live: control.exercise.O-10 (effective: POST /native/config/commit faktor.telemetry.enabled -> revision 8)."
         },
         {
@@ -22267,7 +22265,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 284,
+          "line": 292,
           "note": "VS Code route binding (read). Live: control.exercise.O-11 (effective: Acknowledged GET /native/workers.)."
         },
         {
@@ -22380,7 +22378,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 285,
+          "line": 293,
           "note": "VS Code route binding (act). Live: control.exercise.O-12 (effective: Acknowledged POST /native/config/import.)."
         },
         {
@@ -22498,7 +22496,7 @@
         {
           "host": "vscode",
           "file": "apps/vscode/src/edition8/routes.ts",
-          "line": 286,
+          "line": 294,
           "note": "VS Code route binding (read). Live: control.exercise.O-13 (effective: Acknowledged GET /native/semantic/capabilities.)."
         },
         {

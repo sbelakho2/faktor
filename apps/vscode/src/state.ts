@@ -1169,6 +1169,17 @@ export function summarizeAgents(
   presence?: ReadonlyMap<string, PixelPresence>,
 ): AgentSummary[] {
   const folded = presence !== undefined ? nextPixelPresence(presence, agents) : null;
+  // ONE catalog index (first entry wins, exactly the historical `find`):
+  // the per-agent scan made a 200-agent listing O(agents · catalog).
+  const catalogByProvider = new Map<string, Map<string, AgentModelInfo>>();
+  for (const entry of catalog) {
+    let byModel = catalogByProvider.get(entry.provider);
+    if (byModel === undefined) {
+      byModel = new Map();
+      catalogByProvider.set(entry.provider, byModel);
+    }
+    if (!byModel.has(entry.model)) byModel.set(entry.model, entry);
+  }
   const out: AgentSummary[] = [];
   for (const raw of agents) {
     const agent = asObject(raw);
@@ -1188,7 +1199,7 @@ export function summarizeAgents(
     const provider = asString(agent.provider);
     const info =
       provider !== null && model !== null
-        ? catalog.find((entry) => entry.provider === provider && entry.model === model)
+        ? catalogByProvider.get(provider)?.get(model)
         : undefined;
     const itemIdsRaw = Array.isArray(agent.item_ids) ? (agent.item_ids as Json[]) : [];
     const capabilitiesRaw = Array.isArray(agent.capabilities) ? (agent.capabilities as Json[]) : [];

@@ -15,6 +15,11 @@ use faktor_context::sanitize_ledger_text;
 /// [`AgentRuntime::set_stall_silence_ms`]; 0 disables time-stall detection.
 pub const DEFAULT_STALL_SILENCE_MS: u64 = 10 * 60 * 1000;
 
+/// The spec's minimum reduction for a successful compaction (25%). The
+/// daemon setting overrides it, but an unconfigured runtime uses this exact
+/// value for BOTH the compaction request and the durable policy check.
+pub const DEFAULT_COMPACTION_MIN_REDUCTION: f64 = 0.25;
+
 /// Per-envelope backing cap of the runtime's durable evidence authority:
 /// normalized/compressed output up to this many bytes stays retrievable
 /// from the CAS; larger backing is recorded by digest and dropped (the
@@ -810,6 +815,10 @@ pub struct AgentRuntime {
     /// Stall-silence budget in ms (see [`DEFAULT_STALL_SILENCE_MS`]); 0
     /// disables time-stall verdicts.
     pub(crate) stall_silence_ms: std::sync::atomic::AtomicU64,
+    /// Proactive-compaction minimum reduction ratio (f64 bits). Atomic so a
+    /// host can install the daemon setting after construction without
+    /// rebuilding the runtime; clamped to `[0, 1)` on read.
+    pub(crate) compaction_min_reduction_bits: std::sync::atomic::AtomicU64,
     /// Verification/review quality override (audit 92): 0 = unset —
     /// mutating turns run Strict, non-mutating turns run Normal (see
     /// [`VerificationQuality`]); 1 = Normal forced; 2 = Strict forced.
@@ -2289,6 +2298,9 @@ impl AgentRuntime {
             coordination: std::sync::Mutex::new(std::collections::HashMap::new()),
             token_cache: TokenCache::new(),
             stall_silence_ms: std::sync::atomic::AtomicU64::new(DEFAULT_STALL_SILENCE_MS),
+            compaction_min_reduction_bits: std::sync::atomic::AtomicU64::new(
+                DEFAULT_COMPACTION_MIN_REDUCTION.to_bits(),
+            ),
             quality_mode: std::sync::atomic::AtomicU8::new(0),
             index_service: std::sync::OnceLock::new(),
             evidence_authority,

@@ -1,12 +1,18 @@
 {
   "id": "INV-STORAGE-AGGREGATE-BUDGET",
-  "file": "crates/storage/src/governor.rs",
-  "find": "        if bytes <= available {",
-  "replace": "        if true {\n            let _ = available;",
+  "file": "crates/storage/src/ledger.rs",
+  "find": "        let reservation_id = if class_deficit == 0 && total_deficit == 0 && bytes <= total {",
+  "replace": "        let reservation_id = if true {",
   "gate": "cargo test -p faktor-storage --lib budget_refusal_guard_is_pinned_against_mutation",
   "expect": "FAILED",
-  "note": "Removes the aggregate/class admission comparison: an over-budget object is admitted and the refusal oracle fails.",
-  "capabilities": ["storage.governor"],
+  "note": "Removes the atomic class/aggregate admission comparison: an over-budget object is admitted and the refusal oracle fails.",
+  "capabilities": [
+    "storage.governor"
+  ],
   "oracle": "mutation",
-  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
 }

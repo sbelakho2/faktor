@@ -96,7 +96,10 @@ pub async fn billing_get(
 ) -> SiteResult<Response> {
     let auth = state.require_auth(&headers)?;
     let org = org_id(&auth)?;
-    let _ = state.payments.tick(&org);
+    match state.payments.tick(&org) {
+        Ok(_) | Err(faktor_payments::PaymentError::NotFound(_)) => {}
+        Err(error) => return Err(error.into()),
+    }
     let overview = state.payments.overview(&org)?;
     let invoices = state.payments.invoices(&org, None, 20)?.items;
     let methods = state.payments.payment_methods(&org)?;
@@ -170,7 +173,10 @@ async fn begin_subscription(
     org: &OrganizationId,
     form: &CheckoutForm,
 ) -> SiteResult<Invoice> {
-    let _ = state.payments.tick(org);
+    match state.payments.tick(org) {
+        Ok(_) | Err(faktor_payments::PaymentError::NotFound(_)) => {}
+        Err(error) => return Err(error.into()),
+    }
     let overview = state.payments.overview(org)?;
     let interval = crate::config::parse_interval(&form.interval).ok_or(
         SiteError::Unprocessable("Choose monthly or annual billing."),

@@ -3251,7 +3251,12 @@ async fn child_boundary_coordination_notice_is_bounded_never_a_body_and_memoized
                 tools: true,
                 ..Default::default()
             },
-            vec![ScriptedResponse::Text("ok".into()), ScriptedResponse::End],
+            vec![
+                ScriptedResponse::Text("ok".into()),
+                ScriptedResponse::End,
+                ScriptedResponse::Text("ok again".into()),
+                ScriptedResponse::End,
+            ],
         )),
         move |_n, req| {
             cap.lock().unwrap().push(req.clone());
@@ -3303,16 +3308,48 @@ async fn child_boundary_coordination_notice_is_bounded_never_a_body_and_memoized
         "{:?}",
         outcome.final_state
     );
-    let requests = captured.lock().unwrap();
-    assert_eq!(requests.len(), 1, "one wire request for the turn");
-    let system = format!("{}\n{}", requests[0].system, request_text(&requests[0]));
+    {
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1, "one wire request for the turn");
+        let system = format!("{}\n{}", requests[0].system, request_text(&requests[0]));
+        assert!(
+            system.contains("coordination: 2 unread; use board_read"),
+            "the bounded notice must ride the child prompt: {system}"
+        );
+        assert!(
+            !system.contains(secret) && !system.contains("another body"),
+            "board bodies never enter the prompt automatically"
+        );
+    }
+
+    // STALE-CACHE EDGE: recording reads appends `BoardRead` markers WITHOUT
+    // bumping the board revision. A revision-only memo would keep serving
+    // "2 unread" after this exact read; the ledger-cursor key recomputes.
+    let page = child
+        .board_read_posts(
+            Some(faktor_session::board::ChildId::of_session(child.id())),
+            None,
+            50,
+            false,
+        )
+        .unwrap();
+    assert_eq!(page.posts.len(), 2, "the child reads both posts: {page:?}");
     assert!(
-        system.contains("coordination: 2 unread; use board_read"),
-        "the bounded notice must ride the child prompt: {system}"
+        runtime.child_coordination_notice(&child).unwrap().is_none(),
+        "a completed read must clear the notice at the SAME board revision"
+    );
+    runtime.run_turn(child.id(), "go again", &[]).await.unwrap();
+    let requests = captured.lock().unwrap();
+    assert_eq!(requests.len(), 2, "the second turn planned one request");
+    let system = format!(
+        "{}
+{}",
+        requests[1].system,
+        request_text(&requests[1])
     );
     assert!(
-        !system.contains(secret) && !system.contains("another body"),
-        "board bodies never enter the prompt automatically"
+        !system.contains("coordination:"),
+        "the next prompt never carries a stale unread count: {system}"
     );
 }
 

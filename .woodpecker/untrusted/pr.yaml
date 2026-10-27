@@ -457,6 +457,7 @@ steps:
         fi
         echo "vscode-render: chromium at $chrome_bin (uid $(id -u))"
         FAKTOR_CHROME="$chrome_bin" node scripts/render-webview.mjs --check
+        cd "$CI_WORKSPACE"
         CMDS
         )"
         cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"

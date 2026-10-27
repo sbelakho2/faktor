@@ -1,0 +1,16 @@
+{
+  "id": "INV-EDITION8-CONFIG-TYPE-WIRING",
+  "file": "apps/vscode/src/edition8/bindings.ts",
+  "find": "  'B-03': 'number',",
+  "replace": "  'B-03': 'text',",
+  "gate": "node --no-warnings apps/vscode/scripts/selftest.mjs",
+  "expect": "FAIL",
+  "timeout_ms": 180000,
+  "note": "The budget warning threshold can be staged as free text and refused by the daemon.",
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

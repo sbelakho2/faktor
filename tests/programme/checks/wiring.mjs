@@ -26,6 +26,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { discoverNativeRoutes } from '../../../scripts/discover-capabilities.mjs';
+import { bindingOf8 } from '../../../apps/vscode/src/edition8/bindings.ts';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const ROOT = resolve(HERE, '..', '..', '..');
@@ -175,7 +176,7 @@ function routeConsumed(route, text) {
 
 function loadManifest(root) {
   const text = read(root, MANIFEST);
-  if (text === null) return { schema: SCHEMA, routes: {}, configEvidence: {}, configUnwired: {} };
+  if (text === null) return { schema: SCHEMA, routes: {}, configEvidence: {}, configUnwired: {}, controls: {} };
   return JSON.parse(text);
 }
 
@@ -442,9 +443,41 @@ function configProblems(root, manifest) {
 }
 
 /** Scan one tree. `root` may be a synthetic fixture for the selftest. */
+
+function controlsProblems(root, manifest) {
+  const declared = manifest.controls ?? {};
+  const ids = Object.keys(declared);
+  if (ids.length === 0) return { problems: [], warnings: [], counts: { controls: 0 } };
+  const problems = [];
+  for (const [controlId, entry] of Object.entries(declared)) {
+    let binding;
+    try {
+      binding = bindingOf8(controlId);
+    } catch {
+      problems.push(`edition8 control ${controlId}: wiring entry is stale (control no longer binds)`);
+      continue;
+    }
+    const observed = {
+      kind: binding.kind,
+      method: binding.route.method,
+      path: binding.route.path,
+    };
+    if (entry.kind !== observed.kind || entry.method !== observed.method || entry.path !== observed.path) {
+      problems.push(
+        `edition8 control ${controlId}: wiring entry ${entry.kind} ${entry.method} ${entry.path} ` +
+          `does not match binding ${observed.kind} ${observed.method} ${observed.path}`,
+      );
+    }
+    if (typeof entry.effect !== 'string' || entry.effect.length === 0) {
+      problems.push(`edition8 control ${controlId}: wiring entry has no effect statement`);
+    }
+  }
+  return { problems, warnings: [], counts: { controls: ids.length } };
+}
+
 export function scan(root = ROOT) {
   const manifest = loadManifest(root);
-  const parts = [vscodeProblems(root, manifest), jetbrainsProblems(root), routeProblems(root, manifest), configProblems(root, manifest)];
+  const parts = [vscodeProblems(root, manifest), jetbrainsProblems(root), routeProblems(root, manifest), configProblems(root, manifest), controlsProblems(root, manifest)];
   const problems = parts.flatMap((part) => part.problems);
   const warnings = parts.flatMap((part) => part.warnings);
   const counts = Object.assign({}, ...parts.map((part) => part.counts));
@@ -540,7 +573,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     for (const warning of result.warnings) console.error(`warning: ${warning}`);
     for (const problem of result.problems) console.error(`problem: ${problem}`);
     console.log(
-      `wiring matrix: ${result.counts.commands ?? 0} commands, ${result.counts.settings ?? 0} settings, ${result.counts.routes ?? 0} routes, ${result.counts.configKeys ?? 0} config keys; ${result.problems.length} problems, ${result.warnings.length} warnings`,
+      `wiring matrix: ${result.counts.commands ?? 0} commands, ${result.counts.settings ?? 0} settings, ${result.counts.controls ?? 0} edition8 controls, ${result.counts.routes ?? 0} routes, ${result.counts.configKeys ?? 0} config keys; ${result.problems.length} problems, ${result.warnings.length} warnings`,
     );
     process.exitCode = result.problems.length === 0 && !(args.includes('--release') && result.warnings.length > 0) ? 0 : 1;
   }

@@ -882,13 +882,15 @@ impl SessionHandle {
             if page.is_empty() {
                 break;
             }
+            let ids: Vec<i64> = page.iter().map(|row| row.id).collect();
+            let mut parts_by_message = self.parts_for_messages(&ids)?;
             for row in &page {
                 if scanned >= MAX_SCAN {
                     break 'scan;
                 }
                 scanned += 1;
                 let mut saw_tool_part = false;
-                for part in self.parts_of(row.id)? {
+                for part in parts_by_message.remove(&row.id).unwrap_or_default() {
                     let Some(call_id) = part
                         .data
                         .get("tool_call_id")

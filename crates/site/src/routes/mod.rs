@@ -122,6 +122,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/account/invoices/", get(account::invoices_get))
         .route("/account/invoices/export/", get(account::invoices_export))
         .route("/account/invoices/{id}/", get(account::invoice_get))
+        .route(
+            "/account/invoices/{id}/download/",
+            get(account::invoice_download),
+        )
         .route("/account/invoices/{id}/receipt/", get(account::receipt_get))
         .route("/account/usage/", get(account::usage_get))
         .route("/admin/", get(admin::admin_get))

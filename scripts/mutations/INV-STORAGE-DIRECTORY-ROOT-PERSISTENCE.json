@@ -1,0 +1,18 @@
+{
+  "id": "INV-STORAGE-DIRECTORY-ROOT-PERSISTENCE",
+  "file": "crates/storage/src/governor.rs",
+  "find": "        self.inner.ledger.lock().unwrap().store_directory_roots(\n            class,\n            &DirectoryRootsMeta {\n                roots,\n                min_age_ms: age,\n            },\n        )?;",
+  "replace": "        let _ = (class, roots, age);",
+  "gate": "cargo test -p faktor-storage --lib directory_roots_persist_across_governor_instances",
+  "expect": "FAILED",
+  "note": "Drops the durable root registry: a reopened governor only knows defaults and never scans the browser download/profile root.",
+  "capabilities": [
+    "storage.governor"
+  ],
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

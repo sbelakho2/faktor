@@ -177,7 +177,9 @@
    * global lock). Refusal reasons stay on the card while the request is
    * still visible; both are bounded.
    */
-  var permissionInFlight = [];
+  // Insertion-ordered Set: membership is the per-button gate. The historical
+  // array made every rendered card scan up to MAX_PENDING_PERMISSIONS ids.
+  var permissionInFlight = new Set();
   var permissionRefusals = [];
   var MAX_PERMISSION_REFUSALS = 8;
   var MAX_PERMISSION_REASON_CHARS = 240;
@@ -1913,15 +1915,17 @@
     var task = snapshot ? snapshot.task : null;
     var card = byId('task-card');
     var spec = runStateSpec(snapshot);
-    // Content guard: the run card is a pure function of the task, the run
-    // strip source, the agent count and the proof's embedded state. A stream
-    // delta that only grows transcript text must not rebuild it.
+    // Content guard: the status row is a pure function of the task, the run
+    // strip source, the agent/approval counts and the proof's embedded state.
+    // A stream delta that only grows transcript text must not rebuild it.
     var guardKey =
       (spec === null ? 'none' : spec.label) +
       '#' +
       hash128(jsonForHash(task)) +
       '#' +
       hash128(jsonForHash(snapshot ? snapshot.agents : null)) +
+      '#' +
+      hash128(jsonForHash(snapshot ? snapshot.permissions : null)) +
       '#' +
       String(snapshot ? snapshot.proofTaskState : null) +
       '#' +
@@ -1933,23 +1937,85 @@
     }
     renderedTaskKey = guardKey;
     renderProbe('task');
-    // No task and no served run condition: an empty card full of em-dashes
-    // would be pure noise. The Inspect sections carry whatever metadata
-    // outlives the task. A served run condition (a terminal task-run row or
-    // the proof's embedded task state) still renders its own strip.
-    if (!task && spec === null) {
-      card.hidden = true;
-      writeStateStrip(RUN_STATE_IDS, null);
-      return;
+    // The status row is always present and quiet when idle. Run details
+    // (goal, plan, candidate boundary) live in Inspect, never as a second
+    // board above the conversation.
+    if (card) {
+      card.hidden = false;
     }
-    card.hidden = false;
-    renderRunStrip(task);
+    renderRunStrip(task, snapshot);
     writeStateStrip(RUN_STATE_IDS, spec);
     renderTaskProgress(task);
+    renderStatusTokens(snapshot);
+    renderStatusApprovals(snapshot);
     renderTaskTests(task);
     renderTaskAgents(snapshot ? snapshot.agents : null);
     setText('task-goal', task ? task.goal : '—');
     renderCompletion(task);
+  }
+
+  /**
+   * Exact token accounting for the sticky status row: the served run budget
+   * wins, otherwise the session usage total. Nothing is estimated.
+   */
+  function renderStatusTokens(snapshot) {
+    var node = byId('work-status-tokens');
+    if (!node) {
+      return;
+    }
+    var budget = snapshot && snapshot.task ? snapshot.task.budget : null;
+    var spent =
+      budget && typeof budget.spentTokens === 'number' && isFinite(budget.spentTokens)
+        ? budget.spentTokens
+        : null;
+    var max =
+      budget && typeof budget.maxTokens === 'number' && isFinite(budget.maxTokens)
+        ? budget.maxTokens
+        : null;
+    var total =
+      spent === null && snapshot && snapshot.usage && typeof snapshot.usage.tokens === 'number'
+        ? snapshot.usage.tokens
+        : null;
+    clear(node);
+    if (spent === null && total === null) {
+      node.hidden = true;
+      return;
+    }
+    var value = spent === null ? total : spent;
+    var label = formatCount(value) + ' tokens';
+    if (max !== null) {
+      label += ' / ' + formatCount(max);
+    }
+    node.hidden = false;
+    span(node, label, 'chip run-chip run-chip-neutral');
+  }
+
+  /** Pending approvals are an attention count, not another transcript card. */
+  function renderStatusApprovals(snapshot) {
+    var node = byId('work-status-approvals');
+    if (!node) {
+      return;
+    }
+    var count =
+      snapshot && Array.isArray(snapshot.permissions) ? snapshot.permissions.length : 0;
+    clear(node);
+    if (count === 0) {
+      node.hidden = true;
+      node.setAttribute('data-state', '');
+      return;
+    }
+    node.hidden = false;
+    node.setAttribute('data-state', 'attention');
+    span(
+      node,
+      count === 1 ? '1 approval' : String(count) + ' approvals',
+      'chip run-chip run-chip-fail'
+    );
+  }
+
+  function formatCount(value) {
+    var text = String(Math.trunc(Number(value)));
+    return text.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
   }
 
   /** One lifecycle bucket per run state: the strip chip is theme-colored. */
@@ -1986,15 +2052,24 @@
     return 'unknown';
   }
 
-  /** The run strip: one state chip, muted chips, and the quiet goal line. */
-  function renderRunStrip(task) {
+  /** The run strip: one state chip and the compact run identity. */
+  function renderRunStrip(task, snapshot) {
     var node = byId('task-state');
     if (!node) {
       return;
     }
     var state = task ? String(task.state == null ? '' : task.state) : '';
-    var bucket = runStateClass(state);
-    node.textContent = state.length > 0 ? state : '—';
+    var daemon = snapshot ? String(snapshot.daemon == null ? '' : snapshot.daemon) : '';
+    var running = snapshot ? snapshot.busy === true || snapshot.activeRunId != null : false;
+    var label = state;
+    if (label.length === 0) {
+      label = running ? 'Running' : daemon === 'running' ? 'Ready' : 'Idle';
+    }
+    var bucket = running ? 'running' : runStateClass(state);
+    if (!running && daemon !== 'running' && state.length === 0) {
+      bucket = 'unknown';
+    }
+    node.textContent = label;
     node.className = 'state-chip state-' + bucket;
     node.setAttribute('data-state', bucket);
   }
@@ -2289,18 +2364,20 @@
     }
     button.textContent = label;
     button.setAttribute('aria-label', label + ' permission request ' + id);
-    button.disabled = permissionInFlight.indexOf(id) !== -1;
+    button.disabled = permissionInFlight.has(id);
     button.addEventListener('click', function () {
       // The in-flight lock gates BEFORE the post: a double click, an
       // Enter+click race or a hostile burst can never emit a second reply
       // for the same request. It is released ONLY by that request's
       // explicit host result (permissionResult).
-      if (permissionInFlight.indexOf(id) !== -1) {
+      if (permissionInFlight.has(id)) {
         return;
       }
-      permissionInFlight.push(id);
-      if (permissionInFlight.length > MAX_PENDING_PERMISSIONS) {
-        permissionInFlight.shift();
+      permissionInFlight.add(id);
+      if (permissionInFlight.size > MAX_PENDING_PERMISSIONS) {
+        // Set preserves insertion order: evict the oldest id, like shift().
+        var oldest = permissionInFlight.values().next().value;
+        permissionInFlight.delete(oldest);
       }
       setPermissionDecisionsDisabled(id, true);
       vscode.postMessage({
@@ -2375,13 +2452,13 @@
 
   /** Drop refusal state for requests no longer pending; keep it bounded. */
   function prunePermissionRefusals(items) {
-    var live = [];
+    var live = new Set();
     for (var i = 0; i < items.length; i++) {
-      live.push(String(items[i].id == null ? '' : items[i].id));
+      live.add(String(items[i].id == null ? '' : items[i].id));
     }
     var next = [];
     for (var j = 0; j < permissionRefusals.length; j++) {
-      if (live.indexOf(permissionRefusals[j].id) !== -1) {
+      if (live.has(permissionRefusals[j].id)) {
         next.push(permissionRefusals[j]);
       }
     }
@@ -2427,12 +2504,12 @@
     var announcements = [];
     if (lastPermissionIds !== null) {
       for (var q = 0; q < items.length; q++) {
-        if (lastPermissionIds.indexOf(pendingIds[q]) === -1) {
+        if (!lastPermissionIds.has(pendingIds[q])) {
           announcements.push(permissionHeadline(items[q]).headline);
         }
       }
     }
-    lastPermissionIds = pendingIds;
+    lastPermissionIds = new Set(pendingIds);
     var announceNode = byId('permission-announce');
     if (announceNode) {
       if (announcements.length > 0) {
@@ -3554,7 +3631,8 @@
       // in place: the disclosure, focus and evidence controls survive.
       var canPatchTool =
         existingRow &&
-        existingRow.parentNode === node &&
+        node.contains &&
+        node.contains(existingRow) &&
         oldTool &&
         oldTool.state === newTool.state &&
         oldTool.name === newTool.name &&
@@ -3601,15 +3679,21 @@
       // per-token text patch never clones the whole entry.
       var rowState = existingRow ? captureEntryState(existingRow) : null;
       var fresh = renderToolNode(newTool);
-      if (existingRow && existingRow.parentNode === node) {
-        node.replaceChild(fresh, existingRow);
+      if (existingRow && existingRow.parentNode && (!node.contains || node.contains(existingRow))) {
+        existingRow.parentNode.replaceChild(fresh, existingRow);
       } else {
-        node.appendChild(fresh);
+        var host = node.__faktorToolGroup
+          ? node.querySelector('.activity-group-body')
+          : node;
+        if (host) host.appendChild(fresh);
       }
       if (rowState) {
         restoreEntryState(fresh, rowState);
       }
       toolNodes[t] = fresh;
+    }
+    if (node.__faktorToolGroup) {
+      updateToolGroupSummary(node.__faktorToolGroup, newTools);
     }
     node.__faktorToolNodes = toolNodes;
     node.__faktorEntry = entry;
@@ -4346,15 +4430,61 @@
     }
     var tools = Array.isArray(entry.tools) ? entry.tools : [];
     var toolNodes = [];
+    var toolHost = wrapper;
+    var toolGroup = null;
+    if (tools.length > 1) {
+      toolGroup = document.createElement('details');
+      toolGroup.className = 'activity-group';
+      var groupSummary = document.createElement('summary');
+      groupSummary.className = 'activity-group-summary';
+      toolGroup.appendChild(groupSummary);
+      toolHost = document.createElement('div');
+      toolHost.className = 'activity-group-body';
+      toolGroup.appendChild(toolHost);
+      // A settled batch stays collapsed; live or failed work opens because
+      // its output is the part worth reading.
+      toolGroup.open = tools.some(function (tool) {
+        var tone = toolOutcome(tool).tone;
+        return tone === 'run' || tone === 'fail';
+      });
+      wrapper.appendChild(toolGroup);
+    }
     for (var i = 0; i < tools.length; i++) {
       var toolNode = renderToolNode(tools[i]);
-      wrapper.appendChild(toolNode);
+      toolHost.appendChild(toolNode);
       toolNodes.push(toolNode);
+    }
+    if (toolGroup !== null) {
+      updateToolGroupSummary(toolGroup, tools);
     }
     wrapper.__faktorEntry = entry;
     wrapper.__faktorParts = parts;
     wrapper.__faktorToolNodes = toolNodes;
+    wrapper.__faktorToolGroup = toolGroup;
     return wrapper;
+  }
+
+  /** One concise header for a batch of consecutive tool calls. */
+  function updateToolGroupSummary(group, tools) {
+    if (!group) {
+      return;
+    }
+    var summary = group.querySelector('.activity-group-summary');
+    if (!summary) {
+      return;
+    }
+    var failed = 0;
+    var running = 0;
+    for (var i = 0; i < tools.length; i++) {
+      var tone = toolOutcome(tools[i]).tone;
+      if (tone === 'fail') failed += 1;
+      else if (tone === 'run') running += 1;
+    }
+    var parts = [tools.length + (tools.length === 1 ? ' tool call' : ' tool calls')];
+    if (failed > 0) parts.push(failed + ' failed');
+    if (running > 0) parts.push(running + ' running');
+    summary.textContent = parts.join(' · ');
+    summary.setAttribute('aria-label', 'Tool activity: ' + parts.join(', '));
   }
 
   function setDaemon(status, detail) {
@@ -5492,10 +5622,7 @@
       // request visible with its exact reason, and the buttons re-enable.
       // Nothing is retried implicitly; a retry is always a new user click.
       var resultId = String(message.permissionId == null ? '' : message.permissionId);
-      var inFlightIndex = permissionInFlight.indexOf(resultId);
-      if (inFlightIndex !== -1) {
-        permissionInFlight.splice(inFlightIndex, 1);
-      }
+      permissionInFlight.delete(resultId);
       if (message.ok !== true) {
         var refusalReason =
           typeof message.reason === 'string' && message.reason.length > 0
@@ -5948,6 +6075,12 @@
   });
   byId('btn-cancel-run').addEventListener('click', function () {
     vscode.postMessage({ type: 'cancelRun' });
+  });
+  // Run details are an Inspect destination: the status row never duplicates
+  // the plan, goal or candidate boundary inside the conversation.
+  byId('btn-status-inspect').addEventListener('click', function () {
+    setActiveView('inspect');
+    setActiveSubview('overview');
   });
   byId('btn-refresh').addEventListener('click', function () {
     vscode.postMessage({ type: 'refresh' });

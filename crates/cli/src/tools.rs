@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! Built-in tools for the daemon (spec §17/§22/§30). Tools never touch
 //! session persistence; every invocation carries its workspace identity and
 //! runs through the permission engine.

@@ -701,11 +701,15 @@ export class Edition8Client implements E8Backend {
           ? await this.native.legacyCatalogJson('GET', route.path, (value) => value)
           : await this.native.edition5Json<Json>(route.method, route.path, body, (value) => value);
       const ok = booleanOf(raw, 'ok') ?? (booleanOf(raw, 'deleted') === true ? true : booleanOf(raw, 'applied') ?? true);
+      const hits = isObject(raw) && Array.isArray(raw.hits) ? raw.hits.length : null;
+      const searchQuery = typeof payload.query === 'string' ? payload.query : null;
       return {
         ok,
         message:
-          textOf(raw, 'message', 'state', 'status') ??
-          (ok ? 'Daemon acknowledged the request.' : 'The daemon refused the request.'),
+          controlId === 'O-01' && hits !== null
+            ? `${hits} setting${hits === 1 ? '' : 's'} matched${searchQuery === null ? '' : ` “${searchQuery}”`}; this screen is filtered locally.`
+            : textOf(raw, 'message', 'state', 'status') ??
+              (ok ? 'Daemon acknowledged the request.' : 'The daemon refused the request.'),
         method: route.method,
         path: route.path,
         body: raw,

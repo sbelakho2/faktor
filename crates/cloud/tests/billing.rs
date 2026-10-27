@@ -1,9 +1,11 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! Adversarial tests of the Wave 3 commercial metering domain (usage ledger,
 //! entitlements, credits): append-only corrections, BYOK-vs-managed
 //! accounting, credit exactness across crashes, the in-flight-transaction
 //! invariant, quota refusals naming the exact limit, and org isolation.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use faktor_cloud::billing::{
     task_id_text, CreditLedgerError, ALL_LIMITS, FEATURE_BYOK, FEATURE_CREDITS,
@@ -3120,6 +3122,109 @@ fn commercial_mutation_idempotency_keys_are_bounded_per_organization() {
                 .claim_billing_mutation(&organization, "key_0", "request_0", 0)
                 .unwrap(),
             faktor_cloud::BillingMutationClaim::Fresh
+        );
+    }
+}
+
+/// The in-memory store is an embedded-host backend: appending N usage rows
+/// must stay O(N log N), never rescan every prior row per append (the old
+/// source-key/correction lookup was O(N^2) and made 1M-row ingestion
+/// impractical). 50k rows is large enough to separate the two growth curves
+/// while staying a bounded CI probe.
+#[test]
+fn memory_usage_append_50k_is_not_quadratic() {
+    let store = MemoryBillingStore::new();
+    let started = Instant::now();
+    for index in 0..50_000u64 {
+        let mut event = usage_event(&format!("uev_scale_{index}"));
+        event.task_id = 1 + (index % 200);
+        event.occurred_at_ms = index as i64;
+        assert!(matches!(
+            store.append_usage_event(&event).unwrap(),
+            faktor_cloud::UsageAppend::Appended
+        ));
+    }
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "50k memory usage appends took {elapsed:?}; the append path regressed to a full scan"
+    );
+    let rows = store
+        .usage_events_of_task(&org("org_a"), 7, 0, 250)
+        .unwrap();
+    assert_eq!(rows.len(), 250, "the task index stays exact");
+    assert!(rows
+        .windows(2)
+        .all(|pair| pair[0].event_seq < pair[1].event_seq));
+}
+
+/// Credit appends validate against the incremental balance/index; folding
+/// the whole ledger per append was O(N^2). 20k grants is a bounded guard
+/// that also checks the final balance is byte-for-byte the grant sum.
+#[test]
+fn memory_credit_append_20k_keeps_the_balance_incremental() {
+    let store = MemoryBillingStore::new();
+    let started = Instant::now();
+    for index in 0..20_000u64 {
+        let mut entry = credit_entry(&format!("crd_scale_{index}"), CreditKind::Grant, 3, None);
+        entry.occurred_at_ms = index as i64;
+        assert!(matches!(
+            store.append_credit_entry(&entry).unwrap(),
+            CreditAppend::Appended
+        ));
+    }
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "20k memory credit appends took {elapsed:?}; the append path regressed to a full fold"
+    );
+    let balance = store.credit_balance(&org("org_a")).unwrap();
+    assert_eq!(balance.granted_micro, 60_000);
+    assert_eq!(balance.balance_micro().unwrap(), 60_000);
+    assert_eq!(
+        store
+            .credit_entries(&org("org_a"), 0, 25_000)
+            .unwrap()
+            .len(),
+        20_000
+    );
+}
+
+/// Both backends must refuse a reused durable id: SQLite enforces the
+/// primary key, and the in-memory store must not silently overwrite the row
+/// (which would leave the old source-key/index entry pointing at new data).
+#[test]
+fn memory_store_refuses_reused_usage_and_credit_ids_like_sqlite() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("billing.db");
+    let sqlite = SqliteControlPlaneStore::open(&path).unwrap();
+    let memory = MemoryBillingStore::new();
+    let organization = org("org_a");
+    for store in [&memory as &dyn BillingStore, &sqlite as &dyn BillingStore] {
+        let first = usage_event("uev_reused");
+        store.append_usage_event(&first).unwrap();
+        let mut second = first.clone();
+        second.source_key = "manual:other".into();
+        assert!(
+            store.append_usage_event(&second).is_err(),
+            "a reused usage id must be refused, not overwrite the row"
+        );
+
+        let grant = credit_entry("crd_reused", CreditKind::Grant, 10, None);
+        assert_eq!(
+            store.append_credit_entry(&grant).unwrap(),
+            CreditAppend::Appended
+        );
+        let mut changed = grant.clone();
+        changed.amount_micro = 11;
+        assert!(
+            store.append_credit_entry(&changed).is_err(),
+            "a reused credit id must be refused, not overwrite the row"
+        );
+        assert_eq!(
+            store.credit_balance(&organization).unwrap().granted_micro,
+            10,
+            "the first credit row is untouched"
         );
     }
 }

@@ -1959,6 +1959,7 @@ version = "0.1.0"
 dependencies = [
  "faktor-core",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
@@ -2299,6 +2300,7 @@ dependencies = [
  "faktor-server",
  "faktor-session",
  "faktor-snapshot",
+ "faktor-storage",
  "faktor-store",
  "faktor-supply-core",
  "faktor-supply-cost",

@@ -124,6 +124,7 @@ fn paid_body(event_id: &str, provider_invoice: &str, amount: i64, created: i64) 
 struct Fixture {
     _dir: TempDir,
     service: PaymentService,
+    clock: Arc<ManualClock>,
     organization: OrganizationId,
     provider_invoice: String,
     invoice_id: String,
@@ -134,7 +135,7 @@ async fn fixture() -> Fixture {
     let dir = TempDir::new().unwrap();
     let clock = Arc::new(ManualClock::new(START));
     let store = Arc::new(SqlitePaymentStore::open(&dir.path().join("payment.db")).unwrap());
-    let service = PaymentService::open_local(store, config(), clock, secrets()).unwrap();
+    let service = PaymentService::open_local(store, config(), clock.clone(), secrets()).unwrap();
     let organization = org("org-authority");
     let subscription = service
         .subscribe(&organization, subscribe_request())
@@ -149,6 +150,7 @@ async fn fixture() -> Fixture {
     Fixture {
         _dir: dir,
         service,
+        clock,
         organization,
         provider_invoice: invoice.provider_invoice_id.clone().unwrap(),
         invoice_id: invoice.id,
@@ -401,7 +403,11 @@ async fn invoice_and_payment_events_describe_one_receipt() {
         .handle_webhook(&signed(&payment_event), &payment_event, START + 1_000)
         .await
         .unwrap();
-    assert_eq!(second.disposition, WebhookDisposition::Applied);
+    // The payment event describes the same settled provider payment that the
+    // invoice event already bound. It is authenticated and recorded, but it
+    // produces no second ledger effect, so the truthful disposition is
+    // `Ignored` rather than a second `Applied`.
+    assert_eq!(second.disposition, WebhookDisposition::Ignored);
 
     let payments = fixture.service.payments(&fixture.organization, 10).unwrap();
     assert_eq!(
@@ -474,6 +480,46 @@ async fn manual_reconciliation_matches_present_and_surfaces_absent_provider_invo
         InvoiceReconciliationState::ProviderInvoiceMissing
     );
     assert_eq!(stored.total_minor, invoice.total_minor);
+}
+
+#[tokio::test]
+async fn bounded_reconciliation_passes_rotate_across_the_whole_ledger() {
+    let fixture = fixture().await;
+    let organization = fixture.organization.clone();
+    let subscription_id = fixture
+        .service
+        .invoice(&organization, &fixture.invoice_id)
+        .unwrap()
+        .subscription_id
+        .expect("the fixture invoice is subscription-bound");
+    let mut expected = vec![fixture.invoice_id.clone()];
+    for index in 0..2 {
+        let mut request = invoice_request(&subscription_id);
+        request.usage[0].description = format!("rotating usage {index}");
+        request.idempotency_key = format!("rotation-invoice-{index}");
+        expected.push(
+            fixture
+                .service
+                .issue_invoice(&organization, request)
+                .await
+                .unwrap()
+                .invoice
+                .id,
+        );
+    }
+
+    // The per-pass bound is one invoice. Four passes must still reach every
+    // invoice rather than re-checking the same first row forever.
+    let mut seen = Vec::new();
+    for _ in 0..expected.len() {
+        fixture.clock.advance(1);
+        let report = fixture.service.reconcile(&organization, 1).await.unwrap();
+        assert_eq!(report.checked, 1);
+        seen.push(report.items[0].invoice_id.clone());
+    }
+    seen.sort();
+    expected.sort();
+    assert_eq!(seen, expected);
 }
 
 #[tokio::test]

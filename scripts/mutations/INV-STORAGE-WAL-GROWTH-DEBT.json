@@ -1,0 +1,18 @@
+{
+  "id": "INV-STORAGE-WAL-GROWTH-DEBT",
+  "file": "crates/storage/src/governor.rs",
+  "find": "        let class_used = snapshot\n            .class_bytes\n            .saturating_add(snapshot.class_pending)\n            .saturating_add(debt);\n        let total_used = snapshot\n            .total_bytes\n            .saturating_add(snapshot.total_pending)\n            .saturating_add(debt);\n        if class_used.saturating_add(bound) <= quota",
+  "replace": "        let _ = debt;\n        let class_used = snapshot.class_bytes.saturating_add(snapshot.class_pending);\n        let total_used = snapshot.total_bytes.saturating_add(snapshot.total_pending);\n        if class_used.saturating_add(bound) <= quota",
+  "gate": "cargo test -p faktor-storage --lib sqlite_wal_flood_cannot_exceed_the_class_quota_between_scans",
+  "expect": "FAILED",
+  "note": "Ignores admitted-but-unsettled WAL growth: the stale inventory snapshot admits a flood far past the class quota between scans.",
+  "capabilities": [
+    "storage.governor"
+  ],
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

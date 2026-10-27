@@ -107,4 +107,19 @@ impl StorageClass {
     pub const fn requires_loss_marker(self) -> bool {
         matches!(self, StorageClass::CompactionArchive)
     }
+
+    /// Retention strength of one logical class sharing a physical CAS root.
+    /// A deduplicated blob is owned by the STRONGEST class that ever
+    /// referenced it, so an archive/checkpoint/capture reference cannot lose
+    /// its class (and its loss marker) merely because identical bytes were
+    /// first stored as general main-CAS content.
+    pub const fn retention_rank(self) -> u8 {
+        match self {
+            StorageClass::CompactionArchive => 3,
+            StorageClass::Checkpoint => 2,
+            StorageClass::TerminalCapture => 1,
+            StorageClass::MainCas => 0,
+            _ => 0,
+        }
+    }
 }

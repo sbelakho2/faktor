@@ -39,6 +39,11 @@ impl PaymentService {
         }
         let now = self.now_ms();
         let existing = self.store.payment_methods(org)?;
+        if existing.len() >= MAX_PAYMENT_METHODS {
+            return Err(PaymentError::Conflict(format!(
+                "an organization may store at most {MAX_PAYMENT_METHODS} payment methods"
+            )));
+        }
         let is_default = request.set_default || existing.is_empty();
         let method_id = format!("pm_{}", uuid::Uuid::new_v4());
         let token_ciphertext = self.vault.seal(org, &method_id, &request.token)?;

@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! faktor-provider — the common LLM provider interface hub.
 //!
 //! The agent depends on this trait; the transport families (ollama, openai,
@@ -2568,8 +2569,40 @@ impl Provider for FakeProvider {
         // assert it shares the turn's cancellation lineage.
         *self.last_cancellation.lock().unwrap() = Some(req.meta.cancellation.clone());
         // Scripts are consumed exactly once (a replaying provider would let
-        // the agent loop forever re-executing the same calls).
-        let script = std::mem::take(&mut *self.script.lock().unwrap());
+        // the agent loop forever re-executing the same calls). ONE stream is
+        // one model response: a leading run of tool calls (optionally with
+        // preceding text) is one response; text/reasoning that FOLLOWS a
+        // tool call belongs to the next response and stays queued. Without
+        // this boundary a tool-using turn consumed the whole script on its
+        // first call and the tool-continuation call saw an empty script.
+        let script = {
+            let mut guard = self.script.lock().unwrap();
+            let mut split = 0usize;
+            let mut saw_tool = false;
+            for (index, response) in guard.iter().enumerate() {
+                match response {
+                    ScriptedResponse::ToolCall { .. } => {
+                        saw_tool = true;
+                        split = index + 1;
+                    }
+                    ScriptedResponse::End | ScriptedResponse::Die(_) => {
+                        split = index + 1;
+                        break;
+                    }
+                    ScriptedResponse::Text(_) | ScriptedResponse::Reasoning(_) => {
+                        if saw_tool {
+                            break;
+                        }
+                        split = index + 1;
+                    }
+                }
+            }
+            if split == 0 {
+                Vec::new()
+            } else {
+                guard.drain(..split).collect()
+            }
+        };
         let fail_after = self.fail_after_chunks;
         let stream = futures::stream::unfold(
             (script.into_iter(), 0usize, fail_after, false),
@@ -3204,6 +3237,74 @@ mod tests {
         assert!(matches!(chunks[0], Ok(ProviderChunk::Text { .. })));
         assert!(matches!(chunks[1], Ok(ProviderChunk::ToolCall { .. })));
         assert_eq!(chunks[2], Ok(ProviderChunk::Done));
+    }
+
+    /// CASE INV-FAKE-STREAM-BOUNDARY: one stream is one model response. A
+    /// scripted tool continuation is a separate response: the tool call(s)
+    /// go to the first stream and the following text+End to the next.
+    /// Before this boundary the first stream drained the whole script, so
+    /// the post-tool request saw an empty completion and every tool-using
+    /// turn failed.
+    #[tokio::test]
+    async fn fake_provider_splits_a_tool_continuation_into_two_responses() {
+        let fake = FakeProvider::with_script(
+            "f",
+            ModelCapabilities::default(),
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "read_file".into(),
+                    input: serde_json::json!({"path": "x"}),
+                },
+                ScriptedResponse::Text("after tool".into()),
+                ScriptedResponse::End,
+            ],
+        );
+        let first: Vec<_> = fake.stream(req()).collect().await;
+        assert_eq!(first.len(), 2, "tool call + synthetic Done");
+        assert!(matches!(first[0], Ok(ProviderChunk::ToolCall { .. })));
+        assert_eq!(first[1], Ok(ProviderChunk::Done));
+        let second: Vec<_> = fake.stream(req()).collect().await;
+        assert_eq!(second.len(), 2);
+        assert!(matches!(second[0], Ok(ProviderChunk::Text { .. })));
+        assert_eq!(second[1], Ok(ProviderChunk::Done));
+        let exhausted: Vec<_> = fake.stream(req()).collect().await;
+        assert_eq!(exhausted, vec![Ok(ProviderChunk::Done)]);
+    }
+
+    /// CASE INV-FAKE-STREAM-BATCH: a batch of tool calls is still ONE
+    /// response; the continuation text is the next one. No stream may
+    /// replay consumed responses.
+    #[tokio::test]
+    async fn fake_provider_batches_consecutive_tool_calls_in_one_response() {
+        let fake = FakeProvider::with_script(
+            "f",
+            ModelCapabilities::default(),
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "read_file".into(),
+                    input: serde_json::json!({"path": "x"}),
+                },
+                ScriptedResponse::ToolCall {
+                    id: "c2".into(),
+                    name: "read_file".into(),
+                    input: serde_json::json!({"path": "y"}),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+        );
+        let first: Vec<_> = fake.stream(req()).collect().await;
+        assert_eq!(first.len(), 3, "two tool calls + synthetic Done");
+        assert!(first[..2]
+            .iter()
+            .all(|item| matches!(item, Ok(ProviderChunk::ToolCall { .. }))));
+        assert_eq!(first[2], Ok(ProviderChunk::Done));
+        let second: Vec<_> = fake.stream(req()).collect().await;
+        assert_eq!(second.len(), 2);
+        assert!(matches!(second[0], Ok(ProviderChunk::Text { .. })));
+        assert_eq!(second[1], Ok(ProviderChunk::Done));
     }
 
     #[tokio::test]

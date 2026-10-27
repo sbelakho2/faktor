@@ -1,0 +1,18 @@
+{
+  "id": "INV-STORAGE-SQLITE-DEBT-SHARED",
+  "file": "crates/storage/src/governor.rs",
+  "find": "        let wal_debt = shared_wal_debt(&root.join(GOVERNOR_DB_NAME));",
+  "replace": "        let wal_debt = Arc::new(SharedWalDebt::default());",
+  "gate": "cargo test -p faktor-storage --lib sqlite_admission_debt_is_shared_and_inflight_safe",
+  "expect": "FAILED",
+  "note": "Gives every governor instance its own SQLite admission debt: concurrent instances can spend the same room past the class quota.",
+  "capabilities": [
+    "storage.governor"
+  ],
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

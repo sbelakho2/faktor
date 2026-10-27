@@ -250,7 +250,9 @@ async fn exact_invoice_proration_seat_tax_and_currency_math() {
     let third = service.issue_invoice(&org, third_req).await.unwrap();
     assert_eq!(third.invoice.subtotal_minor, 2_250);
 
-    // Plan change pro -> team: old 1000, new 2000, 20/30 remaining.
+    // Plan change pro -> team with 5 seats: old recurring 1000 + 5 x 250 =
+    // 2250, new recurring 2000 + 5 x 0 = 2000, 20/30 remaining. Both the
+    // plan and the seat price difference are prorated.
     let plan_preview = service
         .preview_plan_change(
             &org,
@@ -261,9 +263,9 @@ async fn exact_invoice_proration_seat_tax_and_currency_math() {
             },
         )
         .unwrap();
-    assert_eq!(plan_preview.credit_minor, -667);
+    assert_eq!(plan_preview.credit_minor, -1_500);
     assert_eq!(plan_preview.charge_minor, 1_333);
-    assert_eq!(plan_preview.net_minor, 666);
+    assert_eq!(plan_preview.net_minor, -167);
     let changed = service
         .change_plan(
             &org,
@@ -284,7 +286,8 @@ async fn exact_invoice_proration_seat_tax_and_currency_math() {
     fourth_req.discount_minor = 0;
     fourth_req.tax_jurisdiction = None;
     let fourth = service.issue_invoice(&org, fourth_req).await.unwrap();
-    assert_eq!(fourth.invoice.subtotal_minor, 2_666);
+    // New recurring 2000 + proration net -167 = 1833.
+    assert_eq!(fourth.invoice.subtotal_minor, 1_833);
 
     // Pure money helpers: the exact same arithmetic the service embeds.
     assert_eq!(exclusive_tax(1_700, 1_900).unwrap(), 323);

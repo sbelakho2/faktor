@@ -1,0 +1,112 @@
+{
+  "version": 1,
+  "comment": "Static superlinearity budget. Limits are unlisted-site counts; allowlist entries carry a reason and measured bound. Maintained by scripts/check-superlinearity.mjs.",
+  "limits": {
+    "rust-parts-per-item": 0,
+    "rust-governor-per-blob": 0,
+    "rust-period-full-bucket-scan": 0,
+    "rust-usage-full-row-scan": 0,
+    "rust-plan-position-per-child": 0,
+    "rust-position-in-loop": 0,
+    "ui-permission-linear-lookup": 0,
+    "ui-control-linear-lookup": 0,
+    "rust-assignment-per-item-find": 0,
+    "rust-abort-dedupe-scan": 0,
+    "rust-json-parse-per-fact": 0,
+    "ui-permission-inflight-linear": 0,
+    "ui-agent-catalog-find": 0
+  },
+  "allowlist": [
+    {
+      "file": "crates/instructions/src/lib.rs",
+      "rule": "rust-position-in-loop",
+      "count": 2,
+      "reason": "hex decode scans the fixed 16-byte alphabet",
+      "measured": "16 entries per nibble"
+    },
+    {
+      "file": "crates/verify/src/rebind.rs",
+      "rule": "rust-position-in-loop",
+      "count": 1,
+      "reason": "scans one declaration's identifier words for a rename",
+      "measured": "bounded by one declaration"
+    },
+    {
+      "file": "crates/pty/src/win_common.rs",
+      "rule": "rust-position-in-loop",
+      "count": 1,
+      "reason": "finds the argv module terminator",
+      "measured": "bounded by argv"
+    },
+    {
+      "file": "crates/security/src/lib.rs",
+      "rule": "rust-position-in-loop",
+      "count": 1,
+      "reason": "scans one chunk for a literal pattern",
+      "measured": "one chunk window"
+    },
+    {
+      "file": "crates/security/src/payload.rs",
+      "rule": "rust-position-in-loop",
+      "count": 1,
+      "reason": "scans one chunk for a literal pattern",
+      "measured": "one chunk window"
+    },
+    {
+      "file": "crates/browser/src/egress.rs",
+      "rule": "rust-position-in-loop",
+      "count": 1,
+      "reason": "finds CRLF in one bounded header buffer",
+      "measured": "bounded header buffer"
+    },
+    {
+      "file": "crates/ci-tools/src/impact.rs",
+      "rule": "rust-position-in-loop",
+      "count": 1,
+      "reason": "finds one newline in a source line",
+      "measured": "one line"
+    },
+    {
+      "file": "crates/ci-tools/src/lane_marker.rs",
+      "rule": "rust-position-in-loop",
+      "count": 1,
+      "reason": "finds one flag in a bounded argv",
+      "measured": "bounded CLI argv"
+    },
+    {
+      "file": "crates/acp/src/protocol.rs",
+      "rule": "rust-position-in-loop",
+      "count": 1,
+      "reason": "finds the colon in one protocol header line",
+      "measured": "one header line"
+    },
+    {
+      "file": "crates/impact/src/topology.rs",
+      "rule": "rust-position-in-loop",
+      "count": 1,
+      "reason": "finds a glob segment in one pattern",
+      "measured": "MAX_ADAPTER_UNITS patterns"
+    },
+    {
+      "file": "crates/impact/src/lsp.rs",
+      "rule": "rust-position-in-loop",
+      "count": 1,
+      "reason": "finds the LSP header delimiter in one bounded header",
+      "measured": "one header"
+    },
+    {
+      "file": "crates/storage/src/governor.rs",
+      "rule": "rust-position-in-loop",
+      "count": 1,
+      "reason": "locates the configured directory root for one blob key",
+      "measured": "<= configured roots (default 2)"
+    },
+    {
+      "file": "crates/storage/src/directory.rs",
+      "rule": "rust-position-in-loop",
+      "count": 1,
+      "reason": "locates the configured directory root for one inventory key",
+      "measured": "<= configured roots (default 1-2), exact-match fast path"
+    }
+  ]
+}

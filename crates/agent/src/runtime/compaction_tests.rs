@@ -6,6 +6,192 @@ use crate::runtime::fixtures_tests::*;
 use crate::runtime::tests::*;
 use crate::*;
 
+fn files_under(root: &std::path::Path) -> usize {
+    match std::fs::read_dir(root) {
+        Ok(entries) => entries
+            .flatten()
+            .map(|entry| {
+                let path = entry.path();
+                if path.is_dir() {
+                    files_under(&path)
+                } else {
+                    1
+                }
+            })
+            .sum(),
+        Err(_) => 0,
+    }
+}
+
+fn archive_plan() -> faktor_context::compactor::CompactionPlan {
+    faktor_context::compactor::CompactionPlan {
+        accepted: true,
+        before_tokens: 1_000,
+        after_tokens: 250,
+        target_tokens: 250,
+        strategy: faktor_context::CompactionStrategy::DeterministicPruning,
+        ledger: TaskLedger::default(),
+        kept_recent: vec![RecentTurn {
+            role: "assistant".into(),
+            text: "[Earlier context archived: 10 turns\n<artifact://hash>]".into(),
+        }],
+        archived: Vec::new(),
+        archive_chunks: vec!["old turn one\n".into(), "old turn two\n".into()],
+        evidence_refs: Vec::new(),
+    }
+}
+
+#[test]
+fn unavailable_archive_is_an_explicit_marker_never_a_dangling_artifact_ref() {
+    // CAS absent (embedded host) and CAS publish refusal must both replace
+    // the compactor's `<artifact://hash>` placeholder with the truth. A
+    // dangling ref made the model believe the evicted context was
+    // retrievable and re-derive it (fallback work).
+    let mut plan = archive_plan();
+    assert_eq!(attach_compaction_archive(None, &mut plan), None);
+    let first = &plan.kept_recent[0].text;
+    assert!(!first.contains("<artifact://hash>"), "{first}");
+    assert!(!first.contains("artifact://"), "{first}");
+    assert!(first.contains("archive unavailable"), "{first}");
+    assert!(first.contains("original rows remain"), "{first}");
+}
+
+#[test]
+fn evicted_archive_ref_is_marked_instead_of_replayed_as_retrievable() {
+    let dir = tempfile::tempdir().unwrap();
+    let cas = faktor_cas::Cas::open(dir.path().join("cas")).unwrap();
+    let live = store_compaction_archive(&cas, &["live archive chunk\n".to_string()])
+        .expect("live archive");
+    let missing = faktor_core::hash::FileHash::from_hex(&"a".repeat(64)).unwrap();
+    assert!(!cas.has(missing), "precondition: the archive was evicted");
+    let mut plan = archive_plan();
+    plan.kept_recent[0].text = format!(
+        "[Earlier context archived: old ref artifact://{live} and evicted ref artifact://{missing}]"
+    );
+    assert_eq!(mark_evicted_compaction_archives(Some(&cas), &mut plan), 1);
+    let text = &plan.kept_recent[0].text;
+    assert!(text.contains(&format!("artifact://{live}")), "{text}");
+    assert!(
+        text.contains(&format!("[archive evicted: {missing}]")),
+        "{text}"
+    );
+    assert!(!text.contains(&format!("artifact://{missing}")), "{text}");
+
+    // Without a CAS the marker cannot be checked; the existing text is kept
+    // verbatim (never a guessed eviction).
+    let mut unchecked = archive_plan();
+    unchecked.kept_recent[0].text = format!("artifact://{missing}");
+    assert_eq!(mark_evicted_compaction_archives(None, &mut unchecked), 0);
+    assert_eq!(
+        unchecked.kept_recent[0].text,
+        format!("artifact://{missing}")
+    );
+}
+
+#[test]
+fn published_archive_replaces_the_placeholder_with_the_manifest_ref() {
+    let dir = tempfile::tempdir().unwrap();
+    let cas = faktor_cas::Cas::open(dir.path().join("cas")).unwrap();
+    let mut plan = archive_plan();
+    let hash = attach_compaction_archive(Some(&cas), &mut plan).expect("archive published");
+    let first = &plan.kept_recent[0].text;
+    assert!(first.contains(&format!("artifact://{hash}")), "{first}");
+    assert!(!first.contains("<artifact://hash>"), "{first}");
+    assert!(!first.contains("archive unavailable"), "{first}");
+    assert!(cas.has(hash), "the manifest is durable at its ref");
+}
+
+/// CASE INV-COMPACTION-MANIFEST-TRUTH: a manifest that names an evicted
+/// chunk is not retrievable even though `cas.has(manifest)` is true.
+#[test]
+fn a_manifest_with_an_evicted_chunk_is_not_retrievable() {
+    // Manifest truth: the small manifest can survive per-object eviction
+    // while one chunk is gone. `cas.has(manifest)` must not be mistaken for
+    // "the archive is retrievable"; the wire must name the loss instead of
+    // replaying a dead ref.
+    let dir = tempfile::tempdir().unwrap();
+    let cas = faktor_cas::Cas::open(dir.path().join("cas")).unwrap();
+    let chunks = vec!["old turn one\n".to_string(), "old turn two\n".to_string()];
+    let manifest = store_compaction_archive(&cas, &chunks).expect("archive stored");
+    let bytes = cas
+        .get_bounded(manifest, 256 * 1024)
+        .unwrap()
+        .expect("manifest readable");
+    let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let chunk_hex = parsed["chunks"][0]["hash"].as_str().unwrap();
+    let chunk = faktor_core::hash::FileHash::from_hex(chunk_hex).unwrap();
+    cas.evict_verified(chunk).unwrap();
+    assert!(cas.has(manifest), "precondition: the manifest survived");
+    assert!(
+        !archive_manifest_is_retrievable(&cas, manifest),
+        "a manifest with one missing chunk is not retrievable"
+    );
+
+    let mut plan = archive_plan();
+    plan.kept_recent[0].text = format!("[Earlier context archived: old ref artifact://{manifest}]");
+    assert_eq!(mark_evicted_compaction_archives(Some(&cas), &mut plan), 1);
+    let text = &plan.kept_recent[0].text;
+    assert!(
+        text.contains(&format!("[archive evicted: {manifest}]")),
+        "{text}"
+    );
+    assert!(!text.contains(&format!("artifact://{manifest}")), "{text}");
+}
+
+#[test]
+fn archive_pointers_are_handled_in_any_kept_turn_and_no_pointer_means_no_archive() {
+    let dir = tempfile::tempdir().unwrap();
+    let cas = faktor_cas::Cas::open(dir.path().join("cas")).unwrap();
+
+    // No wire pointer at all: publishing chunks would only create an
+    // unreachable artifact, so nothing is stored.
+    let mut without_pointer = archive_plan();
+    without_pointer.kept_recent[0].text = "[Earlier context archived: 10 turns]".into();
+    assert_eq!(
+        attach_compaction_archive(Some(&cas), &mut without_pointer),
+        None
+    );
+    assert_eq!(
+        without_pointer.kept_recent[0].text,
+        "[Earlier context archived: 10 turns]"
+    );
+
+    // The pointer is normally first, but the wire must never miss it when a
+    // plan orders it later.
+    let mut plan = archive_plan();
+    plan.kept_recent[0].text = "durable projection first".into();
+    plan.kept_recent.push(RecentTurn {
+        role: "assistant".into(),
+        text: "[Earlier context archived: 10 turns\n<artifact://hash>]".into(),
+    });
+    let manifest =
+        attach_compaction_archive(Some(&cas), &mut plan).expect("pointer-bearing archive stored");
+    assert!(plan.kept_recent[1]
+        .text
+        .contains(&format!("artifact://{manifest}")));
+    assert!(!plan.kept_recent[0].text.contains("artifact://"));
+    cas.evict_verified(manifest).unwrap();
+    assert_eq!(mark_evicted_compaction_archives(Some(&cas), &mut plan), 1);
+    assert!(plan.kept_recent[1]
+        .text
+        .contains(&format!("[archive evicted: {manifest}]")));
+
+    // A tool-log `artifact://` ref is a single blob, not a compaction
+    // manifest: the manifest check must never relabel it as evicted.
+    let missing = faktor_core::hash::FileHash::from_hex(&"b".repeat(64)).unwrap();
+    let mut tool_log = archive_plan();
+    tool_log.kept_recent[0].text = format!("tool log artifact://{missing}");
+    assert_eq!(
+        mark_evicted_compaction_archives(Some(&cas), &mut tool_log),
+        0,
+        "only compaction digest turns are manifest-backed"
+    );
+    assert_eq!(
+        tool_log.kept_recent[0].text,
+        format!("tool log artifact://{missing}")
+    );
+}
+
 #[test]
 fn compaction_archive_store_is_classified_evictable_and_leaves_a_loss_marker() {
     use faktor_cas::faktor_storage::{StorageClass, StorageGovernor, StorageGovernorConfig};
@@ -61,6 +247,112 @@ fn compaction_archive_store_is_classified_evictable_and_leaves_a_loss_marker() {
         .unwrap()
         .iter()
         .any(|(key, _, reason)| key == &manifest.to_hex() && reason == "archive_evicted"));
+}
+
+#[test]
+fn proactive_compaction_min_reduction_is_wired_into_request_and_policy() {
+    let (deps, _dir) = deps(scripted_provider(vec![]), vec![]);
+    let runtime = AgentRuntime::new(deps).unwrap();
+    assert!(
+        (runtime.compaction_min_reduction() - DEFAULT_COMPACTION_MIN_REDUCTION).abs()
+            < f64::EPSILON
+    );
+    runtime.set_compaction_min_reduction(0.4);
+    assert!((runtime.compaction_min_reduction() - 0.4).abs() < f64::EPSILON);
+    runtime.set_compaction_min_reduction(f64::NAN);
+    assert!(
+        (runtime.compaction_min_reduction() - DEFAULT_COMPACTION_MIN_REDUCTION).abs()
+            < f64::EPSILON
+    );
+    runtime.set_compaction_min_reduction(2.0);
+    assert!(runtime.compaction_min_reduction() < 1.0);
+
+    // Mutation witness: the configured value must reach BOTH sides of the
+    // compaction contract. Relaxing the request back to the 25% literal (or
+    // the durable policy to `default()`) would let the compactor plan and
+    // the store accept different reductions.
+    const SOURCE: &str = include_str!("compaction.rs");
+    assert!(SOURCE.contains("request.min_reduction_ratio = min_reduction;"));
+    assert!(SOURCE.contains("min_reduction_ratio: min_reduction,"));
+    assert!(
+        SOURCE.contains("record_compaction_rejected("),
+        "the rejected branch must submit the plan verdict, never numbers alone"
+    );
+    let mutated = SOURCE.replace(
+        "request.min_reduction_ratio = min_reduction;",
+        "request.min_reduction_ratio = 0.25;",
+    );
+    assert_ne!(SOURCE, mutated, "mutation applies to the request wiring");
+    let mutated_policy = SOURCE.replace(
+        "min_reduction_ratio: min_reduction,",
+        "min_reduction_ratio: 0.25,",
+    );
+    assert_ne!(
+        SOURCE, mutated_policy,
+        "mutation applies to the durable policy wiring"
+    );
+}
+
+/// CASE INV-COMPACTION-VERDICT: the rejected branch must record the
+/// COMPACTOR's verdict with the configured minimum: a plan that dropped the
+/// active instruction (only the archive digest fit) has a tiny `after` and
+/// would pass every numeric check at the 25% default. It must journal
+/// `CompactRejected` and persist no checkpoint.
+#[tokio::test]
+async fn rejected_plan_is_journaled_rejected_with_the_configured_policy() {
+    let (deps, dir) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
+    let runtime = AgentRuntime::new(deps).unwrap();
+    let session = new_session(runtime.deps());
+    let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+    runtime.set_compaction_min_reduction(0.95);
+    let history: Vec<RecentTurn> = (0..10)
+        .map(|index| RecentTurn {
+            role: if index == 9 { "user" } else { "assistant" }.into(),
+            // The active prompt alone exceeds the 5% hard cap, so the
+            // deterministic plan cannot keep it and must reject.
+            text: format!("turn {index} {}", "z".repeat(1_000)),
+        })
+        .collect();
+    assert!(faktor_context::estimate_history_tokens(&history) >= 128);
+    let cas_before = files_under(&dir.path().join("cas"));
+    let plan = runtime
+        .try_compact_with_head(
+            &handle,
+            &history,
+            &TaskLedger::default(),
+            &ContextBudget::default(),
+            &CancellationToken::new(),
+            Some(1),
+        )
+        .await
+        .unwrap();
+    assert!(
+        plan.is_none(),
+        "a rejected plan is never returned as applied"
+    );
+    assert!(
+        handle.context_checkpoint().unwrap().is_none(),
+        "a rejected compaction must not persist a replacement context"
+    );
+    let kinds: Vec<_> = handle
+        .events_range(1, None)
+        .unwrap()
+        .into_iter()
+        .map(|event| event.kind)
+        .collect();
+    assert!(
+        kinds.contains(&faktor_core::event::EventKind::CompactRejected),
+        "the rejection must be journaled truthfully"
+    );
+    assert!(
+        !kinds.contains(&faktor_core::event::EventKind::ContextCompacted),
+        "a rejected plan's tiny after must never be recorded as applied"
+    );
+    assert_eq!(
+        files_under(&dir.path().join("cas")),
+        cas_before,
+        "a rejected plan must not publish unreachable archive artifacts"
+    );
 }
 
 #[tokio::test]
@@ -124,7 +416,14 @@ async fn compaction_trigger_uses_wire_footprint() {
 
     // The final turn re-plans from the accumulated durable history: the
     // wire footprint (system + 12 prompts' text + tools) crosses the
-    // threshold, so compaction MUST trigger off plan.total_tokens.
+    // threshold, so compaction MUST trigger off plan.total_tokens. The
+    // trigger is proven by the attempt itself: an accepted plan journals
+    // ContextCompacted and a plan that cannot preserve the active
+    // instruction journals CompactRejected. With a sentinel threshold the
+    // history may still be too small for the 25% cap to keep the prompt, so
+    // asserting `compacted` on this single turn would assert the compactor
+    // accepts the impossible, not that the footprint fired.
+    let events_before_final = handle.events_range(1, None).unwrap().len();
     let outcome = runtime
         .drive_turn(
             &handle,
@@ -134,9 +433,33 @@ async fn compaction_trigger_uses_wire_footprint() {
         )
         .await
         .unwrap();
+    assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+    let final_events = handle.events_range(1, None).unwrap();
+    let final_attempt = &final_events[events_before_final..];
     assert!(
-        outcome.compacted,
-        "the wire footprint must trigger compaction"
+        final_attempt.iter().any(|event| matches!(
+            event.kind,
+            faktor_core::event::EventKind::ContextCompacted
+                | faktor_core::event::EventKind::CompactRejected
+        )),
+        "the wire footprint must trigger a compaction attempt (checkpoint={:?}, events={:?})",
+        handle
+            .context_checkpoint()
+            .unwrap()
+            .map(|checkpoint| (checkpoint.through_seq, checkpoint.payload.len())),
+        final_attempt
+            .iter()
+            .filter(|event| matches!(
+                event.kind,
+                faktor_core::event::EventKind::ContextCompacted
+                    | faktor_core::event::EventKind::CompactRejected
+            ))
+            .map(|event| (event.kind, event.payload.clone()))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        compacted_count > 0,
+        "at least the larger accumulated histories must compact"
     );
     assert!(
         compacted_count >= 2,

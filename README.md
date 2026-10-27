@@ -112,7 +112,9 @@ implementations of the neutral `SystemIntelligenceProvider` and
   OpenAI Chat Completions and the native **Responses** API are both
   first-class (`api=chat|responses`, Responses by default for the official
   endpoint; strict parsing, streaming/deadline/retry/terminal tests). No
-  `if provider == "deepseek"` anywhere in the agent.
+  `if provider == "deepseek"` anywhere in the agent; the live DeepSeek
+  pricing-origin and quality-floor configuration requirements are in
+  [`docs/deepseek-live.md`](docs/deepseek-live.md).
 
 ## Layout
 

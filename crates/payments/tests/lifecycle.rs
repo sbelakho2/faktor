@@ -4,11 +4,11 @@ use std::sync::Arc;
 
 use faktor_cloud::{ManualClock, OrganizationId};
 use faktor_payments::{
-    AddPaymentMethodRequest, BillingInterval, CancelRequest, ChangePlanRequest, ChangeSeatsRequest,
-    CurrencySpec, DunningConfig, InvoiceStatus, IssueInvoiceRequest, PayInvoiceRequest,
-    PaymentError, PaymentService, PaymentsConfig, PlanPrice, PriceCatalogue, ProviderKind,
-    RefundRequest, SqlitePaymentStore, StaticSecrets, StripeConfig, SubscribeRequest, TaxConfig,
-    TaxRate, UsageCharge, WebhookHeaders, DEFAULT_WEBHOOK_WINDOW_MS,
+    sign_local_webhook, AddPaymentMethodRequest, BillingInterval, CancelRequest, ChangePlanRequest,
+    ChangeSeatsRequest, CurrencySpec, DunningConfig, InvoiceStatus, IssueInvoiceRequest,
+    PayInvoiceRequest, PaymentError, PaymentService, PaymentsConfig, PlanPrice, PriceCatalogue,
+    ProviderKind, RefundRequest, SqlitePaymentStore, StaticSecrets, StripeConfig, SubscribeRequest,
+    TaxConfig, TaxRate, UsageCharge, WebhookHeaders, DEFAULT_WEBHOOK_WINDOW_MS,
 };
 use tempfile::TempDir;
 
@@ -284,6 +284,163 @@ async fn full_local_provider_lifecycle_is_durable_and_exact() {
 }
 
 #[tokio::test]
+async fn cross_event_settlement_never_credits_twice_and_partial_paid_total_is_exact() {
+    let dir = TempDir::new().unwrap();
+    let clock = Arc::new(ManualClock::new(START));
+    let service = service(&dir.path().join("payment.db"), clock);
+    let now_secs = START / 1000;
+
+    // Order 1: the provider invoice settles first. `invoice.paid` binds the
+    // payment_intent, creates the one local payment and marks the invoice
+    // paid.
+    let organization = org("org-cross-event");
+    let subscription = service
+        .subscribe(&organization, subscribe(1, None))
+        .await
+        .unwrap()
+        .subscription;
+    let invoice = service
+        .issue_invoice(&organization, invoice_request(&subscription.id))
+        .await
+        .unwrap()
+        .invoice;
+    let provider_invoice = invoice.provider_invoice_id.clone().unwrap();
+    let total = invoice.total_minor;
+    let paid_body = serde_json::to_vec(&serde_json::json!({
+        "id": "evt_invoice_paid_cross",
+        "type": "invoice.paid",
+        "created": now_secs,
+        "data": {"object": {
+            "id": provider_invoice,
+            "status": "paid",
+            "amount": total,
+            "amount_paid": total,
+            "amount_refunded": 0,
+            "currency": "USD",
+            "payment_intent": "pi_cross_event",
+            "metadata": {
+                "organization_id": organization.as_str(),
+                "local_invoice_id": invoice.id,
+            }
+        }}
+    }))
+    .unwrap();
+    let paid = service
+        .handle_webhook(
+            &WebhookHeaders::from_pairs([(
+                "Stripe-Signature",
+                sign_local_webhook(WEBHOOK_SECRET, now_secs, &paid_body).as_str(),
+            )]),
+            &paid_body,
+            START,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        paid.disposition,
+        faktor_payments::WebhookDisposition::Applied
+    );
+    let after_paid = service.invoice(&organization, &invoice.id).unwrap();
+    assert_eq!(after_paid.status, InvoiceStatus::Paid);
+    assert_eq!(after_paid.amount_paid_minor, total);
+    assert_eq!(service.payments(&organization, 10).unwrap().len(), 1);
+
+    // Order 2: a DIFFERENT event id reports the SAME provider payment. The
+    // event is authenticated and recorded, but it must not credit the
+    // invoice a second time.
+    let payment_body = serde_json::to_vec(&serde_json::json!({
+        "id": "evt_payment_succeeded_cross",
+        "type": "payment.succeeded",
+        "created": now_secs + 1,
+        "data": {"object": {
+            "id": "pi_cross_event",
+            "amount_minor": total,
+            "currency": "USD",
+            "metadata": {
+                "organization_id": organization.as_str(),
+                "local_invoice_id": invoice.id,
+            }
+        }}
+    }))
+    .unwrap();
+    let signature = sign_local_webhook(WEBHOOK_SECRET, now_secs + 1, &payment_body);
+    let duplicate_settlement = service
+        .handle_webhook(
+            &WebhookHeaders::from_pairs([("Stripe-Signature", signature.as_str())]),
+            &payment_body,
+            START + 1_000,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        duplicate_settlement.disposition,
+        faktor_payments::WebhookDisposition::Ignored
+    );
+    let after_replay = service.invoice(&organization, &invoice.id).unwrap();
+    assert_eq!(after_replay.amount_paid_minor, total);
+    assert_eq!(after_replay.status, InvoiceStatus::Paid);
+    assert_eq!(service.payments(&organization, 10).unwrap().len(), 1);
+    assert_eq!(service.overview(&organization).unwrap().paid_minor, total);
+
+    // A partial provider settlement is still money collected: the overview
+    // must count it even while the invoice remains open, and outstanding is
+    // the exact remainder.
+    let partial_org = org("org-partial-paid");
+    let partial_subscription = service
+        .subscribe(
+            &partial_org,
+            SubscribeRequest {
+                idempotency_key: "subscribe-partial".into(),
+                ..subscribe(1, None)
+            },
+        )
+        .await
+        .unwrap()
+        .subscription;
+    let mut partial_request = invoice_request(&partial_subscription.id);
+    partial_request.idempotency_key = "invoice-partial".into();
+    let partial_invoice = service
+        .issue_invoice(&partial_org, partial_request)
+        .await
+        .unwrap()
+        .invoice;
+    let partial_total = partial_invoice.total_minor;
+    let partial = partial_total / 2;
+    let partial_body = serde_json::to_vec(&serde_json::json!({
+        "id": "evt_payment_partial",
+        "type": "payment.succeeded",
+        "created": now_secs + 2,
+        "data": {"object": {
+            "id": "pi_partial_event",
+            "amount_minor": partial,
+            "currency": "USD",
+            "metadata": {
+                "organization_id": partial_org.as_str(),
+                "local_invoice_id": partial_invoice.id,
+            }
+        }}
+    }))
+    .unwrap();
+    let signature = sign_local_webhook(WEBHOOK_SECRET, now_secs + 2, &partial_body);
+    assert_eq!(
+        service
+            .handle_webhook(
+                &WebhookHeaders::from_pairs([("Stripe-Signature", signature.as_str())]),
+                &partial_body,
+                START + 2_000,
+            )
+            .await
+            .unwrap()
+            .disposition,
+        faktor_payments::WebhookDisposition::Applied
+    );
+    let partial_overview = service.overview(&partial_org).unwrap();
+    assert_eq!(partial_overview.paid_minor, partial);
+    assert_eq!(partial_overview.outstanding_minor, partial_total - partial);
+    assert_eq!(partial_overview.open_invoice_count, 1);
+}
+
+#[tokio::test]
 async fn plan_and_seat_proration_use_real_prices_and_exact_integer_math() {
     let dir = TempDir::new().unwrap();
     let clock = Arc::new(ManualClock::new(START));
@@ -347,10 +504,12 @@ async fn plan_and_seat_proration_use_real_prices_and_exact_integer_math() {
             },
         )
         .unwrap();
-    // Old 100.00 unused = -6666.67 -> -6667; new 200.00 remaining = 13333.33.
-    assert_eq!(plan_preview.credit_minor, -6_667);
-    assert_eq!(plan_preview.charge_minor, 13_333);
-    assert_eq!(plan_preview.net_minor, 6_666);
+    // Old recurring 100.00 + 3 x 25.00 seats = 175.00; unused 20/30 =
+    // -11666.67 -> -11667. New recurring 200.00 + 3 x 30.00 = 290.00;
+    // remaining 20/30 = 19333.33 -> 19333. Net 7666.
+    assert_eq!(plan_preview.credit_minor, -11_667);
+    assert_eq!(plan_preview.charge_minor, 19_333);
+    assert_eq!(plan_preview.net_minor, 7_666);
 
     let changed = service
         .change_plan(
@@ -365,7 +524,7 @@ async fn plan_and_seat_proration_use_real_prices_and_exact_integer_math() {
         .await
         .unwrap();
     assert_eq!(changed.subscription.plan_id, "team");
-    assert_eq!(changed.proration.net_minor, 6_666);
+    assert_eq!(changed.proration.net_minor, 7_666);
 
     let euro = service
         .preview_plan_change(
@@ -442,6 +601,17 @@ async fn invoices_cover_inclusive_tax_credits_discounts_and_exports() {
         .unwrap();
     assert_eq!(second.items.len(), 1);
     assert_ne!(page.items[0].id, second.items[0].id);
+    // The CSV download is cursor-aware too: page two is the older invoice,
+    // never the same first page relabelled as a full export.
+    let first_csv = service
+        .export_invoices_page(&organization, "csv", None, 1)
+        .unwrap();
+    let second_csv = service
+        .export_invoices_page(&organization, "csv", page.next_cursor.as_deref(), 1)
+        .unwrap();
+    assert!(first_csv.contains(&page.items[0].number));
+    assert!(!first_csv.contains(&second.items[0].number));
+    assert!(second_csv.contains(&second.items[0].number));
     assert!(matches!(
         service.export_invoices(&organization, "yaml", 1),
         Err(PaymentError::Malformed(_))
@@ -914,6 +1084,106 @@ async fn dunning_attempts_and_grace_cancel_a_past_due_subscription() {
 }
 
 #[tokio::test]
+async fn one_failed_attempt_fanned_out_into_two_events_advances_dunning_once() {
+    let dir = TempDir::new().unwrap();
+    let clock = Arc::new(ManualClock::new(START));
+    let service = service(&dir.path().join("payment.db"), clock);
+    let organization = org("org-dunning-fanout");
+    let subscription = service
+        .subscribe(&organization, subscribe(1, None))
+        .await
+        .unwrap()
+        .subscription;
+    let invoice = service
+        .issue_invoice(&organization, invoice_request(&subscription.id))
+        .await
+        .unwrap()
+        .invoice;
+    let provider_invoice = invoice.provider_invoice_id.clone().unwrap();
+    let now_secs = START / 1000;
+    let body = |event_id: &str, created: i64, payment_intent: &str| {
+        serde_json::to_vec(&serde_json::json!({
+            "id": event_id,
+            "type": "invoice.payment_failed",
+            "created": created,
+            "data": {"object": {
+                "id": provider_invoice,
+                "status": "failed",
+                "currency": "USD",
+                "payment_intent": payment_intent,
+                "metadata": {
+                    "organization_id": organization.as_str(),
+                    "local_invoice_id": invoice.id,
+                }
+            }}
+        }))
+        .unwrap()
+    };
+    let deliver = |event_id: &str, created: i64, payment_intent: &str| {
+        let payload = body(event_id, created, payment_intent);
+        let signature = sign_local_webhook(WEBHOOK_SECRET, created, &payload);
+        let service = &service;
+        async move {
+            service
+                .handle_webhook(
+                    &WebhookHeaders::from_pairs([("Stripe-Signature", signature.as_str())]),
+                    &payload,
+                    created * 1_000,
+                )
+                .await
+                .unwrap()
+        }
+    };
+
+    // The first failure event moves the invoice/subscription to past due and
+    // counts attempt 1.
+    assert_eq!(
+        deliver("evt_fanout_a", now_secs, "pi_fanout")
+            .await
+            .disposition,
+        faktor_payments::WebhookDisposition::Applied
+    );
+    let once = service
+        .overview(&organization)
+        .unwrap()
+        .subscription
+        .unwrap();
+    assert_eq!(once.state, faktor_payments::SubscriptionState::PastDue);
+    assert_eq!(once.dunning_attempts, 1);
+
+    // The SAME provider payment arrives as a second invoice event with a
+    // different event id. It is applied to the record but must not count a
+    // second attempt.
+    assert_eq!(
+        deliver("evt_fanout_b", now_secs + 1, "pi_fanout")
+            .await
+            .disposition,
+        faktor_payments::WebhookDisposition::Applied
+    );
+    let still_one = service
+        .overview(&organization)
+        .unwrap()
+        .subscription
+        .unwrap();
+    assert_eq!(still_one.state, faktor_payments::SubscriptionState::PastDue);
+    assert_eq!(still_one.dunning_attempts, 1);
+
+    // A genuinely new provider payment is a new attempt, and the configured
+    // max_attempts of 2 is now exhausted.
+    deliver("evt_fanout_c", now_secs + 2, "pi_retry").await;
+    let exhausted = service
+        .overview(&organization)
+        .unwrap()
+        .subscription
+        .unwrap();
+    assert_eq!(exhausted.dunning_attempts, 2);
+    assert_eq!(
+        exhausted.state,
+        faktor_payments::SubscriptionState::Canceled
+    );
+}
+
+#[tokio::test]
 async fn dunning_grace_expiry_cancels_without_exhausting_attempts() {
     let dir = TempDir::new().unwrap();
     let clock = Arc::new(ManualClock::new(START));
@@ -948,4 +1218,106 @@ async fn dunning_grace_expiry_cancels_without_exhausting_attempts() {
         canceled.subscription.state,
         faktor_payments::SubscriptionState::Canceled
     );
+}
+
+#[tokio::test]
+async fn payment_failure_after_settlement_never_regresses_an_active_subscription() {
+    let dir = TempDir::new().unwrap();
+    let clock = Arc::new(ManualClock::new(START));
+    let service = service(&dir.path().join("payment.db"), clock);
+    let organization = org("org-late-decline");
+    let subscription = service
+        .subscribe(&organization, subscribe(1, None))
+        .await
+        .unwrap()
+        .subscription;
+    let invoice = service
+        .issue_invoice(&organization, invoice_request(&subscription.id))
+        .await
+        .unwrap()
+        .invoice;
+    let method = service
+        .add_payment_method(&organization, method_request())
+        .unwrap()
+        .payment_method;
+    let paid = service
+        .pay_invoice(
+            &organization,
+            PayInvoiceRequest {
+                invoice_id: invoice.id.clone(),
+                payment_method_id: method.id,
+                idempotency_key: "pay-before-late-decline".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(paid.invoice.status, InvoiceStatus::Paid);
+
+    // A late decline callback for the already-settled invoice is not
+    // dunning: the invoice stays paid and the active subscription keeps its
+    // zero-attempt state.
+    let returned = service
+        .record_payment_failure(&organization, &invoice.id)
+        .unwrap()
+        .expect("the active subscription row is returned unchanged");
+    assert_eq!(returned.state, faktor_payments::SubscriptionState::Active);
+    assert_eq!(returned.dunning_attempts, 0);
+    assert_eq!(
+        service.invoice(&organization, &invoice.id).unwrap().status,
+        InvoiceStatus::Paid
+    );
+    assert_eq!(
+        service
+            .store()
+            .subscription(organization.as_str())
+            .unwrap()
+            .unwrap()
+            .state,
+        faktor_payments::SubscriptionState::Active
+    );
+}
+
+#[tokio::test]
+async fn subscription_webhook_quantity_outside_the_seat_bound_is_refused() {
+    let dir = TempDir::new().unwrap();
+    let clock = Arc::new(ManualClock::new(START));
+    let service = service(&dir.path().join("payment.db"), clock);
+    let organization = org("org-quantity-webhook");
+    let subscription = service
+        .subscribe(&organization, subscribe(2, None))
+        .await
+        .unwrap()
+        .subscription;
+    for (event_id, quantity) in [
+        ("evt_quantity_zero", 0u64),
+        (
+            "evt_quantity_overflow",
+            u64::from(faktor_payments::MAX_SEATS) + 1,
+        ),
+    ] {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "id": event_id,
+            "type": "customer.subscription.updated",
+            "created": START / 1000,
+            "data": {"object": {
+                "id": subscription.provider_subscription_id,
+                "status": "active",
+                "quantity": quantity,
+                "metadata": {"organization_id": organization.as_str()}
+            }}
+        }))
+        .unwrap();
+        let header = sign_local_webhook(WEBHOOK_SECRET, START / 1000, &body);
+        let headers = WebhookHeaders::from_pairs([("Stripe-Signature", header.as_str())]);
+        assert!(matches!(
+            service.handle_webhook(&headers, &body, START).await,
+            Err(PaymentError::WebhookMalformed(_))
+        ));
+    }
+    let stored = service
+        .store()
+        .subscription(organization.as_str())
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.quantity, 2);
 }

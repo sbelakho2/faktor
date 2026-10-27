@@ -1,0 +1,27 @@
+{
+  "id": "INV-STORAGE-WAL-TRUNCATION-TRUTH",
+  "gate": "cargo test -p faktor-storage --lib wal_checkpoint_busy_never_fakes_reclaimed_bytes",
+  "expect": "FAILED",
+  "note": "Treats a busy/unshrunk WAL checkpoint as an eviction: the ledger row is deleted while the bytes stay on disk, fabricating free room.",
+  "capabilities": [
+    "storage.governor"
+  ],
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ],
+  "files": [
+    {
+      "file": "crates/storage/src/directory.rs",
+      "find": "            Ok((busy, log_frames)) if busy != 0 => {",
+      "replace": "            Ok((busy, log_frames)) if false && busy != 0 => {"
+    },
+    {
+      "file": "crates/storage/src/directory.rs",
+      "find": "        if after >= before {\n            // A checkpoint that cannot shrink the sidecar must not be",
+      "replace": "        if false && after >= before {\n            // A checkpoint that cannot shrink the sidecar must not be"
+    }
+  ]
+}

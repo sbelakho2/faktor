@@ -30,6 +30,7 @@
 //! (signature/timestamp where the provider signs, an authoritative id-bound
 //! API fetch where it does not) runs before any state is touched, and every
 //! query is organization-scoped.
+// TEST-SEPARATION: oracle=independent-reference isolation=isolated-data-dir
 
 pub mod authority;
 pub mod catalog;
@@ -40,6 +41,8 @@ pub mod model;
 pub mod mollie;
 pub mod money;
 pub mod provider;
+#[cfg(test)]
+mod scale_tests;
 pub mod secrets;
 pub mod service;
 pub mod store;
@@ -91,7 +94,7 @@ pub use provider::{
 pub use secrets::{EnvSecrets, SecretSource, SecretString, StaticSecrets};
 pub use service::{
     validate_payment_token, PaymentService, MAX_DUE_DAYS, MAX_EXPORT_BYTES, MAX_INVOICE_PAGE,
-    MAX_SEATS, MAX_TEXT_BYTES, MAX_TRIAL_DAYS, MAX_USAGE_LINES,
+    MAX_PAYMENT_METHODS, MAX_SEATS, MAX_TEXT_BYTES, MAX_TRIAL_DAYS, MAX_USAGE_LINES,
 };
 pub use store::{
     ClaimRecovery, IdempotencyRecord, IdempotencyWrite, InvoiceStats, ProviderObjectWrite,

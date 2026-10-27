@@ -1,12 +1,18 @@
 {
   "id": "INV-STORAGE-ARCHIVE-LOSS-MARKER",
-  "file": "crates/storage/src/governor.rs",
-  "find": "                if object.class.requires_loss_marker() {",
-  "replace": "                if false && object.class.requires_loss_marker() {",
+  "file": "crates/storage/src/ledger.rs",
+  "find": "        bump_counter_on(&tx, \"evictions\")?;\n        if class.requires_loss_marker() {\n            record_loss_marker_on(",
+  "replace": "        bump_counter_on(&tx, \"evictions\")?;\n        if false && class.requires_loss_marker() {\n            record_loss_marker_on(",
   "gate": "cargo test -p faktor-storage --lib archive_eviction_writes_a_durable_loss_marker",
   "expect": "FAILED",
-  "note": "Suppresses the durable archive loss marker on eviction: the archive oracle must fail.",
-  "capabilities": ["storage.governor"],
+  "note": "Suppresses the durable archive loss marker inside the atomic eviction transaction: the archive oracle must fail.",
+  "capabilities": [
+    "storage.governor"
+  ],
   "oracle": "mutation",
-  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
 }

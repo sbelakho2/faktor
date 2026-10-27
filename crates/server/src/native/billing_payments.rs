@@ -305,7 +305,12 @@ pub(crate) async fn native_billing_invoices(
     };
     let format = query.format.as_deref().unwrap_or("json");
     if format == "csv" {
-        return match service.export_invoices(&organization, "csv", page_limit(query.limit)) {
+        return match service.export_invoices_page(
+            &organization,
+            "csv",
+            query.cursor.as_deref(),
+            page_limit(query.limit),
+        ) {
             Ok(text) => (
                 [
                     (CONTENT_TYPE, "text/csv; charset=utf-8"),

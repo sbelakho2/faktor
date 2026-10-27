@@ -312,8 +312,15 @@ pub(crate) async fn native_orchestrator_graph(
             child_rows.len()
         )));
     }
-    // plan_step_index: position of the child's item id in the plan.
-    let step_index = |item: &str| plan.work_items.iter().position(|w| w.id == item);
+    // plan_step_index: position of the child's item id in the plan. One map
+    // for the whole projection (the historical per-child plan scan was
+    // O(children x plan steps)).
+    let mut step_index: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::with_capacity(plan.work_items.len());
+    for (index, item) in plan.work_items.iter().enumerate() {
+        // FIRST occurrence, exactly the historical `position` result.
+        step_index.entry(item.id.as_str()).or_insert(index);
+    }
     // The SHARED aggregation: this JSON surface and the typed operation
     // graph call the SAME functions over the SAME rows, so their derived
     // states are byte-identical.
@@ -329,7 +336,7 @@ pub(crate) async fn native_orchestrator_graph(
         faktor_orchestrator::runtime::ChildRuntime,
     )> = Vec::new();
     for (child_id, row) in child_rows {
-        let idx = step_index(&row.item_id);
+        let idx = step_index.get(row.item_id.as_str()).copied();
         children.push((idx, row.created_ms, child_id, row));
     }
     children.sort_by(|a, b| {
@@ -500,7 +507,7 @@ pub(crate) async fn native_orchestrator_graph(
             "blocker": blocker,
             "budget": row.budget_max_tokens,
             "capabilities": row.permissions,
-            "plan_step_index": step_index(&row.item_id),
+            "plan_step_index": step_index.get(row.item_id.as_str()).copied(),
             "steer_events": steer_events,
             "merge": merge,
         }));
@@ -623,11 +630,21 @@ impl<'a> FactIndex<'a> {
         let mut merge_by_prefix: std::collections::HashMap<&'a str, (u64, &'a str)> =
             std::collections::HashMap::new();
         for (kind, key, value) in facts {
-            let chunked = serde_json::from_str::<serde_json::Value>(value)
-                .ok()
-                .and_then(|j| j.get("chunks").and_then(|c| c.as_u64()))
-                .unwrap_or(0)
-                > 0;
+            // Almost every row is an ordinary JSON object; only a chunked
+            // header carries a top-level `chunks` count. Parsing every row
+            // just to discover that made the one-pass index O(facts) full
+            // JSON decodes. The byte probe is a superset of real headers,
+            // so the decision is identical while non-chunked rows cost one
+            // substring scan.
+            // A JSON key spelling `chunks` can only be raw or use a `\u`
+            // escape, so the probe (raw key OR any unicode escape) is a
+            // strict superset of headers that decode a top-level key.
+            let chunked = (value.contains("\"chunks\"") || value.contains("\\u"))
+                && serde_json::from_str::<serde_json::Value>(value)
+                    .ok()
+                    .and_then(|j| j.get("chunks").and_then(|c| c.as_u64()))
+                    .unwrap_or(0)
+                    > 0;
             first
                 .entry((kind.as_str(), key.as_str()))
                 .or_insert((value.as_str(), chunked));

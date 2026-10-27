@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! `runtime::retry_tests`: out-of-line tests.
 
 use super::*;

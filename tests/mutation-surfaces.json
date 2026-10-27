@@ -1,350 +1,388 @@
 {
- "schema": "faktor-mutation-surfaces/v1",
- "note": "Per-surface mutation requirement. Every spec under scripts/mutations/ must resolve to exactly one surface; every registered invariant must have one; every programme row kind must be owned by a surface. New surfaces/specs without a mutation fail scripts/check-mutation-surfaces.mjs.",
- "surfaces": [
-  {
-   "id": "programme.registry",
-   "title": "Programme registry, capability discovery and CI aggregates",
-   "specs": [
-    "INV-AUTHORITY-COLLAPSE-FREE",
-    "INV-CAPABILITY-COVERAGE",
-    "INV-CAPABILITY-DISCOVERY-OMISSION",
-    "INV-CI-THREE-PLATFORM-AGGREGATE"
-   ],
-   "row_kinds": [
-    "act-now"
-   ]
-  },
-  {
-   "id": "invariants",
-   "title": "Every registered release-critical invariant",
-   "all_invariants": true,
-   "row_kinds": [
-    "invariant"
-   ]
-  },
-  {
-   "id": "payments.billing",
-   "title": "Payments, billing, money truth and financial fencing",
-   "specs": [
-    "INV-AVOIDED-HOSTED-UNMEASURED-NULL",
-    "INV-BILLING-CHARGE-TRUTH",
-    "INV-BILLING-CHECKOUT-PROVIDER-TRUTH",
-    "INV-BILLING-DUNNING-INVOICE-MONOTONIC",
-    "INV-BILLING-DUNNING-SUBSCRIPTION-TERMINAL",
-    "INV-BILLING-INVOICE-RECEIPT-IDENTITY",
-    "INV-BILLING-LEASE-CLAIM-LOOKUP",
-    "INV-BILLING-PAYMENT-FAILURE-FENCE",
-    "INV-BILLING-REFUND-AMOUNT-TRUTH",
-    "INV-BILLING-REFUND-COMMITTED",
-    "INV-BILLING-REFUND-CURRENCY-TRUTH",
-    "INV-BILLING-REFUND-INFLIGHT-DEFERRAL",
-    "INV-BILLING-TICK-FENCE",
-    "INV-BILLING-WEBHOOK-PAYMENT-ID",
-    "INV-BILLING-WEBHOOK-PAYMENT-TRUTH",
-    "INV-CLOUD-BILLING-CHECKED-OVERFLOW",
-    "INV-CLOUD-MONEY-STRING-SERDE",
-    "INV-LOCALZERO-CLASSIFICATION-AUTHORITY",
-    "INV-PAYMENTS-INVOICE-TRUTH",
-    "INV-PAYMENTS-LEASE-FENCE",
-    "INV-PAYMENTS-REFUND-BOUND",
-    "INV-PAYMENTS-TENANT-SCOPE",
-    "INV-PAYMENTS-TOKEN-PAN-SHAPE",
-    "INV-PAYMENTS-WEBHOOK-WINDOW",
-    "INV-SETTLEMENT-MONEY-STATE-LEGALITY",
-    "INV-SITE-BILLING-DESTRUCTIVE-CONFIRM",
-    "INV-SITE-BILLING-PROVIDER-AVAILABILITY",
-    "INV-SITE-BILLING-TERMINAL-RESUBSCRIBE",
-    "INV-VCSC-MONEY-COMPLETE-COHORT"
-   ]
-  },
-  {
-   "id": "compaction",
-   "title": "Context compaction hard invariants",
-   "specs": [
-    "INV-COMPACTION-CRITERIA-TRUTH",
-    "INV-COMPACTION-EXECUTOR-RAII",
-    "INV-COMPACTION-MANUAL-DIGEST",
-    "INV-COMPACTION-MIN-REDUCTION",
-    "INV-COMPACTION-RESTART-DIGEST",
-    "INV-COMPACTION-SUMMARY-CAP",
-    "INV-COMPACTION-TOOL-EXCERPT"
-   ]
-  },
-  {
-   "id": "agent.communication",
-   "title": "Agent communication: ACP, MCP and child handoff",
-   "specs": [
-    "INV-ACP-CANCEL-EXACTLY-ONCE",
-    "INV-ACP-CONTENT-LENGTH-CORPUS",
-    "INV-ACP-DUPLICATE-FRAME-HEADER",
-    "INV-ACP-SHUTDOWN-WRITER-ABORT",
-    "INV-ACP-WRITER-BACKPRESSURE",
-    "INV-CHILD-HANDOFF-AUTHORITY",
-    "INV-CHILD-HANDOFF-UNAVAILABLE",
-    "INV-MCP-CANCEL-BEFORE-WRITE",
-    "INV-MCP-DELIVERY-UNKNOWN-TYPED",
-    "INV-MCP-SPAWN-LIFECYCLE",
-    "INV-CHILD-HANDOFF-EXACTLY-ONCE",
-    "INV-HANDOFF-CANCELLED",
-    "INV-HANDOFF-RUN-QUALIFIED"
-   ]
-  },
-  {
-   "id": "approval",
-   "title": "Human-only approval authority",
-   "specs": [
-    "INV-APPROVAL-HUMAN-ONLY"
-   ]
-  },
-  {
-   "id": "task.intelligence",
-   "title": "Task intelligence, contracts, semantic routing and admission",
-   "specs": [
-    "INV-ADMISSION-LEASE-FENCING",
-    "INV-ADMISSION-RECOVERY-LANDING",
-    "INV-CHANGE-BUDGET-PREEXEC-REFUSAL",
-    "INV-CHILD-CAPABILITY-BUDGET",
-    "INV-CONTRACT-DISPROVEN-BLOCKS",
-    "INV-CONTRACT-EVIDENCE-PERSISTED",
-    "INV-CONTRACT-MERGE-ADDITIVE",
-    "INV-DESIGN-FOCUS-DIVIDEND",
-    "INV-DESIGN-FOCUS-LAZY",
-    "INV-DESIGN-FOCUS-RANKING",
-    "INV-DESIGN-FOCUS-SANITIZATION",
-    "INV-DESIGN-READINESS-CONCERN-MATCH",
-    "INV-DESIGN-READINESS-CONTRACT-BOUND",
-    "INV-DESIGN-READINESS-ELEVATED-MATCH",
-    "INV-DESIGN-READINESS-EPHEMERAL",
-    "INV-DESIGN-READINESS-PROMOTION",
-    "INV-DUAL-PRODUCER-FACTS-DURABLE",
-    "INV-ENTITLEMENT-OUTCOME-ANALYTICS-REFUSAL",
-    "INV-FINDING-DIGEST-BINDING",
-    "INV-FINDING-PROVIDER-IDENTITY",
-    "INV-IMPACT-SEMANTIC-OWNER",
-    "INV-INTELLIGENCE-TIER-BOUNDS",
-    "INV-MAX-QUALITY-ONE-AUTHORITY",
-    "INV-MERGE-COMPLETENESS-REQUIRED",
-    "INV-MERGE-POLICY-UNREADABLE",
-    "INV-MERGE-SEMANTIC-AWAITED",
-    "INV-MERGE-SEMANTIC-FIDELITY-REQUIRED",
-    "INV-POST-ADMISSION-READ-LOUD",
-    "INV-PROGRAM-SNAPSHOT-IDENTITY",
-    "INV-PROMPT-START-IDEMPOTENT",
-    "INV-QUEUE-ADMISSION-FILES",
-    "INV-SEMANTIC-CAPABILITY-INTERSECTION",
-    "INV-SEMANTIC-ENTITY-ORIGIN",
-    "INV-SEMANTIC-FALLBACK",
-    "INV-SEMANTIC-FIDELITY-TRUTH",
-    "INV-SEMANTIC-LIVE-REVISION",
-    "INV-SEMANTIC-PROCESS-CLIENT",
-    "INV-SEMANTIC-PROVIDER-PIN",
-    "INV-SEMANTIC-QUERY-READY",
-    "INV-SEMANTIC-QUERY-REAL-TOOL",
-    "INV-SEMANTIC-RISK-SERDE-DEFAULT",
-    "INV-SEMANTIC-SEARCH-LOCK-DISCIPLINE",
-    "INV-SEMANTIC-STATUS-VALIDATED",
-    "INV-SEMANTIC-WATCHDOG",
-    "INV-TASK-START-IDEMPOTENT"
-   ]
-  },
-  {
-   "id": "security",
-   "title": "Security, sandboxing, redaction and authority confinement",
-   "specs": [
-    "INV-ARTIFACT-READ-LOUD-SCOPED",
-    "INV-COMPLETION-EGRESS-REQUIRES-SANDBOX",
-    "INV-FS-CONFINEMENT-LANDLOCK-DEMAND",
-    "INV-FS-MUTATION-PARENT-REVERIFY",
-    "INV-GIT-METADATA-TRUST",
-    "INV-HOOKS-SESSION-WORKSPACE-CWD",
-    "INV-INSTRUCTION-ROOT-AUTHORITY",
-    "INV-NETWORK-AUTHORITY-SINGULAR",
-    "INV-PRIVATE-RUNNERS-PLACEMENT-REFUSAL",
-    "INV-PTY-CONTROL-PIPE-CLOEXEC",
-    "INV-READONLY-SHELL-ROOTED-PROVISIONING",
-    "INV-REDACTION-CAP-FAIL-CLOSED",
-    "INV-RUNTIME-PATH-CANONICALIZATION",
-    "INV-SANDBOX-FIRST-RUN-AUDIT-CONFIRMED",
-    "INV-SANDBOX-PRIVILEGE-DROP",
-    "INV-SITE-PROXY-TRUST-CHAIN",
-    "INV-SEMANTIC-TRUST-DECLARED",
-    "INV-SHELL-CHANGE-MANIFEST-ATTRIBUTION",
-    "INV-SHELL-CRASH-DISCOVERY",
-    "INV-SHELL-FULL-WORKSPACE-OWNERSHIP",
-    "INV-UPDATER-EXEC-IDENTITY",
-    "INV-WORKER-AUTH-REQUIRES-CONSUMPTION",
-    "INV-WORKER-REVOCATION-IMMUTABLE"
-   ]
-  },
-  {
-   "id": "ui.wiring",
-   "title": "VS Code/JetBrains controls, screens, workflow and contribution wiring",
-   "specs": [
-    "INV-CLIENT-ROUTE-CONTRACT",
-    "INV-EDITION8-ORG-SCOPED-COMMERCIAL-READS",
-    "INV-EDITION8-READONLY-COMMERCIAL-PROVENANCE",
-    "INV-EDITION8-S55-CONNECT-PRIMARY",
-    "INV-CLIENT-STOP-ZERO-LIVE-AUTHORITIES",
-    "INV-CLIENT-SUBPROCESS-DRAIN-BOUNDED",
-    "INV-IDE-SSE-BLOCKED-DURABLE",
-    "INV-IDE-SSE-BLOCKED-DURABLE-JB",
-    "INV-IDE-SSE-FRAME-BOUNDED",
-    "INV-JETBRAINS-PROMPT-DRAFT-ACCEPTANCE",
-    "INV-TRANSCRIPT-SCROLL-OWNERSHIP",
-    "INV-VERIFICATION-CACHE-FRESHNESS",
-    "INV-VSCODE-ACCESSIBILITY",
-    "INV-VSCODE-ATTACHMENT-UI-REACHABILITY",
-    "INV-VSCODE-KEYBOARD-SUBMISSION"
-   ],
-   "row_kinds": [
-    "control",
-    "screen",
-    "vscode-contribution",
-    "jetbrains-contribution",
-    "vscode-setting",
-    "workflow",
-    "acceptance-scenario"
-   ]
-  },
-  {
-   "id": "performance.bounds",
-   "title": "Bounded work, paging and response-size performance limits",
-   "specs": [
-    "INV-IMPACT-BOUNDED-QUERY",
-    "INV-LSP-BOUNDED-WRITER-QUEUE",
-    "INV-LSP-READER-BOUNDS",
-    "INV-MANIFEST-READ-BOUNDED",
-    "INV-MCP-BOUNDED-WRITER-QUEUE",
-    "INV-SEMANTIC-CONTEXT-BYTE-BOUND",
-    "INV-SEMANTIC-EMBED-BATCH-BOUNDS",
-    "INV-VSCODE-COCKPIT-RENDER-BOUND",
-    "INV-WATCH-WORKER-CAP",
-    "INV-WATCHER-WORKER-LIVENESS"
-   ]
-  },
-  {
-   "id": "routes.contract",
-   "title": "Native routes, CLI commands and frozen wire contracts",
-   "specs": [
-    "INV-CLI-DOCTOR-EXIT-CODE",
-    "INV-FROZEN-CONTRACTS",
-    "INV-GENERATED-DTO-PARITY",
-    "INV-NATIVE-ROUTE-BEHAVIOR"
-   ],
-   "row_kinds": [
-    "native-route",
-    "cli-command"
-   ]
-  },
-  {
-   "id": "tools.providers",
-   "title": "Builtin tools, provider adapters and config keys",
-   "specs": [
-    "INV-ACQUIRE-DESTINATION-CANONICAL",
-    "INV-ACQUIRE-HEALTH-REFUSAL",
-    "INV-ACQUIRE-PLANNER",
-    "INV-ACQUIRE-RETRY-AFTER-DIGITS",
-    "INV-ACQUIRE-RETRY-GATE",
-    "INV-KIWI-CLAIM-BATCH-INDEPENDENCE",
-    "INV-KIWI-OPTIONAL-ADAPTER",
-    "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE"
-   ],
-   "row_kinds": [
-    "builtin-tool",
-    "provider-adapter",
-    "adapter",
-    "config-key"
-   ]
-  },
-  {
-   "id": "browser",
-   "title": "Browser confinement, egress and download controls",
-   "specs": [
-    "INV-BROWSER-CAPTURE-CLEANUP",
-    "INV-BROWSER-DOWNLOAD-DEFAULT-DENY",
-    "INV-BROWSER-DOWNLOAD-FILENAME",
-    "INV-BROWSER-EGRESS-DEFAULT-DENY",
-    "INV-BROWSER-INTERCEPTION",
-    "INV-BROWSER-LAUNCH-ROLLBACK",
-    "INV-BROWSER-PROFILE-CONFINEMENT",
-    "INV-BROWSER-SHUTDOWN-ORPHANS"
-   ]
-  },
-  {
-   "id": "commerce",
-   "title": "Commerce BOM and quote identity",
-   "specs": [
-    "INV-COMMERCE-ACCOUNT-SCOPE",
-    "INV-COMMERCE-BOM-BOUND",
-    "INV-COMMERCE-DIGEST-STABILITY",
-    "INV-COMMERCE-MPN-MATCH-EXACT",
-    "INV-COMMERCE-PART-IDENTITY"
-   ]
-  },
-  {
-   "id": "scm",
-   "title": "SCM webhook, token and branch reconciliation bounds",
-   "specs": [
-    "INV-SCM-BRANCH-RECONCILE-EXACT-HEAD",
-    "INV-SCM-INSTALLATION-ID-BOUND",
-    "INV-SCM-RECONCILE-CADENCE-BOUNDS",
-    "INV-SCM-TOKEN-BOUNDS",
-    "INV-SCM-WEBHOOK-CLAIMS"
-   ]
-  },
-  {
-   "id": "lsp.protocol",
-   "title": "LSP initialize/shutdown contract",
-   "specs": [
-    "INV-LSP-INITIALIZE-ROOT",
-    "INV-LSP-SHUTDOWN-EXIT-NOTIFICATION"
-   ]
-  },
-  {
-   "id": "core.runtime",
-   "title": "Durable store, session, worker, browser-adjacent and CLI runtime controls",
-   "specs": [
-    "INV-ATTACHMENT-REFERENCE-IDENTITY",
-    "INV-ATTACHMENT-SEED-ATOMIC",
-    "INV-CAS-COPY-TO-VERIFIED-STREAM",
-    "INV-CHECKPOINT-EVIDENCE-STORE-FAILURE",
-    "INV-CHUNK-DROP-ACCOUNTING",
-    "INV-CLOUD-BACKUP-RETENTION-BOUND",
-    "INV-CLOUD-MIGRATION-CLAIM",
-    "INV-CLOUD-RESTORE-VERIFICATION",
-    "INV-CREATE-SESSION-SEED-ATOMIC",
-    "INV-DURABLE-CORRUPTION-LOUD",
-    "INV-DURABLE-JSON-NO-EMPTY-DEFAULT",
-    "INV-GIT-LEASE-UNREADABLE-NOT-STOLEN",
-    "INV-INDEX-EVICTION-DETERMINISTIC",
-    "INV-JOURNAL-INTEGRITY",
-    "INV-MEMORY-CAS-GROUP-ATOMIC",
-    "INV-MEMO-READ-ONLY-VIEW",
-    "INV-PERSISTENCE-SIGNED-DOMAIN",
-    "INV-PREPARED-WRITER-JOBS",
-    "INV-PROOF-BASIS-NO-SYNTHETIC",
-    "INV-SHUTDOWN-ZERO-LIVE-AUTHORITIES",
-    "INV-SNAPSHOT-IDENTITY-NO-SYNTHETIC",
-    "INV-TERMINAL-EVENTS-SESSION-ISOLATED",
-    "INV-VERIFICATION-REQUIRE-PROVIDER",
-    "INV-WATCH-ROOT-ANCHORED",
-    "INV-WORKER-ACCEPT-JOURNAL-ATOMIC",
-    "INV-WORKER-ATTEMPT-GENERATION-COHERENCE",
-    "INV-WORKER-RECOVERY-COMPLETES-LOSS",
-    "INV-WORKER-RECOVERY-ERROR-PROPAGATION",
-    "INV-WORKER-REGISTER-JOURNAL-ATOMIC",
-    "INV-WORKER-REGISTRATION-ATOMIC-REPAIR",
-    "INV-WORKER-TOKEN-SINGLE-BINDING"
-   ]
-  },
-  {
-   "id": "storage.governor",
-   "title": "Always-on storage governor: aggregate budget, quotas, eviction, loss markers",
-   "specs": [
-    "INV-STORAGE-AGGREGATE-BUDGET",
-    "INV-STORAGE-ARCHIVE-LOSS-MARKER"
-   ]
-  }
- ]
+  "schema": "faktor-mutation-surfaces/v1",
+  "note": "Per-surface mutation requirement. Every spec under scripts/mutations/ must resolve to exactly one surface; every registered invariant must have one; every programme row kind must be owned by a surface. New surfaces/specs without a mutation fail scripts/check-mutation-surfaces.mjs.",
+  "surfaces": [
+    {
+      "id": "programme.registry",
+      "title": "Programme registry, capability discovery and CI aggregates",
+      "specs": [
+        "INV-AUTHORITY-COLLAPSE-FREE",
+        "INV-CAPABILITY-COVERAGE",
+        "INV-CAPABILITY-DISCOVERY-OMISSION",
+        "INV-CI-THREE-PLATFORM-AGGREGATE"
+      ],
+      "row_kinds": [
+        "act-now"
+      ]
+    },
+    {
+      "id": "invariants",
+      "title": "Every registered release-critical invariant",
+      "all_invariants": true,
+      "row_kinds": [
+        "invariant"
+      ]
+    },
+    {
+      "id": "payments.billing",
+      "title": "Payments, billing, money truth and financial fencing",
+      "specs": [
+        "INV-AVOIDED-HOSTED-UNMEASURED-NULL",
+        "INV-BILLING-CHARGE-TRUTH",
+        "INV-BILLING-CHECKOUT-PROVIDER-TRUTH",
+        "INV-BILLING-DUNNING-INVOICE-MONOTONIC",
+        "INV-BILLING-DUNNING-SUBSCRIPTION-TERMINAL",
+        "INV-BILLING-INVOICE-RECEIPT-IDENTITY",
+        "INV-BILLING-LEASE-CLAIM-LOOKUP",
+        "INV-BILLING-PAYMENT-FAILURE-FENCE",
+        "INV-BILLING-REFUND-AMOUNT-TRUTH",
+        "INV-BILLING-REFUND-COMMITTED",
+        "INV-BILLING-REFUND-CURRENCY-TRUTH",
+        "INV-BILLING-REFUND-INFLIGHT-DEFERRAL",
+        "INV-BILLING-TICK-FENCE",
+        "INV-BILLING-WEBHOOK-PAYMENT-ID",
+        "INV-BILLING-WEBHOOK-PAYMENT-TRUTH",
+        "INV-CLOUD-BILLING-CHECKED-OVERFLOW",
+        "INV-CLOUD-MONEY-STRING-SERDE",
+        "INV-LOCALZERO-CLASSIFICATION-AUTHORITY",
+        "INV-PAYMENTS-INVOICE-TRUTH",
+        "INV-PAYMENTS-LEASE-FENCE",
+        "INV-PAYMENTS-REFUND-BOUND",
+        "INV-PAYMENTS-TENANT-SCOPE",
+        "INV-PAYMENTS-TOKEN-PAN-SHAPE",
+        "INV-PAYMENTS-WEBHOOK-WINDOW",
+        "INV-SETTLEMENT-MONEY-STATE-LEGALITY",
+        "INV-SITE-BILLING-DESTRUCTIVE-CONFIRM",
+        "INV-SITE-BILLING-PROVIDER-AVAILABILITY",
+        "INV-BILLING-EXPORT-CURSOR-TRUTH",
+        "INV-BILLING-OVERVIEW-TICK-TRUTH",
+        "INV-BILLING-PAYMENT-FAILURE-SETTLED-NO-DUNNING",
+        "INV-BILLING-PRORATION-SEAT-TRUTH",
+        "INV-BILLING-RECONCILE-ROTATION",
+        "INV-BILLING-WEBHOOK-SEAT-BOUND",
+        "INV-SITE-BILLING-INVOICE-DOWNLOAD",
+        "INV-SITE-BILLING-TERMINAL-RESUBSCRIBE",
+        "INV-VCSC-MONEY-COMPLETE-COHORT",
+        "INV-SITE-BILLING-DISCLOSURE",
+        "INV-BILLING-CROSS-EVENT-SETTLED-ONCE",
+        "INV-BILLING-DUNNING-ATTEMPT-IDENTITY",
+        "INV-BILLING-RECONCILE-SEAT-FENCE",
+        "INV-BILLING-PARTIAL-PAID-TOTAL",
+        "INV-SITE-BILLING-INVOICE-PAGE-CURSOR",
+        "INV-PAYMENTS-METHOD-BOUND"
+      ]
+    },
+    {
+      "id": "compaction",
+      "title": "Context compaction hard invariants",
+      "specs": [
+        "INV-COMPACTION-CRITERIA-TRUTH",
+        "INV-COMPACTION-EXECUTOR-RAII",
+        "INV-COMPACTION-MANUAL-DIGEST",
+        "INV-COMPACTION-MIN-REDUCTION",
+        "INV-COMPACTION-RESTART-DIGEST",
+        "INV-COMPACTION-SUMMARY-CAP",
+        "INV-COMPACTION-TOOL-EXCERPT"
+      ]
+    },
+    {
+      "id": "agent.communication",
+      "title": "Agent communication: ACP, MCP and child handoff",
+      "specs": [
+        "INV-ACP-CANCEL-EXACTLY-ONCE",
+        "INV-ACP-CONTENT-LENGTH-CORPUS",
+        "INV-ACP-DUPLICATE-FRAME-HEADER",
+        "INV-ACP-SHUTDOWN-WRITER-ABORT",
+        "INV-ACP-WRITER-BACKPRESSURE",
+        "INV-CHILD-HANDOFF-AUTHORITY",
+        "INV-CHILD-HANDOFF-UNAVAILABLE",
+        "INV-MCP-CANCEL-BEFORE-WRITE",
+        "INV-MCP-DELIVERY-UNKNOWN-TYPED",
+        "INV-MCP-SPAWN-LIFECYCLE",
+        "INV-CHILD-HANDOFF-EXACTLY-ONCE",
+        "INV-HANDOFF-CANCELLED",
+        "INV-HANDOFF-RUN-QUALIFIED"
+      ]
+    },
+    {
+      "id": "approval",
+      "title": "Human-only approval authority",
+      "specs": [
+        "INV-APPROVAL-HUMAN-ONLY"
+      ]
+    },
+    {
+      "id": "task.intelligence",
+      "title": "Task intelligence, contracts, semantic routing and admission",
+      "specs": [
+        "INV-ADMISSION-LEASE-FENCING",
+        "INV-ADMISSION-RECOVERY-LANDING",
+        "INV-CHANGE-BUDGET-PREEXEC-REFUSAL",
+        "INV-CHILD-CAPABILITY-BUDGET",
+        "INV-CONTRACT-DISPROVEN-BLOCKS",
+        "INV-CONTRACT-EVIDENCE-PERSISTED",
+        "INV-CONTRACT-MERGE-ADDITIVE",
+        "INV-DESIGN-FOCUS-DIVIDEND",
+        "INV-DESIGN-FOCUS-LAZY",
+        "INV-DESIGN-FOCUS-RANKING",
+        "INV-DESIGN-FOCUS-SANITIZATION",
+        "INV-DESIGN-READINESS-CONCERN-MATCH",
+        "INV-DESIGN-READINESS-CONTRACT-BOUND",
+        "INV-DESIGN-READINESS-ELEVATED-MATCH",
+        "INV-DESIGN-READINESS-EPHEMERAL",
+        "INV-DESIGN-READINESS-PROMOTION",
+        "INV-DUAL-PRODUCER-FACTS-DURABLE",
+        "INV-ENTITLEMENT-OUTCOME-ANALYTICS-REFUSAL",
+        "INV-FINDING-DIGEST-BINDING",
+        "INV-FINDING-PROVIDER-IDENTITY",
+        "INV-IMPACT-SEMANTIC-OWNER",
+        "INV-INTELLIGENCE-TIER-BOUNDS",
+        "INV-MAX-QUALITY-ONE-AUTHORITY",
+        "INV-MERGE-COMPLETENESS-REQUIRED",
+        "INV-MERGE-POLICY-UNREADABLE",
+        "INV-MERGE-SEMANTIC-AWAITED",
+        "INV-MERGE-SEMANTIC-FIDELITY-REQUIRED",
+        "INV-POST-ADMISSION-READ-LOUD",
+        "INV-PROGRAM-SNAPSHOT-IDENTITY",
+        "INV-PROMPT-START-IDEMPOTENT",
+        "INV-QUEUE-ADMISSION-FILES",
+        "INV-SEMANTIC-CAPABILITY-INTERSECTION",
+        "INV-SEMANTIC-ENTITY-ORIGIN",
+        "INV-SEMANTIC-FALLBACK",
+        "INV-SEMANTIC-FIDELITY-TRUTH",
+        "INV-SEMANTIC-LIVE-REVISION",
+        "INV-SEMANTIC-PROCESS-CLIENT",
+        "INV-SEMANTIC-PROVIDER-PIN",
+        "INV-SEMANTIC-QUERY-READY",
+        "INV-SEMANTIC-QUERY-REAL-TOOL",
+        "INV-SEMANTIC-RISK-SERDE-DEFAULT",
+        "INV-SEMANTIC-SEARCH-LOCK-DISCIPLINE",
+        "INV-SEMANTIC-STATUS-VALIDATED",
+        "INV-SEMANTIC-WATCHDOG",
+        "INV-TASK-START-IDEMPOTENT"
+      ]
+    },
+    {
+      "id": "security",
+      "title": "Security, sandboxing, redaction and authority confinement",
+      "specs": [
+        "INV-ARTIFACT-READ-LOUD-SCOPED",
+        "INV-COMPLETION-EGRESS-REQUIRES-SANDBOX",
+        "INV-FS-CONFINEMENT-LANDLOCK-DEMAND",
+        "INV-FS-MUTATION-PARENT-REVERIFY",
+        "INV-GIT-METADATA-TRUST",
+        "INV-HOOKS-SESSION-WORKSPACE-CWD",
+        "INV-INSTRUCTION-ROOT-AUTHORITY",
+        "INV-NETWORK-AUTHORITY-SINGULAR",
+        "INV-PRIVATE-RUNNERS-PLACEMENT-REFUSAL",
+        "INV-PTY-CONTROL-PIPE-CLOEXEC",
+        "INV-READONLY-SHELL-ROOTED-PROVISIONING",
+        "INV-REDACTION-CAP-FAIL-CLOSED",
+        "INV-RUNTIME-PATH-CANONICALIZATION",
+        "INV-SANDBOX-FIRST-RUN-AUDIT-CONFIRMED",
+        "INV-SANDBOX-PRIVILEGE-DROP",
+        "INV-SITE-PROXY-TRUST-CHAIN",
+        "INV-SEMANTIC-TRUST-DECLARED",
+        "INV-SHELL-CHANGE-MANIFEST-ATTRIBUTION",
+        "INV-SHELL-CRASH-DISCOVERY",
+        "INV-SHELL-FULL-WORKSPACE-OWNERSHIP",
+        "INV-UPDATER-EXEC-IDENTITY",
+        "INV-WORKER-AUTH-REQUIRES-CONSUMPTION",
+        "INV-WORKER-REVOCATION-IMMUTABLE"
+      ]
+    },
+    {
+      "id": "ui.wiring",
+      "title": "VS Code/JetBrains controls, screens, workflow and contribution wiring",
+      "specs": [
+        "INV-CLIENT-ROUTE-CONTRACT",
+        "INV-EDITION8-ORG-SCOPED-COMMERCIAL-READS",
+        "INV-EDITION8-READONLY-COMMERCIAL-PROVENANCE",
+        "INV-EDITION8-S55-CONNECT-PRIMARY",
+        "INV-CLIENT-STOP-ZERO-LIVE-AUTHORITIES",
+        "INV-CLIENT-SUBPROCESS-DRAIN-BOUNDED",
+        "INV-IDE-SSE-BLOCKED-DURABLE",
+        "INV-IDE-SSE-BLOCKED-DURABLE-JB",
+        "INV-IDE-SSE-FRAME-BOUNDED",
+        "INV-JETBRAINS-PROMPT-DRAFT-ACCEPTANCE",
+        "INV-TRANSCRIPT-SCROLL-OWNERSHIP",
+        "INV-VERIFICATION-CACHE-FRESHNESS",
+        "INV-VSCODE-ACCESSIBILITY",
+        "INV-VSCODE-ATTACHMENT-UI-REACHABILITY",
+        "INV-VSCODE-KEYBOARD-SUBMISSION",
+        "INV-EDITION8-CONFIG-TYPE-WIRING",
+        "INV-EDITION8-STORED-ONLY-TRUTH",
+        "INV-EDITION8-APPROVAL-DISPLAY-NO-SHELL-WRITE",
+        "INV-CHAT-BOARD-NOT-IN-WORK",
+        "INV-EDITION8-ONE-SETTINGS-SURFACE",
+        "INV-EDITION8-SETTINGS-WIRING"
+      ],
+      "row_kinds": [
+        "control",
+        "screen",
+        "vscode-contribution",
+        "jetbrains-contribution",
+        "vscode-setting",
+        "workflow",
+        "acceptance-scenario"
+      ]
+    },
+    {
+      "id": "performance.bounds",
+      "title": "Bounded work, paging and response-size performance limits",
+      "specs": [
+        "INV-IMPACT-BOUNDED-QUERY",
+        "INV-LSP-BOUNDED-WRITER-QUEUE",
+        "INV-LSP-READER-BOUNDS",
+        "INV-MANIFEST-READ-BOUNDED",
+        "INV-MCP-BOUNDED-WRITER-QUEUE",
+        "INV-SEMANTIC-CONTEXT-BYTE-BOUND",
+        "INV-SEMANTIC-EMBED-BATCH-BOUNDS",
+        "INV-VSCODE-COCKPIT-RENDER-BOUND",
+        "INV-WATCH-WORKER-CAP",
+        "INV-WATCHER-WORKER-LIVENESS"
+      ]
+    },
+    {
+      "id": "routes.contract",
+      "title": "Native routes, CLI commands and frozen wire contracts",
+      "specs": [
+        "INV-CLI-DOCTOR-EXIT-CODE",
+        "INV-FROZEN-CONTRACTS",
+        "INV-GENERATED-DTO-PARITY",
+        "INV-NATIVE-ROUTE-BEHAVIOR"
+      ],
+      "row_kinds": [
+        "native-route",
+        "cli-command"
+      ]
+    },
+    {
+      "id": "tools.providers",
+      "title": "Builtin tools, provider adapters and config keys",
+      "specs": [
+        "INV-ACQUIRE-DESTINATION-CANONICAL",
+        "INV-ACQUIRE-HEALTH-REFUSAL",
+        "INV-ACQUIRE-PLANNER",
+        "INV-ACQUIRE-RETRY-AFTER-DIGITS",
+        "INV-ACQUIRE-RETRY-GATE",
+        "INV-KIWI-CLAIM-BATCH-INDEPENDENCE",
+        "INV-KIWI-OPTIONAL-ADAPTER",
+        "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE"
+      ],
+      "row_kinds": [
+        "builtin-tool",
+        "provider-adapter",
+        "adapter",
+        "config-key"
+      ]
+    },
+    {
+      "id": "browser",
+      "title": "Browser confinement, egress and download controls",
+      "specs": [
+        "INV-BROWSER-CAPTURE-CLEANUP",
+        "INV-BROWSER-DOWNLOAD-DEFAULT-DENY",
+        "INV-BROWSER-DOWNLOAD-FILENAME",
+        "INV-BROWSER-EGRESS-DEFAULT-DENY",
+        "INV-BROWSER-INTERCEPTION",
+        "INV-BROWSER-LAUNCH-ROLLBACK",
+        "INV-BROWSER-PROFILE-CONFINEMENT",
+        "INV-BROWSER-SHUTDOWN-ORPHANS",
+        "INV-BROWSER-STORAGE-ROOT-GOVERNED"
+      ]
+    },
+    {
+      "id": "commerce",
+      "title": "Commerce BOM and quote identity",
+      "specs": [
+        "INV-COMMERCE-ACCOUNT-SCOPE",
+        "INV-COMMERCE-BOM-BOUND",
+        "INV-COMMERCE-DIGEST-STABILITY",
+        "INV-COMMERCE-MPN-MATCH-EXACT",
+        "INV-COMMERCE-PART-IDENTITY"
+      ]
+    },
+    {
+      "id": "scm",
+      "title": "SCM webhook, token and branch reconciliation bounds",
+      "specs": [
+        "INV-SCM-BRANCH-RECONCILE-EXACT-HEAD",
+        "INV-SCM-INSTALLATION-ID-BOUND",
+        "INV-SCM-RECONCILE-CADENCE-BOUNDS",
+        "INV-SCM-TOKEN-BOUNDS",
+        "INV-SCM-WEBHOOK-CLAIMS"
+      ]
+    },
+    {
+      "id": "lsp.protocol",
+      "title": "LSP initialize/shutdown contract",
+      "specs": [
+        "INV-LSP-INITIALIZE-ROOT",
+        "INV-LSP-SHUTDOWN-EXIT-NOTIFICATION"
+      ]
+    },
+    {
+      "id": "core.runtime",
+      "title": "Durable store, session, worker, browser-adjacent and CLI runtime controls",
+      "specs": [
+        "INV-ATTACHMENT-REFERENCE-IDENTITY",
+        "INV-ATTACHMENT-SEED-ATOMIC",
+        "INV-CAS-COPY-TO-VERIFIED-STREAM",
+        "INV-CHECKPOINT-EVIDENCE-STORE-FAILURE",
+        "INV-CHUNK-DROP-ACCOUNTING",
+        "INV-CLOUD-BACKUP-RETENTION-BOUND",
+        "INV-CLOUD-MIGRATION-CLAIM",
+        "INV-CLOUD-RESTORE-VERIFICATION",
+        "INV-CREATE-SESSION-SEED-ATOMIC",
+        "INV-DURABLE-CORRUPTION-LOUD",
+        "INV-DURABLE-JSON-NO-EMPTY-DEFAULT",
+        "INV-GIT-LEASE-UNREADABLE-NOT-STOLEN",
+        "INV-INDEX-EVICTION-DETERMINISTIC",
+        "INV-JOURNAL-INTEGRITY",
+        "INV-MEMORY-CAS-GROUP-ATOMIC",
+        "INV-MEMO-READ-ONLY-VIEW",
+        "INV-PERSISTENCE-SIGNED-DOMAIN",
+        "INV-PREPARED-WRITER-JOBS",
+        "INV-PROOF-BASIS-NO-SYNTHETIC",
+        "INV-SHUTDOWN-ZERO-LIVE-AUTHORITIES",
+        "INV-SNAPSHOT-IDENTITY-NO-SYNTHETIC",
+        "INV-TERMINAL-EVENTS-SESSION-ISOLATED",
+        "INV-VERIFICATION-REQUIRE-PROVIDER",
+        "INV-WATCH-ROOT-ANCHORED",
+        "INV-WORKER-ACCEPT-JOURNAL-ATOMIC",
+        "INV-WORKER-ATTEMPT-GENERATION-COHERENCE",
+        "INV-WORKER-RECOVERY-COMPLETES-LOSS",
+        "INV-WORKER-RECOVERY-ERROR-PROPAGATION",
+        "INV-WORKER-REGISTER-JOURNAL-ATOMIC",
+        "INV-WORKER-REGISTRATION-ATOMIC-REPAIR",
+        "INV-WORKER-TOKEN-SINGLE-BINDING"
+      ]
+    },
+    {
+      "id": "storage.governor",
+      "title": "Always-on storage governor: aggregate budget, quotas, eviction, loss markers",
+      "specs": [
+        "INV-STORAGE-AGGREGATE-BUDGET",
+        "INV-STORAGE-ARCHIVE-LOSS-MARKER",
+        "INV-STORAGE-CANONICAL-DIRECTORY-KEY",
+        "INV-STORAGE-CLASS-EVICTION-SCOPE",
+        "INV-STORAGE-DEDUP-PROMOTION",
+        "INV-STORAGE-DIRECTORY-ROOT-PERSISTENCE",
+        "INV-STORAGE-EVIDENCE-PIN-RELEASE",
+        "INV-STORAGE-FOREIGN-RESERVATION-SWEEP",
+        "INV-STORAGE-LEASE-EXPIRED-COMMIT",
+        "INV-STORAGE-LRU-EVICTION-ORDER",
+        "INV-STORAGE-MAINTENANCE-TICK",
+        "INV-STORAGE-PINNED-DELTA",
+        "INV-STORAGE-PROMOTION-PIN-MOVE",
+        "INV-STORAGE-RESERVATION-ATOMIC",
+        "INV-STORAGE-RESERVATION-RELEASE",
+        "INV-STORAGE-SQLITE-DEBT-SHARED",
+        "INV-STORAGE-WAL-GROWTH-DEBT",
+        "INV-STORAGE-WAL-TRUNCATION-TRUTH",
+        "INV-STORAGE-WATERMARK-HYSTERESIS"
+      ]
+    }
+  ]
 }

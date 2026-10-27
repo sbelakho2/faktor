@@ -1341,6 +1341,13 @@ impl SqliteControlPlaneStore {
         })
     }
 
+    /// Test-only direct-connection seam for deterministic storage probes
+    /// (e.g. seeding 10k rollup buckets without 10k public appends).
+    #[cfg(test)]
+    pub(crate) fn raw_conn_for_test(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap()
+    }
+
     /// The database path (`None` for in-memory stores).
     pub fn db_path(&self) -> Option<&Path> {
         self.path.as_deref()

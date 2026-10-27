@@ -1,0 +1,18 @@
+{
+  "id": "INV-STORAGE-RESERVATION-RELEASE",
+  "file": "crates/storage/src/governor.rs",
+  "find": "    fn drop(&mut self) {\n        if self.active {\n            if let Ok(mut ledger) = self.governor.inner.ledger.lock() {",
+  "replace": "    fn drop(&mut self) {\n        if false && self.active {\n            if let Ok(mut ledger) = self.governor.inner.ledger.lock() {",
+  "gate": "cargo test -p faktor-storage --lib dropped_reservation_is_released_immediately",
+  "expect": "FAILED",
+  "note": "Leaks every aborted/dropped reservation until lease expiry, blocking budget for work that never published.",
+  "capabilities": [
+    "storage.governor"
+  ],
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

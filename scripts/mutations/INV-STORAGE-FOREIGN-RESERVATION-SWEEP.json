@@ -1,0 +1,18 @@
+{
+  "id": "INV-STORAGE-FOREIGN-RESERVATION-SWEEP",
+  "file": "crates/storage/src/ledger.rs",
+  "find": "            if owner_is_alive(&foreign) {",
+  "replace": "            if false && owner_is_alive(&foreign) {",
+  "gate": "cargo test -p faktor-storage --lib restart_sweeps_reservations_from_a_previous_process",
+  "expect": "FAILED",
+  "note": "Disables the liveness filter: a live second process's in-flight reservations are swept, and a dead process's row is not the only thing reclaimed.",
+  "capabilities": [
+    "storage.governor"
+  ],
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

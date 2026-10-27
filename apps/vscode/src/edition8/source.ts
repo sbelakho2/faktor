@@ -185,6 +185,57 @@ function readConfigValues(config: Json | null): readonly E8ConfigValue[] {
   return rows;
 }
 
+export interface E8Descriptor {
+  readonly key: string;
+  readonly label: string | null;
+  readonly description: string | null;
+  readonly category: string | null;
+  readonly writable: boolean;
+  readonly applyTiming: string | null;
+  readonly runtimeConsumer: Json | null;
+}
+
+const DESCRIPTOR_LOOKUP = new WeakMap<object, Map<string, E8Descriptor>>();
+const EMPTY_DESCRIPTOR_LOOKUP: ReadonlyMap<string, E8Descriptor> = new Map();
+
+function readDescriptors(descriptors: Json | null): Map<string, E8Descriptor> {
+  const rows = new Map<string, E8Descriptor>();
+  if (!isObject(descriptors)) return rows;
+  const entries = descriptors.descriptors;
+  if (!Array.isArray(entries)) return rows;
+  for (const entry of entries) {
+    if (!isObject(entry) || typeof entry.key !== 'string') continue;
+    rows.set(entry.key, {
+      key: entry.key,
+      label: typeof entry.label === 'string' && entry.label.length > 0 ? entry.label : null,
+      description: typeof entry.description === 'string' && entry.description.length > 0 ? entry.description : null,
+      category: typeof entry.category === 'string' && entry.category.length > 0 ? entry.category : null,
+      writable: entry.writable === true,
+      applyTiming: typeof entry.applyTiming === 'string' ? entry.applyTiming : null,
+      runtimeConsumer: isObject(entry.runtimeConsumer) ? entry.runtimeConsumer : null,
+    });
+  }
+  return rows;
+}
+
+/** Descriptor metadata for the settings catalog, cached per served read. */
+export function descriptorMap(descriptors: Json | null): ReadonlyMap<string, E8Descriptor> {
+  if (!isObject(descriptors)) return EMPTY_DESCRIPTOR_LOOKUP;
+  const cached = DESCRIPTOR_LOOKUP.get(descriptors);
+  if (cached !== undefined) return cached;
+  const rows = readDescriptors(descriptors);
+  DESCRIPTOR_LOOKUP.set(descriptors, rows);
+  return rows;
+}
+
+export function descriptorFor(
+  snapshot: { readonly descriptors: Json | null } | null,
+  key: string,
+): E8Descriptor | null {
+  if (snapshot === null) return null;
+  return descriptorMap(snapshot.descriptors).get(key) ?? null;
+}
+
 function stableJson(value: Json): string {
   return JSON.stringify(value, (key, entry) => (key === 'snapshotMs' ? undefined : entry));
 }
@@ -249,7 +300,7 @@ export async function loadEdition8Snapshot(native: NativeClient, options: E8Snap
     readJson(native, 'GET', '/models', null, sources, 'models'),
     readJson(native, 'GET', '/capabilities', null, sources, 'capabilities'),
     readJson(native, 'GET', '/native/config/snapshot', null, sources, 'config'),
-    skip(sources, 'descriptors', 'GET', '/native/config/descriptors', 'The effective config snapshot is authoritative; Revision 8 does not render the descriptor catalog.'),
+    readJson(native, 'GET', '/native/config/descriptors', null, sources, 'descriptors'),
     readJson(native, 'GET', '/native/providers/connections', null, sources, 'connections'),
     readJson(native, 'GET', '/native/providers', null, sources, 'providers'),
   ]);

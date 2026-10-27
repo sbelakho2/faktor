@@ -205,8 +205,12 @@ async fn model_override_changes_wire_request_model() {
     // The provider records the model of every request streamed through
     // it: the per-message override must reach the wire request, and a
     // plain run_turn must keep sending the session model.
+    // ONE response per stream: two logical turns need two scripted
+    // responses (a scripted provider never replays a consumed response).
     let provider = scripted_provider(vec![
         ScriptedResponse::Text("pong".into()),
+        ScriptedResponse::End,
+        ScriptedResponse::Text("pong again".into()),
         ScriptedResponse::End,
     ]);
     let (deps, _dir) = deps(provider.clone(), vec![]);

@@ -11330,9 +11330,7 @@ export const E8_CONTROLS: readonly Edition8Control[] = [
     "staleState": "Keep the last coherent snapshot with age; disable admission/apply until reconciled (global state contract, p.222).",
     "pendingState": "Pending/unknown is a named state; suppress duplicate effects and reconcile before replay (global state contract, p.222).",
     "classification": "H",
-    "configKeys": [
-      "faktor.telemetry.categories"
-    ],
+    "configKeys": [],
     "endpoints": [],
     "contractGap": "",
     "currentStatus": "exists",

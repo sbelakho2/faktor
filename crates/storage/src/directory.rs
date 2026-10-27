@@ -84,6 +84,16 @@ fn safe_relative(key: &str) -> Option<PathBuf> {
 }
 
 impl StorageBackend for DirectoryBackend {
+    fn canonical_directory_key(&self, root: &Path, rel: &Path) -> Option<String> {
+        let index = self.roots.iter().position(|candidate| {
+            candidate == root
+                || (candidate.exists()
+                    && root.exists()
+                    && candidate.canonicalize().ok() == root.canonicalize().ok())
+        })?;
+        Some(self.key_for(index, rel))
+    }
+
     fn class(&self) -> StorageClass {
         self.class
     }
@@ -172,6 +182,10 @@ impl StorageBackend for DirectoryBackend {
             }
         }
         Ok(out)
+    }
+
+    fn directory_roots(&self) -> Option<(&[PathBuf], i64)> {
+        Some((&self.roots, self.min_age_ms))
     }
 
     fn evict(
@@ -389,18 +403,47 @@ impl StorageBackend for SqliteBackend {
                 })
             }
         };
-        if let Err(e) = conn.execute_batch(
-            "PRAGMA busy_timeout = 0; PRAGMA wal_checkpoint(TRUNCATE); PRAGMA busy_timeout = 5000;",
-        ) {
-            return Ok(EvictionOutcome::Refused {
-                detail: format!("wal_checkpoint(TRUNCATE) refused: {e}"),
-            });
+        let _ = conn.execute_batch("PRAGMA busy_timeout = 0;");
+        let checkpoint = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        });
+        let _ = conn.execute_batch("PRAGMA busy_timeout = 5000;");
+        match checkpoint {
+            Ok((busy, log_frames)) if busy != 0 => {
+                return Ok(EvictionOutcome::Refused {
+                    detail: format!(
+                        "wal_checkpoint(TRUNCATE) is busy ({} pinned frames); the WAL keeps its {} bytes",
+                        log_frames, before
+                    ),
+                })
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return Ok(EvictionOutcome::Refused {
+                    detail: format!("wal_checkpoint(TRUNCATE) refused: {e}"),
+                })
+            }
         }
         let after = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        Ok(EvictionOutcome::Evicted {
-            bytes: before.saturating_sub(after),
-            verified: false,
-            digest: None,
+        if after >= before {
+            // A checkpoint that cannot shrink the sidecar must not be
+            // reported as an eviction: the ledger would otherwise delete a
+            // row that still names bytes on disk and fake free room.
+            return Ok(EvictionOutcome::Refused {
+                detail: format!("wal_checkpoint(TRUNCATE) left the {before} byte WAL unchanged"),
+            });
+        }
+        if after == 0 {
+            return Ok(EvictionOutcome::Evicted {
+                bytes: before,
+                verified: true,
+                digest: None,
+            });
+        }
+        Ok(EvictionOutcome::Reclaimed {
+            bytes: before - after,
+            remaining_bytes: after,
+            verified: true,
         })
     }
 }

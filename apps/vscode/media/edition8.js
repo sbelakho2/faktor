@@ -178,7 +178,15 @@
 
   function display(value) {
     if (typeof value === 'string') return value.length > 80 ? value.slice(0, 77) + '\u2026' : value;
-    return JSON.stringify(value);
+    if (Array.isArray(value)) {
+      var joined = value.map(display).join(', ');
+      return joined.length > 80 ? joined.slice(0, 77) + '\u2026' : joined;
+    }
+    if (value !== null && typeof value === 'object') {
+      var fields = Object.keys(value).length;
+      return fields + (fields === 1 ? ' configured field' : ' configured fields');
+    }
+    return String(value);
   }
 
   function hasChanges() {
@@ -188,6 +196,12 @@
   function selectScreen(screenId, moveFocus) {
     var screen = screens.get(screenId);
     if (!screen) return false;
+    // Settings is one surface: opening a setting replaces the domain index;
+    // Back returns to it. The registry screen stays the contract owner.
+    var settingsHome = document.getElementById('e8-settings-home');
+    var settingsBack = document.getElementById('e8-settings-back');
+    if (settingsHome) settingsHome.hidden = true;
+    if (settingsBack) settingsBack.hidden = false;
     selected = screenId;
     var destination = screen.getAttribute('data-destination');
     for (var [key, panel] of destinations) panel.hidden = key !== destination;
@@ -257,6 +271,21 @@
     if (reset) reset.disabled = applyInFlight || !changes;
     var defaults = document.getElementById('e8-defaults');
     if (defaults) defaults.disabled = applyInFlight;
+    var saveState = document.getElementById('e8-settings-save-state');
+    if (saveState) {
+      if (applyInFlight) {
+        saveState.textContent = 'Applying one atomic patch\u2026';
+        saveState.setAttribute('data-state', 'saving');
+      } else if (changes) {
+        var total = entries.length + unstaged.size;
+        saveState.textContent = total + (total === 1 ? ' change' : ' changes') +
+          ' staged \u2014 not saved until Apply changes.';
+        saveState.setAttribute('data-state', 'dirty');
+      } else {
+        saveState.textContent = 'Autosave is off \u2014 no staged changes.';
+        saveState.setAttribute('data-state', 'clean');
+      }
+    }
   }
 
   function applyDraft(message) {
@@ -268,6 +297,124 @@
     if (message.error) setNotice(message.error, 'error');
     if (message.notice) setNotice(message.notice, 'info');
     footerPatch();
+  }
+
+  /**
+   * One searchable settings surface: filters the domain rows (and their
+   * advanced disclosure) from the rendered catalog only. No daemon read is
+   * triggered by typing.
+   */
+  function filterSettingsHome(input) {
+    var home = document.getElementById('e8-settings-home');
+    if (!home) return;
+    var query = input.value.trim().toLowerCase();
+    var rows = home.querySelectorAll('[data-settings-row]');
+    var visible = 0;
+    for (var i = 0; i < rows.length; i++) {
+      var row = rows[i];
+      var haystack = row.getAttribute('data-settings-search') || '';
+      var match = query.length === 0 || haystack.indexOf(query) !== -1;
+      row.hidden = !match;
+      if (match) visible += 1;
+    }
+    var domains = home.querySelectorAll('[data-settings-domain]');
+    for (var d = 0; d < domains.length; d++) {
+      var domainRows = domains[d].querySelectorAll('[data-settings-row]');
+      var shown = 0;
+      for (var r = 0; r < domainRows.length; r++) if (!domainRows[r].hidden) shown += 1;
+      domains[d].hidden = shown === 0;
+    }
+    var count = home.querySelector('[data-settings-global-count]');
+    if (count) {
+      count.textContent = query.length === 0
+        ? rows.length + ' settings screens'
+        : visible + (visible === 1 ? ' setting matches' : ' settings match');
+    }
+    var empty = home.querySelector('[data-settings-empty]');
+    if (empty) empty.hidden = visible !== 0;
+  }
+
+  function installSettingsHome() {
+    var input = document.getElementById('e8-settings-search');
+    if (input && input.dataset.bound !== 'true') {
+      input.dataset.bound = 'true';
+      input.addEventListener('input', function () { filterSettingsHome(input); });
+      input.addEventListener('search', function () { filterSettingsHome(input); });
+      filterSettingsHome(input);
+    }
+    var rows = document.querySelectorAll('[data-settings-open]');
+    for (var i = 0; i < rows.length; i++) {
+      if (rows[i].dataset.bound === 'true') continue;
+      rows[i].dataset.bound = 'true';
+      rows[i].addEventListener('click', function (event) {
+        var button = event.currentTarget;
+        selectScreen(button.getAttribute('data-settings-open'), true);
+      });
+    }
+    var back = document.getElementById('e8-settings-back');
+    if (back && back.dataset.bound !== 'true') {
+      back.dataset.bound = 'true';
+      back.addEventListener('click', function () {
+        var home = document.getElementById('e8-settings-home');
+        if (home) home.hidden = false;
+        for (var panel of Array.from(document.querySelectorAll('.e8-screen'))) panel.hidden = true;
+        back.hidden = true;
+        selected = null;
+        var search = document.getElementById('e8-settings-search');
+        if (search) search.focus();
+        if (home) home.scrollIntoView({ block: 'start' });
+      });
+    }
+    var review = document.querySelector('[data-settings-review]');
+    if (review && review.dataset.bound !== 'true') {
+      review.dataset.bound = 'true';
+      review.addEventListener('click', function () {
+        var footer = document.getElementById('e8-footer');
+        if (footer) {
+          footer.scrollIntoView({ block: 'nearest' });
+          var apply = document.getElementById('e8-apply');
+          if (apply && !apply.disabled) apply.focus();
+        }
+      });
+    }
+  }
+
+  function filterSettings(input) {
+    var screen = input.closest('.e8-screen');
+    if (!screen) return;
+    var query = input.value.trim().toLowerCase();
+    var cards = screen.querySelectorAll('.e8-control');
+    var shown = 0;
+    for (var i = 0; i < cards.length; i++) {
+      var card = cards[i];
+      if (card.querySelector('[data-settings-search]')) continue;
+      var text = (card.textContent || '').toLowerCase();
+      var match = query.length === 0 || text.indexOf(query) !== -1;
+      card.hidden = !match;
+      if (match) shown += 1;
+    }
+    var rows = screen.querySelectorAll('.e8-row');
+    for (var j = 0; j < rows.length; j++) {
+      var row = rows[j];
+      row.hidden = query.length > 0 && (row.textContent || '').toLowerCase().indexOf(query) === -1;
+    }
+    var count = screen.querySelector('[data-settings-count]');
+    if (count) {
+      count.textContent = query.length === 0
+        ? 'Searches the served catalog on this screen; no daemon round trip is needed.'
+        : shown + ' control' + (shown === 1 ? '' : 's') + ' and ' + Array.prototype.filter.call(rows, function (row) { return !row.hidden; }).length + ' served row(s) match.';
+    }
+  }
+
+  function installSettingsSearch() {
+    var inputs = document.querySelectorAll('[data-settings-search]');
+    for (var i = 0; i < inputs.length; i++) {
+      if (inputs[i].dataset.bound === 'true') continue;
+      inputs[i].dataset.bound = 'true';
+      inputs[i].addEventListener('input', function (event) { filterSettings(event.currentTarget); });
+      inputs[i].addEventListener('search', function (event) { filterSettings(event.currentTarget); });
+      filterSettings(inputs[i]);
+    }
   }
 
   function actionPayload(id) {
@@ -610,7 +757,7 @@
     var target = event.target;
     if (!(target instanceof Element)) return;
     var id = target.getAttribute && target.getAttribute('data-input');
-    if (!id) return;
+    if (!id || id === 'O-01') return;
     var raw = target.type === 'checkbox' ? target.checked : target.value;
     vscode.postMessage({ type: 'e8Stage', controlId: id, raw: raw });
   });
@@ -624,6 +771,8 @@
         return;
       case 'e8Patch':
         applyPatch(message);
+        installSettingsSearch();
+        installSettingsHome();
         return;
       case 'e8Notice':
         setNotice(message.message || '', 'info');
@@ -658,9 +807,13 @@
     }
   });
 
-  if (window.__faktorE8Initial) {
+  // Settings boots on its one searchable surface, not on whichever screen
+  // happens to be the command's initial screen.
+  if (window.__faktorE8Initial && !document.getElementById('e8-settings-home')) {
     selectScreen(window.__faktorE8Initial, false);
   }
   footerPatch();
   vscode.postMessage({ type: 'e8Ready' });
+  installSettingsSearch();
+  installSettingsHome();
 })();

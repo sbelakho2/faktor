@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! `ledger` journal-authority tests: the bounded per-session authority
 //! (`journal_session_problems`) and the doctor sweep derived from it, plus
 //! the legacy gapless/cursor event invariants they build on.

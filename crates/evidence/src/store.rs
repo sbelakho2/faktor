@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! In-memory evidence storage with scoped reads and bounded backing retention.
 //!
 //! Two invariants are structural in this module:
@@ -934,10 +935,21 @@ impl<'a> DurableEvidenceStore<'a> {
                     EvidenceError::Malformed(format!("evidence backing pin failed: {e}"))
                 })?;
         }
-        let hash = self
-            .cas
-            .put(bytes)
-            .map_err(|e| EvidenceError::Malformed(format!("backing cas put: {e}")))?;
+        let hash = match self.cas.put(bytes) {
+            Ok(hash) => hash,
+            Err(error) => {
+                // The pre-publish pin is released again when the CAS refused
+                // (budget, size, IO): a leaked pin would later mark unrelated
+                // content required forever.
+                if let Some(governor) = self.cas.governor() {
+                    let _ =
+                        governor.unpin(faktor_storage::StorageClass::EvidenceCas, &hex(&digest));
+                }
+                return Err(EvidenceError::Malformed(format!(
+                    "backing cas put: {error}"
+                )));
+            }
+        };
         Ok((Some(hash.to_hex()), Some(hash.bytes())))
     }
 
@@ -1936,6 +1948,15 @@ mod tests {
         assert!(refused.is_err(), "over-quota backing must be refused");
         assert_eq!(store.evidence_high_water().unwrap(), water);
         assert!(governor.counters().unwrap().refusals >= 1);
+        assert!(
+            !governor
+                .is_pinned(
+                    StorageClass::EvidenceCas,
+                    &hex(blake3::hash(&noise).as_bytes())
+                )
+                .unwrap(),
+            "a refused publish must release its pre-publication evidence pin"
+        );
 
         // Eviction can never remove the pinned, row-referenced backing.
         let _ = governor.enforce();

@@ -1,0 +1,19 @@
+{
+  "id": "INV-PAYMENTS-METHOD-BOUND",
+  "surface": "payments.billing",
+  "file": "crates/payments/src/service/tokens.rs",
+  "find": "        if existing.len() >= MAX_PAYMENT_METHODS {\n            return Err(PaymentError::Conflict(format!(\n                \"an organization may store at most {MAX_PAYMENT_METHODS} payment methods\"\n            )));\n        }\n",
+  "replace": "        // mutated: payment methods grow without a per-organization bound\n",
+  "gate": "cargo test -p faktor-payments --test tokens stored_payment_methods_are_bounded_and_overview_counts_without_payloads",
+  "expect": "FAILED",
+  "note": "Removing the bound lets one organization grow method rows without limit; overview then loads and decodes every ciphertext.",
+  "capabilities": [
+    "payments.method_bound"
+  ],
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

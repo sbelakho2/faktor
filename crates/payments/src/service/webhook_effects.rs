@@ -119,9 +119,17 @@ impl PaymentService {
                     "webhook payment truth does not match the recorded payment".into(),
                 ));
             }
-            if !payment.status.can_transition_to(PaymentStatus::Succeeded)
-                && payment.status != PaymentStatus::Succeeded
-            {
+            // A payment that is already settled has already credited its
+            // invoice in the same transaction that recorded it. Applying a
+            // second event for the same provider payment (for example
+            // `payment.succeeded` after `invoice.paid` bound the same
+            // payment_intent) must not add the amount again: the event id
+            // differs, so event-level dedupe alone cannot protect the
+            // ledger from order-dependent over-crediting.
+            if payment.status == PaymentStatus::Succeeded {
+                return Ok(WebhookEffects::default());
+            }
+            if !payment.status.can_transition_to(PaymentStatus::Succeeded) {
                 return Ok(WebhookEffects::default());
             }
             payment.status = PaymentStatus::Succeeded;
@@ -277,6 +285,12 @@ impl PaymentService {
                 ));
             }
         }
+        // One failed provider attempt can be delivered as both a payment
+        // event and an invoice event with different event ids. Advance the
+        // attempt counter only when the payment identity is new.
+        let advance_dunning =
+            invoice.last_dunning_payment_id.as_deref() != Some(provider_payment_id);
+        invoice.last_dunning_payment_id = Some(provider_payment_id.to_string());
         invoice.status = InvoiceStatus::PastDue;
         let mut subscription = invoice
             .subscription_id
@@ -289,7 +303,9 @@ impl PaymentService {
             });
         if let Some(sub) = subscription.as_mut() {
             sub.state = SubscriptionState::PastDue;
-            sub.dunning_attempts = sub.dunning_attempts.saturating_add(1);
+            if advance_dunning {
+                sub.dunning_attempts = sub.dunning_attempts.saturating_add(1);
+            }
             sub.updated_ms = now;
             if sub.grace_end_ms.is_none() {
                 sub.grace_end_ms = Some(now.saturating_add(self.config.dunning.grace_ms.max(0)));
@@ -506,6 +522,14 @@ impl PaymentService {
                 ));
             }
         }
+        let failure_identity = failed_payment
+            .as_ref()
+            .map(|payment| payment.provider_payment_id.clone())
+            .or_else(|| failure_payment_identity(object))
+            .unwrap_or_else(|| event.id.clone());
+        let advance_dunning =
+            invoice.last_dunning_payment_id.as_deref() != Some(failure_identity.as_str());
+        invoice.last_dunning_payment_id = Some(failure_identity);
         invoice.status = InvoiceStatus::PastDue;
         let subscription = invoice
             .subscription_id
@@ -517,7 +541,9 @@ impl PaymentService {
                     .can_transition_to(SubscriptionState::PastDue)
             })
             .map(|mut subscription| {
-                subscription.dunning_attempts = subscription.dunning_attempts.saturating_add(1);
+                if advance_dunning {
+                    subscription.dunning_attempts = subscription.dunning_attempts.saturating_add(1);
+                }
                 subscription.state = SubscriptionState::PastDue;
                 if subscription.grace_end_ms.is_none() {
                     subscription.grace_end_ms =
@@ -594,9 +620,16 @@ impl PaymentService {
             .and_then(|object| object.get("quantity"))
             .and_then(serde_json::Value::as_u64)
         {
-            subscription.quantity = u32::try_from(quantity).map_err(|_| {
+            let quantity = u32::try_from(quantity).map_err(|_| {
                 PaymentError::WebhookMalformed("subscription quantity overflow".into())
             })?;
+            if quantity == 0 || quantity > crate::service::MAX_SEATS {
+                return Err(PaymentError::WebhookMalformed(format!(
+                    "subscription quantity must be 1..={}",
+                    crate::service::MAX_SEATS
+                )));
+            }
+            subscription.quantity = quantity;
         }
         if let Some(cancel) = object
             .and_then(|object| object.get("cancel_at_period_end"))
@@ -677,4 +710,23 @@ impl PaymentService {
             ..WebhookEffects::default()
         })
     }
+}
+
+/// The provider payment identity carried by a failed payment/invoice event.
+/// Stripe nests an id or object under `payment_intent`/`charge`; Mollie's
+/// failed payment object id is already the payment id.
+fn failure_payment_identity(object: Option<&serde_json::Value>) -> Option<String> {
+    object
+        .and_then(|object| {
+            object
+                .get("payment_intent")
+                .or_else(|| object.get("charge"))
+        })
+        .and_then(|value| {
+            value
+                .as_str()
+                .or_else(|| value.get("id").and_then(serde_json::Value::as_str))
+        })
+        .filter(|id| !id.is_empty() && id.len() <= MAX_TEXT_BYTES)
+        .map(str::to_string)
 }

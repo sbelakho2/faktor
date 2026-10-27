@@ -55,8 +55,14 @@ export interface E8ActivationResult {
   readonly call: { readonly method: string; readonly path: string } | null;
 }
 
+const CONTROL_BY_ID = new Map<string, (typeof E8_CONTROLS)[number]>();
+for (const entry of E8_CONTROLS) {
+  // FIRST occurrence, exactly the historical `find` result.
+  if (!CONTROL_BY_ID.has(entry.id)) CONTROL_BY_ID.set(entry.id, entry);
+}
+
 function controlById(id: string) {
-  const control = E8_CONTROLS.find((entry) => entry.id === id);
+  const control = CONTROL_BY_ID.get(id);
   if (control === undefined) throw new Error(`edition8: unknown control ${id}`);
   return control;
 }

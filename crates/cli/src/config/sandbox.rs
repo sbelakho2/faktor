@@ -65,6 +65,10 @@ fn default_model() -> String {
     crate::config::Config::default().model
 }
 
+fn default_compaction_min_reduction() -> f64 {
+    crate::config::Config::default().compaction_min_reduction
+}
+
 fn default_compact_at_usage() -> f64 {
     crate::config::Config::default().compact_at_usage
 }
@@ -92,10 +96,14 @@ impl<'de> serde::Deserialize<'de> for Config {
             model: String,
             #[serde(default)]
             compaction_model: Option<String>,
+            #[serde(default = "default_compaction_min_reduction")]
+            compaction_min_reduction: f64,
             #[serde(default = "default_compact_at_usage")]
             compact_at_usage: f64,
             #[serde(default = "default_instructions")]
             instructions: String,
+            #[serde(default)]
+            provider_env_file: Option<String>,
             #[serde(default)]
             providers: Vec<ProviderCfg>,
             /// `"economy"` (the default when absent), or
@@ -149,8 +157,10 @@ impl<'de> serde::Deserialize<'de> for Config {
         Ok(Self {
             model: file.model,
             compaction_model: file.compaction_model,
+            compaction_min_reduction: file.compaction_min_reduction,
             compact_at_usage: file.compact_at_usage,
             instructions: file.instructions,
+            provider_env_file: file.provider_env_file,
             providers: file.providers,
             routing_mode: file.routing_mode,
             mcp: file.mcp,

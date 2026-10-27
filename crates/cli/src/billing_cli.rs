@@ -19,8 +19,9 @@ use faktor_cloud::{
     OrganizationId, SubscriptionStatus, SystemClock,
 };
 use faktor_payments::{
-    AddPaymentMethodRequest, BillingInterval, ChangeSeatsRequest, PaymentService,
-    SqlitePaymentStore, SubscribeRequest,
+    AddPaymentMethodRequest, BillingInterval, CancelRequest, ChangePlanRequest, ChangeSeatsRequest,
+    PayInvoiceRequest, PaymentService, PreviewPlanRequest, RefundRequest, SqlitePaymentStore,
+    SubscribeRequest,
 };
 use serde_json::{json, Value};
 
@@ -118,6 +119,60 @@ pub(crate) enum BillingAction {
         subscription: Option<String>,
         #[arg(long)]
         idempotency_key: Option<String>,
+    },
+    /// Change the paid subscription plan with a durable proration preview.
+    Plan {
+        /// A priced plan id from `[billing.payments.prices]`.
+        #[arg(long)]
+        plan: String,
+        /// `monthly` or `annual`; omitted = keep the current interval.
+        #[arg(long)]
+        interval: Option<String>,
+        /// Subscription id; omitted = the organization's current subscription.
+        #[arg(long)]
+        subscription: Option<String>,
+        #[arg(long)]
+        idempotency_key: Option<String>,
+        /// Required: a plan change is consequential.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Cancel the paid subscription now or at the period end.
+    Cancel {
+        #[arg(long)]
+        at_period_end: bool,
+        /// Subscription id; omitted = the organization's current subscription.
+        #[arg(long)]
+        subscription: Option<String>,
+        #[arg(long)]
+        idempotency_key: Option<String>,
+        /// Required: cancellation is consequential.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Pay an open invoice with a vault-backed stored method.
+    Pay {
+        /// The invoice id (`inv_...`).
+        invoice: String,
+        /// Payment method id; omitted = the default stored method.
+        #[arg(long)]
+        method: Option<String>,
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
+    /// Refund a settled payment and allocate its credit note.
+    Refund {
+        /// The payment id (`pay_...`).
+        payment: String,
+        #[arg(long)]
+        amount_minor: i64,
+        #[arg(long, default_value = "operator refund")]
+        reason: String,
+        #[arg(long)]
+        idempotency_key: Option<String>,
+        /// Required: a refund is consequential.
+        #[arg(long)]
+        confirm: bool,
     },
     /// The configured tax jurisdictions and exact plan price catalogue.
     Tax,
@@ -417,6 +472,24 @@ fn payment_limit(limit: Option<u64>, operation: &str) -> Result<usize, String> {
     }
 }
 
+fn resolve_subscription(
+    service: &PaymentService,
+    organization: &OrganizationId,
+    requested: Option<String>,
+) -> Result<String, String> {
+    match requested {
+        Some(id) => Ok(id),
+        None => service
+            .overview(organization)
+            .map_err(|e| format!("subscription: {e}"))?
+            .subscription
+            .map(|subscription| subscription.id)
+            .ok_or_else(|| {
+                "subscription: the organization has no payment subscription".to_string()
+            }),
+    }
+}
+
 fn price_surface(service: &PaymentService) -> Value {
     let mut prices = serde_json::Map::new();
     for (plan_id, price) in &service.config().catalogue.plans {
@@ -456,6 +529,10 @@ async fn render_impl(
                 .is_some_and(|payments| payments.enabled)
             {
                 let (payments, _) = payments_service(&config, data_dir)?;
+                match payments.tick(&organization) {
+                    Ok(_) | Err(faktor_payments::PaymentError::NotFound(_)) => {}
+                    Err(error) => return Err(format!("billing payments tick: {error}")),
+                }
                 let real = payments
                     .overview(&organization)
                     .map_err(|e| format!("billing payments overview: {e}"))?;
@@ -578,7 +655,7 @@ async fn render_impl(
             let limit = payment_limit(limit, "invoices")?;
             if format == "csv" {
                 return service
-                    .export_invoices(&organization, "csv", limit)
+                    .export_invoices_page(&organization, "csv", since.as_deref(), limit)
                     .map(Value::String)
                     .map_err(|e| format!("invoices: {e}"));
             }
@@ -698,6 +775,151 @@ async fn render_impl(
                 "subscription": outcome.subscription,
                 "proration": outcome.proration,
                 "prorationText": service.preview_text(&outcome.proration),
+            }))
+        }
+        BillingAction::Plan {
+            plan,
+            interval: interval_raw,
+            subscription,
+            idempotency_key,
+            confirm,
+        } => {
+            if !confirm {
+                return Err(
+                    "plan change: pass --confirm (the plan and its proration are consequential)"
+                        .into(),
+                );
+            }
+            let (service, organization) = payments_service(&config, data_dir)?;
+            let subscription = resolve_subscription(&service, &organization, subscription)?;
+            let interval = interval_raw.as_deref().map(interval).transpose()?;
+            let preview = service
+                .preview_plan_change(
+                    &organization,
+                    PreviewPlanRequest {
+                        subscription_id: subscription.clone(),
+                        plan_id: plan.clone(),
+                        interval,
+                    },
+                )
+                .map_err(|e| format!("plan preview: {e}"))?;
+            let outcome = service
+                .change_plan(
+                    &organization,
+                    ChangePlanRequest {
+                        subscription_id: subscription,
+                        plan_id: plan,
+                        interval,
+                        idempotency_key: idempotency_key
+                            .unwrap_or_else(|| new_idempotency_key(None, "plan")),
+                    },
+                )
+                .await
+                .map_err(|e| format!("plan change: {e}"))?;
+            Ok(json!({
+                "replayed": outcome.replayed,
+                "subscription": outcome.subscription,
+                "preview": preview,
+                "proration": outcome.proration,
+                "prorationText": service.preview_text(&outcome.proration),
+            }))
+        }
+        BillingAction::Cancel {
+            at_period_end,
+            subscription,
+            idempotency_key,
+            confirm,
+        } => {
+            if !confirm {
+                return Err("cancel: pass --confirm (cancellation is consequential)".into());
+            }
+            let (service, organization) = payments_service(&config, data_dir)?;
+            let subscription = resolve_subscription(&service, &organization, subscription)?;
+            let outcome = service
+                .cancel(
+                    &organization,
+                    CancelRequest {
+                        subscription_id: subscription,
+                        at_period_end,
+                        idempotency_key: idempotency_key
+                            .unwrap_or_else(|| new_idempotency_key(None, "cancel")),
+                    },
+                )
+                .await
+                .map_err(|e| format!("cancel: {e}"))?;
+            Ok(json!({
+                "replayed": outcome.replayed,
+                "subscription": outcome.subscription,
+            }))
+        }
+        BillingAction::Pay {
+            invoice,
+            method,
+            idempotency_key,
+        } => {
+            let (service, organization) = payments_service(&config, data_dir)?;
+            let method = match method {
+                Some(method) => method,
+                None => service
+                    .payment_methods(&organization)
+                    .map_err(|e| format!("pay: {e}"))?
+                    .into_iter()
+                    .find(|method| method.is_default)
+                    .map(|method| method.id)
+                    .ok_or("pay: no default payment method; pass --method")?,
+            };
+            let outcome = service
+                .pay_invoice(
+                    &organization,
+                    PayInvoiceRequest {
+                        invoice_id: invoice,
+                        payment_method_id: method,
+                        idempotency_key: idempotency_key
+                            .unwrap_or_else(|| new_idempotency_key(None, "pay")),
+                    },
+                )
+                .await
+                .map_err(|e| format!("pay: {e}"))?;
+            Ok(json!({
+                "replayed": outcome.replayed,
+                "invoice": outcome.invoice,
+                "payment": outcome.payment,
+                "subscription": outcome.subscription,
+            }))
+        }
+        BillingAction::Refund {
+            payment,
+            amount_minor,
+            reason,
+            idempotency_key,
+            confirm,
+        } => {
+            if !confirm {
+                return Err("refund: pass --confirm (a refund moves money)".into());
+            }
+            if amount_minor <= 0 {
+                return Err("refund: --amount-minor must be positive".into());
+            }
+            let (service, organization) = payments_service(&config, data_dir)?;
+            let outcome = service
+                .refund(
+                    &organization,
+                    RefundRequest {
+                        payment_id: payment,
+                        amount_minor,
+                        reason,
+                        idempotency_key: idempotency_key
+                            .unwrap_or_else(|| new_idempotency_key(None, "refund")),
+                    },
+                )
+                .await
+                .map_err(|e| format!("refund: {e}"))?;
+            Ok(json!({
+                "replayed": outcome.replayed,
+                "refund": outcome.refund,
+                "creditNote": outcome.credit_note,
+                "payment": outcome.payment,
+                "invoice": outcome.invoice,
             }))
         }
         BillingAction::Method { action } => {

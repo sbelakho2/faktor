@@ -803,11 +803,18 @@ pub async fn advance_job(
         items = store.job_items(job_id)?;
     }
 
+    // ONE index, FIRST request line wins (the historical `lines.iter().find`):
+    // the per-item scan was O(items · lines) for a large basket.
+    let mut line_by_key: std::collections::HashMap<&str, &JobLine> =
+        std::collections::HashMap::with_capacity(lines.len());
+    for line in &lines {
+        line_by_key.entry(line.item_key.as_str()).or_insert(line);
+    }
     for item in &items {
         if item.state.is_settled() {
             continue;
         }
-        let Some(line) = lines.iter().find(|line| line.item_key == item.item_key) else {
+        let Some(line) = line_by_key.get(item.item_key.as_str()).copied() else {
             // A durable item without a matching request line is corruption:
             // settle it unmatched rather than retrying forever.
             store.upsert_job_item(&JobItemRow {

@@ -1,0 +1,19 @@
+{
+  "id": "INV-BILLING-WEBHOOK-SEAT-BOUND",
+  "surface": "payments.billing",
+  "file": "crates/payments/src/service/webhook_effects.rs",
+  "find": "            if quantity == 0 || quantity > crate::service::MAX_SEATS {\n                return Err(PaymentError::WebhookMalformed(format!(\n                    \"subscription quantity must be 1..={}\",\n                    crate::service::MAX_SEATS\n                )));\n            }\n",
+  "replace": "            // mutated: any provider quantity is written over the durable seat count\n",
+  "gate": "cargo test -p faktor-payments --test lifecycle subscription_webhook_quantity_outside_the_seat_bound_is_refused",
+  "expect": "FAILED",
+  "note": "Dropping the seat bound accepts zero/overflow quantities and silently drifts billable seats.",
+  "capabilities": [
+    "payments.seat_truth"
+  ],
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

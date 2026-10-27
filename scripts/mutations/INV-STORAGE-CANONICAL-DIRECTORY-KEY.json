@@ -1,0 +1,18 @@
+{
+  "id": "INV-STORAGE-CANONICAL-DIRECTORY-KEY",
+  "file": "crates/storage/src/directory.rs",
+  "find": "        Some(self.key_for(index, rel))",
+  "replace": "        Some(rel.to_string_lossy().replace('\\\\', \"/\"))",
+  "gate": "cargo test -p faktor-storage --lib directory_key_is_canonical_and_survives_reconcile_and_eviction",
+  "expect": "FAILED",
+  "note": "Publishes a bare root-relative key on a multi-root backend: the reservation row names an object scan never reports (orphaned, unevictable bytes).",
+  "capabilities": [
+    "storage.governor"
+  ],
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

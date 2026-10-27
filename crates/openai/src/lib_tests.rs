@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 #[cfg(test)]
 mod openai_contract_tests {
     use super::super::*;

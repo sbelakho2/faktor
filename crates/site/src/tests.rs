@@ -428,6 +428,38 @@ async fn local_billing_flow_records_exact_money_receipts_methods_changes_and_can
     let billing = client.get("/account/billing/").await;
     assert!(!billing.body.contains("<script"));
     assert!(!billing.body.contains(" style="));
+    assert!(
+        billing.body.contains("plan-alt-price"),
+        "annual plan price is hidden from the card"
+    );
+    assert!(
+        billing.body.contains("or €"),
+        "annual plan amount is not visible before submit"
+    );
+    assert!(
+        billing.body.contains("at the chosen boundary"),
+        "cancel copy conflates scheduled and immediate cancellation"
+    );
+    let invoice_page = client
+        .get(&format!("/account/invoices/{}/", invoice.id))
+        .await;
+    assert_eq!(invoice_page.status, StatusCode::OK);
+    let basis = format!(
+        "{} · {}",
+        invoice
+            .tax_jurisdiction
+            .as_deref()
+            .unwrap_or("unconfigured"),
+        if invoice.tax_inclusive {
+            "inclusive"
+        } else {
+            "exclusive"
+        }
+    );
+    assert!(
+        invoice_page.body.contains(&basis),
+        "invoice tax basis omits jurisdiction/basis: {basis}"
+    );
     let csrf = client.form_csrf(&billing.body);
     let response = client
         .post(
@@ -486,6 +518,149 @@ async fn local_billing_flow_records_exact_money_receipts_methods_changes_and_can
     assert_eq!(response.status, StatusCode::SEE_OTHER);
     let overview = app.payments().overview(&org_id).unwrap();
     assert!(overview.subscription.unwrap().cancel_at_period_end);
+}
+
+#[tokio::test]
+async fn invoice_download_is_attachment_bounded_and_tenant_scoped() {
+    let app = TestApp::build();
+    let mut client = signup_verified(&app, "download@example.com").await;
+    let location = start_local_checkout(&mut client).await;
+    let return_url = pay_local(&mut client, &location).await;
+    assert!(client.get(&return_url).await.status.is_success());
+    let org = app.org_for_email("download@example.com");
+    let invoice = invoice_for(&app, &org);
+
+    let csv = client
+        .get(&format!(
+            "/account/invoices/{}/download/?format=csv",
+            invoice.id
+        ))
+        .await;
+    assert_eq!(csv.status, StatusCode::OK, "{}", csv.body);
+    assert_eq!(
+        csv.headers.get("content-type").unwrap(),
+        "text/csv; charset=utf-8"
+    );
+    let disposition = csv
+        .headers
+        .get("content-disposition")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(disposition.starts_with("attachment;"));
+    assert!(disposition.contains(&format!("{}.csv", invoice.number)));
+    assert!(csv.body.starts_with("number,invoice_id,status,"));
+    assert!(csv.body.contains(&invoice.number));
+
+    let json = client
+        .get(&format!("/account/invoices/{}/?format=json", invoice.id))
+        .await;
+    assert_eq!(json.status, StatusCode::OK);
+    assert_eq!(
+        json.headers.get("content-type").unwrap(),
+        "application/json; charset=utf-8"
+    );
+    assert!(json.body.contains(&invoice.number));
+
+    let refused = client
+        .get(&format!(
+            "/account/invoices/{}/download/?format=yaml",
+            invoice.id
+        ))
+        .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+
+    let mut foreign = signup_verified(&app, "other-download@example.com").await;
+    let foreign_view = foreign
+        .get(&format!("/account/invoices/{}/download/", invoice.id))
+        .await;
+    assert_eq!(foreign_view.status, StatusCode::NOT_FOUND);
+    let anonymous = app
+        .client()
+        .get(&format!("/account/invoices/{}/download/", invoice.id))
+        .await;
+    assert!(
+        anonymous.status == StatusCode::SEE_OTHER
+            || anonymous.status == StatusCode::UNAUTHORIZED
+            || anonymous.status == StatusCode::FOUND,
+        "anonymous download must not disclose bytes: {}",
+        anonymous.status
+    );
+}
+
+#[tokio::test]
+async fn invoice_list_paginates_with_an_exclusive_cursor_and_truthful_bounds() {
+    let app = TestApp::build();
+    let mut client = signup_verified(&app, "invoice-pages@example.com").await;
+    let location = start_local_checkout(&mut client).await;
+    let return_url = pay_local(&mut client, &location).await;
+    assert!(client.get(&return_url).await.status.is_success());
+    let organization = app.org_for_email("invoice-pages@example.com");
+    let organization_id = faktor_cloud::OrganizationId::try_new(organization.clone()).unwrap();
+    let subscription = app
+        .payments()
+        .overview(&organization_id)
+        .unwrap()
+        .subscription
+        .expect("subscription");
+    // One invoice per distinct usage description: the period/content key
+    // deliberately deduplicates identical requests, so vary the content.
+    for index in 0..101 {
+        app.payments()
+            .issue_invoice(
+                &organization_id,
+                faktor_payments::IssueInvoiceRequest {
+                    subscription_id: subscription.id.clone(),
+                    usage: vec![faktor_payments::UsageCharge {
+                        description: format!("page usage {index}"),
+                        quantity: 1,
+                        unit_amount_minor: 1,
+                    }],
+                    credits_minor: 0,
+                    discount_minor: 0,
+                    tax_jurisdiction: None,
+                    due_in_days: Some(7),
+                    idempotency_key: format!("page-invoice-{index}"),
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let first = client.get("/account/invoices/").await;
+    assert_eq!(first.status, StatusCode::OK);
+    assert!(first.body.contains("Older invoices"));
+    assert!(!first.body.contains("Newest invoices"));
+
+    let page = app
+        .payments()
+        .invoices(&organization_id, None, 100)
+        .unwrap();
+    assert_eq!(page.items.len(), 100);
+    assert!(page.has_more);
+    let first_page_number = page.items[0].number.clone();
+    let cursor = page.next_cursor.unwrap();
+    let remainder = app
+        .payments()
+        .invoices(&organization_id, Some(&cursor), 100)
+        .unwrap();
+    assert_eq!(remainder.items.len(), 2);
+    assert!(!remainder.has_more);
+    let second = client
+        .get(&format!("/account/invoices/?since={cursor}"))
+        .await;
+    assert_eq!(second.status, StatusCode::OK);
+    assert!(second.body.contains("Newest invoices"));
+    for invoice in &remainder.items {
+        assert!(
+            second.body.contains(&invoice.number),
+            "older page omitted {}",
+            invoice.number
+        );
+    }
+    assert!(
+        !second.body.contains(&first_page_number),
+        "the second page must not repeat the newest 100 rows"
+    );
 }
 
 #[tokio::test]
@@ -1413,6 +1588,7 @@ fn provider_checkout_returns_to_the_registered_return_route() {
         reconciliation: Default::default(),
         currency: "EUR".into(),
         status: faktor_payments::InvoiceStatus::Open,
+        last_dunning_payment_id: None,
         lines: Vec::new(),
         subtotal_minor: 100,
         discount_minor: 0,

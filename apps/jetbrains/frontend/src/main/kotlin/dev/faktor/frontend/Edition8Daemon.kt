@@ -163,12 +163,22 @@ internal object Edition8Contracts {
 
 /** The one effective configuration snapshot used by every Rev8 setting form. */
 internal class Edition8ConfigDraft {
+    private companion object {
+        val LIST_KEYS = setOf(
+            "faktor.permissions.allowedTools",
+            "faktor.permissions.childRoles",
+            "faktor.telemetry.categories",
+            "faktor.context.ignorePatterns",
+            "faktor.context.protectedPatterns",
+        )
+    }
+
     var revision: Long = -1
         private set
     var runtimeRevision: Long = -1
         private set
-    private val values = LinkedHashMap<String, String>()
-    private val staged = LinkedHashMap<String, String>()
+    private val values = LinkedHashMap<String, JsonValue>()
+    private val staged = LinkedHashMap<String, JsonValue>()
     private val locked = LinkedHashSet<String>()
 
     fun committed(savedRevision: Long, runtimeRevision: Long) {
@@ -187,26 +197,70 @@ internal class Edition8ConfigDraft {
             for ((key, value) in objectValues.fields) {
                 val effective = value as? JsonValue.Obj
                 val v = effective?.fields?.get("value")
-                values[key] = when (v) {
-                    is JsonValue.Str -> v.value
-                    JsonValue.Null -> ""
-                    null -> JsonCodec.write(value)
-                    else -> JsonCodec.write(v)
-                }
+                values[key] = v ?: JsonValue.Null
                 val isLocked = (effective?.fields?.get("locked") as? JsonValue.Bool)?.value == true
                 if (isLocked) locked.add(key)
             }
         }
     }
 
-    fun value(key: String): String = staged[key] ?: values[key] ?: ""
+    fun value(key: String): String = display(staged[key] ?: values[key] ?: JsonValue.Null)
     fun isLocked(key: String): Boolean = key in locked
     fun stage(key: String, value: String) {
         if (isLocked(key)) return
-        if (values[key] == value) staged.remove(key) else staged[key] = value
+        val next = coerce(key, value, values[key])
+        if (next == values[key]) staged.remove(key) else staged[key] = next
     }
-    fun changes(): Map<String, String> = LinkedHashMap(staged)
+    fun changes(): Map<String, JsonValue> = LinkedHashMap(staged)
     fun clearStaged() = staged.clear()
+
+    private fun display(value: JsonValue): String = when (value) {
+        JsonValue.Null -> ""
+        is JsonValue.Str -> value.value
+        is JsonValue.Bool -> value.value.toString()
+        is JsonValue.Int64 -> value.value.toString()
+        is JsonValue.Dbl -> value.value.toString()
+        is JsonValue.Arr -> value.items.joinToString(", ") { display(it) }
+        is JsonValue.Obj -> JsonCodec.write(value)
+    }
+
+    /**
+     * The served value's JSON type is the authority. A boolean toggle must
+     * never commit `"true"` as a string and a numeric field must never commit
+     * `"3"`; the daemon's strict descriptor validation refuses both. Unset
+     * values infer from the field text, including the known string-list keys.
+     */
+    private fun coerce(key: String, raw: String, current: JsonValue?): JsonValue {
+        val text = raw.trim()
+        return when (current) {
+            is JsonValue.Bool -> JsonValue.Bool(text.equals("true", ignoreCase = true))
+            is JsonValue.Int64 -> text.toLongOrNull()?.let { JsonValue.Int64(it) } ?: JsonValue.Str(raw)
+            is JsonValue.Dbl -> text.toDoubleOrNull()?.let { JsonValue.Dbl(it) } ?: JsonValue.Str(raw)
+            is JsonValue.Arr -> JsonValue.Arr(splitList(text).map { JsonValue.Str(it) })
+            is JsonValue.Obj -> JsonValue.Str(raw)
+            else -> infer(key, text, raw)
+        }
+    }
+
+    private fun infer(key: String, text: String, raw: String): JsonValue {
+        if (key in LIST_KEYS) return JsonValue.Arr(splitList(text).map { JsonValue.Str(it) })
+        if (text.equals("true", ignoreCase = true) || text.equals("false", ignoreCase = true)) {
+            return JsonValue.Bool(text.equals("true", ignoreCase = true))
+        }
+        if (Regex("^-?\\d+$").matches(text)) {
+            return text.toLongOrNull()?.let { JsonValue.Int64(it) } ?: JsonValue.Str(raw)
+        }
+        if (Regex("^-?\\d+\\.\\d+$").matches(text)) {
+            return text.toDoubleOrNull()?.let { JsonValue.Dbl(it) } ?: JsonValue.Str(raw)
+        }
+        if (text.contains(',') || text.contains('\n')) {
+            return JsonValue.Arr(splitList(text).map { JsonValue.Str(it) })
+        }
+        return JsonValue.Str(raw)
+    }
+
+    private fun splitList(text: String): List<String> =
+        text.split(',', '\n').map { it.trim() }.filter { it.isNotEmpty() }
 
     fun patchBody(expectedRevision: Long): String {
         val changes = staged.map { (key, value) ->
@@ -214,7 +268,7 @@ internal class Edition8ConfigDraft {
                 linkedMapOf(
                     "key" to JsonValue.Str(key),
                     "scope" to JsonValue.Str("user"),
-                    "value" to JsonValue.Str(value)
+                    "value" to value
                 )
             )
         }

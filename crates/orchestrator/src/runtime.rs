@@ -1311,12 +1311,19 @@ impl OrchestratorRuntime {
     ) -> Result<HashMap<String, WorkItemAssignment>, ExecError> {
         let mut violations =
             Self::assignment_shape_violations(run_id, plan, specs, rows, child_rows);
+        // ONE index, FIRST row wins (the historical `rows.iter().find`):
+        // the per-item scan made re-attach/spawn O(items · rows).
+        let mut rows_by_item: HashMap<&str, &WorkItemAssignment> =
+            HashMap::with_capacity(rows.len());
+        for row in rows {
+            rows_by_item.entry(row.item_id.as_str()).or_insert(row);
+        }
         let mut map = HashMap::new();
         for (index, item) in plan.work_items.iter().enumerate() {
             if !specs.get(&item.id).map(|s| s.spawn).unwrap_or(true) {
                 continue;
             }
-            let Some(row) = rows.iter().find(|a| a.item_id == item.id) else {
+            let Some(row) = rows_by_item.get(item.id.as_str()).copied() else {
                 violations.push(format!(
                     "work item {:?} (plan step {index}) has no durable assignment row; refusing to fabricate a child id after a crash",
                     item.id

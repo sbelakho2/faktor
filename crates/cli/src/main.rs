@@ -818,12 +818,14 @@ pub(crate) fn assistant_text(
     handle: &faktor_session::SessionHandle,
 ) -> faktor_core::Result<String> {
     let rows = handle.messages_before(None, 16)?;
+    let ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
+    let mut parts_by_message = handle.parts_for_messages(&ids)?;
     for row in rows {
         if row.role != "assistant" {
             continue;
         }
         let mut out = String::new();
-        for part in handle.parts_of(row.id)? {
+        for part in parts_by_message.remove(&row.id).unwrap_or_default() {
             if part.kind == "text" {
                 if let Some(text) = part.data.get("text").and_then(|v| v.as_str()) {
                     out.push_str(text);
@@ -1807,9 +1809,17 @@ pub(crate) fn doctor_storage_governor_line(
     lines: &mut Vec<String>,
     issues: &mut usize,
 ) {
-    let Some(governor) = crate::config::StorageCfg::existing_governor(data_dir) else {
-        lines.push("storage-governor: not initialized (next daemon start creates it)".into());
-        return;
+    let governor = match crate::config::StorageCfg::existing_governor_result(data_dir) {
+        Ok(Some(governor)) => governor,
+        Ok(None) => {
+            lines.push("storage-governor: not initialized (next daemon start creates it)".into());
+            return;
+        }
+        Err(error) => {
+            lines.push(format!("storage-governor: UNREADABLE ({error})"));
+            *issues += 1;
+            return;
+        }
     };
     match governor.metrics() {
         Ok(metrics) => {

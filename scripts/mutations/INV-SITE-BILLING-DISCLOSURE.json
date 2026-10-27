@@ -1,0 +1,16 @@
+{
+  "id": "INV-SITE-BILLING-DISCLOSURE",
+  "file": "crates/site/src/web/billing_pages.rs",
+  "find": "<p class=\\\"plan-alt-price\\\">or {} / year</p>",
+  "replace": "<p class=\\\"plan-desc\\\">or {} / year</p>",
+  "gate": "node --no-warnings apps/vscode/scripts/selftest.mjs",
+  "expect": "FAIL",
+  "timeout_ms": 180000,
+  "note": "The annual plan price is no longer a distinct disclosure line.",
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

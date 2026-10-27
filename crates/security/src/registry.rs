@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! Exact configured-secret registry (audit P0-38).
 //!
 //! [`SecretRegistry`] detects **exact** credentials (provider keys,
@@ -304,6 +305,18 @@ fn scan_exact_impl(payload: &[u8], fps: &[Fingerprint]) -> Vec<(usize, usize)> {
     }
     let mut hits = Vec::new();
     for (len, group) in by_len {
+        // Bucket the cohort by its 64-bit pre-filter. Without this map every
+        // sliding window scanned EVERY same-length secret (`group.iter().any`),
+        // i.e. O(payload x secrets-in-that-length-class); the map makes the
+        // hot loop O(payload) hash probes with verification only on a hit.
+        let mut by_roll: std::collections::HashMap<u64, Vec<&Fingerprint>> =
+            std::collections::HashMap::with_capacity(group.len());
+        for fingerprint in &group {
+            by_roll
+                .entry(fingerprint.roll)
+                .or_default()
+                .push(fingerprint);
+        }
         let mut hash = 0u64;
         let mut pow = 1u64;
         for _ in 0..len.saturating_sub(1) {
@@ -317,14 +330,12 @@ fn scan_exact_impl(payload: &[u8], fps: &[Fingerprint]) -> Vec<(usize, usize)> {
                 hash = hash.wrapping_sub(pow.wrapping_mul(payload[i - len] as u64));
                 hash = hash.wrapping_mul(ROLL_BASE).wrapping_add(*b as u64);
                 let cand_start = i + 1 - len;
-                if group.iter().any(|f| f.roll == hash) {
-                    for f in &group {
-                        if f.roll == hash {
-                            // Verify: never trust the 64-bit pre-filter.
-                            let slice = &payload[cand_start..cand_start + len];
-                            if sha256(slice) == f.digest {
-                                hits.push((cand_start, len));
-                            }
+                if let Some(candidates) = by_roll.get(&hash) {
+                    let slice = &payload[cand_start..cand_start + len];
+                    for f in candidates {
+                        // Verify: never trust the 64-bit pre-filter.
+                        if sha256(slice) == f.digest {
+                            hits.push((cand_start, len));
                         }
                     }
                 }
@@ -332,9 +343,9 @@ fn scan_exact_impl(payload: &[u8], fps: &[Fingerprint]) -> Vec<(usize, usize)> {
                 hash = hash.wrapping_mul(ROLL_BASE).wrapping_add(*b as u64);
                 if i + 1 == len {
                     let cand_start = 0;
-                    if group.iter().any(|f| f.roll == hash) {
-                        for f in &group {
-                            if f.roll == hash && sha256(&payload[..len]) == f.digest {
+                    if let Some(candidates) = by_roll.get(&hash) {
+                        for f in candidates {
+                            if sha256(&payload[..len]) == f.digest {
                                 hits.push((cand_start, len));
                             }
                         }
@@ -895,6 +906,34 @@ mod tests {
         assert!(reg.scan_exact(&out).is_empty(), "{out:?}");
         assert_eq!(&out[..2], &[0u8, 0xff]);
         assert_eq!(*out.last().unwrap(), 0u8);
+    }
+
+    #[test]
+    fn exact_scan_stays_linear_with_hundreds_of_same_length_secrets() {
+        // The pre-filter must index by rolling hash: a per-window scan of all
+        // same-length fingerprints is O(payload x secrets). 512 secrets and a
+        // 1 MiB payload separate linear from that quadratic shape.
+        let mut reg = SecretRegistry::new();
+        let mut last = Vec::new();
+        for index in 0..512u32 {
+            let mut secret = vec![b'k'; 32];
+            secret[..4].copy_from_slice(&index.to_le_bytes());
+            reg.register(&secret);
+            last = secret;
+        }
+        let mut payload = vec![b'x'; 1 << 20];
+        let offset = payload.len();
+        payload.extend_from_slice(&last);
+        let started = std::time::Instant::now();
+        let hits = reg.scan_exact(&payload);
+        let elapsed = started.elapsed();
+        assert_eq!(hits.len(), 1, "exactly the planted secret is found");
+        assert_eq!(hits[0].offset, offset);
+        assert_eq!(hits[0].len, 32);
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "1 MiB x 512 same-length secrets took {elapsed:?}; the rolling-hash index regressed"
+        );
     }
 
     #[test]

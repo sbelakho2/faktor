@@ -262,8 +262,17 @@ const CHECKS = {
   A19: async () => {
     const rule = control('Q-04');
     const display = control('X-12');
+    const ruleBinding = bindingOf8('Q-04');
+    const displayBinding = bindingOf8('X-12');
     return {
-      pass: bindingOf8('Q-04').configKey === 'faktor.sandbox.shell' && bindingOf8('X-12').configKey === 'faktor.sandbox.shell',
+      pass:
+        ruleBinding.kind === 'read' &&
+        ruleBinding.route.path === '/native/permissions/policy' &&
+        ruleBinding.configKey === null &&
+        displayBinding.kind === 'read' &&
+        displayBinding.route.path === '/native/permissions/policy' &&
+        displayBinding.configKey === null &&
+        /normaliz|compound|interpreter|symlink|prefix/i.test(rule?.control.behavior ?? ''),
       observations: [rule?.valueText ?? '', display?.routeText ?? '', rule?.control.behavior.slice(0, 100) ?? ''],
     };
   },

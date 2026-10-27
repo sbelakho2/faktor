@@ -157,6 +157,74 @@ async fn acceptance_a11_a12_context_usage_null_then_authoritative() {
 /// A15 + S10/K-03/K-04: an explicit compaction operation is durable,
 /// post-inspection survives, a stale expected revision refuses, and a cancel
 /// after the terminal state returns the exact terminal row (no rewrite).
+/// The legacy `/context/compact` route must not claim a reduction while the
+/// live context is untouched: it now commits the same replacement checkpoint
+/// (and the truthful archive marker) as the durable operation route.
+#[tokio::test]
+async fn legacy_compact_route_persists_its_replacement_context() {
+    let rig = Rig::new().await;
+    let handle = rig.handle();
+    for turn in 0..20 {
+        let seq = handle
+            .force_append_event(
+                faktor_core::event::EventKind::ModelChunkReceived,
+                faktor_core::state::AgentState::ReadyForNextTurn,
+                None,
+                None,
+            )
+            .unwrap();
+        let message = handle
+            .put_message(
+                seq.raw() as i64,
+                if turn % 2 == 0 { "user" } else { "assistant" },
+                json!({"parts": []}),
+            )
+            .unwrap();
+        handle
+            .put_text_part(message, &format!("LEGACY-{turn:03} {}", "h".repeat(3_000)))
+            .unwrap();
+    }
+    let path = format!("/native/session/{}/context/compact", rig.session);
+    let (status, compacted) = rig
+        .send(
+            reqwest::Method::POST,
+            &path,
+            Some(json!({
+                "operationId": "op-legacy-compact",
+                "targetTokens": 4_000,
+                "minReductionRatio": 0.25
+            })),
+        )
+        .await;
+    assert_eq!(status, 200, "{compacted}");
+    assert_eq!(compacted["accepted"], true, "{compacted}");
+    let checkpoint = handle
+        .context_checkpoint()
+        .unwrap()
+        .expect("the route persisted a replacement");
+    let kept: Vec<faktor_context::RecentTurn> =
+        serde_json::from_slice(&checkpoint.payload).unwrap();
+    assert!(
+        kept.iter().any(|turn| turn.text.contains("LEGACY-019")),
+        "the active tail survives: {kept:?}"
+    );
+    assert!(
+        !kept.iter().any(|turn| turn.text.contains("LEGACY-000")),
+        "the oldest turn is archived: {kept:?}"
+    );
+    assert!(
+        !kept
+            .iter()
+            .any(|turn| turn.text.contains("<artifact://hash>")),
+        "no dangling placeholder survives: {kept:?}"
+    );
+    assert!(
+        kept.iter()
+            .any(|turn| turn.text.contains("archive unavailable")),
+        "the no-CAS rig records the truthful archive state: {kept:?}"
+    );
+}
+
 #[tokio::test]
 async fn acceptance_a15_long_task_compaction_operation_contract() {
     let rig = Rig::new().await;
@@ -226,6 +294,36 @@ async fn acceptance_a15_long_task_compaction_operation_contract() {
         !kept.iter().any(|turn| turn.text.contains("TURN-000")),
         "the oldest turn must be archived, not kept as a 'newest' suffix: {kept:?}"
     );
+    // The evicted turns are durable and the checkpoint names the truth:
+    // never the compactor's `<artifact://hash>` placeholder. This rig's agent
+    // CAS is absent, so the correct outcome is the explicit unavailable
+    // marker (the production CAS path is covered by the agent archive probe;
+    // a dangling ref would invite fallback re-derivation).
+    assert!(
+        !kept
+            .iter()
+            .any(|turn| turn.text.contains("<artifact://hash>")),
+        "no placeholder may survive into the durable replacement"
+    );
+    match rig.deps.agent.deps().cas.as_ref() {
+        Some(cas) => {
+            let archive_text = kept
+                .iter()
+                .find_map(|turn| turn.text.split("artifact://").nth(1))
+                .expect("the evicted turns ride behind a manifest artifact ref");
+            let hash_hex = archive_text
+                .split(|c: char| !c.is_ascii_hexdigit())
+                .next()
+                .unwrap();
+            let hash = faktor_core::hash::FileHash::from_hex(hash_hex).expect("manifest hash");
+            assert!(cas.has(hash), "the checkpoint's artifact ref resolves");
+        }
+        None => assert!(
+            kept.iter()
+                .any(|turn| turn.text.contains("archive unavailable")),
+            "without a CAS the replacement states that truth: {kept:?}"
+        ),
+    }
     // Duplicate op id is idempotent: the same durable outcome, no re-run.
     let (status, replay) = rig
         .send(

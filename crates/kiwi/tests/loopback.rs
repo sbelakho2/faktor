@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! Loopback integration tests for the Kiwi external verification provider:
 //! request shape, counterexample ingestion, hostile/malformed/oversized
 //! response refusals, deadlines/watchdog, auth headers, and dispatch.

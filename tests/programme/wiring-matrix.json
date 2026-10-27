@@ -297,5 +297,103 @@
       "state": "unwired",
       "reason": "stored-only descriptor; read-only in this build"
     }
+  },
+  "controls": {
+    "B-03": {
+      "kind": "config",
+      "method": "POST",
+      "path": "/native/config/commit",
+      "effect": "integer percent (1..=100) staged into config.commit"
+    },
+    "B-09": {
+      "kind": "read",
+      "method": "GET",
+      "path": "/native/config/snapshot",
+      "effect": "effective limits read; never an empty commit"
+    },
+    "B-10": {
+      "kind": "read",
+      "method": "GET",
+      "path": "/native/session/:session/task-runs",
+      "effect": "served task-run state/deadline fact"
+    },
+    "B-11": {
+      "kind": "read",
+      "method": "GET",
+      "path": "/native/health",
+      "effect": "observed connectivity; no fake retry"
+    },
+    "B-12": {
+      "kind": "read",
+      "method": "GET",
+      "path": "/native/session/:session/tasks",
+      "effect": "served admission receipt identity"
+    },
+    "C-09": {
+      "kind": "config",
+      "method": "POST",
+      "path": "/native/config/commit",
+      "effect": "closed enum selection staged into config.commit"
+    },
+    "C-11": {
+      "kind": "read",
+      "method": "GET",
+      "path": "/native/index/coverage?session=:session",
+      "effect": "served coverage; reindex is not advertised as served"
+    },
+    "D-12": {
+      "kind": "host",
+      "method": "GET",
+      "path": "host",
+      "effect": "host-local notification classes; no telemetry write"
+    },
+    "Q-02": {
+      "kind": "read",
+      "method": "GET",
+      "path": "/native/permissions/policy",
+      "effect": "served per-tool policy; never writes the allowed-tools list"
+    },
+    "T-02": {
+      "kind": "config",
+      "method": "POST",
+      "path": "/native/config/commit",
+      "effect": "string-list allowed tools staged into config.commit"
+    },
+    "T-08": {
+      "kind": "config",
+      "method": "POST",
+      "path": "/native/config/commit",
+      "effect": "string-list per-MCP tools staged into config.commit"
+    },
+    "V-01": {
+      "kind": "read",
+      "method": "GET",
+      "path": "/native/session/:session/verification",
+      "effect": "served candidate state; no unserved diff action"
+    },
+    "Q-03": {
+      "kind": "read",
+      "method": "GET",
+      "path": "/native/permissions/policy",
+      "effect": "served file-scope rules; never writes sandbox.shell"
+    },
+    "Q-04": {
+      "kind": "read",
+      "method": "GET",
+      "path": "/native/permissions/policy",
+      "effect": "served command rules; never writes sandbox.shell"
+    },
+    "X-12": {
+      "kind": "read",
+      "method": "GET",
+      "path": "/native/permissions/policy",
+      "effect": "served approval/sandbox state; never writes sandbox.shell"
+    },
+    "O-01": {
+      "kind": "read",
+      "method": "GET",
+      "path": "/native/config/search?q=:query",
+      "effect": "daemon search query; the same field filters the already-served catalog locally"
+    }
   }
 }

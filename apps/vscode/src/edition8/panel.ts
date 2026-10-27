@@ -307,6 +307,26 @@ class Edition8Controller {
         if (this.state.snapshot?.binding?.session !== null && payload.session === undefined) {
           payload.session = this.state.snapshot?.binding?.session ?? null;
         }
+        if (controlId === 'Q-07') {
+          const toolId = typeof payload.tool_id === 'string' ? payload.tool_id.trim() : '';
+          const target = typeof payload.target === 'string' ? payload.target.trim() : '';
+          const decision = payload.decision;
+          if (toolId.length === 0 || target.length === 0) {
+            this.post({
+              type: 'e8Error',
+              message:
+                'A remembered rule needs an explicit tool_id and target. Paste the rule JSON in the request payload; nothing was sent.',
+            });
+            return;
+          }
+          if (decision !== 'allow' && decision !== 'ask' && decision !== 'deny') {
+            this.post({
+              type: 'e8Error',
+              message: 'Set the remembered rule decision to allow, ask or deny; nothing was sent.',
+            });
+            return;
+          }
+        }
         if (controlId === 'Q-06') {
           if (payload.decision !== 'allow' && payload.decision !== 'deny') {
             this.post({ type: 'e8Error', message: 'Choose Allow once or Deny before sending a decision. Nothing was sent.' });

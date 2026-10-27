@@ -199,7 +199,7 @@ export const SITE_COMMERCIAL_ACTIONS = [
     id: 'site.invoices_export',
     file: 'crates/site/src/routes/account.rs',
     handler: 'invoices_export',
-    service: /state\.payments\.export_invoices\s*\(/,
+    service: /state\s*\.\s*payments\s*\.\s*export_invoices(?:_page)?\s*\(/,
   },
   {
     id: 'site.usage_read',

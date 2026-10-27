@@ -4,7 +4,7 @@
 // model. The webview script performs local interaction only (selection,
 // staging, disclosure) and never invents a daemon value.
 
-import { E8_SCREENS, type E8Control, type E8Screen } from '../generated/edition8Registry.ts';
+import { E8_CONTROLS, E8_SCREENS, type E8Control, type E8Screen } from '../generated/edition8Registry.ts';
 import {
   destinationOf,
   screenView,
@@ -217,6 +217,12 @@ function controlInput(control: E8Control, view: E8ControlView): string {
   const disabled = view.disabled ? ' disabled' : '';
   const describedBy = `e8-desc-${control.id}`;
   const common = `id="${id}" data-input="${control.id}" data-kind="${binding.input}" aria-describedby="${describedBy}"`;
+  if (control.id === 'O-01') {
+    return `<div class="e8-search">
+      <input type="search" ${common} data-action-input="O-01" data-settings-search="O-01" placeholder="Filter settings by name, key or description" autocomplete="off" spellcheck="false"${disabled} />
+      <p class="e8-search-count" data-settings-count aria-live="polite"></p>
+    </div>`;
+  }
   switch (binding.input) {
     case 'toggle':
       return `<label class="e8-toggle"><input type="checkbox" ${common}${view.configValue === true ? ' checked' : ''}${disabled} /> <span>Enabled</span></label>`;
@@ -300,6 +306,10 @@ function actionButton(view: E8ControlView): string {
   // Config controls are applied through the single screen/footer action. The
   // activation path remains for secret-reference/money controls so every
   // contract role still has a focusable element.
+  if (control.id === 'O-01') {
+    const disabled = view.disabled ? ' disabled aria-disabled="true"' : '';
+    return `<button type="button" class="e8-secondary e8-action" data-activate="${control.id}"${disabled}>${esc(actionLabel(view))}</button>`;
+  }
   if (binding.input === 'secret-ref' || binding.input === 'money') {
     const disabled = view.disabled ? ' disabled aria-disabled="true"' : '';
     return `<button type="button" class="e8-secondary e8-action e8-hidden-action" data-activate="${control.id}"${disabled}>${esc(actionLabel(view))}</button>`;
@@ -332,15 +342,16 @@ function controlMarkup(view: E8ControlView): string {
     <div class="e8-control-main">
       <div class="e8-control-copy">
         <div class="e8-control-head">
-          <h3 id="e8-name-${control.id}" class="e8-control-name">${esc(control.name)}</h3>
+          <h3 id="e8-name-${control.id}" class="e8-control-name">${esc(view.label)}</h3>
           ${status}
           <span class="e8-state-badge" data-state="${view.state}">${esc(view.state)}</span>
         </div>
+        <p class="e8-descriptor">${esc(view.description)}</p>
         <p id="e8-desc-${control.id}" class="e8-help">${esc(shownValue)}</p>
         <p class="e8-control-state" data-control-state="${control.id}">${esc(view.stateText)}</p>
       </div>
       <div class="e8-control-value">
-        ${binding.input === 'action' ? control.id === 'Q-06' ? '' : '<span class="e8-field-label">Action</span>' : binding.input === 'toggle' ? '' : `<label for="e8-input-${control.id}" class="e8-field-label">${binding.input === 'readonly' ? 'Served value' : 'Value'}</label>`}
+        ${binding.input === 'action' ? control.id === 'Q-06' ? '' : '<span class="e8-field-label">Action</span>' : binding.input === 'toggle' ? '' : `<label for="e8-input-${control.id}" class="e8-field-label">${binding.input === 'readonly' ? 'Served value' : control.id === 'O-01' ? 'Search settings' : 'Value'}</label>`}
         ${controlInput(control, view)}
         ${decisionMarkup(view)}
         ${actionButton(view)}
@@ -401,8 +412,11 @@ function surfaceNote(screen: E8ScreenView): string {
   return notes[surface] ?? notes.sidebar;
 }
 
-function primaryMarkup(primary: PrimaryAction, screen: E8ScreenView, host: 'vscode' | 'jetbrains'): string {
+function primaryMarkup(primary: PrimaryAction, screen: E8ScreenView, host: 'vscode' | 'jetbrains', mode: 'shell' | 'settings'): string {
   if (primary.kind === 'apply') {
+    // Settings mode has ONE apply in the footer; a second per-screen primary
+    // would compete with it and invite a partial commit.
+    if (mode === 'settings') return '';
     return `<button type="button" class="e8-primary" data-primary-apply="true" disabled aria-keyshortcuts="Control+Enter Meta+Enter">${esc(primary.label)}</button>
       <span class="e8-action-note">Staged changes are not written until this commit.</span>`;
   }
@@ -438,7 +452,7 @@ function primaryScreenLinkMarkup(screenId: string): string {
   return `<button type="button" class="e8-primary" data-open-screen="${esc(link.screen)}">${esc(link.label)}</button>`;
 }
 
-function screenMarkup(screen: E8ScreenView, initial: boolean, host: 'vscode' | 'jetbrains'): string {
+function screenMarkup(screen: E8ScreenView, initial: boolean, host: 'vscode' | 'jetbrains', mode: 'shell' | 'settings'): string {
   const screenEntry = screen.screen;
   const primary = primaryActionFor(screen);
   const showControls = screen.controls.length > 0;
@@ -464,7 +478,7 @@ function screenMarkup(screen: E8ScreenView, initial: boolean, host: 'vscode' | '
         <span class="e8-status" data-level="${screen.statusLevel}" role="status" aria-live="polite"><span aria-hidden="true">${statusGlyph(screen.statusLevel)}</span> <span data-status-text>${esc(screen.status)}</span></span>
       </div>
       <p class="e8-purpose">${esc(GROUP_SUMMARY[screenEntry.group] ?? screenEntry.job)}</p>
-      <div class="e8-primary-row">${primaryMarkup(primary, screen, host)}${primaryScreenLinkMarkup(screenEntry.id)}${secondaryMarkup(screenEntry.id)}</div>
+      <div class="e8-primary-row">${primaryMarkup(primary, screen, host, mode)}${primaryScreenLinkMarkup(screenEntry.id)}${secondaryMarkup(screenEntry.id)}</div>
       <details class="e8-screen-details">
         <summary>Screen contract and traceability</summary>
         <dl class="e8-screen-contract">
@@ -487,6 +501,99 @@ function screenMarkup(screen: E8ScreenView, initial: boolean, host: 'vscode' | '
     ${controlsMarkup}
     ${rowsFirst ? '' : rowsMarkup}
   </section>`;
+}
+
+
+/**
+ * The one searchable settings surface. The 72-screen registry stays the
+ * contract, but a person configures by domain, not by screen ID: providers
+ * and models, context and compaction, tools and MCP, permissions, billing
+ * and appearance. Advanced screens stay behind one disclosure per domain.
+ */
+interface SettingsDomain {
+  readonly key: string;
+  readonly label: string;
+  readonly description: string;
+}
+
+const SETTINGS_DOMAINS: readonly SettingsDomain[] = [
+  { key: 'providers', label: 'Providers and models', description: 'Connections, default models and generation tuning.' },
+  { key: 'context', label: 'Context and compaction', description: 'Sources, attachments, memory, rules and compaction.' },
+  { key: 'tools', label: 'Tools and MCP', description: 'Tool authority, MCP servers, skills, hooks and terminals.' },
+  { key: 'permissions', label: 'Permissions', description: 'One effective policy, sandbox isolation and remembered rules.' },
+  { key: 'billing', label: 'Billing and usage', description: 'Entitlements, quota, spend and the account connection.' },
+  { key: 'appearance', label: 'Appearance and general', description: 'Budgets, display, diagnostics and revision conflicts.' },
+];
+
+const SETTINGS_ADVANCED = new Set(['S21', 'S28', 'S30', 'S31', 'S55', 'S56', 'S58', 'S60', 'S64']);
+
+function settingsDomainFor(screen: E8Screen): string {
+  if (screen.group === 'Models and providers') return 'providers';
+  if (screen.group === 'Context' || screen.group === 'Instructions and memory') return 'context';
+  if (screen.id === 'S16' || screen.id === 'S17' || screen.id === 'S18' || screen.id === 'S19' || screen.id === 'S20' || screen.id === 'S15' || screen.id === 'S68') return 'tools';
+  if (screen.id === 'S13' || screen.id === 'S57' || screen.id === 'S67') return 'permissions';
+  if (screen.group === 'Usage') return 'billing';
+  return 'appearance';
+}
+
+function settingsDescription(screen: E8Screen): string {
+  const prefix = `${screen.group}. `;
+  const body = screen.job.startsWith(prefix) ? screen.job.slice(prefix.length) : screen.job;
+  const first = body.split('. ')[0].trim();
+  return first.length === 0 ? (GROUP_SUMMARY[screen.group] ?? screen.job) : first;
+}
+
+function settingsRow(screen: E8Screen): string {
+  const summary = settingsDescription(screen);
+  const controlNames = screen.controls
+    .map((id) => E8_CONTROLS.find((control) => control.id === id)?.name ?? id)
+    .slice(0, 3)
+    .join(' ');
+  const search = `${screen.id} ${screen.title} ${screen.group} ${summary} ${controlNames}`.toLowerCase();
+  return `<button type="button" class="e8-settings-row" data-settings-open="${esc(screen.id)}" data-settings-search="${esc(search)}" data-settings-row>
+    <span class="e8-settings-row-title">${esc(screen.title)}</span>
+    <span class="e8-settings-row-desc">${esc(summary)}</span>
+    <span class="e8-settings-row-id">${esc(screen.id)}</span>
+  </button>`;
+}
+
+function settingsHomeMarkup(): string {
+  const screens = screensFor('settings');
+  const domains = SETTINGS_DOMAINS.map((domain) => {
+    const rows = screens.filter((screen) => settingsDomainFor(screen) === domain.key);
+    const primary = rows.filter((screen) => !SETTINGS_ADVANCED.has(screen.id));
+    const advanced = rows.filter((screen) => SETTINGS_ADVANCED.has(screen.id));
+    const advancedMarkup = advanced.length === 0
+      ? ''
+      : `<details class="e8-settings-advanced"><summary>Advanced · ${advanced.length}</summary>${advanced.map(settingsRow).join('')}</details>`;
+    return `<section class="e8-settings-domain" data-settings-domain="${domain.key}">
+      <header class="e8-settings-domain-head">
+        <h3>${esc(domain.label)}</h3>
+        <p>${esc(domain.description)}</p>
+      </header>
+      <div class="e8-settings-rows">${primary.map(settingsRow).join('')}</div>
+      ${advancedMarkup}
+    </section>`;
+  }).join('');
+  return `<div class="e8-settings-route">
+  <button type="button" id="e8-settings-back" class="e8-secondary e8-settings-back" data-settings-back hidden>Back to settings</button>
+  <section id="e8-settings-home" class="e8-settings-home" aria-labelledby="e8-settings-title">
+    <header class="e8-settings-head">
+      <div>
+        <h2 id="e8-settings-title">Settings</h2>
+        <p class="e8-settings-lead">One surface for every persistent setting. Values are staged locally; the one Apply action commits them together.</p>
+      </div>
+      <label class="e8-search e8-settings-search"><span class="sr-only">Search settings</span><input type="search" id="e8-settings-search" data-settings-global-search placeholder="Search settings by name, domain or description" autocomplete="off" spellcheck="false" /></label>
+      <p class="e8-settings-search-count" data-settings-global-count role="status" aria-live="polite">${screens.length} settings screens</p>
+    </header>
+    <div class="e8-settings-save" role="status" aria-live="polite">
+      <span id="e8-settings-save-state" data-state="clean">Autosave is off — no staged changes.</span>
+      <button type="button" class="e8-secondary" data-settings-review>Review staged changes</button>
+    </div>
+    ${domains}
+    <p class="e8-settings-empty" data-settings-empty hidden>No setting matches this search.</p>
+  </section>
+  </div>`;
 }
 
 function screenBrowser(destination: E8Destination, initialScreen: string): string {
@@ -521,13 +628,13 @@ function screenBrowser(destination: E8Destination, initialScreen: string): strin
   </details>`;
 }
 
-function destinationMarkup(destination: E8Destination, state: E8PanelState, initialScreen: string, host: 'vscode' | 'jetbrains'): string {
+function destinationMarkup(destination: E8Destination, state: E8PanelState, initialScreen: string, host: 'vscode' | 'jetbrains', mode: 'shell' | 'settings'): string {
   const screens = screensFor(destination);
   const visible = screens.some((screen) => screen.id === initialScreen);
   return `<div class="e8-destination" data-destination-panel="${destination}"${visible ? '' : ' hidden'}>
     ${screenBrowser(destination, initialScreen)}
     <div class="e8-screens-host">
-      ${screens.map((screen) => screenMarkup(screenView(screen.id, state), screen.id === initialScreen && visible, host)).join('\n')}
+      ${screens.map((screen) => screenMarkup(screenView(screen.id, state), screen.id === initialScreen && visible && mode !== 'settings', host, mode)).join('\n')}
     </div>
   </div>`;
 }
@@ -583,8 +690,9 @@ export function renderEdition8Html(options: Edition8HtmlOptions): string {
       : ''
   }
   <main id="e8-main">
+    ${mode === 'settings' ? settingsHomeMarkup() : ''}
     ${destinations
-      .map((destination) => destinationMarkup(destination, options.state, initial, options.host))
+      .map((destination) => destinationMarkup(destination, options.state, initial, options.host, mode))
       .join('\n')}
   </main>
   <footer class="e8-footer" id="e8-footer" aria-label="Draft and apply" hidden>

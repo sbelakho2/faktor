@@ -1,0 +1,28 @@
+{
+  "id": "INV-BILLING-CROSS-EVENT-SETTLED-ONCE",
+  "surface": "payments.billing",
+  "files": [
+    {
+      "file": "crates/payments/src/service/webhook_effects.rs",
+      "find": "            if payment.status == PaymentStatus::Succeeded {\n                return Ok(WebhookEffects::default());\n            }\n",
+      "replace": "            // mutated: already-settled payments fall through\n"
+    },
+    {
+      "file": "crates/payments/src/service/webhook_effects.rs",
+      "find": "            if !payment.status.can_transition_to(PaymentStatus::Succeeded) {\n                return Ok(WebhookEffects::default());\n            }\n",
+      "replace": "            if !payment.status.can_transition_to(PaymentStatus::Succeeded)\n                && payment.status != PaymentStatus::Succeeded\n            {\n                return Ok(WebhookEffects::default());\n            }\n"
+    }
+  ],
+  "gate": "cargo test -p faktor-payments --test lifecycle cross_event_settlement_never_credits_twice_and_partial_paid_total_is_exact",
+  "expect": "FAILED",
+  "note": "Removing the settled-payment guard lets invoice.paid followed by payment.succeeded add the amount twice because the event ids differ.",
+  "capabilities": [
+    "payments.invoice_truth"
+  ],
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

@@ -661,7 +661,7 @@ fn decode_checkpoint_with_seq(
 
 /// Load the LOGICAL history (checkpoint replacement + strictly newer rows)
 /// bounded by messages and bytes. Parts are loaded in one batch, never N+1.
-fn load_turns(
+pub(super) fn load_turns(
     deps: &ServerDeps,
     handle: &faktor_session::SessionHandle,
     max_messages: u64,
@@ -906,7 +906,7 @@ async fn execute_compaction(
             )
         }
     };
-    let plan = compactor
+    let mut plan = compactor
         .compact(
             &turns,
             &ledger,
@@ -931,6 +931,19 @@ async fn execute_compaction(
         )
         .map_err(|e| api_err(&e));
     }
+    // Persist the evicted turns BEFORE the checkpoint names them: the
+    // manifest content address replaces the compactor's placeholder, or an
+    // explicit "archive unavailable" marker replaces it when the CAS is
+    // absent/refusing. Committing a dangling `<artifact://hash>` made the
+    // model believe the archived context was retrievable and re-derive it.
+    let _ = faktor_agent::runtime::mark_evicted_compaction_archives(
+        state.deps.agent.deps().cas.as_deref(),
+        &mut plan,
+    );
+    let _ = faktor_agent::runtime::attach_compaction_archive(
+        state.deps.agent.deps().cas.as_deref(),
+        &mut plan,
+    );
     // The replacement context is bound to the window THIS operation loaded,
     // never to a re-read of the checkpoint: a corrupt head's high-water mark
     // was already refused by `load_turns` (base_seq = None), and a concurrent

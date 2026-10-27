@@ -1,7 +1,7 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! `connection`: cohesive slice of the mechanically decomposed parent module.
 
 use super::*;
-
 use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
 

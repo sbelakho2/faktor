@@ -438,6 +438,11 @@ section_static_authority() {
     cargo test -p faktor-tests-static-authority
 }
 
+section_superlinearity() {
+    node scripts/check-superlinearity.mjs --selftest &&
+        node scripts/check-superlinearity.mjs
+}
+
 section_test_separation() {
     node scripts/check-test-separation.mjs --selftest &&
         node scripts/check-test-separation.mjs --check &&
@@ -705,6 +710,7 @@ else
     else
         add_skip static-authority "static-authority crate absent from this workspace"
     fi
+    add_section section_superlinearity superlinearity "static superlinearity budget"
     if [ -f tests/fault/Cargo.toml ]; then
         add_section section_fault_smoke fault-smoke "fault campaign smoke"
     else
@@ -924,6 +930,7 @@ emit_manifest() {
         printf '      "workspace_tests": %s,\n' "$(section_passed workspace-tests)"
         printf '      "fault_smoke": %s,\n' "$(section_passed fault-smoke)"
         printf '      "static_authority": %s,\n' "$(section_passed static-authority)"
+        printf '      "superlinearity": %s,\n' "$(section_passed superlinearity)"
         printf '      "test_separation": %s,\n' "$(section_passed test-separation)"
         printf '      "doctor_deep": %s,\n' "$(section_passed doctor-deep)"
         printf '      "release_cli_doctor": %s,\n' "$(section_passed release-cli)"

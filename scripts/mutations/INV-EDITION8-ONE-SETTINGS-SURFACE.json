@@ -1,0 +1,16 @@
+{
+  "id": "INV-EDITION8-ONE-SETTINGS-SURFACE",
+  "file": "apps/vscode/src/edition8/html.ts",
+  "find": "    ${mode === 'settings' ? settingsHomeMarkup() : ''}",
+  "replace": "    ${''}",
+  "gate": "node --no-warnings apps/vscode/scripts/selftest.mjs",
+  "expect": "FAIL",
+  "timeout_ms": 180000,
+  "note": "Settings falls back to the per-screen registry browser instead of the one searchable domain surface.",
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

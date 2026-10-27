@@ -347,6 +347,20 @@ class FaktorChatPanel(
 
     private val runSummaryArea = JTextArea(3, 24)
 
+    // The compact sticky Work status row: state, run, tokens and approvals
+    // only. Run details (goal, phase, candidate boundary) live in Inspect.
+    private val workStateChip = statusChip("Ready", SemanticState.DIM)
+
+    private val workRunLabel = mutedLabel("No active run")
+
+    private val workTokensLabel = mutedLabel("Tokens —")
+
+    private val workApprovalLabel = mutedLabel("No approvals")
+
+    private val workDetailsButton = secondaryButton("Details")
+
+    private val workStopButton = secondaryButton("Stop")
+
     // T06: the composer's ready/empty state — the exact design label+copy
     // render while the composer holds no draft; the existing Run task control
     // is the action. Typing hides the row (the state IS the empty composer).
@@ -362,6 +376,9 @@ class FaktorChatPanel(
     private var currentRunView: NativeTaskView? = null
 
     private var currentRunStateTag: String? = null
+
+    /** The moved run-details surface (Inspect › Overview › Run details). */
+    private var runDetailsPanel: JComponent? = null
 
     // The served proof task state of the current run (`GET
     // /native/tasks/{id}/proof` -> `task.state`): the ONLY source of the T12
@@ -561,6 +578,7 @@ class FaktorChatPanel(
         attachments.onNotice = { message -> onEdt { appendSystem(message) } }
         buildLayout()
         wireActions()
+        updateWorkStatus()
         setControlsEnabled(false)
         val scope = controlPlaneScopeStore?.read()
         if (scope != null) {
@@ -860,6 +878,7 @@ class FaktorChatPanel(
                 "Overview",
                 listOf(
                     inspectDetail("Overview", overviewPanel),
+                    inspectDetail("Run details", runDetailsPanel ?: JPanel()),
                     inspectDetail("Blockers", blockersPanel),
                     inspectDetail("Terminal", terminalPanel)
                 )
@@ -935,24 +954,26 @@ class FaktorChatPanel(
      * budget and the attachments.
      */
     private fun buildWorkPlane() {
-        // S01 cockpit identity: the selected run default, the context
-        // authority and the attention rail. These are real served/local
-        // values; context usage stays Unavailable until a durable read.
-        edition5ModelButton.a11y("Choose model", "Opens the native model picker over the served catalog.")
-        edition5ModelButton.addActionListener { openEdition5ModelPicker() }
-        edition5ContextButton.a11y("Open context inspector", "Shows capacity, sources and compaction.")
-        edition5ContextButton.addActionListener {
-            selectCluster("Inspect")
-            selectInspectDetail("Context", "Manifest")
-        }
-        val cockpit = wrapRow(
-            edition5ModelLabel, edition5ModelButton,
-            edition5ContextLabel, edition5ContextButton,
-            edition5Attention
-        )
-        cockpit.background = panelSurface()
-        cockpit.border = BorderFactory.createEmptyBorder(Spacing.XS, Spacing.M, Spacing.XS, Spacing.M)
-        workPlane.add(cockpit, BorderLayout.NORTH)
+        // The Work status row is the whole persistent chrome above the
+        // conversation: state, the active run, exact tokens and pending
+        // approvals. Everything else (model, context, goal, plan, candidate)
+        // stays in Task options, Inspect or Settings.
+        workStateChip.a11y("Run state", "The served state of the current run.")
+        workRunLabel.a11y("Active run", "The phase or identity of the current run.")
+        workTokensLabel.a11y("Token usage", "Exact spent and limit tokens served for this run.")
+        workApprovalLabel.a11y("Pending approvals", "The number of requests waiting for a decision.")
+        workDetailsButton.toolTipText = "Open the run details in Inspect"
+        workDetailsButton.a11y("Open run details", "Opens the full run summary in Inspect.")
+        workDetailsButton.addActionListener { inspectCurrentRun() }
+        workStopButton.toolTipText = "Cancel the selected task run"
+        workStopButton.a11y("Stop the current run", "Requests cancellation of the selected task run.")
+        workStopButton.addActionListener { cancelRunButton.doClick() }
+        val statusBody = pageColumn(gap = Spacing.XS, padding = 0)
+        statusBody.add(wrapRow(workStateChip, workRunLabel, workTokensLabel, workApprovalLabel))
+        statusBody.add(actionRow(workDetailsButton, workStopButton))
+        statusBody.background = panelSurface()
+        statusBody.border = BorderFactory.createEmptyBorder(Spacing.XS, Spacing.M, Spacing.XS, Spacing.M)
+        workPlane.add(statusBody, BorderLayout.NORTH)
 
         val transcriptBody = JPanel(BorderLayout())
         transcriptBody.isOpaque = false
@@ -1002,7 +1023,9 @@ class FaktorChatPanel(
         cancelRunButton.toolTipText = "Cancel the selected task run"
         cancelRunButton.a11y("Cancel selected run", "Cancels the selected task run.")
         runsBody.add(actionRow(inspectRunsButton, cancelRunButton))
-        south.add(card("Current run", runsBody))
+        // Run details are an Inspect destination, never a persistent board
+        // between the conversation and the composer.
+        runDetailsPanel = card("Run details", runsBody)
 
         // The bounded Work attention card sits ABOVE the composer (hidden
         // while nothing is pending): the live pending request set with its
@@ -1052,6 +1075,22 @@ class FaktorChatPanel(
         })
         composerBody.add(composerReadyRow)
         updateComposerReady()
+        // Model, context and attention stay one quiet composer row: they are
+        // configuration beside the draft, not a second transcript header.
+        edition5ModelButton.a11y("Choose model", "Opens the native model picker over the served catalog.")
+        edition5ModelButton.addActionListener { openEdition5ModelPicker() }
+        edition5ContextButton.a11y("Open context inspector", "Shows capacity, sources and compaction.")
+        edition5ContextButton.addActionListener {
+            selectCluster("Inspect")
+            selectInspectDetail("Context", "Manifest")
+        }
+        composerBody.add(
+            wrapRow(
+                edition5ModelLabel, edition5ModelButton,
+                edition5ContextLabel, edition5ContextButton,
+                edition5Attention
+            )
+        )
         composerBody.add(modeRow)
         composerBody.add(actions)
         south.add(card("Ask Faktor", composerBody))
@@ -3295,7 +3334,8 @@ class FaktorChatPanel(
             }
         }
         selectNestedTitle(inspectTabs, "Overview")
-        appendSystem("inspecting the current run in Overview")
+        selectInspectDetail("Overview", "Run details")
+        appendSystem("inspecting the current run in Inspect")
     }
 
     private fun refreshStatusBlocking() {
@@ -3397,9 +3437,57 @@ class FaktorChatPanel(
         currentRunView = view
         currentRunStateTag = runStateTag
         runSummaryArea.text = runSummaryText(view, runStatusBanner())
+        updateWorkStatus()
         prSetupBody.isVisible = prScmSetupBlocked(view)
         prSetupBody.revalidate()
         prSetupBody.repaint()
+    }
+
+    /**
+     * The compact Work status row. It carries only served facts: the design
+     * run state, the active phase/run tag, exact token accounting and the
+     * pending approval count. No estimate, no duplicated goal/plan.
+     */
+    private fun updateWorkStatus() {
+        val banner = runStatusBanner()
+        val tag = currentRunStateTag
+        val bucket = when {
+            tag == null -> if (currentRunView == null) SemanticState.DIM else SemanticState.POSITIVE
+            tag.equals("Failed", ignoreCase = true) -> SemanticState.NEGATIVE
+            tag.equals("Blocked", ignoreCase = true) ||
+                tag.equals("Cancelled", ignoreCase = true) -> SemanticState.WARNING
+            tag.equals("Running", ignoreCase = true) -> SemanticState.DIM
+            else -> SemanticState.POSITIVE
+        }
+        workStateChip.text = banner?.label
+            ?: tag?.takeIf { it.isNotBlank() }
+            ?: if (currentRunView == null) "Idle" else "Ready"
+        workStateChip.foreground = semanticForeground(bucket)
+        val phase = currentRunView?.phase?.takeIf { it.isNotBlank() }
+        workRunLabel.text = phase ?: tag?.takeIf { it.isNotBlank() } ?: "No active run"
+        workTokensLabel.text = tokenStatusText(currentRunView)
+        updateApprovalStatus()
+    }
+
+    private fun tokenStatusText(view: NativeTaskView?): String {
+        val budget = view?.budget ?: return "Tokens —"
+        val spent = budget.spentTokens
+        val max = budget.maxTokens
+        val value = spent ?: max ?: return "Tokens —"
+        val grouped = java.text.NumberFormat.getIntegerInstance().format(value)
+        return if (spent != null && max != null && max > 0) {
+            "Tokens $grouped / " + java.text.NumberFormat.getIntegerInstance().format(max)
+        } else {
+            "Tokens $grouped"
+        }
+    }
+
+    private fun updateApprovalStatus() {
+        val count = pendingPermissions.size
+        workApprovalLabel.text =
+            if (count == 0) "No approvals" else "$count approval" + (if (count == 1) "" else "s")
+        workApprovalLabel.foreground =
+            if (count == 0) mutedForeground() else semanticForeground(SemanticState.WARNING)
     }
 
     /**
@@ -3430,6 +3518,7 @@ class FaktorChatPanel(
     private fun refreshRunSummaryForClientState() {
         onEdt {
             runSummaryArea.text = runSummaryText(currentRunView, runStatusBanner())
+            updateWorkStatus()
         }
     }
 
@@ -3850,6 +3939,7 @@ class FaktorChatPanel(
         } else {
             semanticForeground(SemanticState.WARNING)
         }
+        updateApprovalStatus()
         val model = TaskTree.build(
             projection = projection,
             task = task,
@@ -3897,6 +3987,7 @@ class FaktorChatPanel(
                 currentProofTaskState = proofTaskState
                 if (currentRunView != null || currentRunStateTag != null) {
                     runSummaryArea.text = runSummaryText(currentRunView, runStatusBanner())
+                    updateWorkStatus()
                 }
             }
         }
@@ -4354,6 +4445,25 @@ class FaktorChatPanel(
     internal fun submitTaskForTest() {
         startTaskFromControls()
     }
+
+    // ---------------------------------------------------- UX test seams
+
+    /** The compact status row's exact visible words (state, run, tokens, approvals). */
+    internal fun workStatusTextForTest(): List<String> =
+        listOf(workStateChip.text, workRunLabel.text, workTokensLabel.text, workApprovalLabel.text)
+
+    internal fun workStatusComponentsForTest(): List<java.awt.Component> =
+        listOf(workStateChip, workRunLabel, workTokensLabel, workApprovalLabel)
+
+    internal fun workDetailsButtonForTest(): javax.swing.JButton = workDetailsButton
+
+    internal fun workStopButtonForTest(): javax.swing.JButton = workStopButton
+
+    /** The run details moved out of Work into Inspect › Overview. */
+    internal fun runDetailsPanelForTest(): JComponent? = runDetailsPanel
+
+    /** The Work center surface that owns the transcript and the anchored composer. */
+    internal fun workCenterForTest(): JComponent = workPlane.getComponent(1) as JComponent
 
     /** The keyboard twin of Run task (Ctrl+Enter in the composer). */
     internal fun submitTaskViaEnterForTest() {
@@ -4959,6 +5069,7 @@ class FaktorChatPanel(
             currentRunStateTag = null
             currentProofTaskState = null
             runSummaryArea.text = ""
+            updateWorkStatus()
             prSetupBody.isVisible = false
             // Session-scoped identities and tracked targets never cross a
             // switch: a stale completion contract or tournament id would be

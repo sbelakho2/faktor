@@ -50,6 +50,8 @@ mod mcp;
 pub use mcp::*;
 mod provider;
 pub use provider::*;
+mod provider_env;
+pub use provider_env::*;
 mod commerce;
 pub use commerce::*;
 mod storage;

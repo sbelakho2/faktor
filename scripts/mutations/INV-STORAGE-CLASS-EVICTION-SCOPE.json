@@ -1,0 +1,18 @@
+{
+  "id": "INV-STORAGE-CLASS-EVICTION-SCOPE",
+  "file": "crates/storage/src/governor.rs",
+  "find": "                        freed = self.evict_class_for(class, need.class_deficit)?;",
+  "replace": "                        freed = self.evict_global_for(need.class_deficit)?;",
+  "gate": "cargo test -p faktor-storage --lib class_quota_pressure_never_evicts_another_class",
+  "expect": "FAILED",
+  "note": "Uses global eviction for a pure class-quota deficit: unrelated cold data is destroyed and the class quota still cannot be met.",
+  "capabilities": [
+    "storage.governor"
+  ],
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "id": "INV-BILLING-PARTIAL-PAID-TOTAL",
+  "surface": "payments.billing",
+  "file": "crates/payments/src/store.rs",
+  "find": "             COALESCE(SUM(amount_paid_minor), 0), \\\n",
+  "replace": "             COALESCE(SUM(CASE WHEN status = 'paid' THEN amount_paid_minor ELSE 0 END), 0), \\\n",
+  "gate": "cargo test -p faktor-payments --test lifecycle cross_event_settlement_never_credits_twice_and_partial_paid_total_is_exact",
+  "expect": "FAILED",
+  "note": "Counting only fully paid invoices reports a partially settled invoice as zero collected money.",
+  "capabilities": [
+    "payments.overview_truth"
+  ],
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

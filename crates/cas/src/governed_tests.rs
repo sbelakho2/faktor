@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 use std::sync::Arc;
 
 use faktor_storage::{StorageClass, StorageGovernor, StorageGovernorConfig};
@@ -285,4 +286,72 @@ fn evidence_class_backend_is_the_evidence_root() {
             .unwrap()
             > 0
     );
+}
+
+/// CAS reconciliation classifies the whole physical root in memory from ONE
+/// index load per logical class backend; it must not issue point queries per
+/// stored blob.
+#[test]
+fn cas_reconcile_loads_the_family_index_once_per_root_not_per_blob() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cas, governor) = governed(dir.path(), StorageClass::MainCas, 10_000_000);
+    for index in 0..40u32 {
+        cas.put_in_class(
+            StorageClass::MainCas,
+            "bulk",
+            format!("blob-{index}").as_bytes(),
+        )
+        .unwrap();
+    }
+    let before = governor.family_index_loads();
+    let report = governor.reconcile().unwrap();
+    let loads = governor.family_index_loads() - before;
+    assert_eq!(report.scanned, 40);
+    assert!(loads >= 1, "reconciliation must use the index");
+    assert!(
+        loads <= 8,
+        "40 blobs caused {loads} family-index loads (must be bounded by class backends, not blobs)"
+    );
+}
+
+/// Identical bytes first stored as general main-CAS content and then
+/// referenced as a compaction archive must be PROMOTED to the archive class:
+/// eviction of the deduplicated blob then leaves the durable loss marker, and
+/// a later weaker main-CAS hit never demotes it.
+#[test]
+fn dedup_hit_promotes_to_the_strongest_retention_class() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cas, governor) = governed(dir.path(), StorageClass::MainCas, 10_000_000);
+    let payload = b"same bytes referenced by a compaction archive";
+    let main = cas.put(payload).unwrap();
+    assert_eq!(
+        governor.object_class_of_digest(&main.to_hex()).unwrap(),
+        Some(StorageClass::MainCas)
+    );
+    let archive = cas
+        .put_in_class(StorageClass::CompactionArchive, "chunk", payload)
+        .unwrap();
+    assert_eq!(main, archive, "content address is unchanged");
+    assert_eq!(
+        governor.object_class_of_digest(&main.to_hex()).unwrap(),
+        Some(StorageClass::CompactionArchive),
+        "archive claim must promote the deduplicated blob"
+    );
+    let metrics = governor.metrics().unwrap();
+    assert_eq!(metrics.per_class["main_cas"].bytes, 0);
+    assert!(metrics.per_class["compaction_archive"].bytes > 0);
+    // A later general CAS hit must not demote the archive owner.
+    cas.put(payload).unwrap();
+    assert_eq!(
+        governor.object_class_of_digest(&main.to_hex()).unwrap(),
+        Some(StorageClass::CompactionArchive)
+    );
+    governor
+        .evict_object(StorageClass::CompactionArchive, &main.to_hex())
+        .unwrap();
+    let markers = governor
+        .loss_markers(Some(StorageClass::CompactionArchive))
+        .unwrap();
+    assert_eq!(markers.len(), 1);
+    assert_eq!(markers[0].0, main.to_hex());
 }

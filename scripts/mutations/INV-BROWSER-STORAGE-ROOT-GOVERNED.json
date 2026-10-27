@@ -1,0 +1,19 @@
+{
+  "id": "INV-BROWSER-STORAGE-ROOT-GOVERNED",
+  "file": "crates/browser/src/download.rs",
+  "find": "            let _ = governor.add_directory_root(\n                faktor_storage::StorageClass::BrowserStorage,\n                root.root().to_path_buf(),\n                0,\n            );",
+  "replace": "            let _ = governor;",
+  "gate": "cargo test -p faktor-browser --lib download_manager_registers_its_profile_root_with_the_governor",
+  "expect": "FAILED",
+  "note": "Does not register the concrete browser profile root: downloads under <data>/store/browser are admitted against the class but never scanned or enforced.",
+  "capabilities": [
+    "browser.download_policy",
+    "storage.governor"
+  ],
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

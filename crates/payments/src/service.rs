@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=property isolation=pure-unit
 //! The payment/invoice service: one durable authority over the local SQLite
 //! store and exactly one [`PaymentProvider`]. It implements the subscription
 //! lifecycle, exact invoice arithmetic, seats/proration, tax, payment
@@ -74,6 +75,8 @@ pub const MAX_SEATS: u32 = 1_000_000;
 pub const MAX_TRIAL_DAYS: u32 = 365;
 /// Bound on an invoice due window.
 pub const MAX_DUE_DAYS: i64 = 365;
+/// Bound on stored payment methods per organization.
+pub const MAX_PAYMENT_METHODS: usize = 100;
 
 /// The payment service.
 pub struct PaymentService {
@@ -276,7 +279,7 @@ impl PaymentService {
         let subscription = self.store.subscription(org)?;
         let stats = self.store.invoice_stats(org)?;
         let reconciliation = self.store.reconciliation_summary(org)?;
-        let methods = self.store.payment_methods(org)?;
+        let method_count = self.store.payment_method_count(org)?;
         let plan_price = subscription
             .as_ref()
             .and_then(|subscription| self.config.catalogue.plan(&subscription.plan_id).cloned());
@@ -319,7 +322,7 @@ impl PaymentService {
             paid_minor: stats.paid_minor,
             refunded_minor: stats.refunded_minor,
             reconciliation,
-            payment_method_count: methods.len() as u64,
+            payment_method_count: method_count,
             tax,
             payment,
             invoices: CapabilityStatus::available(),
@@ -559,6 +562,14 @@ impl PaymentService {
                 "provider created an already-canceled subscription".into(),
             ));
         }
+        let quantity = match provider_quantity(remote.quantity, request.seats) {
+            Ok(quantity) => quantity,
+            Err(error) => {
+                self.store
+                    .mark_claim_unknown(org, &request.idempotency_key, now)?;
+                return Err(error);
+            }
+        };
         let subscription = PaymentSubscription {
             id: subscription_id,
             organization_id: org.to_string(),
@@ -569,7 +580,7 @@ impl PaymentService {
             provider_price_id: remote.price_id,
             plan_id: request.plan_id.clone(),
             interval: request.interval,
-            quantity: request.seats,
+            quantity,
             state,
             currency: plan.currency.clone(),
             current_period_start_ms: period_start,
@@ -780,12 +791,20 @@ impl PaymentService {
                 return Err(error);
             }
         };
+        let quantity = match provider_quantity_exact(remote.quantity, subscription.quantity) {
+            Ok(quantity) => quantity,
+            Err(error) => {
+                self.store
+                    .mark_claim_unknown(org, &request.idempotency_key, self.now_ms())?;
+                return Err(error);
+            }
+        };
         let mut updated = subscription.clone();
         updated.provider_subscription_id = remote.id;
         updated.provider_item_id = remote.item_id;
         updated.provider_product_id = remote.product_id;
         updated.provider_price_id = remote.price_id;
-        updated.quantity = remote.quantity;
+        updated.quantity = quantity;
         updated.plan_id = request.plan_id.clone();
         updated.interval = interval;
         updated.updated_ms = self.now_ms();
@@ -1155,12 +1174,20 @@ impl PaymentService {
             }
         };
         let now = self.now_ms();
+        let quantity = match provider_quantity_exact(remote.quantity, request.quantity) {
+            Ok(quantity) => quantity,
+            Err(error) => {
+                self.store
+                    .mark_claim_unknown(org, &request.idempotency_key, now)?;
+                return Err(error);
+            }
+        };
         let mut updated = subscription;
         updated.provider_subscription_id = remote.id;
         updated.provider_item_id = remote.item_id;
         updated.provider_product_id = remote.product_id;
         updated.provider_price_id = remote.price_id;
-        updated.quantity = request.quantity;
+        updated.quantity = quantity;
         updated.updated_ms = now;
         let pending = self.pending_from_preview(org, &updated.id, &proration, now);
         let write = self.write(
@@ -1419,6 +1446,7 @@ impl PaymentService {
             reconciliation: Default::default(),
             currency: subscription.currency.clone(),
             status: InvoiceStatus::Open,
+            last_dunning_payment_id: None,
             lines: lines.clone(),
             subtotal_minor: subtotal,
             discount_minor: request.discount_minor,
@@ -1718,6 +1746,13 @@ impl PaymentService {
                 else {
                     return Ok(None);
                 };
+                // A decline that arrives after another attempt settled the
+                // invoice (paid/void/uncollectible) is not dunning: the
+                // invoice re-read above refused the past-due transition, so
+                // the subscription must not regress or accrue attempts.
+                if invoice.status != InvoiceStatus::PastDue {
+                    return Ok(Some(subscription));
+                }
                 // The subscription row belongs to a provider mutation while
                 // its fence is held; never overwrite that operation's result.
                 if crate::lease::active_lease_conn(
@@ -2092,10 +2127,23 @@ impl PaymentService {
         format: &str,
         limit: usize,
     ) -> Result<String, PaymentError> {
+        self.export_invoices_page(organization, format, None, limit)
+    }
+
+    /// Cursor-aware export: a bounded page can be continued by passing the
+    /// previous page's `next_cursor`. Without a cursor this is the first
+    /// page, so an export never silently claims to be the whole ledger.
+    pub fn export_invoices_page(
+        &self,
+        organization: &OrganizationId,
+        format: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<String, PaymentError> {
         if format != "json" && format != "csv" {
             return Err(PaymentError::Malformed("format must be json or csv".into()));
         }
-        let page = self.invoices(organization, None, limit)?;
+        let page = self.invoices(organization, cursor, limit)?;
         let text = if format == "json" {
             serde_json::to_string_pretty(&page.items)
                 .map_err(|e| PaymentError::Store(format!("invoice export: {e}")))?
@@ -2342,12 +2390,32 @@ impl PaymentService {
         new_interval: BillingInterval,
         now: i64,
     ) -> Result<ProrationPreview, PaymentError> {
-        let old_amount = self.plan_amount_in(
-            &subscription.plan_id,
-            subscription.interval,
-            &subscription.currency,
+        // The recurring amount is plan + per-seat price for every billed
+        // seat. A plan change can change BOTH components (pro seats cost
+        // 25.00 while team seats cost 30.00, for example), so prorating only
+        // the plan line silently loses or invents the seat difference.
+        let old_amount = checked_add(
+            self.plan_amount_in(
+                &subscription.plan_id,
+                subscription.interval,
+                &subscription.currency,
+            )?,
+            checked_mul(
+                i64::from(subscription.quantity),
+                self.seat_amount_in(
+                    &subscription.plan_id,
+                    subscription.interval,
+                    &subscription.currency,
+                )?,
+            )?,
         )?;
-        let new_amount = self.plan_amount_in(new_plan, new_interval, &subscription.currency)?;
+        let new_amount = checked_add(
+            self.plan_amount_in(new_plan, new_interval, &subscription.currency)?,
+            checked_mul(
+                i64::from(subscription.quantity),
+                self.seat_amount_in(new_plan, new_interval, &subscription.currency)?,
+            )?,
+        )?;
         let remaining = subscription.remaining_ms(now);
         let period = subscription.period_ms();
         let credit = -prorate(old_amount, remaining, period)?;
@@ -2708,6 +2776,7 @@ impl PaymentService {
                 } else {
                     SubscriptionState::Active
                 };
+                let quantity = provider_quantity(remote.quantity, request.seats)?;
                 let subscription = PaymentSubscription {
                     id: claim.resource_id.clone(),
                     organization_id: org.to_string(),
@@ -2718,7 +2787,7 @@ impl PaymentService {
                     provider_price_id: remote.price_id,
                     plan_id: request.plan_id.clone(),
                     interval: request.interval,
-                    quantity: remote.quantity,
+                    quantity,
                     state,
                     currency: plan.currency.clone(),
                     current_period_start_ms: period_start,
@@ -2748,9 +2817,16 @@ impl PaymentService {
                 let request: ChangePlanRequest = decode_field(&context, "request")?;
                 let proration: ProrationPreview = decode_field(&context, "proration")?;
                 let mut subscription = self.require_subscription(org, &request.subscription_id)?;
+                // Reconciliation is a second writer of the durable seat row:
+                // it must apply the same provider-quantity guard as the live
+                // path, never writing 0/oversize values over billed seats.
+                let quantity = provider_quantity_exact(remote.quantity, subscription.quantity)?;
+                subscription.provider_item_id = remote.item_id;
+                subscription.provider_product_id = remote.product_id;
+                subscription.provider_price_id = remote.price_id;
                 subscription.plan_id = request.plan_id;
                 subscription.interval = request.interval.unwrap_or(subscription.interval);
-                subscription.quantity = remote.quantity;
+                subscription.quantity = quantity;
                 subscription.updated_ms = now;
                 let pending = self.pending_from_preview(org, &subscription.id, &proration, now);
                 let response = serde_json::json!({
@@ -2774,7 +2850,11 @@ impl PaymentService {
                 let request: ChangeSeatsRequest = decode_field(&context, "request")?;
                 let proration: ProrationPreview = decode_field(&context, "proration")?;
                 let mut subscription = self.require_subscription(org, &request.subscription_id)?;
-                subscription.quantity = remote.quantity;
+                let quantity = provider_quantity_exact(remote.quantity, request.quantity)?;
+                subscription.provider_item_id = remote.item_id;
+                subscription.provider_product_id = remote.product_id;
+                subscription.provider_price_id = remote.price_id;
+                subscription.quantity = quantity;
                 subscription.updated_ms = now;
                 let pending = self.pending_from_preview(org, &subscription.id, &proration, now);
                 let response = serde_json::json!({
@@ -3321,6 +3401,36 @@ impl PaymentService {
     }
 }
 
+/// The durable seat quantity is provider truth when the provider reports it;
+/// `0` means the adapter does not carry the field and the requested quantity
+/// remains authoritative. A provider quantity outside the bounded domain is
+/// refused, never written over the local row (which would drift billing).
+fn provider_quantity(remote: u32, fallback: u32) -> Result<u32, PaymentError> {
+    if remote == 0 {
+        return Ok(fallback);
+    }
+    if remote > MAX_SEATS {
+        return Err(PaymentError::Provider(format!(
+            "provider subscription quantity {remote} exceeds the local bound {MAX_SEATS}"
+        )));
+    }
+    Ok(remote)
+}
+
+/// A plan/seat mutation is prorated from the quantity that was requested
+/// before the provider call. If the provider reports a different quantity,
+/// persisting it would pair the provider's seat count with a proration for a
+/// different count, so the mutation stays unresolved instead.
+fn provider_quantity_exact(remote: u32, expected: u32) -> Result<u32, PaymentError> {
+    let quantity = provider_quantity(remote, expected)?;
+    if quantity != expected {
+        return Err(PaymentError::Provider(format!(
+            "provider subscription quantity {quantity} does not match the fenced request {expected}"
+        )));
+    }
+    Ok(quantity)
+}
+
 fn provider_subscription_state(
     status: &str,
     trial_end_ms: Option<i64>,
@@ -3547,5 +3657,31 @@ impl PaymentService {
 
     pub fn stats(&self, organization: &OrganizationId) -> Result<InvoiceStats, PaymentError> {
         self.store.invoice_stats(organization.as_str())
+    }
+}
+
+#[cfg(test)]
+mod quantity_guard_tests {
+    use super::{provider_quantity, provider_quantity_exact, MAX_SEATS};
+    use crate::error::PaymentError;
+
+    #[test]
+    fn subscription_quantity_uses_provider_truth_within_the_bound() {
+        assert_eq!(provider_quantity(7, 3).unwrap(), 7);
+        assert_eq!(provider_quantity(0, 3).unwrap(), 3);
+        assert!(matches!(
+            provider_quantity(MAX_SEATS + 1, 3),
+            Err(PaymentError::Provider(_))
+        ));
+    }
+
+    #[test]
+    fn mutation_quantity_must_match_the_fenced_request() {
+        assert_eq!(provider_quantity_exact(4, 4).unwrap(), 4);
+        assert_eq!(provider_quantity_exact(0, 4).unwrap(), 4);
+        assert!(matches!(
+            provider_quantity_exact(5, 4),
+            Err(PaymentError::Provider(_))
+        ));
     }
 }

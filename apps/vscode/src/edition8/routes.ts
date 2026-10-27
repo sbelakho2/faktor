@@ -162,9 +162,9 @@ const ROUTES: Readonly<Record<string, E8Route>> = {
 
   // Permissions and sandbox
   'Q-01': cfg('faktor.permissions.preset'),
-  'Q-02': cfg('faktor.permissions.allowedTools'),
-  'Q-03': cfg('faktor.sandbox.shell'),
-  'Q-04': cfg('faktor.sandbox.shell'),
+  'Q-02': read('/native/permissions/policy'),
+  'Q-03': read('/native/permissions/policy'),
+  'Q-04': read('/native/permissions/policy'),
   'Q-05': cfg('faktor.sandbox.network'),
   'Q-06': act('POST', '/native/permission/reply'),
   'Q-07': act('POST', '/native/permissions/rules'),
@@ -221,7 +221,9 @@ const ROUTES: Readonly<Record<string, E8Route>> = {
   'X-09': read('/native/browser/sessions/:browser/observations'),
   'X-10': host('Language-server diagnostics are read from the host; no daemon route duplicates them.'),
   'X-11': host('Inline code actions are executed by the host editor; the daemon never mutates the editor.'),
-  'X-12': cfg('faktor.sandbox.shell'),
+  // X-12 displays the served approval state; editing sandbox.shell here was
+  // a different (and dangerous) effect than the control's label promised.
+  'X-12': read('/native/permissions/policy'),
   'X-13': read('/native/runtime/status'),
 
   // Budgets, retries and reliability
@@ -233,10 +235,16 @@ const ROUTES: Readonly<Record<string, E8Route>> = {
   'B-06': cfg('faktor.retry.maxAttempts'),
   'B-07': cfg('faktor.retry.baseDelayMs'),
   'B-08': read('/native/session/:session/efficiency'),
-  'B-09': act('POST', '/native/config/commit'),
-  'B-10': read('/native/config/descriptors'),
+  // B-09 serves effective limits from the same committed snapshot the
+  // settings surface reads; it is not a write and never posts an empty patch.
+  'B-09': read('/native/config/snapshot'),
+  // B-10 is the operation deadline display. The task-run projection is the
+  // only served owner; the descriptor catalog is not a deadline.
+  'B-10': read('/native/session/:session/task-runs'),
   'B-11': read('/native/health'),
-  'B-12': read('/native/outcomes?limit=50'),
+  // B-12 resolves the original submission identity from the session's task
+  // rows (the admission receipt), not the outcome ledger.
+  'B-12': read('/native/session/:session/tasks'),
 
   // Changes, checkpoints and verification
   'V-01': read('/native/session/:session/verification'),
@@ -265,7 +273,7 @@ const ROUTES: Readonly<Record<string, E8Route>> = {
   'D-09': host('Theme, zoom and density belong to the VS Code host and are never overridden by Faktor.'),
   'D-10': host('Composer send behavior is the host keybinding.'),
   'D-11': host('Keymaps and command discovery are host-owned.'),
-  'D-12': cfg('faktor.telemetry.categories'),
+  'D-12': host('Permission, failure and completion notices are host-local; the daemon telemetry category list is a different effect and is not reused here.'),
   'D-13': read('/native/session/:session/events'),
   'D-14': host('Accessibility and reduced-motion preferences are read from the host.'),
   'D-15': read('/native/sessions/parallel'),

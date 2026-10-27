@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! `main_doctor_tests`: out-of-line slice of the CLI test module.
 
 use super::*;
@@ -2164,6 +2165,32 @@ fn doctor_surfaces_the_explicit_real_home_grant() {
         !lines.iter().any(|l| l.contains("EXPLICIT operator grant")),
         "{lines:?}"
     );
+}
+
+#[test]
+fn doctor_names_a_corrupt_storage_governor_instead_of_not_initialized() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = faktor_storage::StorageGovernor::database_path(dir.path());
+    std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+    std::fs::write(&marker, b"this is not a sqlite ledger").unwrap();
+    let report = doctor_run(dir.path(), false);
+    assert!(
+        report
+            .lines
+            .iter()
+            .any(|line| line.starts_with("storage-governor: UNREADABLE")),
+        "{:?}",
+        report.lines
+    );
+    assert!(
+        report
+            .lines
+            .iter()
+            .all(|line| !line.contains("not initialized")),
+        "{:?}",
+        report.lines
+    );
+    assert!(report.issues >= 1, "{:?}", report.lines);
 }
 
 #[test]

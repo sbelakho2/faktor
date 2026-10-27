@@ -605,23 +605,35 @@ impl FallbackEvaluator {
                 ),
             };
         }
+        // ONE index each: the historical per-item `contributions.iter().filter`
+        // and per-path `change_set.iter().find` made this O(items ·
+        // contributions + paths · change_set) on a 200-child run.
+        let mut contributions: std::collections::HashMap<&str, Vec<&SourceContribution>> =
+            std::collections::HashMap::with_capacity(integration.contributions.len());
+        for contribution in &integration.contributions {
+            contributions
+                .entry(contribution.work_item.as_str())
+                .or_default()
+                .push(contribution);
+        }
+        let mut change_set: std::collections::HashMap<&str, &ChangeSetEntry> =
+            std::collections::HashMap::with_capacity(ctx.change_set.len());
+        for entry in &ctx.change_set {
+            change_set.entry(entry.path.as_str()).or_insert(entry);
+        }
         let mut evidence = Vec::new();
         for item in required_work_items {
-            let matches: Vec<&SourceContribution> = integration
-                .contributions
-                .iter()
-                .filter(|c| &c.work_item == item)
-                .collect();
-            if matches.len() != 1 {
+            let matches = contributions.get(item.as_str());
+            let match_count = matches.map(Vec::len).unwrap_or(0);
+            if match_count != 1 {
                 return CriterionEvaluation::Failed {
                     evidence: vec![format!("work-item:{item}")],
                     reason: format!(
-                        "required work item {item:?} contributed {} source/change-set entries; exactly one is required",
-                        matches.len()
+                        "required work item {item:?} contributed {match_count} source/change-set entries; exactly one is required"
                     ),
                 };
             }
-            let contribution = matches[0];
+            let contribution = matches.expect("one match proved above")[0];
             if contribution.source_digest.is_empty() {
                 return CriterionEvaluation::Failed {
                     evidence: vec![format!("work-item:{item}")],
@@ -629,7 +641,7 @@ impl FallbackEvaluator {
                 };
             }
             for path in &contribution.paths {
-                match ctx.change_set.iter().find(|e| &e.path == path) {
+                match change_set.get(path.as_str()).copied() {
                     Some(entry) if entry.status != ChangeSetStatus::Deleted => {}
                     Some(_) => {
                         return CriterionEvaluation::Failed {

@@ -1242,53 +1242,14 @@ pub(crate) async fn native_context_compact(
         return wire_status(malformed_body("minReductionRatio must be in [0, 1)"));
     }
     let max_history = req.max_history_messages.unwrap_or(2_000).clamp(1, 10_000);
-    let store = state.deps.session.store();
-    let mut newest_first = Vec::new();
-    let mut cursor = None;
-    let mut remaining = max_history;
-    while remaining > 0 {
-        let page = match store.messages_before(handle.id(), cursor, remaining.min(200)) {
-            Ok(page) => page,
-            Err(e) => return api_err(&store_err_to_core(e)),
-        };
-        if page.is_empty() {
-            break;
-        }
-        remaining = remaining.saturating_sub(page.len() as u64);
-        cursor = page.last().map(|r| r.seq);
-        newest_first.extend(page);
-        if remaining == 0 {
-            break;
-        }
-    }
-    let mut turns: Vec<RecentTurn> = newest_first
-        .iter()
-        .rev()
-        .map(|row| {
-            let text = row
-                .data
-                .get("text")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            RecentTurn {
-                role: row.role.clone(),
-                text,
-            }
-        })
-        .filter(|turn| !turn.text.is_empty())
-        .collect();
-    // Cap per-turn text at a bounded prefix so the plan cannot allocate
-    // unbounded strings from hostile rows.
-    for turn in &mut turns {
-        if turn.text.len() > 256 * 1024 {
-            let mut cut = 256 * 1024;
-            while !turn.text.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            turn.text.truncate(cut);
-        }
-    }
+    // SAME logical-history loader as the durable compaction route: a valid
+    // checkpoint is the replacement prefix and only strictly newer durable
+    // rows are appended. The old newest-first raw scan re-compacted rows the
+    // checkpoint already replaced and could keep the WRONG (oldest) suffix.
+    let (turns, newest_seq) = match super::longtask::load_turns(&state.deps, &handle, max_history) {
+        Ok(loaded) => loaded,
+        Err(e) => return api_err(&e),
+    };
     let ledger: TaskLedger = handle
         .get_task_ledger()
         .ok()
@@ -1301,7 +1262,7 @@ pub(crate) async fn native_context_compact(
             text: ledger.compact_render(),
         }])) as u64;
     let target = req.target_tokens.min(before.saturating_sub(1));
-    let plan = Compactor::deterministic_only().deterministic_prune(
+    let mut plan = Compactor::deterministic_only().deterministic_prune(
         &turns,
         &ledger,
         &CompactionRequest {
@@ -1312,14 +1273,45 @@ pub(crate) async fn native_context_compact(
                 faktor_context::DEFAULT_SUMMARIZER_RESIDUE_BUDGET_TOKENS,
         },
     );
-    let compaction = match handle.record_compaction(
+    if plan.accepted {
+        // The response's `archivedRefs`/`keptRecentTurns` describe the REAL
+        // replacement. Persist the archive before naming it; a missing CAS
+        // becomes an explicit marker, never a dangling artifact ref.
+        let _ = faktor_agent::runtime::mark_evicted_compaction_archives(
+            state.deps.agent.deps().cas.as_deref(),
+            &mut plan,
+        );
+        let _ = faktor_agent::runtime::attach_compaction_archive(
+            state.deps.agent.deps().cas.as_deref(),
+            &mut plan,
+        );
+    }
+    let strategy = match plan.strategy {
+        faktor_context::CompactionStrategy::LlmSummary => "llm_summary",
+        faktor_context::CompactionStrategy::DeterministicPruning => "deterministic_pruning",
+        faktor_context::CompactionStrategy::Rejected => "rejected",
+    };
+    let payload = match serde_json::to_vec(&plan.kept_recent) {
+        Ok(payload) => payload,
+        Err(e) => return api_err(&faktor_core::Error::malformed(e.to_string())),
+    };
+    let digest = faktor_context::history_digest(&plan.kept_recent);
+    // The old route journaled a compaction row and returned `accepted` while
+    // the LIVE context was unchanged; a client that trusted it kept sending
+    // the full history. Commit the replacement (or the rejected record)
+    // atomically, exactly like the durable operation route.
+    let compaction = match handle.commit_compaction_with_checkpoint(
         plan.before_tokens as i64,
         plan.after_tokens as i64,
         plan.target_tokens as i64,
-        "deterministic_pruning",
+        plan.accepted,
+        strategy,
         &faktor_session::compaction::CompactionPolicy {
             min_reduction_ratio: min_reduction,
         },
+        newest_seq,
+        &digest,
+        &payload,
     ) {
         Ok(record) => record,
         Err(e) => return api_err(&e),

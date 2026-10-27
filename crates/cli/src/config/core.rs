@@ -10,8 +10,19 @@ use super::*;
 pub struct Config {
     pub model: String,
     pub compaction_model: Option<String>,
+    /// Minimum fraction a compaction must shrink by (`[0, 1)`), shared by the
+    /// proactive agent path and the explicit compaction routes. Defaults to
+    /// the spec's 25%.
+    pub compaction_min_reduction: f64,
     pub compact_at_usage: f64,
     pub instructions: String,
+    /// Optional machine-scoped `KEY=VALUE` file loaded during boot preflight,
+    /// before the provider secret registry and adapters are built. It lets
+    /// `providers[].api_key_env` resolve without putting key values in this
+    /// config, in argv or in logs. The path is non-secret; the file is read
+    /// as a bounded owner-only document. An already-set process variable is
+    /// never overwritten.
+    pub provider_env_file: Option<String>,
     pub providers: Vec<ProviderCfg>,
     /// Economic routing mode of the daemon (P0-2): `None` = Economy — every
     /// model call routes through the RouterService built from the
@@ -259,6 +270,26 @@ impl Config {
         self.mcp_servers()?;
         if self.model.trim().is_empty() {
             return Err("model must not be empty".into());
+        }
+        if !(0.0..1.0).contains(&self.compaction_min_reduction) {
+            return Err(format!(
+                "compaction_min_reduction must be in [0, 1), got {}",
+                self.compaction_min_reduction
+            ));
+        }
+        if let Some(path) = &self.provider_env_file {
+            if path.is_empty() || path.len() > 4096 || path.contains('\0') {
+                return Err(
+                    "provider_env_file must be a non-empty absolute path of at most 4096 bytes"
+                        .into(),
+                );
+            }
+            if !Path::new(path).is_absolute() {
+                return Err(format!(
+                    "provider_env_file must be an absolute path (got {path:?}); relative paths \
+                     would depend on an uncontrolled working directory"
+                ));
+            }
         }
         self.retry.validate()?;
         let sandbox = self

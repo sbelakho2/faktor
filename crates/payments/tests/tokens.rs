@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir,separate-process
 //! Token-ingestion and at-rest secrecy probes. These tests deliberately try
 //! card-like payloads, legacy plaintext rows, tenant swaps and rotation to
 //! prove the provider-token-only boundary.
@@ -306,5 +307,42 @@ fn legacy_plaintext_rows_are_migrated_or_deleted_fail_closed() {
             .unwrap()
             .expose(),
         "tok_legacy_valid_value"
+    );
+}
+
+#[test]
+fn stored_payment_methods_are_bounded_and_overview_counts_without_payloads() {
+    let dir = tempfile::tempdir().unwrap();
+    let (service, store, _) = service(&dir);
+    let org = OrganizationId::try_new("org_method_bound").unwrap();
+    for index in 0..faktor_payments::MAX_PAYMENT_METHODS {
+        service
+            .add_payment_method(
+                &org,
+                method(
+                    &format!("pm_bounded_token_{index}"),
+                    &format!("add-{index}"),
+                ),
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        store.payment_method_count(org.as_str()).unwrap(),
+        faktor_payments::MAX_PAYMENT_METHODS as u64
+    );
+    let refused = service
+        .add_payment_method(&org, method("pm_bounded_token_overflow", "add-overflow"))
+        .expect_err("the payment-method bound is enforced before sealing");
+    assert!(matches!(
+        refused,
+        faktor_payments::PaymentError::Conflict(_)
+    ));
+    assert_eq!(
+        store.payment_method_count(org.as_str()).unwrap(),
+        faktor_payments::MAX_PAYMENT_METHODS as u64
+    );
+    assert_eq!(
+        service.overview(&org).unwrap().payment_method_count,
+        faktor_payments::MAX_PAYMENT_METHODS as u64
     );
 }

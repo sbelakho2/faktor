@@ -1,6 +1,7 @@
 //! Adversarial HTTP tests for the additive payment/invoice plane: real
 //! overview states, strict DTOs, tenant isolation, idempotency, signature-
 //! first webhook ingress and disabled parity.
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -115,11 +116,18 @@ fn bootstrap(
 async fn payments_deps(
     root: &std::path::Path,
 ) -> (ServerHandle, Arc<faktor_cloud::ControlPlane>, String) {
+    payments_deps_with_clock(root, Arc::new(ManualClock::new(NOW_MS))).await
+}
+
+async fn payments_deps_with_clock(
+    root: &std::path::Path,
+    clock: Arc<ManualClock>,
+) -> (ServerHandle, Arc<faktor_cloud::ControlPlane>, String) {
     let control_plane = Arc::new(faktor_cloud::ControlPlane::new(
         Arc::new(faktor_cloud::MemoryControlPlaneStore::new()),
         Arc::new(ManualClock::new(NOW_MS)),
     ));
-    let payments = payments_service(Arc::new(ManualClock::new(NOW_MS)));
+    let payments = payments_service(clock);
     let deps = test_deps(root)
         .with_control_plane(control_plane.clone())
         .with_billing(billing_service())
@@ -337,6 +345,53 @@ async fn payments_routes_are_real_and_overview_states_are_wired() {
     assert_eq!(detail["invoice"]["total_minor"], 17_645);
     assert_eq!(detail["invoice"]["status"], "paid");
     assert_eq!(detail["invoice"]["reconciliation"], "matched");
+}
+
+#[tokio::test]
+async fn payment_overview_ticks_lifecycle_before_reporting_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(ManualClock::new(NOW_MS));
+    let (handle, control_plane, token) = payments_deps_with_clock(dir.path(), clock.clone()).await;
+    let base = format!("http://{}", handle.addr);
+    let client = reqwest::Client::new();
+    let (_org, owner) = bootstrap(&control_plane, "Trial", "trial@a.test");
+    let mut body = subscribe_body();
+    body["trial_days"] = serde_json::json!(1);
+    let response = client
+        .post(format!("{base}/native/billing/subscribe"))
+        .bearer_auth(&token)
+        .header("x-faktor-control-token", &owner)
+        .header("Idempotency-Key", "overview-tick-subscribe")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let subscribed: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(subscribed["subscription"]["state"], "trialing");
+
+    // No mutation happens between these reads. The overview itself must
+    // apply the durable lifecycle tick, exactly like the site/CLI.
+    clock.advance(2 * 24 * 60 * 60 * 1_000);
+    let response = client
+        .get(format!("{base}/native/billing/overview"))
+        .bearer_auth(&token)
+        .header("x-faktor-control-token", &owner)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let overview: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(
+        overview["billing"]["payments"]["subscription"]["state"],
+        "active"
+    );
+    assert!(
+        overview["billing"]["payments"]["subscription"]["trial_end_ms"]
+            .as_i64()
+            .unwrap_or_default()
+            <= NOW_MS + 2 * 24 * 60 * 60 * 1_000
+    );
 }
 
 #[tokio::test]

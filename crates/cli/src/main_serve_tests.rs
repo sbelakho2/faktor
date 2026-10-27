@@ -1298,6 +1298,11 @@ pub(crate) fn egress_cfg(
             // The tests below target loopback mock servers, so the
             // entry carries the explicit loopback address-class rule.
             "allow_loopback": true,
+            // Economy (the default) refuses Unknown-priced rows at build
+            // time; a loopback mock has no catalog price, so declare the
+            // conservative ceiling explicitly. These tests exercise egress
+            // and secret handling, not routing.
+            "pricing": {"pricing_ceiling_micro_usd_per_million_tokens": 1000000},
         }],
     });
     if let Some(rows) = rows {

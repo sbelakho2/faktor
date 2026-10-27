@@ -263,6 +263,22 @@ async function main() {
   const byMode = { shell: [], settings: [] };
   for (const screen of E8_SCREENS) byMode[modeFor(screen)].push(screen);
 
+  // The settings surface has no single screen to measure: capture its landing
+  // page before any row navigation, so the domain/search/save layout is a
+  // real review artifact instead of being inferred from a screen.
+  if (WRITE && byMode.settings.length > 0) {
+    const landing = byMode.settings[0];
+    await navigate(cdp, variantFile(landing, edition8Snapshot(), 'dark', 1), 480, 'dark');
+    screenshots.push({
+      screen: 'SETTINGS-HOME',
+      width: 480,
+      theme: 'dark',
+      text_scale: 1,
+      label: 'dark',
+      ...(await capture(cdp, join(baseDir, 'dark', 'settings-home-480.png'))),
+    });
+  }
+
   async function runPage(snapshot, theme, textScale, width, screens, label, captureShots) {
     console.log(`visual: ${label} ${width}px (${screens.length} screens)`);
     const first = screens[0];

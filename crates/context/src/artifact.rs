@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! Artifact storage: historical command output, old source reads, enormous
 //! test logs live in the CAS. The prompt carries `artifact://<hash>` refs
 //! plus short summaries — never the unbounded content itself.

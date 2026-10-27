@@ -148,7 +148,7 @@ fn current_subscription(
         if interval == BillingInterval::Annual { " selected" } else { "" }
     );
     let cancel = format!(
-        "<form class=\"auth-form mt-22\" method=\"post\" action=\"/account/billing/cancel/\">{}<div class=\"field\"><label for=\"cancel_mode\">Cancellation</label><select id=\"cancel_mode\" name=\"at_period_end\"><option value=\"1\" selected>At period end</option><option value=\"0\">Immediately</option></select></div><div class=\"field\"><label class=\"checkbox-field\"><input type=\"checkbox\" name=\"confirm\" value=\"yes\" required> I understand that cancellation denies new admissions; immediate cancellation denies them now.</label></div><div class=\"form-actions\"><button class=\"btn btn-outline btn-small\" type=\"submit\">Cancel subscription</button></div></form>",
+        "<form class=\"auth-form mt-22\" method=\"post\" action=\"/account/billing/cancel/\">{}<div class=\"field\"><label for=\"cancel_mode\">Cancellation</label><select id=\"cancel_mode\" name=\"at_period_end\"><option value=\"1\" selected>At period end</option><option value=\"0\">Immediately</option></select></div><div class=\"field\"><label class=\"checkbox-field\"><input type=\"checkbox\" name=\"confirm\" value=\"yes\" required> I understand that cancellation denies new task admissions at the chosen boundary; the recorded period and refunds do not change.</label></div><div class=\"form-actions\"><button class=\"btn btn-outline btn-small\" type=\"submit\">Cancel subscription</button></div></form>",
         csrf_input(csrf)
     );
     let requested_by = format!(
@@ -209,11 +209,12 @@ fn plan_cards(
                 .map(|feature| format!("<li>{}</li>", html_escape(feature)))
                 .collect::<String>();
             format!(
-                "<article class=\"plan-card{}\"><p class=\"plan-eyebrow\">Plan / {}</p><h2>{}</h2><p class=\"price\">{} <small>/ month</small></p><p class=\"plan-desc\">{}</p><ul>{}</ul><div class=\"stack-sm mt-22\">{}{}</div></article>",
+                "<article class=\"plan-card{}\"><p class=\"plan-eyebrow\">Plan / {}</p><h2>{}</h2><p class=\"price\">{} <small>/ month</small></p><p class=\"plan-alt-price\">or {} / year</p><p class=\"plan-desc\">{}</p><ul>{}</ul><div class=\"stack-sm mt-22\">{}{}</div></article>",
                 if plan.id == "team" { " featured" } else { "" },
                 html_escape(plan.id),
                 plan.name,
                 money(plan.monthly_minor, "EUR"),
+                money(plan.annual_minor, "EUR"),
                 html_escape(plan.description),
                 features,
                 monthly,

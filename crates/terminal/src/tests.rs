@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! Terminal tests (mechanically split from `lib`): unix process-group,
 //! signal and ring-buffer certification.
 

@@ -46,25 +46,30 @@ const ROUTE_LABELS: Readonly<Record<string, string>> = {
   'P-13': 'Inspect binding',
   'P-14': 'Rotate credential',
   'G-14': 'Inspect effective request',
-  'A-01': 'Apply preset',
+  'A-01': 'Inspect presets',
   'A-10': 'Open child controls',
   'C-03': 'Add context source',
   'C-05': 'Add attachment',
   'C-06': 'Admit paste',
   'C-07': 'Pin selected source',
-  'C-11': 'Reindex',
+  'C-11': 'Inspect coverage',
   'C-12': 'Preview capacity',
   'C-14': 'Export manifest',
   'K-03': 'Preview compaction',
   'K-11': 'Review and delete',
   'I-08': 'Import rules',
   'Q-06': 'Reply to approval',
+  'Q-02': 'Inspect tool rules',
+  'Q-03': 'Inspect file scope rules',
+  'Q-04': 'Inspect command rules',
   'Q-08': 'Test against policy',
+  'Q-07': 'Remember this decision',
   'Q-09': 'Revoke rule',
   'Q-11': 'Open native setup',
   'Q-13': 'Open decision log',
-  'T-02': 'Toggle tool',
+  'T-02': 'Save allowed tools',
   'T-06': 'Connect OAuth',
+  'T-08': 'Save per-MCP tools',
   'T-13': 'Restart server',
   'T-15': 'Export diagnostics',
   'S-02': 'Set invocation policy',
@@ -76,12 +81,14 @@ const ROUTE_LABELS: Readonly<Record<string, string>> = {
   'X-06': 'Connect browser',
   'X-08': 'Capture artifact',
   'X-10': 'Add diagnostics',
+  'X-12': 'Inspect approval state',
   'X-11': 'Add code action',
   'B-05': 'Request allowance revision',
   'B-08': 'Cancel retry',
-  'B-11': 'Retry connection',
-  'B-12': 'Look up receipt',
-  'V-01': 'Open native diff',
+  'B-09': 'Inspect served limits',
+  'B-11': 'Check connection',
+  'B-12': 'Look up admission receipt',
+  'V-01': 'Inspect candidate changes',
   'V-02': 'Add review comment',
   'V-03': 'Accept selected hunks',
   'V-05': 'Preview restore',
@@ -209,12 +216,31 @@ function optionsFor(optionsSource: E5OptionsSource, snapshot: E8Snapshot): reado
   }
 }
 
+const INPUT_OVERRIDES: Readonly<Record<string, E8InputKind>> = {
+  // S64 searches the already-served catalog; the same control also supports
+  // the daemon search route for a full-catalog query.
+  'O-01': 'text',
+  // A string-list descriptor cannot be written as a toggle/select/text.
+  'T-02': 'list',
+  'T-08': 'list',
+  // Warn-at is an integer percent (1..=100), not free text.
+  'B-03': 'number',
+  // Retrieval strategy is a closed enum on the daemon descriptor.
+  'C-09': 'select',
+};
+
+const OPTION_OVERRIDES: Readonly<Record<string, readonly string[]>> = {
+  'C-09': ['lexical', 'symbol', 'semantic', 'hybrid'],
+};
+
 export function bindingFor8(control: E8Control): E8Binding {
   const route = rawRoute(control.id);
   const e5 = bindingFor(control as never);
   const kind = route.kind;
+  const overridden = INPUT_OVERRIDES[control.id];
   const input: E8InputKind =
-    control.id === 'X-06'
+    overridden ??
+    (control.id === 'X-06'
       ? 'text'
       : kind === 'missing'
         ? 'readonly'
@@ -226,17 +252,19 @@ export function bindingFor8(control: E8Control): E8Binding {
               ? 'readonly'
               : e5.input === 'readonly'
                 ? 'action'
-                : e5.input;
+                : e5.input);
   return {
     controlId: control.id,
     route,
     input,
     configKey: route.configKey,
-    options: e5.options,
+    options: OPTION_OVERRIDES[control.id] ?? e5.options,
     optionsSource: e5.optionsSource,
     actionLabel: labelFor(control, kind),
     placeholder:
-      input === 'secret-ref'
+      control.id === 'Q-07'
+        ? '{"tool_id":"shell","target":"npm test","decision":"ask"}'
+        : input === 'secret-ref'
         ? 'env:NAME or vault:NAME (never a secret value)'
         : input === 'text' || input === 'textarea' || input === 'money'
           ? kind === 'missing'
@@ -247,10 +275,26 @@ export function bindingFor8(control: E8Control): E8Binding {
                 ? 'https://example.com/ — validated by the daemon before launch'
                 : 'Enter a value'
           : null,
-    min: route.kind === 'config' && e5.input === 'number' ? (control.id === 'G-04' || control.id === 'G-05' ? 0 : e5.min) : null,
-    max: route.kind === 'config' && e5.input === 'number' ? (control.id === 'G-04' ? 2 : control.id === 'G-05' ? 1 : e5.max) : null,
-    step: route.kind === 'config' && e5.input === 'number' ? (control.id === 'G-04' || control.id === 'G-05' ? 0.1 : e5.step) : null,
-    unit: e5.unit,
+    min:
+      route.kind === 'config' && input === 'number'
+        ? control.id === 'B-03'
+          ? 1
+          : control.id === 'G-04' || control.id === 'G-05'
+            ? 0
+            : e5.min
+        : null,
+    max:
+      route.kind === 'config' && input === 'number'
+        ? control.id === 'B-03'
+          ? 100
+          : control.id === 'G-04'
+            ? 2
+            : control.id === 'G-05'
+              ? 1
+              : e5.max
+        : null,
+    step: route.kind === 'config' && input === 'number' ? (control.id === 'G-04' || control.id === 'G-05' ? 0.1 : 1) : null,
+    unit: control.id === 'B-03' ? '%' : e5.unit,
     // A toggle is a boolean control. Edition 5 also carries display options
     // ('on'/'off'); passing that option string to the toggle parser made the
     // real control look unavailable. The checkbox handler already stages a

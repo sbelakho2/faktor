@@ -1,0 +1,18 @@
+{
+  "id": "INV-STORAGE-LRU-EVICTION-ORDER",
+  "file": "crates/storage/src/ledger.rs",
+  "find": "             ORDER BY last_used_ms, key LIMIT ?4",
+  "replace": "             ORDER BY last_used_ms DESC, key LIMIT ?4",
+  "gate": "cargo test -p faktor-storage --lib eviction_at_100k_is_lru_ordered_and_bounded",
+  "expect": "FAILED",
+  "note": "Reverses LRU ordering: the newest object is evicted first instead of the oldest.",
+  "capabilities": [
+    "storage.governor"
+  ],
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

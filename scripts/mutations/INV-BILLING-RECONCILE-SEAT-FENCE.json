@@ -1,0 +1,19 @@
+{
+  "id": "INV-BILLING-RECONCILE-SEAT-FENCE",
+  "surface": "payments.billing",
+  "file": "crates/payments/src/service.rs",
+  "find": "                let quantity = provider_quantity_exact(remote.quantity, request.quantity)?;\n",
+  "replace": "                let quantity = remote.quantity;\n",
+  "gate": "cargo test -p faktor-payments --test subscription_fencing reconciliation_never_writes_provider_seat_drift_over_the_fenced_request",
+  "expect": "FAILED",
+  "note": "Reconciliation without the exact fence writes an oversize/mismatched provider quantity under a proration for the requested seats.",
+  "capabilities": [
+    "payments.seat_truth"
+  ],
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

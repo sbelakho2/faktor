@@ -205,7 +205,7 @@ class FaktorConfigurable : Configurable {
             "Opens the registry-driven screen browser for providers, context, tools, usage and setup."
         )
         screensButton.addActionListener {
-            Edition8ScreenBrowser(edition8Host()).show(component)
+            Edition8ScreenBrowser(edition8Host()).show(component, settingsHome = true)
         }
         val screensBody = pageColumn(gap = Spacing.XS, padding = 0).apply {
             add(actionRow(screensButton))

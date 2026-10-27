@@ -51,6 +51,10 @@ import javax.swing.WindowConstants
 import javax.swing.event.DocumentEvent
 import javax.swing.event.DocumentListener
 
+// Compile once: shortStatus/responseSummary run on every daemon result.
+private val STAGED_COUNT_PATTERN = Regex("Staged (\\d+) change")
+private val WHITESPACE_PATTERN = Regex("\\s+")
+
 /** The host callbacks the real tool window supplies; tests supply fixtures. */
 internal class Edition8Host(
     val client: () -> NativeClient? = { FaktorConnectionRegistry.client() },
@@ -335,7 +339,7 @@ internal class Edition8ControlRow(
             }
             if (configKey != null && panel.daemon.draft.isLocked(configKey)) {
                 field.isEnabled = false
-                field.toolTipText = "Set by managed policy; read-only"
+                field.toolTipText = "The served effective value is read-only"
             }
             field.alignmentX = Component.LEFT_ALIGNMENT
             add(vSpace(Spacing.XS))
@@ -923,7 +927,7 @@ internal class Edition8ScreenPanel(
                             row.field?.text = value
                             row.toggle?.isSelected = value.equals("true", true)
                             row.setState(
-                                if (daemon.draft.isLocked(key)) "Locked by organization — read-only"
+                                if (daemon.draft.isLocked(key)) "Read-only effective value"
                                 else "Loaded · revision ${daemon.draft.revision}",
                                 if (daemon.draft.isLocked(key)) SemanticState.DIM else SemanticState.POSITIVE
                             )
@@ -964,7 +968,7 @@ internal class Edition8ScreenPanel(
         if (loadingValues) return
         val key = row.control.configKeys.firstOrNull() ?: return
         if (daemon.draft.isLocked(key)) {
-            row.setState("Locked by organization — change refused", SemanticState.DIM)
+            row.setState("Read-only effective value — change refused", SemanticState.DIM)
             return
         }
         val value = row.value()
@@ -1463,7 +1467,7 @@ internal class Edition8ScreenPanel(
         text.startsWith("Settings read") -> "Settings read"
         text.startsWith("No unsaved") -> "No unsaved changes"
         text.startsWith("Staged") -> {
-            val count = Regex("Staged (\\d+) change").find(text)?.groupValues?.getOrNull(1)
+            val count = STAGED_COUNT_PATTERN.find(text)?.groupValues?.getOrNull(1)
             if (count == null) "Staged changes" else "Staged $count"
         }
         text.startsWith("Applied") -> "Applied"
@@ -1499,7 +1503,7 @@ internal class Edition8ScreenPanel(
     }
 
     private fun responseSummary(body: String): String {
-        val flat = body.replace(Regex("\\s+"), " ").trim()
+        val flat = body.replace(WHITESPACE_PATTERN, " ").trim()
         return bound(flat, 160)
     }
 
@@ -1557,6 +1561,175 @@ internal class Edition8ScreenPanel(
             "S63" -> "/native/model-parameters"
             else -> null
         }
+    }
+}
+
+/**
+ * The one searchable settings surface for the JetBrains host. It groups the
+ * registry's settings screens by domain (providers/models, context/
+ * compaction, tools/MCP, permissions, billing, appearance), keeps advanced
+ * screens behind one disclosure, and states the save model explicitly: edits
+ * are staged on a screen and one Apply commits the atomic patch.
+ */
+internal class Edition8SettingsHomePanel(private val host: Edition8Host) : JPanel(BorderLayout()) {
+
+    private data class Domain(val key: String, val label: String, val description: String)
+
+    private val domains = listOf(
+        Domain("providers", "Providers and models", "Connections, default models and generation tuning."),
+        Domain("context", "Context and compaction", "Sources, attachments, memory, rules and compaction."),
+        Domain("tools", "Tools and MCP", "Tool authority, MCP servers, skills, hooks and terminals."),
+        Domain("permissions", "Permissions", "One effective policy, sandbox isolation and remembered rules."),
+        Domain("billing", "Billing and usage", "Entitlements, quota, spend and the account connection."),
+        Domain("appearance", "Appearance and general", "Budgets, display, diagnostics and revision conflicts.")
+    )
+
+    private val advanced = setOf("S21", "S28", "S30", "S31", "S55", "S56", "S58", "S60", "S64")
+    private val search = JTextField(28)
+    private val rowsHost = pageColumn(gap = Spacing.S, padding = 0)
+    private val count = mutedLabel("settings")
+    private val empty = mutedLabel("No setting matches this search.")
+    private val saveState = mutedLabel("Autosave is off — Apply commits one atomic patch.")
+    private val rowRecords = ArrayList<Pair<JComponent, String>>()
+
+    init {
+        name = "edition8-settings-home"
+        a11y("Settings", "Searchable Faktor settings grouped by domain.")
+        search.a11y("Search settings", "Filters settings by name, domain and description.")
+        search.addActionListener { filter() }
+        search.document.addDocumentListener(object : DocumentListener {
+            override fun insertUpdate(e: DocumentEvent?) = filter()
+            override fun removeUpdate(e: DocumentEvent?) = filter()
+            override fun changedUpdate(e: DocumentEvent?) = Unit
+        })
+        val header = pageColumn(gap = Spacing.XS, padding = 0)
+        val title = sectionHeader("Settings")
+        header.add(title)
+        header.add(wrappedMutedLabel("One surface for every persistent setting. Values are staged; one Apply commits the atomic patch."))
+        val searchRow = wrapRow(mutedLabel("Search"), search, count)
+        header.add(searchRow)
+        val saveRow = wrapRow(saveState)
+        header.add(saveRow)
+        val body = pageColumn(gap = Spacing.L, padding = 0)
+        val settingsScreens = Edition8Registry.screens.filter { it.group in SETTINGS_GROUPS }
+        for (domain in domains) {
+            val screens = settingsScreens.filter { domainFor(it) == domain.key }
+            if (screens.isEmpty()) continue
+            val section = pageColumn(gap = Spacing.XS, padding = 0)
+            section.add(sectionHeader(domain.label))
+            section.add(wrappedMutedLabel(domain.description))
+            val primary = screens.filter { it.id !in advanced }
+            val more = screens.filter { it.id in advanced }
+            for (screen in primary) section.add(row(screen))
+            if (more.isNotEmpty()) {
+                val disclosure = JPanel(BorderLayout())
+                disclosure.isOpaque = false
+                val label = "Advanced · ${more.size}"
+                val toggle = FaktorToggleButton(label)
+                toggle.a11y(label, "Shows advanced settings screens for ${domain.label}.")
+                val content = pageColumn(gap = Spacing.XS, padding = 0)
+                for (screen in more) content.add(row(screen))
+                content.isVisible = false
+                toggle.addActionListener {
+                    content.isVisible = toggle.isSelected
+                    content.revalidate()
+                    content.repaint()
+                }
+                disclosure.add(toggle, BorderLayout.NORTH)
+                disclosure.add(content, BorderLayout.CENTER)
+                section.add(disclosure)
+            }
+            body.add(section)
+        }
+        body.add(empty)
+        rowsHost.add(body)
+        val scroll = pageScroll(rowsHost)
+        add(header, BorderLayout.NORTH)
+        add(scroll, BorderLayout.CENTER)
+        filter()
+    }
+
+    private fun domainFor(screen: Edition8Screen): String = when {
+        screen.group == "Models and providers" -> "providers"
+        screen.group == "Context" || screen.group == "Instructions and memory" -> "context"
+        screen.id in setOf("S15", "S16", "S17", "S18", "S19", "S20", "S68") -> "tools"
+        screen.id in setOf("S13", "S57", "S67") -> "permissions"
+        screen.group == "Usage" -> "billing"
+        else -> "appearance"
+    }
+
+    private fun row(screen: Edition8Screen): JComponent {
+        val panel = JPanel(BorderLayout(Spacing.S, 0))
+        panel.isOpaque = false
+        panel.border = BorderFactory.createEmptyBorder(Spacing.XS, 0, Spacing.XS, 0)
+        val label = sectionHeader(screen.title)
+        val controlNames = screen.controls.take(3).mapNotNull { id ->
+            Edition8Registry.controls.firstOrNull { it.id == id }?.name
+        }.joinToString(" · ")
+        val summaryText = if (controlNames.isEmpty()) groupSummary(screen.group) else controlNames
+        val summary = wrappedMutedLabel(summaryText + " · " + screen.id)
+        val text = pageColumn(gap = Spacing.XS, padding = 0)
+        text.add(label)
+        text.add(summary)
+        val open = secondaryButton("Open")
+        open.a11y(
+            "Open ${screen.title}",
+            "Opens ${screen.id} ${screen.title} in this settings surface."
+        )
+        open.addActionListener { host.navigateTo(screen.id) }
+        panel.add(text, BorderLayout.CENTER)
+        panel.add(open, BorderLayout.EAST)
+        rowRecords.add(
+            panel to "${screen.id} ${screen.title} ${screen.group} $summaryText ${groupSummary(screen.group)}".lowercase()
+        )
+        return panel
+    }
+
+    private fun groupSummary(group: String): String = when (group) {
+        "Setup and start" -> "Get the service, workspace and first task ready."
+        "Work" -> "Run intent, model, effort and context beside the draft."
+        "Inspect and proof" -> "Review the plan, changes, verification and finish proof."
+        "Agents" -> "Delegate work and keep child runs bounded."
+        "History" -> "Find, compare and switch durable conversations safely."
+        "Usage" -> "See token, cost and outcome evidence."
+        "Models and providers" -> "Choose models and keep provider connections healthy."
+        "Context" -> "Add, inspect and compact the context a run may use."
+        "Instructions and memory" -> "Review standing rules, precedence and memory."
+        "Permissions and tools" -> "Review tool authority, MCP, skills and hooks."
+        "Settings and diagnostics" -> "Tune budgets, efficiency, settings and recovery."
+        else -> "Revision 8 settings."
+    }
+
+    private fun filter() {
+        val query = search.text.trim().lowercase()
+        var visible = 0
+        for ((panel, haystack) in rowRecords) {
+            val match = query.isEmpty() || haystack.contains(query)
+            panel.isVisible = match
+            if (match) visible += 1
+        }
+        count.text = if (query.isEmpty()) "${rowRecords.size} settings screens"
+        else "$visible " + if (visible == 1) "setting matches" else "settings match"
+        empty.isVisible = visible == 0
+        rowsHost.revalidate()
+        rowsHost.repaint()
+    }
+
+    internal fun searchFieldForTest(): JTextField = search
+
+    internal fun visibleRowCountForTest(): Int = rowRecords.count { it.first.isVisible }
+
+    internal fun totalRowCountForTest(): Int = rowRecords.size
+
+    internal fun domainLabelsForTest(): List<String> = domains.map { it.label }
+
+    internal fun saveStateTextForTest(): String = saveState.text
+
+    private companion object {
+        val SETTINGS_GROUPS = setOf(
+            "Models and providers", "Context", "Instructions and memory",
+            "Permissions and tools", "Usage", "Settings and diagnostics"
+        )
     }
 }
 
@@ -1633,15 +1806,30 @@ internal class Edition8ShellPanel(private val host: Edition8Host) : JPanel(Borde
             "History", "Usage", "Settings and diagnostics" -> "History"
             else -> "Inspect"
         }
+        showPanel(cluster, panel) {
+            val wanted = "${screen.id} · ${screen.title}"
+            val pair = clusterHosts[cluster]
+            if (pair != null) {
+                for (i in 0 until pair.first.itemCount) {
+                    if (pair.first.getItemAt(i) == wanted) pair.first.selectedIndex = i
+                }
+            }
+        }
+    }
+
+    /** The one searchable settings surface, opened without a modal copy. */
+    fun openSettings() {
+        val panel = built.getOrPut("settings-home") { Edition8SettingsHomePanel(host) }
+        showPanel("History", panel) {}
+    }
+
+    private fun showPanel(cluster: String, panel: JComponent, select: () -> Unit) {
         val pair = clusterHosts[cluster] ?: return
         val index = tabs.indexOfTab(cluster)
         opening = true
         try {
             if (tabs.selectedIndex != index) tabs.selectedIndex = index
-            val wanted = "${screen.id} · ${screen.title}"
-            for (i in 0 until pair.first.itemCount) {
-                if (pair.first.getItemAt(i) == wanted) pair.first.selectedIndex = i
-            }
+            select()
         } finally {
             opening = false
         }
@@ -1663,7 +1851,7 @@ internal class Edition8ShellPanel(private val host: Edition8Host) : JPanel(Borde
 /** A registry-driven chooser for the real tool window's toolbar. */
 internal class Edition8ScreenBrowser(private val host: Edition8Host) {
 
-    fun show(parent: Component?, initialScreen: String? = null) {
+    fun show(parent: Component?, initialScreen: String? = null, settingsHome: Boolean = false) {
         val dialog = JDialog(
             SwingUtilities.getWindowAncestor(parent),
             "Faktor",
@@ -1678,7 +1866,7 @@ internal class Edition8ScreenBrowser(private val host: Edition8Host) {
         val settings = secondaryButton("Settings")
         settings.name = "edition8-browser-settings"
         settings.a11y("Open Settings", "Opens General settings inside this browser.")
-        settings.addActionListener { shell.open("S29") }
+        settings.addActionListener { shell.openSettings() }
         val close = secondaryButton("Close")
         close.a11y("Close Faktor screens", "Returns to the workbench; the draft is untouched.")
         close.addActionListener { dialog.dispose() }
@@ -1688,7 +1876,7 @@ internal class Edition8ScreenBrowser(private val host: Edition8Host) {
         content.add(toolbar, BorderLayout.NORTH)
         content.add(shell, BorderLayout.CENTER)
         dialog.contentPane = content
-        if (initialScreen != null) shell.open(initialScreen)
+        if (settingsHome) shell.openSettings() else if (initialScreen != null) shell.open(initialScreen)
         val escape = KeyStroke.getKeyStroke(KeyEvent.VK_ESCAPE, 0)
         dialog.rootPane.getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW).put(escape, "edition8.close")
         dialog.rootPane.actionMap.put("edition8.close", object : javax.swing.AbstractAction() {

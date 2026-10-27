@@ -26,6 +26,10 @@ import java.math.BigInteger
 import javax.swing.BoxLayout
 import javax.swing.JPanel
 
+// Compile once: every outcome money row renders through this parser.
+private val COMPACT_MONEY_PATTERN =
+    Regex("^\\$([0-9]+\\.[0-9]{2})00 \\u00b7 ([0-9]+)\\u00b5\\$")
+
 /** Exact empty-denominator copy (never a zero rate claim). */
 const val OUTCOMES_NO_VERIFIED_CHANGES = "No verified changes yet"
 
@@ -524,7 +528,7 @@ internal fun moneyText(micro: String): String {
 
 /** Compact exact display of a ledger money value: $45.00 · 45,000,000µ$. */
 internal fun compactMoneyText(value: String): String {
-    val match = Regex("^\\$([0-9]+\\.[0-9]{2})00 \\u00b7 ([0-9]+)\\u00b5\\$$").find(value)
+    val match = COMPACT_MONEY_PATTERN.find(value)
         ?: return value
     return "$" + match.groupValues[1] + " \u00b7 " +
         groupedDecimal(match.groupValues[2]) + "\u00b5$"

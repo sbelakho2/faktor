@@ -1,0 +1,16 @@
+{
+  "id": "INV-EDITION8-APPROVAL-DISPLAY-NO-SHELL-WRITE",
+  "file": "apps/vscode/src/edition8/routes.ts",
+  "find": "  'Q-03': read('/native/permissions/policy'),",
+  "replace": "  'Q-03': cfg('faktor.sandbox.shell'),",
+  "gate": "node --no-warnings apps/vscode/scripts/selftest.mjs",
+  "expect": "FAIL",
+  "timeout_ms": 180000,
+  "note": "A display/matcher control writes sandbox.shell again.",
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

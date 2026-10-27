@@ -1,0 +1,16 @@
+{
+  "id": "INV-EDITION8-SETTINGS-WIRING",
+  "file": "apps/vscode/media/edition8.js",
+  "find": "  installSettingsSearch();\n  installSettingsHome();",
+  "replace": "  installSettingsSearch();",
+  "gate": "node --no-warnings apps/vscode/scripts/selftest.mjs",
+  "expect": "FAIL",
+  "timeout_ms": 180000,
+  "note": "The one settings surface renders but loses its search, row navigation and review wiring.",
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

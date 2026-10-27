@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! macOS OS-level spawn confinement via the system sandbox engine.
 //!
 //! The backend generates a SBPL (Sandbox Profile Language) profile per spawn

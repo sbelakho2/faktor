@@ -33,13 +33,46 @@ body {
   background: var(--vscode-sideBar-background, transparent);
 }
 
+html,
+body {
+  height: 100%;
+}
+
+body {
+  overflow: hidden;
+}
+
 #app {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
   padding: var(--space-2) var(--space-3);
   box-sizing: border-box;
-  min-height: 100vh;
+  height: 100vh;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* Work is the conversation surface: the transcript owns the flexible height
+   and the composer stays anchored to the bottom edge. Inspect and History
+   scroll as their own destinations. */
+#work-panel {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+}
+
+#inspect-panel,
+#history-panel {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+#diagnostics {
+  flex: none;
+  max-height: 45vh;
+  overflow-y: auto;
 }
 
 /* Primary hierarchy: one active view at a time. Work (conversation → current
@@ -670,10 +703,48 @@ button.toggle[aria-expanded='true'] {
 .transcript-card {
   border: none;
   padding: 0;
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
 
-.run-card {
+.transcript-card > #welcome {
+  flex: none;
+}
+
+/* One compact sticky run status row: state, run, tokens and approvals only.
+   Run details (goal, plan, candidate boundary) live in Inspect. */
+.work-status {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  flex: none;
+  border: 1px solid var(--faktor-border);
   border-left: 3px solid var(--faktor-accent);
+  padding: 4px var(--space-2);
+  background: var(--vscode-sideBar-background, var(--vscode-editor-background, transparent));
+}
+
+.work-status .run-strip {
+  min-height: 28px;
+}
+
+.work-status .run-chip {
+  font-size: 0.78em;
+}
+
+.work-status .status-stop,
+.work-status .status-inspect {
+  min-height: 28px;
+  padding: 1px 8px;
+  font-size: 0.82em;
+}
+
+.work-status #run-state {
+  margin-top: 2px;
+  font-size: 0.88em;
 }
 
 .run-strip {
@@ -867,7 +938,8 @@ button.toggle[aria-expanded='true'] {
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
-  max-height: min(64vh, 640px);
+  flex: 1 1 auto;
+  min-height: 0;
   overflow-y: auto;
   padding-right: 2px;
   /* The transcript owns scroll preservation explicitly (anchor index +
@@ -953,6 +1025,53 @@ button.toggle[aria-expanded='true'] {
 
 .activity {
   margin: 2px 0;
+}
+
+/* Consecutive tool calls read as one activity batch: a concise count/failure
+   summary that expands to the individual, still individually collapsible
+   rows. Settled batches start closed; live/failed batches start open. */
+.activity-group {
+  border: 1px solid var(--faktor-border-quiet);
+  border-radius: var(--faktor-radius);
+  margin: 2px 0;
+}
+
+.activity-group-summary {
+  display: flex;
+  align-items: center;
+  min-height: 28px;
+  padding: 2px 10px;
+  box-sizing: border-box;
+  cursor: pointer;
+  color: var(--vscode-descriptionForeground);
+  font-size: 0.88em;
+  list-style: none;
+}
+
+.activity-group-summary::-webkit-details-marker {
+  display: none;
+}
+
+.activity-group-summary::before {
+  content: '\25B8';
+  width: 12px;
+  flex: none;
+  color: var(--vscode-descriptionForeground);
+}
+
+.activity-group[open] > .activity-group-summary::before {
+  content: '\25BE';
+}
+
+.activity-group-summary:hover {
+  color: var(--vscode-foreground);
+}
+
+.activity-group-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 0 4px 4px;
 }
 
 .activity-details {
@@ -1836,6 +1955,25 @@ button.attachment-remove {
   color: var(--vscode-descriptionForeground);
 }
 
+/* Coordination is an explicit, collapsed drawer inside Inspect > Agents. It
+   is never part of the Work conversation surface. */
+.coordination-drawer {
+  border: 1px solid var(--faktor-border);
+  border-radius: var(--faktor-radius);
+  padding: var(--space-2) var(--space-3);
+}
+
+.coordination-drawer > summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: var(--vscode-descriptionForeground);
+  min-height: 28px;
+}
+
+.coordination-drawer > summary:hover {
+  color: var(--vscode-foreground);
+}
+
 .board-posts {
   list-style: none;
   margin: var(--space-1) 0;
@@ -2218,9 +2356,6 @@ button.attachment-remove {
     padding: var(--space-3) 16px;
     max-width: 1024px;
     margin: 0 auto;
-  }
-  #entries {
-    max-height: 70vh;
   }
   .cockpit {
     display: grid;

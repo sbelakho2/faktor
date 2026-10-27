@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! Compaction records with the hard invariant from section 9 of the
 //! architecture spec: a successful compaction must achieve the configured
 //! minimum reduction. A "summary" that reduces context by ~1% is rejected.
@@ -169,14 +170,48 @@ pub struct CompactionRecord {
 
 impl SessionHandle {
     /// Record a compaction attempt and enforce the hard invariant. Accepted
-    /// iff `after <= target` and `reduction >= min_reduction_ratio`; anything
-    /// else journals `CompactRejected` and reports the reason. The session
-    /// state does not move (compaction is an interior event).
+    /// iff the COMPACTOR accepted the plan AND `after <= target` AND
+    /// `reduction >= min_reduction_ratio`; anything else journals
+    /// `CompactRejected` and reports the reason. The session state does not
+    /// move (compaction is an interior event).
+    ///
+    /// This entry point is for an ACCEPTED plan (the numeric checks still
+    /// run); call [`Self::record_compaction_rejected`] for a plan the
+    /// compactor explicitly refused.
     pub fn record_compaction(
         &self,
         before: i64,
         after: i64,
         target: i64,
+        strategy: &str,
+        policy: &CompactionPolicy,
+    ) -> faktor_core::Result<CompactionRecord> {
+        self.record_compaction_verdict(before, after, target, true, strategy, policy)
+    }
+
+    /// Record the compactor's EXPLICIT rejection. The plan verdict is
+    /// authoritative: a rejected plan can carry a tiny `after` (for example
+    /// when only the archive digest fits), which would satisfy every numeric
+    /// check while having dropped the active instruction. Such a plan must
+    /// never be reinterpreted as `ContextCompacted`.
+    pub fn record_compaction_rejected(
+        &self,
+        before: i64,
+        after: i64,
+        target: i64,
+        strategy: &str,
+        policy: &CompactionPolicy,
+    ) -> faktor_core::Result<CompactionRecord> {
+        self.record_compaction_verdict(before, after, target, false, strategy, policy)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_compaction_verdict(
+        &self,
+        before: i64,
+        after: i64,
+        target: i64,
+        plan_accepted: bool,
         strategy: &str,
         policy: &CompactionPolicy,
     ) -> faktor_core::Result<CompactionRecord> {
@@ -210,9 +245,13 @@ impl SessionHandle {
         }
 
         let reduction_ratio = 1.0 - (after as f64 / before as f64);
-        let accepted = after <= target && reduction_ratio >= policy.min_reduction_ratio;
+        let accepted =
+            plan_accepted && after <= target && reduction_ratio >= policy.min_reduction_ratio;
         let reason = if !accepted {
-            let why = if after > target {
+            let why = if !plan_accepted {
+                "the compactor rejected the plan (active instruction, identity or target invariant)"
+                    .to_string()
+            } else if after > target {
                 format!("after ({after}) exceeds target ({target})")
             } else {
                 format!(
@@ -481,7 +520,6 @@ impl SessionHandle {
     /// replacement checkpoint and the journal event commit together. The
     /// caller passes the EXACT kept wire turns (serialized) and their
     /// canonical digest.
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub fn commit_compaction_with_checkpoint(
         &self,
@@ -1018,6 +1056,56 @@ mod tests {
             .collect();
         assert!(kinds.contains(&EventKind::CompactRejected));
         assert!(!kinds.contains(&EventKind::ContextCompacted));
+    }
+
+    /// CASE INV-COMPACTION-VERDICT: the runtime's no-checkpoint branch
+    /// records the plan verdict too: a rejected plan whose numeric `after`
+    /// is tiny (only the archive digest fit) must journal
+    /// `CompactRejected`, never `ContextCompacted`.
+    #[test]
+    fn record_compaction_rejected_never_flips_a_tiny_after_to_success() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        let record = s
+            .record_compaction_rejected(
+                10_000,
+                10,
+                20_000,
+                "deterministic_pruning",
+                &CompactionPolicy {
+                    min_reduction_ratio: 0.25,
+                },
+            )
+            .unwrap();
+        assert!(!record.accepted);
+        assert!(record
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("compactor rejected"));
+        let kinds: Vec<_> = s
+            .events_range(1, None)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.kind)
+            .collect();
+        assert!(kinds.contains(&EventKind::CompactRejected));
+        assert!(!kinds.contains(&EventKind::ContextCompacted));
+    }
+
+    /// Mutation witness for the verdict guard: dropping `plan_accepted` from
+    /// the acceptance predicate makes the tiny-after rejection above pass
+    /// every numeric check and flip to success.
+    #[test]
+    fn compaction_verdict_guard_is_mutation_sensitive() {
+        const SOURCE: &str = include_str!("compaction.rs");
+        assert!(SOURCE.contains("plan_accepted && after <= target"));
+        let mutated = SOURCE.replace("plan_accepted && after <= target", "after <= target");
+        assert_ne!(SOURCE, mutated, "the verdict guard seam must exist");
+        assert!(
+            !mutated.contains("plan_accepted && after <= target"),
+            "removing the plan verdict is the detected mutation"
+        );
     }
 
     #[test]

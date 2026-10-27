@@ -1,0 +1,18 @@
+{
+  "id": "INV-STORAGE-PINNED-DELTA",
+  "file": "crates/storage/src/ledger.rs",
+  "find": "            } else if required {\n                // Required bytes changing size must move the pinned counter",
+  "replace": "            } else if false {\n                // Required bytes changing size must move the pinned counter",
+  "gate": "cargo test -p faktor-storage --lib required_object_growth_moves_the_pinned_counter",
+  "expect": "FAILED",
+  "note": "Leaves the pinned counter stale when a required object's size changes, under-counting required pressure.",
+  "capabilities": [
+    "storage.governor"
+  ],
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

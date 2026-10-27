@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! Adversarial tests of the shadow mutation-root service (P0-48/49).
 //!
 //! The tests break the invariants the feature exists for: a STABLE begin

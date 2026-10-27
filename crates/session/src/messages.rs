@@ -221,6 +221,19 @@ impl SessionHandle {
             .map_err(|e| crate::map_store_err(e).into())
     }
 
+    /// Bounded batch twin of [`Self::parts_of`]: one indexed `IN` read per
+    /// <=500 message ids. Callers inspecting a transcript page must use this
+    /// (per-message reads make a page O(messages) SQLite round trips).
+    pub fn parts_for_messages(
+        &self,
+        message_ids: &[i64],
+    ) -> faktor_core::Result<std::collections::HashMap<i64, Vec<PartRow>>> {
+        self.manager
+            .store()
+            .parts_for_messages(message_ids)
+            .map_err(|e| crate::map_store_err(e).into())
+    }
+
     /// Convenience: a `text` part.
     pub fn put_text_part(&self, message_id: i64, text: &str) -> faktor_core::Result<i64> {
         self.put_part(
@@ -478,13 +491,15 @@ impl SessionHandle {
             None
         };
 
+        let ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
+        let mut parts_by_message = self
+            .manager
+            .store()
+            .parts_for_messages(&ids)
+            .map_err(crate::map_store_err)?;
         let mut messages = Vec::with_capacity(rows.len());
         for row in rows {
-            let part_rows = self
-                .manager
-                .store()
-                .parts_of(row.id)
-                .map_err(crate::map_store_err)?;
+            let part_rows = parts_by_message.remove(&row.id).unwrap_or_default();
             let mut parts = Vec::with_capacity(part_rows.len());
             for p in &part_rows {
                 parts.push(wire_part(p)?);

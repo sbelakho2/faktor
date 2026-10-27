@@ -1,0 +1,19 @@
+{
+  "id": "INV-BILLING-DUNNING-ATTEMPT-IDENTITY",
+  "surface": "payments.billing",
+  "file": "crates/payments/src/service/webhook_effects.rs",
+  "find": "        let advance_dunning =\n            invoice.last_dunning_payment_id.as_deref() != Some(failure_identity.as_str());\n",
+  "replace": "        let advance_dunning = true;\n",
+  "gate": "cargo test -p faktor-payments --test lifecycle one_failed_attempt_fanned_out_into_two_events_advances_dunning_once",
+  "expect": "FAILED",
+  "note": "Counting every invoice event makes one failed provider payment exhaust dunning twice.",
+  "capabilities": [
+    "payments.invoice_truth"
+  ],
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

@@ -18,13 +18,13 @@
     "extracted_text_sha256": "sha256:bef802a6d53744ce30023be7a12fe5859e5c3b0802efe6c78b3b804a155604a8"
   },
   "inputs": {
-    "controls": "sha256:722f95af635e13f99ae6f2f89a2d7f643d06da129b437cc7e764e8c5730fb80c",
+    "controls": "sha256:dd4db5e1890e919768905e8ba4bf9c49a60a197f1152d6f583b1b631f3184cee",
     "screens": "sha256:c2b9655666e47c23d1ab65aa77164851d25b9bdc187afecef52dc9a50e29fb87",
     "flows": "sha256:a22fa1582ec98d65bab168e6df499ea8604248519ffdf4fe8a522445aaaf8c8d",
     "acceptance": "sha256:ae28d8067593e6a5baef8cf7ab891e01b4ae980c1c71b66a3e8c1ee1ebcb4908",
     "expectations": "sha256:8be92336ebc8553a3f76cf9f8808cd60a5b697f0c8a2c473270c63d7e8b60ac1"
   },
-  "inputs_digest": "sha256:7dc0e69ed1bf8c453c94558d36d9b9574cda01a904ea8da269221acccf7788d0",
+  "inputs_digest": "sha256:993eac4d0bbeebe672c9bbde00e7d93729b6bb7b440c9e8c2f44c4a10216dd19",
   "counts": {
     "screens": 72,
     "host_contracts": 144,
@@ -10367,9 +10367,7 @@
         "source": "Per-control empty/error/disabled copy from the Rev8 catalog; loading/stale/pending are the global state rules, not control-specific copy."
       },
       "classification": "H",
-      "config_keys": [
-        "faktor.telemetry.categories"
-      ],
+      "config_keys": [],
       "current_status": "exists",
       "acceptance_scenario_ids": [
         "A27",

@@ -106,3 +106,34 @@ The new surfaces concentrate on four areas: setup/admission/recovery (S34–S39,
 - The PDF gives global loading/stale/pending state rules, not per-control copy; the per-control empty/error/disabled text comes from the catalog and may be generic for many controls.
 - Screen titles are editorial; IDs are the stable contract. Use S-IDs, not titles, in implementation/tests.
 - The repository now carries the Rev8 72-screen registry in both hosts (`apps/vscode/src/generated/edition8Registry.ts`, `Edition8CatalogData.kt`): 72 screens, 144 host contracts, 200 controls, 40 acceptance scenarios and 16 workflows (5 cells per host). The executable evidence is produced by `node scripts/edition8/run.mjs` and summarized in `target/certification/edition8-summary.json`; `backlog.md` records the historical gap analysis, not the current tree.
+
+## 9. Intentional UX deviations (chat/settings overhaul)
+
+This wave keeps the Rev8 tokens (host fonts, 4/8/12/24 spacing, 24 px targets,
+host focus, status vocabulary) but changes three information-architecture
+choices in response to operator review. These are deliberate deviations, not
+silent registry edits: screen IDs, control IDs and native routes are unchanged.
+
+1. **Work is conversation-first.** S01's "quiet config row" is reduced to one
+   compact sticky status row (state · run · exact tokens · pending approvals)
+   with Details/Stop. The goal, plan, candidate boundary and run picker move to
+   Inspect › Overview › Run details. The composer stays anchored to the bottom
+   and the transcript owns the remaining height (`chat.css`, `FaktorChatPanel`).
+2. **Coordination is a drawer, never chat chrome.** S52 remains in
+   Inspect › Agents, now as an explicitly collapsed `<details>` drawer
+   (`board-card`); the Work surface contains no board, posts or board composer.
+   This overrides the earlier "long transcript may keep the board beside it"
+   reading of S01; evidence is `INV-CHAT-BOARD-NOT-IN-WORK`.
+3. **Settings is one domain surface.** Rev8 lists settings as separate S02–S31
+   screens; the shipped surface presents them as six searchable domains
+   (providers/models, context/compaction, tools/MCP, permissions, billing,
+   appearance) with descriptor labels/descriptions, advanced screens behind one
+   disclosure per domain, human value summaries (no raw JSON), and one footer
+   Apply with an explicit "autosave off" state. This keeps every S-screen and
+   control reachable while removing per-screen duplicate apply actions and the
+   screen-index-as-navigation model. Evidence is
+   `INV-EDITION8-ONE-SETTINGS-SURFACE`.
+
+The host-native Settings editor / Configurable remains the persistence
+authority; the webview only stages a typed patch. No daemon route, control
+contract or acceptance scenario is removed.

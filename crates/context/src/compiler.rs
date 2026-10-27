@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! The production context compiler (audit 2/3/41/42/70): the ONE content
 //! authority that turns durable task facts into the evidence a turn sends.
 //!
@@ -1462,36 +1463,50 @@ pub fn coordination_notice(unread: u64) -> Option<String> {
     ))
 }
 
-/// Revision-keyed memo of the coordination notice. `revision` is the board
-/// revision the unread counts were folded from: while the revision is
+/// Memo of the coordination notice keyed by BOTH the board revision and the
+/// root ledger's fold cursor. The board revision alone is insufficient: a
+/// `BoardRead` appends read markers (and the unread count drops) WITHOUT
+/// bumping the board revision, so a revision-only memo kept serving a stale
+/// "N unread" line after the child had already read the board. The cursor is
+/// the number of folded ledger entries (`LedgerHead::checkpoint_seq`) and
+/// advances on every append, including read markers. While both are
 /// UNCHANGED the cached bytes are returned WITHOUT running the counter
-/// closure again (no board rescan, no prompt change); a revision change
+/// closure again (no board rescan, no prompt change); either moving
 /// recomputes exactly once, coalescing every intermediate change into the
 /// current single line.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CoordinationNoticeMemo {
     revision: Option<u64>,
+    cursor: Option<i64>,
     notice: Option<String>,
 }
 
 impl CoordinationNoticeMemo {
-    /// The notice for `revision`, computed by `count` ONLY when the revision
-    /// moved; `None` when that revision has zero unread. An unchanged
-    /// revision returns the cached bytes and never calls `count`.
-    pub fn notice_for<F>(&mut self, revision: u64, count: F) -> Option<&str>
+    /// The notice for `(revision, cursor)`, computed by `count` ONLY when
+    /// either moved; `None` when that state has zero unread. An unchanged
+    /// state returns the cached bytes and never calls `count`.
+    pub fn notice_for<F>(&mut self, revision: u64, cursor: i64, count: F) -> Option<&str>
     where
         F: FnOnce() -> u64,
     {
-        if self.revision != Some(revision) {
+        if self.revision != Some(revision) || self.cursor != Some(cursor) {
             self.revision = Some(revision);
+            self.cursor = Some(cursor);
             self.notice = coordination_notice(count());
         }
         self.notice.as_deref()
     }
 
-    /// The revision the memo currently holds (`None` before the first call).
+    /// The board revision the memo currently holds (`None` before the first
+    /// call).
     pub fn revision(&self) -> Option<u64> {
         self.revision
+    }
+
+    /// The ledger fold cursor the memo currently holds (`None` before the
+    /// first call).
+    pub fn cursor(&self) -> Option<i64> {
+        self.cursor
     }
 }
 
@@ -2454,7 +2469,7 @@ mod tests {
         assert_eq!(memo.revision(), None);
 
         let first = memo
-            .notice_for(7, || {
+            .notice_for(7, 100, || {
                 calls.set(calls.get() + 1);
                 1
             })
@@ -2466,7 +2481,7 @@ mod tests {
 
         // Unchanged revision: no recompute, byte-identical notice.
         let again = memo
-            .notice_for(7, || {
+            .notice_for(7, 100, || {
                 calls.set(calls.get() + 1);
                 999
             })
@@ -2477,7 +2492,7 @@ mod tests {
 
         // A revision bump recomputes exactly once with the new count.
         let second = memo
-            .notice_for(8, || {
+            .notice_for(8, 101, || {
                 calls.set(calls.get() + 1);
                 10_000
             })
@@ -2488,7 +2503,7 @@ mod tests {
         // Zero unread at a new revision: no notice, and the revision is
         // still cached so the same revision stays silent without a rescan.
         assert_eq!(
-            memo.notice_for(9, || {
+            memo.notice_for(9, 102, || {
                 calls.set(calls.get() + 1);
                 0
             }),
@@ -2496,14 +2511,27 @@ mod tests {
         );
         assert_eq!(calls.get(), 3);
         assert_eq!(
-            memo.notice_for(9, || {
+            memo.notice_for(9, 102, || {
                 calls.set(calls.get() + 1);
                 5
             }),
             None,
-            "zero-unread revision stays cached"
+            "zero-unread state stays cached"
         );
-        assert_eq!(calls.get(), 3, "no recompute within the same revision");
+        assert_eq!(calls.get(), 3, "no recompute within the same state");
+
+        // A BoardRead appends read markers WITHOUT bumping the board
+        // revision; the ledger cursor moves. The memo must recompute and
+        // drop the stale unread line instead of serving revision-only bytes.
+        assert_eq!(
+            memo.notice_for(9, 103, || {
+                calls.set(calls.get() + 1);
+                0
+            }),
+            None,
+            "a read-cursor advance at the same revision recomputes"
+        );
+        assert_eq!(calls.get(), 4, "the cursor move is not a cache hit");
     }
 
     /// Variant selection acquires the evidence candidate set exactly ONCE and

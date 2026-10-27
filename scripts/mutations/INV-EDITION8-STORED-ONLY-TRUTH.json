@@ -1,0 +1,16 @@
+{
+  "id": "INV-EDITION8-STORED-ONLY-TRUTH",
+  "file": "apps/vscode/src/edition8/view.ts",
+  "find": "      if (consumerState === 'stored_only') {",
+  "replace": "      if (consumerState === 'applied') {",
+  "gate": "node --no-warnings apps/vscode/scripts/selftest.mjs",
+  "expect": "FAIL",
+  "timeout_ms": 180000,
+  "note": "Stored-only keys fall through to the misleading lock copy again.",
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

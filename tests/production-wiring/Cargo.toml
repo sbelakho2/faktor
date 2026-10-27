@@ -49,6 +49,7 @@ faktor-impact = { workspace = true, features = ["runtime"] }
 faktor-sandbox.workspace = true
 faktor-store = { workspace = true, features = ["fault-injection"] }
 faktor-cas.workspace = true
+faktor-storage.workspace = true
 faktor-acp.workspace = true
 faktor-verify.workspace = true
 faktor-kiwi.workspace = true

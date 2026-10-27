@@ -1,0 +1,18 @@
+{
+  "id": "INV-STORAGE-EVIDENCE-PIN-RELEASE",
+  "file": "crates/evidence/src/store.rs",
+  "find": "                if let Some(governor) = self.cas.governor() {\n                    let _ =\n                        governor.unpin(faktor_storage::StorageClass::EvidenceCas, &hex(&digest));\n                }",
+  "replace": "                if let Some(governor) = self.cas.governor() {\n                    let _ = (&governor, &digest);\n                }",
+  "gate": "cargo test -p faktor-evidence --lib evidence_backing_is_admitted_and_pinned_before_the_row_commits",
+  "expect": "FAILED",
+  "note": "Leaves the pre-publication evidence pin behind when the CAS refuses the publish: a later object of otherwise unrelated content is treated as required forever.",
+  "capabilities": [
+    "storage.governor"
+  ],
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

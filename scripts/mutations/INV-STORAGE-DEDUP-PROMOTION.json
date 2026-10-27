@@ -1,0 +1,18 @@
+{
+  "id": "INV-STORAGE-DEDUP-PROMOTION",
+  "file": "crates/storage/src/ledger.rs",
+  "find": "                    && owner.is_some_and(|owner| class.retention_rank() > owner.retention_rank())",
+  "replace": "                    && owner.is_some_and(|owner| false && class.retention_rank() > owner.retention_rank())",
+  "gate": "cargo test -p faktor-cas --lib dedup_hit_promotes_to_the_strongest_retention_class",
+  "expect": "FAILED",
+  "note": "Suppresses retention-class promotion on CAS dedup: an archive reference stored as main CAS later evicts without a loss marker.",
+  "capabilities": [
+    "storage.governor"
+  ],
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

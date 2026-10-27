@@ -203,13 +203,11 @@ pub(crate) fn build_daemon_with_seams_and_planner(
     {
         let staging = install_root.join("staging");
         _storage_governor
-            .register_backend(std::sync::Arc::new(
-                faktor_storage::DirectoryBackend::new(
-                    faktor_storage::StorageClass::UpdateRemnant,
-                    &staging,
-                )
-                .with_min_age(config.storage.update_remnant_stale_ms),
-            ))
+            .add_directory_root(
+                faktor_storage::StorageClass::UpdateRemnant,
+                &staging,
+                config.storage.update_remnant_stale_ms,
+            )
             .map_err(|e| format!("storage governor updater remnants: {e}"))?;
         let _ = _storage_governor.cleanup_update_remnants(config.storage.update_remnant_stale_ms);
     }
@@ -336,13 +334,11 @@ pub(crate) async fn build_daemon_with_mcp_inner(
     {
         let staging = install_root.join("staging");
         _storage_governor
-            .register_backend(std::sync::Arc::new(
-                faktor_storage::DirectoryBackend::new(
-                    faktor_storage::StorageClass::UpdateRemnant,
-                    &staging,
-                )
-                .with_min_age(config.storage.update_remnant_stale_ms),
-            ))
+            .add_directory_root(
+                faktor_storage::StorageClass::UpdateRemnant,
+                &staging,
+                config.storage.update_remnant_stale_ms,
+            )
             .map_err(|e| format!("storage governor updater remnants: {e}"))?;
         let _ = _storage_governor.cleanup_update_remnants(config.storage.update_remnant_stale_ms);
     }
@@ -860,6 +856,13 @@ pub(crate) struct DaemonPreflight {
 }
 
 pub(crate) fn preflight_daemon_config(config: &config::Config) -> Result<DaemonPreflight, String> {
+    // Machine-scoped credentials FIRST: the provider secret registry and the
+    // adapters below read `providers[].api_key_env` from the process
+    // environment. Loading the declared file here (idempotently; an explicit
+    // process export wins) means a GUI-launched daemon that did not inherit
+    // the operator's shell export still resolves the key before any store,
+    // registry or provider exists. A refused file leaves no durable state.
+    let _ = config::load_provider_env_file(config)?;
     let sandbox_policy = config
         .sandbox_policy()
         .map_err(|e| format!("sandbox config: {e}"))?;
@@ -1667,6 +1670,11 @@ pub(crate) fn build_daemon_core(
         secret_registry: Some(secret_registry.clone()),
     })
     .map_err(|e| e.to_string())?;
+    // The SAME configured minimum reduction governs the proactive agent
+    // path and the explicit compaction routes; without this the daemon
+    // setting applied only to manual compaction and proactive compaction
+    // silently kept the 25% default.
+    agent.set_compaction_min_reduction(config.compaction_min_reduction);
     // The completion spine (audit item 6): install the ONE daemon registry on
     // the runtime so unresolved contract claims dispatch through the same
     // neutral surface the graph exposes. A native-only registry (the default
@@ -1728,18 +1736,7 @@ pub(crate) fn build_daemon_core(
     // canonical completion adapter. Disabled sections construct nothing
     // (a contracted PR step records `native_pr_scm_not_configured`). Only
     // token source and clock may arrive through the external seams.
-    let scm_store: Option<Arc<dyn faktor_scm::ScmStore>> = if config.cloud.enabled {
-        let path = config
-            .cloud
-            .scm_path(data_dir)
-            .map_err(|e| format!("cloud config: {e}"))?;
-        let path = enabled_section_db_path("cloud scm", path)?;
-        Some(Arc::new(faktor_scm::SqliteScmStore::open(&path).map_err(
-            |e| format!("cloud scm store {}: {e}", path.display()),
-        )?))
-    } else {
-        None
-    };
+    let scm_store = open_scm_store(&config.cloud, data_dir)?;
     wire_completion_scm(
         &config.cloud,
         data_dir,
@@ -1784,6 +1781,26 @@ pub(crate) fn build_daemon_core(
         shadows,
         tasks,
     })
+}
+
+/// Open the optional durable SCM store for the completion pathway. A disabled
+/// `[cloud]` section constructs nothing; an enabled one opens `scm.db` and
+/// fails daemon startup if the path is not admissible.
+fn open_scm_store(
+    cloud: &config::CloudCfg,
+    data_dir: &std::path::Path,
+) -> Result<Option<Arc<dyn faktor_scm::ScmStore>>, String> {
+    if !cloud.enabled {
+        return Ok(None);
+    }
+    let path = cloud
+        .scm_path(data_dir)
+        .map_err(|e| format!("cloud config: {e}"))?;
+    let path = enabled_section_db_path("cloud scm", path)?;
+    Ok(Some(Arc::new(
+        faktor_scm::SqliteScmStore::open(&path)
+            .map_err(|e| format!("cloud scm store {}: {e}", path.display()))?,
+    )))
 }
 
 /// Tokenizer compatibility certification + reporting (audit item 22; the

@@ -1179,34 +1179,37 @@ object TaskTree {
     ): List<StepNode> {
         val plan = task?.plan ?: emptyList()
         if (plan.isNotEmpty()) {
+            // ONE child index: the historical per-step `children.filter`
+            // made a 200-child / 200-step rebuild O(steps x children).
+            val childrenByItem = children.groupBy { it.itemId }
             return plan.map { step ->
                 StepNode(
                     id = step.id,
                     summary = step.summary,
                     state = step.state,
                     dependsOn = step.dependsOn,
-                    childIds = children.filter { it.itemId == step.id }.map { it.childId }
+                    childIds = childrenByItem[step.id].orEmpty().map { it.childId }
                 )
             }
         }
         if (graph != null && graph.workItems.isNotEmpty()) {
+            val childrenByStep = graph.children.groupBy { it.planStepIndex }
             return graph.workItems.mapIndexed { index, item ->
                 StepNode(
                     id = item.itemId,
                     summary = item.kind,
                     state = item.state,
                     dependsOn = emptyList(),
-                    childIds = graph.children
-                        .filter { it.planStepIndex == index }
-                        .map { it.childId }
+                    childIds = childrenByStep[index].orEmpty().map { it.childId }
                 )
             }
         }
         if (task != null) {
+            val childrenByItem = children.groupBy { it.itemId }
             return task.milestones.completed.map { text ->
-                StepNode(text, text, "done", emptyList(), children.filter { it.itemId == text }.map { it.childId })
+                StepNode(text, text, "done", emptyList(), childrenByItem[text].orEmpty().map { it.childId })
             } + task.milestones.open.map { text ->
-                StepNode(text, text, "open", emptyList(), children.filter { it.itemId == text }.map { it.childId })
+                StepNode(text, text, "open", emptyList(), childrenByItem[text].orEmpty().map { it.childId })
             }
         }
         return emptyList()
@@ -1266,18 +1269,28 @@ object TaskTree {
             .filter { it.isNotEmpty() }
         val rows = ArrayList<CriterionProofRow>()
         val explicitSet = explicit.toSet()
-        for (key in explicit) {
-            var matchedRecord: NativeVerificationRecord? = null
-            var matched: NativeCriterionVerdict? = null
-            for (record in records) {
-                val criterion = record.criteria.firstOrNull { it.criterionKey == key }
-                if (criterion != null) {
-                    matchedRecord = record
-                    matched = criterion
-                    break
+        // ONE verdict index (first record/criterion wins, exactly the
+        // historical per-key nested `firstOrNull` scan). Built only when
+        // there are explicit keys: the common no-explicit path must not pay
+        // for an index it never consults.
+        val verdictByKey: Map<String, Pair<NativeVerificationRecord, NativeCriterionVerdict>> =
+            if (explicit.isEmpty()) {
+                emptyMap()
+            } else {
+                val index =
+                    HashMap<String, Pair<NativeVerificationRecord, NativeCriterionVerdict>>()
+                for (record in records) {
+                    for (criterion in record.criteria) {
+                        if (!index.containsKey(criterion.criterionKey)) {
+                            index[criterion.criterionKey] = record to criterion
+                        }
+                    }
                 }
+                index
             }
-            rows.add(criterionProofRow(key, matched, matchedRecord))
+        for (key in explicit) {
+            val verdict = verdictByKey[key]
+            rows.add(criterionProofRow(key, verdict?.second, verdict?.first))
             if (rows.size >= MAX_CRITERIA_PROOF_ROWS) return rows
         }
         for (record in records) {

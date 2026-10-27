@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! Cancellation tokens. Std-only (no tokio) so core stays testable in plain
 //! threads. Parent cancellation cascades to children; a cancel races with
 //! `wait` and never loses (wait observes cancellation even if it started
@@ -55,8 +56,9 @@ struct Inner {
     waiters: Mutex<BTreeMap<u64, Arc<Waiter>>>,
     /// Registrations of live [`CancellationToken::cancelled`] futures. One
     /// entry per awaiting future, removed when the future drops; `cancel()`
-    /// wakes every entry.
-    async_waiters: Mutex<Vec<Waker>>,
+    /// wakes every entry. Keyed by registration id so re-poll/drop is
+    /// O(log n), never a Vec position scan + shift across every waiter.
+    async_waiters: Mutex<BTreeMap<u64, Waker>>,
     /// Back-links `(parent, registration id)` for every cascade `attach()`
     /// this token is registered under. `Weak` so parent and child never
     /// keep each other alive; [`Inner::drop`] unregisters every link.
@@ -68,7 +70,7 @@ impl Default for Inner {
         Self {
             cancelled: AtomicBool::new(false),
             waiters: Mutex::new(BTreeMap::new()),
-            async_waiters: Mutex::new(Vec::new()),
+            async_waiters: Mutex::new(BTreeMap::new()),
             parents: Mutex::new(Vec::new()),
         }
     }
@@ -282,7 +284,7 @@ fn propagate_inner(inner: &Arc<Inner>, queue: &mut VecDeque<Arc<Inner>>) {
         let mut async_waiters = lock_ignore_poison(&inner.async_waiters);
         std::mem::take(&mut *async_waiters)
     };
-    for waker in to_wake {
+    for (_, waker) in to_wake {
         waker.wake();
     }
 }
@@ -292,9 +294,10 @@ fn propagate_inner(inner: &Arc<Inner>, queue: &mut VecDeque<Arc<Inner>>) {
 /// can be released when this future is dropped.
 pub struct CancelledAwait<'a> {
     token: &'a CancellationToken,
-    /// The waker this future registered (cleared on completion so drop
-    /// never removes someone else's entry after `cancel()` drained the list).
-    registered: Option<Waker>,
+    /// The registration id + waker this future holds (cleared on completion
+    /// so drop never removes someone else's entry after `cancel()` drained
+    /// the map).
+    registered: Option<(u64, Waker)>,
 }
 
 impl Future for CancelledAwait<'_> {
@@ -313,22 +316,21 @@ impl Future for CancelledAwait<'_> {
             this.registered = None;
             return Poll::Ready(());
         }
-        match this.registered.as_ref() {
-            // Still registered with the executor's current waker: nothing to
-            // do (a spurious re-poll must not duplicate the registration).
-            Some(existing) if existing.will_wake(cx.waker()) => {}
-            Some(existing) => {
-                // The executor switched wakers: replace our slot.
-                if let Some(pos) = async_waiters.iter().position(|w| w.will_wake(existing)) {
-                    async_waiters.remove(pos);
-                }
-                async_waiters.push(cx.waker().clone());
-                this.registered = Some(cx.waker().clone());
+        // Still registered with the executor's current waker: nothing to do
+        // (a spurious re-poll must not duplicate the registration).
+        if !this
+            .registered
+            .as_ref()
+            .is_some_and(|(_, existing)| existing.will_wake(cx.waker()))
+        {
+            // The executor switched wakers (or this is the first poll):
+            // release the old registration and publish the new one.
+            if let Some((id, _)) = this.registered.take() {
+                async_waiters.remove(&id);
             }
-            None => {
-                async_waiters.push(cx.waker().clone());
-                this.registered = Some(cx.waker().clone());
-            }
+            let id = next_registration_id();
+            async_waiters.insert(id, cx.waker().clone());
+            this.registered = Some((id, cx.waker().clone()));
         }
         Poll::Pending
     }
@@ -340,12 +342,10 @@ impl Drop for CancelledAwait<'_> {
             return;
         };
         let mut async_waiters = lock_ignore_poison(&self.token.inner.async_waiters);
-        // Entries are per-future clones of the same waker; removing any one
-        // matching entry is safe — at most one registration per live future
-        // exists and wake semantics only need one survivor per task.
-        if let Some(pos) = async_waiters.iter().position(|w| w.will_wake(&registered)) {
-            async_waiters.remove(pos);
-        }
+        // The registration id is ours; removing it is O(log n) and can never
+        // touch another future's entry (even if two wakers compare equal).
+        let (id, _) = registered;
+        async_waiters.remove(&id);
     }
 }
 
@@ -455,6 +455,32 @@ mod tests {
         for h in handles {
             assert!(h.join().unwrap());
         }
+    }
+
+    #[test]
+    fn replacing_the_async_waker_moves_the_registration_exactly_once() {
+        let t = CancellationToken::new();
+        let mut fut = Box::pin(t.cancelled());
+        let (tx_a, rx_a) = mpsc::channel::<()>();
+        let waker_a = thread_waker(tx_a);
+        let mut cx_a = std::task::Context::from_waker(&waker_a);
+        assert!(fut.as_mut().poll(&mut cx_a).is_pending());
+        assert_eq!(t.inner.async_waiters.lock().unwrap().len(), 1);
+
+        let (tx_b, rx_b) = mpsc::channel::<()>();
+        let waker_b = thread_waker(tx_b);
+        let mut cx_b = std::task::Context::from_waker(&waker_b);
+        assert!(fut.as_mut().poll(&mut cx_b).is_pending());
+        assert_eq!(
+            t.inner.async_waiters.lock().unwrap().len(),
+            1,
+            "a waker switch replaces, never duplicates, the registration"
+        );
+        t.cancel();
+        assert!(rx_a.try_recv().is_err(), "the stale waker is not woken");
+        assert!(rx_b.try_recv().is_ok(), "the current waker is woken once");
+        drop(fut);
+        assert!(t.inner.async_waiters.lock().unwrap().is_empty());
     }
 
     #[test]

@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! Per-session selectable settings (Rev8 K-02/B-09) and idempotent change
 //! acceptance receipts (V-03). Settings are validated at this boundary;
 //! consumers read the exact persisted value (never a guess).

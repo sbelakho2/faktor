@@ -891,6 +891,84 @@ async fn legacy_row_without_revision_delivers_once_then_records_generation_zero(
     );
 }
 
+/// A LEGACY (`updated_ms`) watermark must not suppress a later state change
+/// that still decodes as revision 0 (old writers never bumped a revision).
+/// The timestamp comparison and the rendered-outcome check close both edges:
+/// a later millisecond, and an in-place same-millisecond transition.
+#[tokio::test]
+async fn legacy_timestamp_watermark_refreshes_same_revision_state_changes() {
+    let _heavy = heavy_guard();
+    for (case, new_state, new_updated, expect_refresh) in [
+        ("later-ms", ChildState::Done, 200i64, true),
+        ("same-ms", ChildState::Done, 100i64, true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Arc::new(open_env(dir.path(), empty_script(), 0));
+        let run = format!("run-legacy-ts-{case}");
+        let child_id = "child-0";
+        craft_child_row(&env, &run, child_id, "analysis", ChildState::Failed, None);
+        let mut row = registry_child(&env, &run, child_id);
+        row.revision = 0;
+        row.updated_ms = 100;
+        overwrite_child_row(&env, &run, &row);
+        row.state = new_state;
+        row.updated_ms = new_updated;
+        overwrite_child_row(&env, &run, &row);
+
+        let parent = env.manager.get_session(env.parent).unwrap().unwrap();
+        let key = format!("child-handoff/{run}/{child_id}");
+        let watermark_key = format!("child-handoff-delivered/{run}/{child_id}");
+        let failed_section = "[faktor:internal-context]\n\
+[internal-context-item kind=child-handoff provenance=orchestrator:child-handoff]\n\
+[child-handoff]\nchild: child-0\noutcome: failed\n[internal-context-item-end]\n\
+[/faktor:internal-context]";
+        parent
+            .upsert_memory_fact("internal_context", &key, failed_section)
+            .unwrap();
+        parent
+            .upsert_memory_fact("internal_context", &watermark_key, "100")
+            .unwrap();
+
+        let mut children = HashMap::new();
+        children.insert(child_id.to_string(), row);
+        env.orchestrator
+            .heal_pending_child_handoffs(env.parent, &run, &children);
+        let refreshed = parent
+            .memory_fact_get("internal_context", &key)
+            .unwrap()
+            .expect("the newer state must have a pending section");
+        assert_eq!(
+            refreshed.contains("outcome: done"),
+            expect_refresh,
+            "{case}: wrong outcome in {refreshed}"
+        );
+        assert!(
+            !refreshed.contains("outcome: failed"),
+            "{case}: stale failed outcome survived: {refreshed}"
+        );
+        assert_eq!(
+            parent
+                .memory_fact_get("internal_context", &watermark_key)
+                .unwrap()
+                .as_deref(),
+            Some("rev:0"),
+            "{case}: the refreshed delivery records generation 0"
+        );
+        // A duplicate heal for the refreshed generation is a no-op.
+        let before = refreshed;
+        env.orchestrator
+            .heal_pending_child_handoffs(env.parent, &run, &children);
+        assert_eq!(
+            parent
+                .memory_fact_get("internal_context", &key)
+                .unwrap()
+                .as_deref(),
+            Some(before.as_str()),
+            "{case}: same-generation healing must not rewrite"
+        );
+    }
+}
+
 /// CONCURRENCY: two re-attach healers race the same undelivered generation.
 /// The section + revision watermark CAS has exactly one winner; the parent
 /// still consumes exactly one handoff and a later heal is a no-op.
@@ -963,7 +1041,7 @@ async fn concurrent_reattach_delivers_one_generation_exactly_once() {
 /// the same defect) must be detectable by this witness.
 fn revision_watermark_guard_present(source: &str) -> bool {
     source.contains("let watermark = handoff_watermark(child.revision);")
-        && source.contains("delivered.covers(child.revision)")
+        && source.contains("Self::Revision(delivered) => delivered >= child.revision")
 }
 
 #[test]

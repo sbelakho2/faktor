@@ -309,6 +309,12 @@
       "fn": "fault_memory_pagers_and_counts_stay_index_backed_at_1m_churn",
       "tag": "fault",
       "reason": "manual fault/scale probe outside the nightly fault lane's package set: run explicitly with `cargo test -- --ignored`"
+    },
+    {
+      "file": "crates/payments/src/scale_tests.rs",
+      "fn": "perf_100k_invoices_reads_stay_bounded",
+      "tag": "perf",
+      "reason": "manual performance/long probe: 100k-invoice billing page/stats/export/reconciliation bound check; run explicitly with `cargo test -p faktor-payments --lib -- --ignored` when the billing read path or scale shape changes; not a CI timing gate"
     }
   ],
   "non_test": [

@@ -41,6 +41,9 @@ import * as e8approval from '../src/edition8/approval.ts';
 import * as oc from '../src/outcomes.ts';
 import { renderEdition8Html, scriptJson } from '../src/edition8/html.ts';
 import { loadEdition8Snapshot } from '../src/edition8/source.ts';
+import { controlView, screenView } from '../src/edition8/view.ts';
+import { bindingOf8 } from '../src/edition8/bindings.ts';
+import { E8_CONTROLS } from '../src/generated/edition8Registry.ts';
 import { edition8Snapshot } from './fixtures/edition8.mjs';
 import composerPolicy from '../media/composer-state.js';
 import boardPolicy from '../media/board-state.js';
@@ -2974,6 +2977,65 @@ async function stateTests() {
       undefined,
       'the delta reducer is removed: a daemon EventKind frame cannot claim incremental message handling',
     );
+  });
+
+  await test('consecutive tool calls group into one collapsed activity batch', () => {
+    const snapshot = webviewSnapshot([]);
+    snapshot.daemon = 'running';
+    snapshot.transcript = [
+      transcriptEntry(1, '', {
+        tools: [
+          { name: 'read_file', state: 'completed', excerpt: 'a', exitCode: null, artifact: null },
+          { name: 'grep', state: 'completed', excerpt: 'b', exitCode: null, artifact: null },
+          { name: 'bash', state: 'completed', excerpt: 'c', exitCode: 0, artifact: null },
+        ],
+      }),
+    ];
+    const { dom } = runChatWebview(snapshot);
+    const groups = dom.document.querySelectorAll('.activity-group');
+    assertEqual(groups.length, 1, 'one batch for consecutive tool calls');
+    const group = groups[0];
+    assertEqual(group.open, false, 'a settled batch starts collapsed');
+    assertEqual(group.querySelectorAll('.activity-details').length, 3, 'each call stays individually expandable');
+    assert(
+      (group.querySelector('.activity-group-summary').textContent || '').includes('3 tool calls'),
+      group.querySelector('.activity-group-summary').textContent,
+    );
+  });
+
+  await test('the Work status row carries state, run, exact tokens and approval count only', () => {
+    const snapshot = webviewSnapshot([]);
+    snapshot.daemon = 'running';
+    snapshot.task = {
+      state: 'running',
+      goal: 'ship',
+      phase: 'build',
+      completed: [],
+      open: [],
+      testsRun: [],
+      testsFailed: [],
+      changedFiles: [],
+      budget: { maxTokens: 120000, spentTokens: 1234, maxCostMicro: null, spentCostMicro: 0n, openReservedMicro: 0n },
+      acceptanceCriteria: [],
+      plan: [],
+      blockers: [],
+      evidenceRefs: [],
+      progress: null,
+      completion: null,
+      contract: null,
+      contractMalformed: null,
+      contractDroppedRows: 0,
+    };
+    snapshot.permissions = [{ id: 'p1' }, { id: 'p2' }];
+    const { dom } = runChatWebview(snapshot);
+    const tokensNode = dom.document.getElementById('work-status-tokens');
+    const approvalsNode = dom.document.getElementById('work-status-approvals');
+    const tokens = findFake(tokensNode, (node) => node.textContent.includes('tokens'));
+    const approvals = findFake(approvalsNode, (node) => node.textContent.includes('approvals'));
+    assert(tokens && tokens.textContent === '1,234 tokens / 120,000', tokens && tokens.textContent);
+    assert(approvals && approvals.textContent === '2 approvals', approvals && approvals.textContent);
+    assertEqual(dom.document.getElementById('task-state').textContent, 'running');
+    assertEqual(dom.document.getElementById('task-goal').textContent, 'ship');
   });
 
   await test('transcript is bounded to MAX_TRANSCRIPT_ENTRIES', () => {
@@ -8816,6 +8878,24 @@ async function composerAttachmentTests() {
       /<button id="btn-board-post" type="submit">Post<\/button>/.test(markup),
       'the board post control must be a submit inside the board form',
     );
+    // Conversation-first Work: one compact status row (state/run/tokens/
+    // approvals), transcript, anchored composer. Run details and the board
+    // are not part of this surface.
+    for (const id of ['task-card', 'task-state', 'work-status-tokens', 'work-status-approvals', 'btn-status-inspect']) {
+      assert(markup.includes(`id="${id}"`), `the Work status row must carry #${id}`);
+    }
+    const workStart = markup.indexOf('<main id="work-panel"');
+    const workEnd = markup.indexOf('</main>', workStart);
+    const workMarkup = markup.slice(workStart, workEnd);
+    assert(!workMarkup.includes('board-card'), 'the coordination board must never render inside Work');
+    assert(!workMarkup.includes('board-post'), 'the board composer must never render inside Work');
+    const inspectStart = markup.indexOf('id="inspect-panel"');
+    const inspectEnd = markup.indexOf('id="history-panel"');
+    const inspectMarkup = markup.slice(inspectStart, inspectEnd);
+    assert(/<details id="board-card"/.test(inspectMarkup), 'the board must be an explicit collapsed drawer inside Inspect');
+    assert(!/<details id="board-card"[^>]*open/.test(inspectMarkup), 'the board drawer starts collapsed');
+    assert(workMarkup.indexOf('id="task-card"') < workMarkup.indexOf('id="transcript-card"'), 'the status row precedes the transcript');
+    assert(workMarkup.indexOf('id="transcript-card"') < workMarkup.indexOf('id="composer"'), 'the composer follows the transcript');
     assert(markup.includes('never skipped'), 'the recovery affordance must say the frame is replayed');
     assert(markup.includes('faktor-cli doctor'), 'the recovery affordance must name the daemon doctor');
     const entries = /<div id="entries"([^>]*)>/.exec(markup);
@@ -16278,10 +16358,156 @@ async function edition8HtmlSafetyTests() {
     assert(html.includes('Connect Account'), 'S55 primary label drifted');
   });
 
+
+  await test('edition8: settings descriptors drive human labels and truthful stored-only locks', async () => {
+    const paths = [];
+    const fake = {
+      edition5Json: async (_method, path) => {
+        paths.push(path);
+        if (path === '/native/config/descriptors') {
+          return {
+            descriptors: [
+              {
+                key: 'faktor.generation.temperature',
+                label: 'Temperature',
+                category: 'generation',
+                writable: false,
+                applyTiming: 'next_call',
+                runtimeConsumer: { state: 'stored_only', reason: 'the adapter owns sampling' },
+              },
+            ],
+          };
+        }
+        if (path === '/native/identity') return { identity: { organization: 'org_1' } };
+        if (path === '/native/usage?org=org_1&limit=1') return { ok: true, organization: 'org_1', fold: { organization_id: 'org_1', totals: {}, per_task: [], next_cursor: null }, credits: {}, items: [], nextCursor: null };
+        if (path === '/native/outcomes?org=org_1&limit=1') return { metrics: { runs: 0, verifiedChanges: 0 }, runs: [], nextCursor: null };
+        return {};
+      },
+      legacyCatalogJson: async (_method, path) => (path === '/models' ? [] : {}),
+    };
+    const snapshot = await loadEdition8Snapshot(fake, {
+      session: null,
+      workspace: null,
+      worktree: null,
+      daemon: null,
+      generation: 1,
+      now: 1,
+    });
+    assert(paths.includes('/native/config/descriptors'), 'descriptor catalog was skipped');
+    assert(snapshot.sources.descriptors.state !== 'unavailable', 'descriptor read did not reach the served route');
+
+    const fixture = edition8Snapshot();
+    fixture.config.values['faktor.generation.temperature'].locked = true;
+    const state = { snapshot: fixture, loading: false, error: null, focusControl: null };
+    const control = E8_CONTROLS.find((entry) => entry.id === 'G-04');
+    const view = controlView(control, fixture, false, null);
+    assertEqual(view.state, 'disabled');
+    assert(view.stateText.includes('Stored only'), `stored-only reason missing: ${view.stateText}`);
+    assert(!view.stateText.includes('Locked by'), 'stored-only was misreported as a user lock');
+
+    const rows = screenView('S29', state).rows;
+    const temperature = rows.find((row) => row.key === 'config-faktor.generation.temperature');
+    assertEqual(temperature.label, 'Temperature');
+    assertEqual(temperature.state, 'warning');
+    assert(temperature.value.includes('stored only'), 'settings row hides the absent consumer');
+  });
+
+  await test('edition8: config controls commit the descriptor JSON type and do not fake actions', () => {
+    const warn = bindingOf8('B-03');
+    assertEqual(warn.input, 'number');
+    assertEqual(warn.min, 1);
+    assertEqual(warn.max, 100);
+    for (const id of ['T-02', 'T-08']) {
+      const binding = bindingOf8(id);
+      assertEqual(binding.input, 'list');
+      assertEqual(binding.configKey, 'faktor.permissions.allowedTools');
+    }
+    assertEqual(bindingOf8('B-09').kind, 'read');
+    assertEqual(bindingOf8('B-09').route.path, '/native/config/snapshot');
+    assertEqual(bindingOf8('B-10').route.path, '/native/session/:session/task-runs');
+    assertEqual(bindingOf8('B-12').route.path, '/native/session/:session/tasks');
+    assertEqual(bindingOf8('D-12').kind, 'host');
+    const search = bindingOf8('O-01');
+    assertEqual(search.input, 'text');
+    assertEqual(search.route.path, '/native/config/search?q=:query');
+    const settingsHtml = renderEdition8Html({
+      nonce: 'testnonce',
+      cspSource: 'vscode-resource:',
+      scriptUri: 'media/edition8.js',
+      styleUri: 'media/edition8.css',
+      state: { snapshot: edition8Snapshot(), loading: false, error: null, focusControl: null },
+      initialScreen: 'S64',
+      host: 'vscode',
+    });
+    assert(settingsHtml.includes('data-settings-search="O-01"'), 'settings search input is absent');
+    assert(settingsHtml.includes('data-activate="O-01"'), 'settings search does not dispatch the served route');
+    assert(settingsHtml.includes('data-settings-count'), 'settings search result count is not live');
+    for (const id of ['Q-02', 'Q-03', 'Q-04', 'X-12']) {
+      const binding = bindingOf8(id);
+      assertEqual(binding.kind, 'read');
+      assertEqual(binding.route.path, '/native/permissions/policy');
+      assertEqual(binding.configKey, null);
+    }
+
+    const fixture = edition8Snapshot();
+    fixture.taskRuns.run.deadlineMs = 1_760_000_500_000;
+    const deadline = controlView(E8_CONTROLS.find((entry) => entry.id === 'B-10'), fixture, false, null);
+    assert(deadline.valueText.startsWith('Deadline ') && deadline.valueText.includes('running'), `deadline not served: ${deadline.valueText}`);
+    const receipt = controlView(E8_CONTROLS.find((entry) => entry.id === 'B-12'), fixture, false, null);
+    assert(receipt.valueText.includes('admission receipt'), `receipt not served: ${receipt.valueText}`);
+  });
+
+  await test('edition8: settings is one searchable domain surface with one apply and human values', () => {
+    const html = renderEdition8Html({
+      nonce: 'testnonce',
+      cspSource: 'vscode-resource:',
+      scriptUri: 'media/edition8.js',
+      styleUri: 'media/edition8.css',
+      state: { snapshot: edition8Snapshot(), loading: false, error: null, focusControl: null },
+      initialScreen: 'S29',
+      host: 'vscode',
+    });
+    assert(html.includes('id="e8-settings-home"'), 'settings home is absent');
+    assert(html.includes('data-settings-global-search'), 'global settings search is absent');
+    for (const domain of ['Providers and models', 'Context and compaction', 'Tools and MCP', 'Permissions', 'Billing and usage', 'Appearance and general']) {
+      assert(html.includes(`>${domain}</h3>`), `settings domain ${domain} is missing`);
+    }
+    assert(html.includes('Autosave is off'), 'the save model is not explicit');
+    assert(html.includes('data-settings-row'), 'settings rows are absent');
+    assert(html.includes('e8-settings-advanced'), 'advanced settings are not disclosed');
+    assert(!html.includes('data-primary-apply'), 'a duplicate per-screen apply survived in settings');
+    const allowed = controlView(E8_CONTROLS.find((entry) => entry.id === 'T-02'), edition8Snapshot(), false, null);
+    assert(allowed.valueText.includes('2 values'), `list setting still renders raw JSON: ${allowed.valueText}`);
+    assert(!allowed.valueText.includes('["'), 'raw JSON list leaked into the settings value');
+    const label = controlView(E8_CONTROLS.find((entry) => entry.id === 'G-04'), edition8Snapshot(), false, null);
+    assert(label.label === 'Temperature', `descriptor label not used: ${label.label}`);
+    assert(label.description.length > 0, 'descriptor description is empty');
+    const script = readFileSync(new URL('../media/edition8.js', import.meta.url), 'utf8');
+    assert(
+      script.includes("vscode.postMessage({ type: 'e8Ready' });\n  installSettingsSearch();\n  installSettingsHome();"),
+      'the settings home interaction is not installed on boot',
+    );
+    assert(
+      script.includes("selectScreen(button.getAttribute('data-settings-open'), true)"),
+      'a settings row does not open its screen',
+    );
+    assert(script.includes("getElementById('e8-settings-back')"), 'the settings surface has no way back');
+    assert(
+      script.includes("window.__faktorE8Initial && !document.getElementById('e8-settings-home')"),
+      'settings still boots into a single screen instead of the one surface',
+    );
+  });
+
   await test('site billing cancellation requires the explicit confirmation field', () => {
     const source = readFileSync(join(ROOT, 'crates/site/src/routes/billing.rs'), 'utf8');
     assert(source.includes('Confirm the cancellation boundary before submitting it.'), 'cancel confirmation guard is absent');
     assert(source.includes('let _ = &form.at_period_end;') === false, 'a bare cancellation path survived');
+    const page = readFileSync(join(ROOT, 'crates/site/src/web/billing_pages.rs'), 'utf8');
+    assert(page.includes('at the chosen boundary'), 'cancel copy still conflates scheduled and immediate cancellation');
+    assert(page.includes('plan-alt-price'), 'annual price has no distinct disclosure line');
+    assert(page.includes('or {} / year'), 'plan cards hide the annual price until submit');
+    const invoice = readFileSync(join(ROOT, 'crates/site/src/web/account_pages.rs'), 'utf8');
+    assert(invoice.includes('invoice.tax_jurisdiction.as_deref()'), 'invoice tax basis omits the jurisdiction');
   });
 
   await test('edition8: read-only commercial screens lead with served state and collapse provenance', () => {

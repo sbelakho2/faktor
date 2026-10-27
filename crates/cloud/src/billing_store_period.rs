@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! Real billing periods: the event→period identity, the per-`(org,
 //! period)` and `(org, period, task, run)` aggregates, the durable period
 //! configuration and the period-rollup catch-up. Split out of
@@ -5,6 +6,30 @@
 //! module so it shares the store's private helpers.
 
 use super::*;
+
+#[cfg(test)]
+thread_local! {
+    /// Full-period bucket loads (the old pointwise path) and targeted bucket
+    /// reads. The regression test pins `full == 0` for one append at 10k
+    /// buckets, so a return to O(period buckets) per event fails loudly.
+    static PERIOD_FULL_BUCKET_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PERIOD_TARGETED_BUCKET_READS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn reset_period_read_counters() {
+    PERIOD_FULL_BUCKET_READS.with(|count| count.set(0));
+    PERIOD_TARGETED_BUCKET_READS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(super) fn period_read_counters() -> (usize, usize) {
+    (
+        PERIOD_FULL_BUCKET_READS.with(std::cell::Cell::get),
+        PERIOD_TARGETED_BUCKET_READS.with(std::cell::Cell::get),
+    )
+}
 
 pub(super) fn memory_event_period(state: &MemBilling, event: &UsageEvent) -> String {
     match state.period_configs.get(event.organization_id.as_str()) {
@@ -214,6 +239,8 @@ pub(super) fn read_period_buckets(
     organization: &OrganizationId,
     period_id: &str,
 ) -> Result<BTreeMap<UsageBucketKey, UsageTotals>, BillingStoreError> {
+    #[cfg(test)]
+    PERIOD_FULL_BUCKET_READS.with(|count| count.set(count.get() + 1));
     let mut stmt = conn
         .prepare(&format!(
             "SELECT task_id, run_id, {USAGE_TOTAL_COLUMNS}
@@ -240,6 +267,32 @@ pub(super) fn read_period_buckets(
         );
     }
     Ok(out)
+}
+
+/// Read ONLY the bucket one event can touch. The live pointwise path never
+/// loads the period's whole bucket set (that made one metering append
+/// O(period buckets), so 1M rows over many tasks became quadratic).
+pub(super) fn read_period_bucket(
+    conn: &Connection,
+    organization: &OrganizationId,
+    period_id: &str,
+    key: &UsageBucketKey,
+) -> Result<Option<UsageTotals>, BillingStoreError> {
+    #[cfg(test)]
+    PERIOD_TARGETED_BUCKET_READS.with(|count| count.set(count.get() + 1));
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {USAGE_TOTAL_COLUMNS} FROM billing_usage_period_task
+             WHERE organization_id = ?1 AND period_id = ?2 AND task_id = ?3 AND run_id = ?4"
+        ))
+        .map_err(backend)?;
+    let mut rows = stmt
+        .query(params![organization.as_str(), period_id, key.0, key.1])
+        .map_err(backend)?;
+    match rows.next().map_err(backend)? {
+        Some(row) => Ok(Some(usage_totals_from_row(row, 0)?)),
+        None => Ok(None),
+    }
 }
 
 pub(super) fn write_period_total(
@@ -352,7 +405,31 @@ pub(super) fn apply_period_event_pointwise(
     period: &BillingPeriod,
 ) -> Result<(), BillingStoreError> {
     let mut totals = read_period_projection(conn, organization, &period.id)?.unwrap_or_default();
-    let mut buckets = read_period_buckets(conn, organization, &period.id)?;
+    // Only the buckets this event can touch are read/written: its own, plus
+    // a correction's prior winner and target. Reading the whole period here
+    // made every append O(tasks in the period), i.e. quadratic at scale.
+    let mut buckets = BTreeMap::new();
+    let event_key = (task_id_text(event.task_id), event.run_id.clone());
+    if let Some(values) = read_period_bucket(conn, organization, &period.id, &event_key)? {
+        buckets.insert(event_key.clone(), values);
+    }
+    if let Some(base_id) = &event.correction_of {
+        let period_scope = Some(period.id.as_str());
+        let winner = correction_winner(conn, organization, base_id.as_str(), seq, period_scope)?;
+        if let Some(winner) = &winner {
+            let key = (task_id_text(winner.task_id), winner.run_id.clone());
+            if let Some(values) = read_period_bucket(conn, organization, &period.id, &key)? {
+                buckets.insert(key, values);
+            }
+        }
+        if let Some(target) = usage_event_by_id(conn, organization, base_id.as_str(), period_scope)?
+        {
+            let key = (task_id_text(target.task_id), target.run_id.clone());
+            if let Some(values) = read_period_bucket(conn, organization, &period.id, &key)? {
+                buckets.insert(key, values);
+            }
+        }
+    }
     let mut dirty = std::collections::BTreeSet::new();
     apply_usage_event(
         conn,
@@ -534,4 +611,85 @@ pub(super) fn read_period_fold(
         per_task,
         next_cursor: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::SqliteControlPlaneStore;
+    use crate::{ReconciliationState, UsageEventId};
+
+    fn probe_event() -> UsageEvent {
+        UsageEvent {
+            id: UsageEventId::try_new("uev_period_probe").unwrap(),
+            organization_id: OrganizationId::try_new("org_period").unwrap(),
+            billing_account_id: BillingAccountId::try_new("acct_period").unwrap(),
+            task_id: 9_999,
+            run_id: "run_probe".into(),
+            attempt_id: "attempt_probe".into(),
+            provider: "openai".into(),
+            model: "m".into(),
+            unit: UsageUnit::ProviderCostMicro,
+            quantity: 1,
+            provider_cost_micro: 7,
+            source_operation: "probe".into(),
+            occurred_at_ms: 1,
+            reconciliation_state: ReconciliationState::Reconciled,
+            correction_of: None,
+            category: SpendCategory::Managed,
+            source_key: "probe:period:1".into(),
+        }
+    }
+
+    #[test]
+    fn pointwise_append_reads_only_touched_period_buckets() {
+        let store = SqliteControlPlaneStore::open_in_memory().unwrap();
+        let event = probe_event();
+        let organization = event.organization_id.clone();
+        let period = BillingPeriod::unconfigured();
+        {
+            let conn = store.raw_conn_for_test();
+            for index in 0..10_000u64 {
+                conn.execute(
+                    "INSERT INTO billing_usage_period_task (
+                        organization_id, period_id, task_id, run_id, input_tokens,
+                        output_tokens, cache_read_tokens, cache_write_tokens,
+                        reasoning_tokens, provider_cost_micro, managed_cost_micro,
+                        byok_cost_micro, events, corrected_events
+                     ) VALUES (?1, ?2, ?3, 'run', '0','0','0','0','0','0','0','0','1','0')",
+                    rusqlite::params![organization.as_str(), period.id, index.to_string()],
+                )
+                .unwrap();
+            }
+        }
+        reset_period_read_counters();
+        {
+            let conn = store.raw_conn_for_test();
+            apply_period_event_pointwise(&conn, &organization, &event, 1, &period).unwrap();
+        }
+        let (full, targeted) = period_read_counters();
+        assert_eq!(
+            full, 0,
+            "one append must never load the whole period's 10k buckets"
+        );
+        assert!(
+            targeted <= 3,
+            "one uncorrected append reads at most its own bucket, got {targeted}"
+        );
+        let conn = store.raw_conn_for_test();
+        let touched: String = conn
+            .query_row(
+                "SELECT provider_cost_micro FROM billing_usage_period_task
+                 WHERE organization_id = ?1 AND period_id = ?2 AND task_id = ?3 AND run_id = ?4",
+                rusqlite::params![
+                    organization.as_str(),
+                    period.id,
+                    task_id_text(event.task_id),
+                    event.run_id
+                ],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(touched, "7");
+    }
 }

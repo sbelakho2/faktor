@@ -1812,7 +1812,8 @@ fn local_billing_payment_cli_uses_the_same_durable_service() {
             "account_name": "CLI Pay",
             "default_plan": "pro",
             "plans": {
-                "pro": { "plan_id": "pro", "features": ["credits"], "limits": {} }
+                "pro": { "plan_id": "pro", "features": ["credits"], "limits": {} },
+                "team": { "plan_id": "team", "features": ["credits"], "limits": {} }
             },
             "payments": {
                 "enabled": true,
@@ -1826,6 +1827,14 @@ fn local_billing_payment_cli_uses_the_same_durable_service() {
                         "annual_minor": 100000,
                         "per_seat_monthly_minor": 2500,
                         "per_seat_annual_minor": 25000
+                    },
+                    "team": {
+                        "plan_id": "team",
+                        "currency": "USD",
+                        "monthly_minor": 20000,
+                        "annual_minor": 200000,
+                        "per_seat_monthly_minor": 3000,
+                        "per_seat_annual_minor": 30000
                     }
                 },
                 "tax": {
@@ -1981,7 +1990,7 @@ fn local_billing_payment_cli_uses_the_same_durable_service() {
         &organization,
         PayInvoiceRequest {
             invoice_id: invoice.id.clone(),
-            payment_method_id: method.id,
+            payment_method_id: method.id.clone(),
             idempotency_key: "cli-pay".into(),
         },
     ))
@@ -2051,7 +2060,7 @@ fn local_billing_payment_cli_uses_the_same_durable_service() {
     let seats = billing_cli::render(
         BillingAction::Seats {
             quantity: 3,
-            subscription: Some(subscription_id),
+            subscription: Some(subscription_id.clone()),
             idempotency_key: Some("cli-seats".into()),
         },
         dir.path(),
@@ -2060,6 +2069,113 @@ fn local_billing_payment_cli_uses_the_same_durable_service() {
     .unwrap();
     assert_eq!(seats["subscription"]["quantity"], 3);
     assert_eq!(seats["proration"]["charge_minor"], 2_500);
+
+    let plan = billing_cli::render(
+        BillingAction::Plan {
+            plan: "team".into(),
+            interval: Some("monthly".into()),
+            subscription: Some(subscription_id.clone()),
+            idempotency_key: Some("cli-plan".into()),
+            confirm: true,
+        },
+        dir.path(),
+        Some(path.clone()),
+    )
+    .unwrap();
+    assert_eq!(plan["subscription"]["plan_id"], "team");
+    assert_eq!(plan["preview"]["credit_minor"], -17_500);
+    assert_eq!(plan["preview"]["charge_minor"], 29_000);
+    assert_eq!(plan["preview"]["net_minor"], 11_500);
+
+    // Pay an open invoice and refund it through the CLI, not a side channel.
+    let second = rt
+        .block_on(service.issue_invoice(
+            &organization,
+            IssueInvoiceRequest {
+                subscription_id: subscription_id.clone(),
+                usage: vec![faktor_payments::UsageCharge {
+                    description: "cli usage after plan change".into(),
+                    quantity: 1,
+                    unit_amount_minor: 500,
+                }],
+                credits_minor: 0,
+                discount_minor: 0,
+                tax_jurisdiction: None,
+                due_in_days: Some(7),
+                idempotency_key: "cli-invoice-after-plan".into(),
+            },
+        ))
+        .unwrap()
+        .invoice;
+    let paid = billing_cli::render(
+        BillingAction::Pay {
+            invoice: second.id.clone(),
+            method: Some(method.id.clone()),
+            idempotency_key: Some("cli-pay-second".into()),
+        },
+        dir.path(),
+        Some(path.clone()),
+    )
+    .unwrap();
+    assert_eq!(paid["invoice"]["status"], "paid");
+    let payment_id = paid["payment"]["id"].as_str().unwrap().to_string();
+    let refunded = billing_cli::render(
+        BillingAction::Refund {
+            payment: payment_id,
+            amount_minor: 500,
+            reason: "cli refund".into(),
+            idempotency_key: Some("cli-refund".into()),
+            confirm: true,
+        },
+        dir.path(),
+        Some(path.clone()),
+    )
+    .unwrap();
+    assert_eq!(refunded["refund"]["status"], "succeeded");
+    assert_eq!(refunded["creditNote"]["amount_minor"], 500);
+    assert_eq!(refunded["invoice"]["amount_refunded_minor"], 500);
+
+    let cancelled = billing_cli::render(
+        BillingAction::Cancel {
+            at_period_end: true,
+            subscription: Some(subscription_id.clone()),
+            idempotency_key: Some("cli-cancel".into()),
+            confirm: true,
+        },
+        dir.path(),
+        Some(path.clone()),
+    )
+    .unwrap();
+    assert_eq!(cancelled["subscription"]["cancel_at_period_end"], true);
+
+    let immediate = billing_cli::render(
+        BillingAction::Cancel {
+            at_period_end: false,
+            subscription: Some(subscription_id.clone()),
+            idempotency_key: Some("cli-cancel-now".into()),
+            confirm: true,
+        },
+        dir.path(),
+        Some(path.clone()),
+    )
+    .unwrap();
+    assert_eq!(immediate["subscription"]["state"], "canceled");
+    let resubscribed = billing_cli::render(
+        BillingAction::Subscribe {
+            plan: "team".into(),
+            interval: "monthly".into(),
+            seats: 1,
+            trial_days: None,
+            email: "cli@example.com".into(),
+            name: "CLI".into(),
+            idempotency_key: Some("cli-resubscribe".into()),
+        },
+        dir.path(),
+        Some(path.clone()),
+    )
+    .unwrap();
+    assert_ne!(resubscribed["subscription"]["id"], subscription_id);
+    assert_eq!(resubscribed["subscription"]["state"], "active");
 
     let tax = billing_cli::render(BillingAction::Tax, dir.path(), Some(path)).unwrap();
     assert_eq!(tax["tax"]["state"], "available");

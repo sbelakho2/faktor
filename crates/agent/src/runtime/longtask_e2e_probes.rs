@@ -17,6 +17,7 @@
 
 use std::sync::Arc;
 
+use super::longtask_probes::AckProvider;
 use super::tests::*;
 use super::*;
 use faktor_memory::{
@@ -54,12 +55,11 @@ fn memory_draft(scope: &MemoryScope, predicate: &str, value: &str) -> NewMemoryR
 
 #[tokio::test]
 async fn rev8_long_task_end_to_end() {
-    // 300 logical turns: one text chunk + End each. History is grown the real
-    // way (submit + drive), and compaction is forced above zero usage.
-    let script = (0..320)
-        .flat_map(|_| vec![ScriptedResponse::Text("ack".into()), ScriptedResponse::End])
-        .collect();
-    let (mut deps, dir) = deps(scripted_provider(script), vec![]);
+    // 300 logical turns: one text chunk + Done each. History is grown the
+    // real way (submit + drive), and compaction is forced above zero usage.
+    // An always-answering provider keeps the 300-turn run independent of a
+    // finite per-turn script.
+    let (mut deps, dir) = deps_with(Arc::new(AckProvider), vec![]);
     deps.compact_at_usage = 0.0;
     let runtime = AgentRuntime::new(deps).unwrap();
     let (manager, session) = shared_session(runtime.deps());

@@ -7,7 +7,7 @@
 //! provider reopened over the same durable store.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -1071,6 +1071,10 @@ struct CrashAfterCommitProvider {
     inner: LocalPaymentProvider,
     subscribe_calls: Arc<AtomicUsize>,
     crash_once: AtomicUsize,
+    crash_change_once: AtomicUsize,
+    /// `-1` = pass provider truth through; `>= 0` = rewrite the reconciled
+    /// subscription quantity so a hostile/provider-drift answer can be tested.
+    reconcile_quantity: AtomicI64,
 }
 
 impl CrashAfterCommitProvider {
@@ -1088,7 +1092,20 @@ impl CrashAfterCommitProvider {
             ),
             subscribe_calls,
             crash_once: AtomicUsize::new(usize::from(crash)),
+            crash_change_once: AtomicUsize::new(0),
+            reconcile_quantity: AtomicI64::new(-1),
         }
+    }
+
+    fn with_crash_change(self) -> Self {
+        self.crash_change_once.store(1, Ordering::SeqCst);
+        self
+    }
+
+    fn with_reconcile_quantity(self, quantity: u32) -> Self {
+        self.reconcile_quantity
+            .store(i64::from(quantity), Ordering::SeqCst);
+        self
     }
 }
 
@@ -1127,7 +1144,13 @@ impl PaymentProvider for CrashAfterCommitProvider {
         &self,
         request: ProviderChangePlanRequest,
     ) -> Result<ProviderSubscription, PaymentError> {
-        self.inner.change_plan(request).await
+        let remote = self.inner.change_plan(request).await?;
+        if self.crash_change_once.swap(0, Ordering::SeqCst) == 1 {
+            return Err(PaymentError::Provider(
+                "simulated crash after the provider committed the change".into(),
+            ));
+        }
+        Ok(remote)
     }
 
     async fn cancel(
@@ -1172,7 +1195,15 @@ impl PaymentProvider for CrashAfterCommitProvider {
         &self,
         request: ProviderReconcileRequest,
     ) -> Result<ProviderReconciled, PaymentError> {
-        self.inner.reconcile(request).await
+        let result = self.inner.reconcile(request).await?;
+        let quantity = self.reconcile_quantity.load(Ordering::SeqCst);
+        if quantity >= 0 {
+            if let ProviderReconciled::Subscription(mut subscription) = result {
+                subscription.quantity = u32::try_from(quantity).unwrap_or(u32::MAX);
+                return Ok(ProviderReconciled::Subscription(subscription));
+            }
+        }
+        Ok(result)
     }
 }
 
@@ -1336,4 +1367,99 @@ async fn subscription_webhook_during_in_flight_mutation_is_ordered() {
     let local = fx.subscription();
     assert_eq!(local.plan_id, "team");
     assert_eq!(local.quantity, 7, "the webhook update is not lost");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reconciliation_never_writes_provider_seat_drift_over_the_fenced_request() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("payment.db");
+    let clock = Arc::new(ManualClock::new(START_MS));
+    let store = Arc::new(SqlitePaymentStore::open(&path).unwrap());
+    let provider = Arc::new(
+        CrashAfterCommitProvider::new(
+            store.clone(),
+            clock.clone(),
+            Arc::new(AtomicUsize::new(0)),
+            false,
+        )
+        .with_crash_change()
+        .with_reconcile_quantity(faktor_payments::MAX_SEATS + 1),
+    );
+    let service = PaymentService::with_provider(
+        store.clone(),
+        provider.clone(),
+        config(),
+        clock.clone(),
+        secrets(),
+    )
+    .unwrap();
+    let organization = org();
+    let subscription = service
+        .subscribe(&organization, subscribe_request("reconcile-seat-drift"))
+        .await
+        .unwrap()
+        .subscription;
+    let error = service
+        .change_seats(
+            &organization,
+            ChangeSeatsRequest {
+                subscription_id: subscription.id.clone(),
+                quantity: 3,
+                idempotency_key: "seat-drift-change".into(),
+            },
+        )
+        .await
+        .expect_err("the provider committed but the caller saw an error");
+    assert!(matches!(error, PaymentError::Provider(_)));
+    assert_eq!(
+        store
+            .subscription(organization.as_str())
+            .unwrap()
+            .unwrap()
+            .quantity,
+        1,
+        "the fenced row is not written before reconciliation"
+    );
+
+    // The provider's reconciled seat count is outside the bounded domain and
+    // does not match the fenced request: the claim must stay unresolved and
+    // must never overwrite the durable row.
+    let refused = service
+        .reconcile_unknown_claims(&organization)
+        .await
+        .expect_err("provider seat drift is a typed refusal");
+    assert!(matches!(refused, PaymentError::Provider(_)));
+    assert_eq!(
+        store
+            .subscription(organization.as_str())
+            .unwrap()
+            .unwrap()
+            .quantity,
+        1
+    );
+    assert_eq!(
+        store
+            .operation_claim(organization.as_str(), "seat-drift-change")
+            .unwrap()
+            .unwrap()
+            .state,
+        faktor_payments::OperationClaimState::Unknown
+    );
+
+    // A provider that omits the quantity means "the fenced request applied";
+    // the fallback is the requested 3, never 0.
+    provider.reconcile_quantity.store(0, Ordering::SeqCst);
+    let resolved = service
+        .reconcile_unknown_claims(&organization)
+        .await
+        .unwrap();
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(
+        store
+            .subscription(organization.as_str())
+            .unwrap()
+            .unwrap()
+            .quantity,
+        3
+    );
 }

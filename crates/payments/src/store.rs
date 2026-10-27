@@ -796,6 +796,18 @@ impl SqlitePaymentStore {
         payment_method_conn(&conn, organization_id, id)
     }
 
+    pub fn payment_method_count(&self, organization_id: &str) -> Result<u64, PaymentError> {
+        let conn = self.lock()?;
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM payment_method WHERE organization_id = ?1",
+                params![organization_id],
+                |row| row.get(0),
+            )
+            .map_err(store_err)?;
+        Ok(count.max(0) as u64)
+    }
+
     pub fn payment_methods(
         &self,
         organization_id: &str,
@@ -1091,7 +1103,7 @@ impl SqlitePaymentStore {
             "SELECT COUNT(*), \
              COALESCE(SUM(CASE WHEN status IN ('open','past_due') THEN 1 ELSE 0 END), 0), \
              COALESCE(SUM(CASE WHEN status IN ('open','past_due') THEN total_minor - amount_paid_minor ELSE 0 END), 0), \
-             COALESCE(SUM(CASE WHEN status = 'paid' THEN amount_paid_minor ELSE 0 END), 0), \
+             COALESCE(SUM(amount_paid_minor), 0), \
              COALESCE(SUM(json_extract(payload, '$.amount_refunded_minor')), 0) \
              FROM payment_invoice WHERE organization_id = ?1",
             params![organization_id],
@@ -1108,9 +1120,13 @@ impl SqlitePaymentStore {
         .map_err(store_err)
     }
 
-    /// Invoices linked to a provider invoice, ordered by issue time. Used by
-    /// the manual/periodic reconciliation pass; the returned rows are Faktor
-    /// truth.
+    /// Invoices linked to a provider invoice, least-recently-observed first.
+    /// A bounded reconciliation pass must make progress across the whole
+    /// ledger: ordering only by issue time would re-check the same prefix
+    /// forever once the ledger exceeds the per-pass bound. The correlated
+    /// observed-at lookup is indexed by
+    /// `(organization_id, invoice_id, observed_ms)`; invoices without an
+    /// observation sort first. The returned rows are Faktor truth.
     pub fn invoices_for_reconciliation(
         &self,
         organization_id: &str,
@@ -1119,9 +1135,13 @@ impl SqlitePaymentStore {
         let conn = self.lock()?;
         let mut statement = conn
             .prepare(
-                "SELECT payload FROM payment_invoice \
-                 WHERE organization_id = ?1 AND provider_invoice_id IS NOT NULL \
-                 ORDER BY issued_ms, id LIMIT ?2",
+                "SELECT payload FROM payment_invoice i \
+                 WHERE i.organization_id = ?1 AND i.provider_invoice_id IS NOT NULL \
+                 ORDER BY (SELECT COALESCE(MAX(p.observed_ms), 0) \
+                           FROM payment_provider_invoice p \
+                           WHERE p.organization_id = i.organization_id \
+                             AND p.invoice_id = i.id), \
+                          i.issued_ms, i.id LIMIT ?2",
             )
             .map_err(store_err)?;
         let rows = statement
@@ -3140,6 +3160,7 @@ mod tests {
             reconciliation: Default::default(),
             currency: "USD".into(),
             status,
+            last_dunning_payment_id: None,
             lines: vec![],
             subtotal_minor: 1_000,
             discount_minor: 0,

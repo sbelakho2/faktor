@@ -382,23 +382,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     </details>
   </section>
   <section id="notices" aria-live="polite"></section>
-  <main id="work-panel" class="view-panel" role="tabpanel" aria-labelledby="nav-work">
-  <section id="task-card" class="card run-card" hidden>
-    <h2>Current run</h2>
+  <main id="work-panel" class="view-panel work-panel" role="tabpanel" aria-labelledby="nav-work">
+  <section id="task-card" class="card run-card work-status" aria-label="Run status" aria-live="polite">
     <div class="run-strip">
-      <span id="task-state" class="state-chip" data-state="unknown">—</span>
-      <span id="task-progress" class="run-meta" hidden></span>
-      <span id="task-tests" class="run-meta" hidden></span>
-      <span id="task-agents" class="run-meta" hidden></span>
+      <span id="task-state" class="state-chip" data-state="unknown">Ready</span>
+      <span id="work-status-tokens" class="run-meta" hidden></span>
+      <span id="work-status-approvals" class="run-meta" hidden></span>
       <span class="spacer"></span>
-      <button id="btn-cancel-run" class="secondary" type="button">Cancel run</button>
+      <button id="btn-status-inspect" class="secondary status-inspect" type="button" title="Open the run details in Inspect">Details</button>
+      <button id="btn-cancel-run" class="secondary status-stop" type="button">Stop</button>
     </div>
-    <div id="run-state" class="state-strip run-state" role="status" hidden>
-      <span id="run-state-glyph" class="state-strip-glyph" aria-hidden="true"></span>
-      <span id="run-state-label" class="state-strip-label"></span>
-      <span id="run-state-copy" class="state-strip-copy muted"></span>
-    </div>
-    <div id="task-goal" class="run-goal"></div>
   </section>
   <section id="permission-card" class="card permission-card" hidden aria-labelledby="permission-card-title">
     <h2 id="permission-card-title">Faktor needs your approval</h2>
@@ -518,6 +511,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     <div id="inspect-subpanel-overview" class="inspect-subpanel" role="tabpanel" aria-labelledby="subtab-overview">
       <section id="inspect-card" class="card">
         <div id="task-completion" class="completion"></div>
+        <section id="run-details" class="run-details" aria-label="Run details">
+          <h2>Run details</h2>
+          <div class="run-strip">
+            <span id="task-progress" class="run-meta" hidden></span>
+            <span id="task-tests" class="run-meta" hidden></span>
+            <span id="task-agents" class="run-meta" hidden></span>
+          </div>
+          <div id="run-state" class="state-strip run-state" role="status" hidden>
+            <span id="run-state-glyph" class="state-strip-glyph" aria-hidden="true"></span>
+            <span id="run-state-label" class="state-strip-label"></span>
+            <span id="run-state-copy" class="state-strip-copy muted"></span>
+          </div>
+          <div id="task-goal" class="run-goal"></div>
+        </section>
         <div id="cockpit" class="cockpit"></div>
       </section>
     </div>
@@ -557,8 +564,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         <h2>Agents</h2>
         <ul id="agent-list"></ul>
       </section>
-      <section id="board-card" class="card" hidden>
-        <h2>Board</h2>
+      <details id="board-card" class="coordination-drawer" hidden>
+        <summary>Coordination board</summary>
         <div id="board-header" class="muted">board: not read yet</div>
         <ul id="board-posts" class="board-posts" aria-label="Coordination board posts"></ul>
         <form id="board-post" class="board-composer">
@@ -572,7 +579,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             <button id="btn-board-post" type="submit">Post</button>
           </div>
         </form>
-      </section>
+      </details>
     </div>
   </section>
   <section id="history-panel" class="view-panel" role="tabpanel" aria-labelledby="nav-history" hidden>

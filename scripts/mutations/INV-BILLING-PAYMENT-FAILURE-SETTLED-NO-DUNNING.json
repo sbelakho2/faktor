@@ -1,0 +1,19 @@
+{
+  "id": "INV-BILLING-PAYMENT-FAILURE-SETTLED-NO-DUNNING",
+  "surface": "payments.billing",
+  "file": "crates/payments/src/service.rs",
+  "find": "                if invoice.status != InvoiceStatus::PastDue {\n                    return Ok(Some(subscription));\n                }\n",
+  "replace": "                // mutated: a late decline may dun a settled invoice\n",
+  "gate": "cargo test -p faktor-payments --test lifecycle payment_failure_after_settlement_never_regresses_an_active_subscription",
+  "expect": "FAILED",
+  "note": "Removing the settled-invoice guard lets a late decline accrue dunning attempts and regress an active subscription.",
+  "capabilities": [
+    "payments.invoice_truth"
+  ],
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

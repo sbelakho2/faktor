@@ -129,6 +129,7 @@ pub(crate) use compaction::*;
 mod verification_attribution;
 pub use verification_attribution::*;
 mod turn;
+pub use compaction::{attach_compaction_archive, mark_evicted_compaction_archives};
 pub use turn::*;
 
 #[cfg(test)]

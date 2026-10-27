@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! Orchestrator perf-wave evidence tests (split from `runtime_tests.rs` to
 //! stay under the source-size ceiling; fixtures reach here via
 //! `use super::*`).
@@ -396,4 +397,72 @@ fn settlement_identity_corruption_is_typed_not_a_policy_fallback() {
         ),
         other => panic!("corrupt linkage row must refuse typed, got {other:?}"),
     }
+}
+
+#[test]
+fn checked_assignment_map_uses_one_pass_index_not_per_item_scans() {
+    // Re-attach/spawn resolve one child per plan item. The first cut of the
+    // one-pass shape check still used `rows.iter().find` here, so 200
+    // children cost O(items · rows). The map must answer exactly the
+    // historical first-row binding and beat the per-item scan.
+    let n = 200usize;
+    let items: Vec<WorkItem> = (0..n)
+        .map(|i| wi(&format!("i{i:03}"), WorkKind::Analysis, &[]))
+        .collect();
+    let plan = raw_plan(items);
+    let specs: HashMap<String, ChildSpec> = plan
+        .work_items
+        .iter()
+        .map(|w| (w.id.clone(), spec(&w.id)))
+        .collect();
+    let rows: Vec<WorkItemAssignment> = (0..n)
+        .map(|i| WorkItemAssignment {
+            run_id: "run-200".into(),
+            item_id: format!("i{i:03}"),
+            plan_step_index: i,
+            child_id: format!("child-{i}"),
+            ownership: OwnershipSpec::NoWrites,
+            run_base_snapshot: None,
+        })
+        .collect();
+
+    let checked =
+        OrchestratorRuntime::checked_assignment_map("run-200", &plan, &specs, &rows, &[]).unwrap();
+    assert_eq!(checked.len(), n);
+    for row in &rows {
+        assert_eq!(checked[row.item_id.as_str()].child_id, row.child_id);
+    }
+
+    let mut sink = 0usize;
+    let t0 = std::time::Instant::now();
+    for item in &plan.work_items {
+        sink += usize::from(
+            rows.iter()
+                .find(|row| row.item_id == item.id)
+                .is_some_and(|row| row.child_id.starts_with("child-")),
+        );
+    }
+    let old_elapsed = t0.elapsed();
+    let t1 = std::time::Instant::now();
+    let mut by_item: HashMap<&str, &WorkItemAssignment> = HashMap::with_capacity(rows.len());
+    for row in &rows {
+        by_item.entry(row.item_id.as_str()).or_insert(row);
+    }
+    for item in &plan.work_items {
+        sink += usize::from(
+            by_item
+                .get(item.id.as_str())
+                .is_some_and(|row| row.child_id.starts_with("child-")),
+        );
+    }
+    let new_elapsed = t1.elapsed();
+    assert_eq!(sink, 2 * n);
+    assert_eq!(checked.len(), by_item.len());
+    eprintln!(
+        "checked assignment map ({n} items x {n} rows): per-item find {old_elapsed:?} -> indexed {new_elapsed:?}"
+    );
+    assert!(
+        new_elapsed < old_elapsed,
+        "indexed map must beat per-item find: old {old_elapsed:?} new {new_elapsed:?}"
+    );
 }

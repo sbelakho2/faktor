@@ -1242,21 +1242,28 @@ impl AgentRuntime {
                 state
             )));
         }
+        // Resolve side effects BEFORE registering the resumed turn: the
+        // in-memory registry is what `recover_session` (and the startup
+        // sweep) uses to recognize a LIVE driver. Registering first made the
+        // sweep treat this resume as a live driver, skip crash recovery and
+        // leave the pending row to the replay path (which then failed on
+        // unknown-effect rows with no descriptor).
+        self.recover_session(handle)?;
+        let state = handle.state()?;
         // Re-register the durable turn op in the in-memory registry BEFORE
         // any replay/permission call: the registry does not survive a
         // restart, and `request_permission_for_tool` refuses an untracked
         // op (the live restart failed with "operation ... is not tracked").
         let resume_token = handle.register_resumed_turn(turn_op);
-        // Resolve side effects (existing tool-run recovery; idempotent runs
-        // come back as deferred rows and are replayed below).
-        self.recover_session(handle)?;
-        let state = handle.state()?;
         // Replay deferred idempotent runs ONCE each (the row stays the SAME
         // logical operation; only the attempt counter moves).
         if state == AgentState::ExecutingTool {
             let pending = handle.pending_tool_runs()?;
             for row in &pending {
-                self.replay_tool_run(handle, row).await?;
+                if let Err(e) = self.replay_tool_run(handle, row).await {
+                    handle.unregister_turn(turn_op);
+                    return Err(e);
+                }
             }
         }
         let state = handle.state()?;
@@ -1300,6 +1307,10 @@ impl AgentRuntime {
                 });
             }
             AgentState::WaitingForPermission | AgentState::ToolRequested => {
+                // No drive owns this turn: release the provisional token so a
+                // later permission resolution (and the startup sweep) sees the
+                // ownerless-turn shape and re-kicks the queue.
+                handle.unregister_turn(turn_op);
                 return Err(Error::conflict(format!(
                     "session {} waits on a durable permission; resolve it before continuing",
                     handle.id()
@@ -1307,7 +1318,10 @@ impl AgentRuntime {
             }
             _ => {}
         }
-        self.walk_to_waiting(handle, turn_op)?;
+        if let Err(e) = self.walk_to_waiting(handle, turn_op) {
+            handle.unregister_turn(turn_op);
+            return Err(e);
+        }
         // Session lifecycle hook (audit): continue_record is the ONLY
         // recovery-resume boundary (an interrupted logical turn is re-driven
         // after a crash — via continue_turn or the queue runner). Fires only
@@ -1324,13 +1338,16 @@ impl AgentRuntime {
             .await;
         if outcome.is_err() {
             // Failure path: the drive's original error is the report; the
-            // record close is recorded, not propagated (marker + audit).
+            // record close is recorded, not propagated (marker + audit). The
+            // provisional token is released: no driver owns this turn now, so
+            // a permission resolution or a later runner can re-kick it.
             self.dw_note_finish_turn_record(
                 handle,
                 turn_op,
                 "failed",
                 DW_SITE_CONTINUE_RECORD_FAILED,
             );
+            handle.unregister_turn(turn_op);
         }
         outcome
     }

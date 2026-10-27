@@ -1,0 +1,19 @@
+{
+  "id": "INV-BILLING-PRORATION-SEAT-TRUTH",
+  "surface": "payments.billing",
+  "file": "crates/payments/src/service.rs",
+  "find": "        let old_amount = checked_add(\n            self.plan_amount_in(\n                &subscription.plan_id,\n                subscription.interval,\n                &subscription.currency,\n            )?,\n            checked_mul(\n                i64::from(subscription.quantity),\n                self.seat_amount_in(\n                    &subscription.plan_id,\n                    subscription.interval,\n                    &subscription.currency,\n                )?,\n            )?,\n        )?;\n        let new_amount =",
+  "replace": "        let old_amount = self.plan_amount_in(\n            &subscription.plan_id,\n            subscription.interval,\n            &subscription.currency,\n        )?;\n        let new_amount =",
+  "gate": "cargo test -p faktor-payments --test lifecycle plan_and_seat_proration_use_real_prices_and_exact_integer_math",
+  "expect": "FAILED",
+  "note": "Prorating only the plan line drops the per-seat price difference when a plan change also changes seat pricing.",
+  "capabilities": [
+    "payments.proration_truth"
+  ],
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

@@ -91,6 +91,9 @@ pub(crate) fn apply_saved_runtime_settings(
     if explicit(&snapshot, "faktor.compaction.model").is_some() {
         config.compaction_model = explicit_string(&snapshot, "faktor.compaction.model");
     }
+    if let Some(value) = explicit_f64(&snapshot, "faktor.context.compactionMinReduction") {
+        config.compaction_min_reduction = value.clamp(0.0, 0.999_999);
+    }
 
     let embedding_provider = explicit_string(&snapshot, "faktor.retrieval.embeddingProvider");
     let embedding_model = explicit_string(&snapshot, "faktor.retrieval.embeddingModel");
@@ -181,6 +184,11 @@ mod tests {
             "faktor.compaction.model",
             serde_json::json!("fake/compact"),
         );
+        commit(
+            &foundation,
+            "faktor.context.compactionMinReduction",
+            serde_json::json!(0.4),
+        );
         // The embedder is a cross-validated pair: one commit sets both.
         let snapshot = foundation.config.snapshot().unwrap();
         foundation
@@ -211,6 +219,7 @@ mod tests {
         assert!((applied.retry.jitter - 0.4).abs() < f64::EPSILON);
         assert!(!applied.efficiency.ccr);
         assert_eq!(applied.compaction_model.as_deref(), Some("fake/compact"));
+        assert!((applied.compaction_min_reduction - 0.4).abs() < f64::EPSILON);
         assert_eq!(applied.embeddings.unwrap().model, "embed");
         assert_eq!(
             applied.sandbox.shell,

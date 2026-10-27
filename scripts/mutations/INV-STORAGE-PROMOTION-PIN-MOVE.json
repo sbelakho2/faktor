@@ -1,0 +1,18 @@
+{
+  "id": "INV-STORAGE-PROMOTION-PIN-MOVE",
+  "file": "crates/storage/src/ledger.rs",
+  "find": "    if let Some((reason, pin_created_ms)) = old_pin {",
+  "replace": "    if let Some((reason, pin_created_ms)) = old_pin.filter(|_| false) {",
+  "gate": "cargo test -p faktor-storage --lib dedup_promotion_moves_the_pin_to_the_new_owner_class",
+  "expect": "FAILED",
+  "note": "Leaves the pin under the previous class after dedup promotion: the new owner is permanently required and unpin can never release it.",
+  "capabilities": [
+    "storage.governor"
+  ],
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

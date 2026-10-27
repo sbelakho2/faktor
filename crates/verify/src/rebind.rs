@@ -193,6 +193,11 @@ pub fn rebind_test_obligations(
         .any(|word| word.eq_ignore_ascii_case("rename"));
     let old_inventory = inventory(&evidence.files, true);
     let new_inventory = inventory(&evidence.files, false);
+    // ONE selector index per inventory: the historical resolution/probe
+    // scanned every declaration for every target and every candidate
+    // (O(obligations · declarations + candidates · declarations) on a wide
+    // changed-file set).
+    let old_index = DeclarationIndex::build(&old_inventory);
     let renames = rename_edges(evidence, &old_inventory, &new_inventory, &substitutions);
 
     let mut plans: Vec<Plan> = Vec::new();
@@ -204,7 +209,7 @@ pub fn rebind_test_obligations(
         }
         let mut old_declarations: Vec<&TestDeclaration> = targets
             .iter()
-            .filter_map(|target| resolve_declaration(target, &old_inventory))
+            .filter_map(|target| resolve_declaration(target, &old_index))
             .collect();
         old_declarations.sort_by(|a, b| {
             a.semantic_selector
@@ -270,7 +275,7 @@ pub fn rebind_test_obligations(
                         .map(|digest| (candidate, digest))
                 })
                 .filter(|(candidate, _)| {
-                    !was_unchanged_elsewhere(declaration, candidate, &old_inventory, &substitutions)
+                    !was_unchanged_elsewhere(declaration, candidate, &old_index, &substitutions)
                 })
                 .collect();
             if matching.len() != 1 {
@@ -512,27 +517,52 @@ fn binding_targets(binding: &EvidenceBinding) -> Vec<String> {
     }
 }
 
+/// One-pass selector index over an inventory. The resolver's contract is
+/// "exactly one declaration across ALL files", so uniqueness is decided from
+/// the indexed bucket (or its absence), never by re-scanning the inventory.
+struct DeclarationIndex<'a> {
+    semantic: std::collections::HashMap<&'a str, Vec<&'a TestDeclaration>>,
+    executable: std::collections::HashMap<&'a str, Vec<&'a TestDeclaration>>,
+}
+
+impl<'a> DeclarationIndex<'a> {
+    fn build(inventory: &'a BTreeMap<String, Vec<TestDeclaration>>) -> Self {
+        let mut semantic: std::collections::HashMap<&'a str, Vec<&'a TestDeclaration>> =
+            std::collections::HashMap::new();
+        let mut executable: std::collections::HashMap<&'a str, Vec<&'a TestDeclaration>> =
+            std::collections::HashMap::new();
+        for declaration in inventory.values().flatten() {
+            semantic
+                .entry(declaration.semantic_selector.as_str())
+                .or_default()
+                .push(declaration);
+            executable
+                .entry(declaration.executable_selector.as_str())
+                .or_default()
+                .push(declaration);
+        }
+        Self {
+            semantic,
+            executable,
+        }
+    }
+}
+
 fn resolve_declaration<'a>(
     target: &str,
-    inventory: &'a BTreeMap<String, Vec<TestDeclaration>>,
+    index: &DeclarationIndex<'a>,
 ) -> Option<&'a TestDeclaration> {
-    let by_selector: Vec<&TestDeclaration> = inventory
-        .values()
-        .flatten()
-        .filter(|declaration| declaration.semantic_selector == target)
-        .collect();
-    if by_selector.len() == 1 {
-        return by_selector.first().copied();
+    let semantic = index.semantic.get(target);
+    match semantic.map(Vec::len) {
+        Some(1) => return Some(semantic.expect("one declaration")[0]),
+        Some(_) => return None,
+        None => {}
     }
-    if by_selector.len() > 1 {
-        return None;
+    let executable = index.executable.get(target);
+    match executable.map(Vec::len) {
+        Some(1) => Some(executable.expect("one declaration")[0]),
+        _ => None,
     }
-    let by_executable: Vec<&TestDeclaration> = inventory
-        .values()
-        .flatten()
-        .filter(|declaration| declaration.executable_selector == target)
-        .collect();
-    (by_executable.len() == 1).then(|| by_executable[0])
 }
 
 fn resolve_new_path(
@@ -564,17 +594,23 @@ fn resolve_new_path(
 fn was_unchanged_elsewhere(
     old: &TestDeclaration,
     candidate: &TestDeclaration,
-    inventory: &BTreeMap<String, Vec<TestDeclaration>>,
+    index: &DeclarationIndex<'_>,
     substitutions: &[(String, String)],
 ) -> bool {
     if candidate.semantic_selector == old.semantic_selector {
         return false;
     }
-    inventory.values().flatten().any(|other| {
-        other.semantic_selector != old.semantic_selector
-            && other.executable_selector == candidate.executable_selector
-            && body_equivalence_digest(other, candidate, substitutions).is_some()
-    })
+    // Only declarations sharing the candidate's EXECUTABLE selector can
+    // satisfy the historical predicate; the index visits exactly those.
+    index
+        .executable
+        .get(candidate.executable_selector.as_str())
+        .into_iter()
+        .flatten()
+        .any(|other| {
+            other.semantic_selector != old.semantic_selector
+                && body_equivalence_digest(other, candidate, substitutions).is_some()
+        })
 }
 
 fn binding_for(declarations: &[&TestDeclaration]) -> EvidenceBinding {

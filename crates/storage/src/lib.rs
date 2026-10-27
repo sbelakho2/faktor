@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! Always-on storage governance for every durable class Faktor owns.
 //!
 //! One hard aggregate budget plus per-class quotas; admission is a durable
@@ -28,8 +29,8 @@ pub use config::{
 pub use directory::{DirectoryBackend, SqliteBackend};
 pub use error::{GovernorError, GovernorResult, RefusalReason, StorageRefusal};
 pub use governor::{
-    GovernorRoots, ReconcileReport, Reservation, StorageGovernor, GOVERNOR_DB_NAME,
-    GOVERNOR_DIR_NAME,
+    GovernorRoots, ReconcileReport, Reservation, SqliteAdmission, StorageGovernor,
+    GOVERNOR_DB_NAME, GOVERNOR_DIR_NAME,
 };
 pub use health::{ClassUsage, DegradedHealth, StorageMetrics};
 pub use object::{EvictionOutcome, StorageBackend, StorageObject};

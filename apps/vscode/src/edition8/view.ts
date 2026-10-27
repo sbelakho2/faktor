@@ -28,7 +28,7 @@ import {
   optionsForBinding,
   type E8Binding,
 } from './bindings.ts';
-import { configValueMap, configValues, type E8ConfigLookup } from './source.ts';
+import { configValueMap, configValues, descriptorFor, type E8ConfigLookup } from './source.ts';
 
 export type E8Destination = 'work' | 'inspect' | 'history' | 'settings';
 
@@ -37,6 +37,10 @@ export type E8ControlState = 'available' | 'empty' | 'loading' | 'stale' | 'erro
 export interface E8ControlView {
   readonly control: E8Control;
   readonly binding: E8Binding;
+  /** Human label/description from the served descriptor; catalog copy is the fallback. */
+  readonly label: string;
+  readonly description: string;
+  readonly category: string | null;
   readonly state: E8ControlState;
   readonly stateText: string;
   readonly valueText: string;
@@ -177,6 +181,23 @@ function jsonText(value: Json | null): string {
   return JSON.stringify(value);
 }
 
+/**
+ * Settings values are read by humans, never as raw JSON. Lists/objects keep
+ * their exact size (a count is truthful) without dumping a wire payload into
+ * a label. The editable control still carries the exact served value.
+ */
+function humanJsonText(value: Json | null): string {
+  if (value === null || value === undefined) return 'Inherit (not configured)';
+  if (Array.isArray(value)) {
+    return value.length === 0 ? 'No values' : `${value.length} value${value.length === 1 ? '' : 's'}`;
+  }
+  if (typeof value === 'object') {
+    const size = Object.keys(value).length;
+    return size === 0 ? 'No fields configured' : `${size} configured field${size === 1 ? '' : 's'}`;
+  }
+  return jsonText(value);
+}
+
 // ----------------------------------------------------------- prerequisites
 
 function sourceError(snapshot: E8Snapshot, key: string): string | null {
@@ -271,6 +292,41 @@ function prerequisite(controlId: string, snapshot: E8Snapshot | null): string | 
   }
 }
 
+/**
+ * Read-only controls whose value lives in a served projection, not in one
+ * config key. Returning null keeps the generic route text; a served value is
+ * shown verbatim so a deadline/receipt is never inferred from a route name.
+ */
+function controlFact(snapshot: E8Snapshot, controlId: string): string | null {
+  if (controlId === 'B-10') {
+    const run = objectAt(snapshot.taskRuns, 'run') ?? list(snapshot.taskRuns, 'runs')[0] ?? null;
+    const deadline =
+      numberAt(run, 'deadlineMs') ??
+      numberAt(run, 'deadline_ms') ??
+      numberAt(run, 'expiresAt') ??
+      numberAt(run, 'expires_at') ??
+      stringAt(run, 'deadline');
+    if (deadline === null) {
+      return snapshot.taskRuns === null
+        ? sourceError(snapshot, 'taskRuns') ?? 'No task-run projection is served for the deadline.'
+        : 'No operation deadline is served for this run.';
+    }
+    const date = typeof deadline === 'number' ? new Date(deadline) : null;
+    const textDeadline = date !== null && !Number.isNaN(date.getTime()) ? date.toISOString() : String(deadline);
+    return `Deadline ${textDeadline} · ${text(run, 'state') ?? 'state unavailable'} · timeout does not undo an external effect`;
+  }
+  if (controlId === 'B-12') {
+    const tasks = list(snapshot.tasks, 'tasks');
+    if (snapshot.tasks === null) return sourceError(snapshot, 'tasks') ?? 'No admission receipt projection is served.';
+    if (tasks.length === 0) return 'No admission receipt is served for this conversation.';
+    const first = tasks[0];
+    const id = text(first, 'id', 'task_id', 'taskId') ?? 'unknown';
+    const state = text(first, 'state', 'status') ?? 'unrecorded';
+    return `${tasks.length} admission receipt${tasks.length === 1 ? '' : 's'} · newest ${id} · ${state}`;
+  }
+  return null;
+}
+
 export function controlView(
   control: E8Control,
   snapshot: E8Snapshot | null,
@@ -301,31 +357,47 @@ export function controlView(
       stateText = reason;
     } else if (config?.locked === true) {
       state = 'disabled';
-      stateText = `Locked by ${config.source}; the served effective value is read-only.`;
+      const descriptor = descriptorFor(snapshot, config.key);
+      const consumerState = stringAt(descriptor?.runtimeConsumer ?? null, 'state');
+      const consumerReason = stringAt(descriptor?.runtimeConsumer ?? null, 'reason');
+      if (consumerState === 'stored_only') {
+        stateText = `Stored only — no runtime consumer${consumerReason === null ? '' : `: ${consumerReason}`}.`;
+      } else if (descriptor !== null && descriptor.writable === false) {
+        stateText = 'Read-only runtime fact; the served value is not writable.';
+      } else {
+        stateText = `Locked by ${config.source}; the served effective value is read-only.`;
+      }
     } else if (snapshot.stale) {
       state = 'stale';
       stateText = `Stale by ${ageText(snapshot.stale_age_ms)}; admission and apply stay disabled until the binding is reconciled.`;
     }
   }
+  const fact = snapshot === null ? null : controlFact(snapshot, control.id);
   const valueText =
     binding.kind === 'missing'
       ? 'Unavailable'
-      : config !== null
-        ? control.id === 'B-02' &&
+      : fact !== null
+        ? fact
+        : config !== null
+          ? control.id === 'B-02' &&
           ((typeof config.value === 'string' && /^\d+$/.test(config.value)) ||
             (typeof config.value === 'number' && Number.isSafeInteger(config.value) && config.value >= 0))
           ? String(config.value) === '0'
             ? `0.00 (no limit) · ${provenanceText(config.source, config.scope)}`
             : `${moneyMicro(config.value)} · advanced ${microExact(config.value)} · ${provenanceText(config.source, config.scope)}`
-          : `${jsonText(config.value)} · ${config.source} · ${config.scope}`
+          : `${humanJsonText(config.value)}${binding.unit === null ? '' : binding.unit} · ${config.source} · ${config.scope}`
         : binding.kind === 'host'
           ? 'Host-owned'
           : binding.input === 'readonly'
             ? `Read-only served value · ${binding.route.method} ${binding.route.path}`
             : 'Inherit (not configured)';
+  const descriptor = descriptorFor(snapshot, binding.configKey ?? '');
   return {
     control,
     binding,
+    label: descriptor?.label ?? control.name,
+    description: descriptor?.description ?? control.behavior,
+    category: descriptor?.category ?? null,
     state,
     stateText,
     valueText,
@@ -1034,10 +1106,26 @@ function rowsForScreen(screenId: string, snapshot: E8Snapshot | null): readonly 
     case 'S29':
     case 'S64':
       for (const value of values.slice(0, 60)) {
-        cap(`config-${value.key}`, value.key, `${jsonText(value.value)} · ${value.source}${value.locked ? ' · locked' : ''}`);
+        const descriptor = descriptorFor(snapshot, value.key);
+        const consumerState = stringAt(descriptor?.runtimeConsumer ?? null, 'state');
+        const consumerReason = stringAt(descriptor?.runtimeConsumer ?? null, 'reason');
+        const storedOnly = consumerState === 'stored_only';
+        const suffix = storedOnly
+          ? ` · stored only (no runtime consumer)${consumerReason === null ? '' : ` — ${consumerReason}`}`
+          : value.locked
+            ? ' · read-only'
+            : '';
+        cap(
+          `config-${value.key}`,
+          descriptor?.label ?? value.key,
+          `${jsonText(value.value)} · ${value.source}${suffix}`,
+          storedOnly ? 'warning' : 'served',
+        );
       }
       for (const [index, rowValue] of list(snapshot.provenance, 'rows').slice(0, 40).entries()) {
-        cap(`provenance-${index}`, text(rowValue, 'key') ?? `Setting ${index + 1}`, `${text(objectAt(rowValue, 'effective'), 'source') ?? 'unset'} · ${text(rowValue, 'applyTiming') ?? ''}`);
+        const key = text(rowValue, 'key') ?? `Setting ${index + 1}`;
+        const descriptor = descriptorFor(snapshot, key);
+        cap(`provenance-${index}`, descriptor?.label ?? key, `${text(objectAt(rowValue, 'effective'), 'source') ?? 'unset'} · ${descriptor?.applyTiming ?? text(rowValue, 'applyTiming') ?? ''}`);
       }
       cap('count', 'Effective settings', String(values.length));
       cap(

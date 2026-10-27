@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! Browser profiles (spec §9): persistent profiles live under
 //! `<data-dir>/commerce/profiles/<name>` with restrictive permissions;
 //! incognito sessions use temporary contexts. Cookies are confined to the

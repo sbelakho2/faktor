@@ -609,6 +609,12 @@ impl AgentRuntime {
         // evidence, model/Tangerine calls or second source of truth. Tangerine
         // has already enriched through the single existing neutral call; Kiwi
         // remains downstream independent verification of neutral claims only.
+        // A calm/empty contract can produce neither findings nor focus
+        // terms: return BEFORE the audit so the ordinary no-signal compile
+        // path performs zero readiness work.
+        if compiled.contract.is_empty() {
+            return;
+        }
         let readiness = faktor_core::audit_compiled_design(&compiled);
         if !readiness.findings.is_empty() {
             tracing::info!(
@@ -618,9 +624,6 @@ impl AgentRuntime {
                 focus_terms = readiness.focus_terms.len(),
                 "fresh-context design readiness reported advisory findings (not persisted)"
             );
-        }
-        if compiled.contract.is_empty() {
-            return;
         }
         match handle.merge_task_contract(task.task_id, &compiled.contract) {
             Ok(_) => tracing::info!(

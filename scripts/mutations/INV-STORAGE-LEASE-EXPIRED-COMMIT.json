@@ -1,0 +1,18 @@
+{
+  "id": "INV-STORAGE-LEASE-EXPIRED-COMMIT",
+  "file": "crates/storage/src/governor.rs",
+  "find": "        if committed.is_none() {\n            // The lease expired while the publisher was still working",
+  "replace": "        if false && committed.is_none() {\n            // The lease expired while the publisher was still working",
+  "gate": "cargo test -p faktor-storage --lib commit_after_lease_expiry_adopts_published_bytes",
+  "expect": "FAILED",
+  "note": "Drops a publish that completed after its reservation lease expired, leaving durable bytes unaccounted until the next scan.",
+  "capabilities": [
+    "storage.governor"
+  ],
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

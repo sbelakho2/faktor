@@ -1,0 +1,18 @@
+{
+  "id": "INV-STORAGE-RESERVATION-ATOMIC",
+  "file": "crates/storage/src/ledger.rs",
+  "find": "        let tx = self\n            .conn\n            .transaction_with_behavior(TransactionBehavior::Immediate)?;\n        tx.execute(\n            \"DELETE FROM reservation WHERE lease_expires_ms < ?1\",\n            params![now_ms],\n        )?;\n        let snapshot = budget_snapshot_on(&tx, class, now_ms)?;",
+  "replace": "        self.conn.execute(\n            \"DELETE FROM reservation WHERE lease_expires_ms < ?1\",\n            params![now_ms],\n        )?;\n        let snapshot = budget_snapshot_on(&self.conn, class, now_ms)?;\n        let tx = self\n            .conn\n            .transaction_with_behavior(TransactionBehavior::Immediate)?;",
+  "gate": "cargo test -p faktor-storage --lib concurrent_governor_instances_cannot_over_admit_the_hard_budget",
+  "expect": "FAILED",
+  "note": "Reads usage/pending BEFORE the write transaction: two governors can observe the same free room and over-admit the hard budget.",
+  "capabilities": [
+    "storage.governor"
+  ],
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

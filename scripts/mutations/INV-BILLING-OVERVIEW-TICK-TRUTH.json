@@ -1,0 +1,20 @@
+{
+  "id": "INV-BILLING-OVERVIEW-TICK-TRUTH",
+  "surface": "payments.billing",
+  "file": "crates/server/src/native/billing.rs",
+  "find": "                match payments.tick(&principal.organization) {\n                    Ok(_) | Err(faktor_payments::PaymentError::NotFound(_)) => {}\n                    Err(error) => return wire_status(crate::native::payments_err(error)),\n                }\n",
+  "replace": "                // mutated: overview reads without applying the lifecycle tick\n",
+  "gate": "cargo test -p faktor-server payment_overview_ticks_lifecycle_before_reporting_state",
+  "expect": "FAILED",
+  "timeout_ms": 600000,
+  "note": "Without the tick an expired trial is still reported as trialing.",
+  "capabilities": [
+    "payments.overview_truth"
+  ],
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

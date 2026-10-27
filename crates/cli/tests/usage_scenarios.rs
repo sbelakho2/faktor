@@ -223,7 +223,7 @@ fn run_exits_nonzero_when_the_turn_fails() {
     let config = dir.path().join("cfg.json");
     std::fs::write(
         &config,
-        r#"{"config_version":1,"model":"m","providers":[{"kind":"open_ai","id":"p1","base_url":"http://127.0.0.1:9/v1","api_key_env":"MOCK_KEY","api":"chat","allow_loopback":true,"models":["m"]}]}"#,
+        r#"{"config_version":1,"model":"m","providers":[{"kind":"open_ai","id":"p1","base_url":"http://127.0.0.1:9/v1","api_key_env":"MOCK_KEY","api":"chat","allow_loopback":true,"models":["m"],"pricing":{"pricing_ceiling_micro_usd_per_million_tokens":1000000}}]}"#,
     )
     .unwrap();
     let out = cli()

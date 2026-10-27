@@ -4,6 +4,28 @@ The live DeepSeek battery (`deepseek-chat`, `deepseek-reasoner`) exposed two
 configuration facts that are **not** provider bugs. Both are enforced at graph
 build time so a bad config fails before the first paid call.
 
+## Credential source
+
+`providers[].api_key_env` reads the daemon process environment. An IDE
+launched from a desktop icon does not inherit a shell export, so a key that
+exists only in an operator file would otherwise reach the daemon as absent and
+the first model call would fail as `Auth` (HTTP 401) after the run started.
+Declare the file at the top level (the path is non-secret; the value stays in
+the file):
+
+```json
+"provider_env_file": "/Users/me/.faktor-live/deepseek.env"
+```
+
+The daemon loads it in the boot preflight, BEFORE the provider secret registry
+and adapters are built, so `api_key_env` resolves and the value is also
+registered for output scrubbing. The file must be absolute, at most 64 KiB,
+owner-only (`chmod 600`) on unix, and contain plain `KEY=VALUE` lines (an
+optional `export ` prefix, matching quotes, and full-line `#` comments are
+accepted). A variable already present in the process environment is never
+overwritten. Never put the key itself in `faktor-plus.json`; a missing,
+malformed, oversized or group/world-readable file is a typed startup refusal.
+
 ## Pricing origin
 
 - Economy and Balanced only admit models whose effective price is known

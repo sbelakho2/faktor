@@ -1327,7 +1327,7 @@ async fn stripe_service_persists_identity_and_uses_it_for_updates() {
                 },
                 MockAction::Respond {
                     status: 200,
-                    body: include_str!("fixtures/stripe/subscription_updated.json").into(),
+                    body: include_str!("fixtures/stripe/subscription_seats_updated.json").into(),
                 },
             ],
         },

@@ -2039,7 +2039,7 @@ mod scans {
         // contract, self-contained and seam-tested).
         (
             "crates/cas/src/lib.rs",
-            "let file = fs::File::create(&tmp)?;",
+            "let file = fs::File::create(tmp)?;",
         ),
         (
             "crates/cas/src/lib.rs",

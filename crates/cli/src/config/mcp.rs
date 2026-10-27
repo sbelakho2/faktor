@@ -16,6 +16,7 @@ impl Default for Config {
         Self {
             model: "default".into(),
             compaction_model: None,
+            compaction_min_reduction: 0.25,
             compact_at_usage: 0.65,
             instructions: concat!(
                 "You are Faktor, a careful senior engineer working inside the user's repository.\n",
@@ -33,6 +34,7 @@ impl Default for Config {
                 "Final answer: list the changed files and the verification command/result."
             )
             .into(),
+            provider_env_file: None,
             providers: vec![],
             routing_mode: None,
             retry: RetryCfg::default(),

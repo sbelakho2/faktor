@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir,separate-process
 //! Payment-token vault: provider tokens are AEAD-sealed before they touch
 //! durable storage and are never rendered in `Debug`, exports or routes.
 //!
@@ -104,7 +105,22 @@ impl PaymentTokenVault {
                 SystemRandom::new().fill(&mut key).map_err(|_| {
                     PaymentError::Store("payment vault key entropy unavailable".into())
                 })?;
-                write_owner_only(&path, &key)?;
+                if let Err(create_error) = write_owner_only(&path, &key) {
+                    // Two processes may construct the service against the
+                    // same fresh database at once. `create_new` lets exactly
+                    // one win; the loser must load the winner's key instead
+                    // of failing every token operation for this process.
+                    match std::fs::read(&path) {
+                        Ok(bytes) if bytes.len() == VAULT_KEY_LEN => {
+                            let mut shared = [0u8; VAULT_KEY_LEN];
+                            shared.copy_from_slice(&bytes);
+                            return Ok(Self {
+                                key: Zeroizing::new(shared),
+                            });
+                        }
+                        _ => return Err(create_error),
+                    }
+                }
                 Ok(Self {
                     key: Zeroizing::new(key),
                 })
@@ -242,31 +258,47 @@ fn decode_key(raw: &str) -> Result<[u8; VAULT_KEY_LEN], PaymentError> {
 
 fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<(), PaymentError> {
     use std::io::Write;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path).map_err(|error| {
-        PaymentError::Store(format!(
-            "create payment vault key {}: {error}",
-            path.display()
-        ))
-    })?;
-    file.write_all(bytes).map_err(|error| {
-        PaymentError::Store(format!(
-            "write payment vault key {}: {error}",
-            path.display()
-        ))
-    })?;
-    file.sync_all().map_err(|error| {
-        PaymentError::Store(format!(
-            "sync payment vault key {}: {error}",
-            path.display()
-        ))
-    })
+    // Write the complete key to a private temporary file, fsync it, then
+    // publish it with an atomic no-replace hard link. A concurrent reader
+    // therefore never observes a partially written key file, and exactly one
+    // process wins the first-use race.
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    let temp = directory.join(format!(".vault-key.tmp-{}", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temp).map_err(|error| {
+            PaymentError::Store(format!(
+                "create payment vault key {}: {error}",
+                temp.display()
+            ))
+        })?;
+        file.write_all(bytes).map_err(|error| {
+            PaymentError::Store(format!(
+                "write payment vault key {}: {error}",
+                temp.display()
+            ))
+        })?;
+        file.sync_all().map_err(|error| {
+            PaymentError::Store(format!(
+                "sync payment vault key {}: {error}",
+                temp.display()
+            ))
+        })?;
+        std::fs::hard_link(&temp, path).map_err(|error| {
+            PaymentError::Store(format!(
+                "publish payment vault key {}: {error}",
+                path.display()
+            ))
+        })
+    })();
+    let _ = std::fs::remove_file(&temp);
+    result
 }
 
 #[cfg(test)]
@@ -305,6 +337,44 @@ mod tests {
         );
         let bad = StaticSecrets::new([("VAULT_KEY".to_string(), "short".to_string())]);
         assert!(PaymentTokenVault::resolve(&bad, "VAULT_KEY", None).is_err());
+    }
+
+    #[test]
+    fn concurrent_first_use_shares_one_key_without_failing() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("payment.db");
+        let barrier = Arc::new(Barrier::new(16));
+        let mut threads = Vec::new();
+        for index in 0..16 {
+            let db = db.clone();
+            let barrier = barrier.clone();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                let vault =
+                    PaymentTokenVault::resolve(&StaticSecrets::default(), "ABSENT", Some(&db))
+                        .expect("a losing key-file creator loads the winner key");
+                let sealed = vault.seal("org", "pm", &format!("tok_{index}")).unwrap();
+                (vault, sealed, index)
+            }));
+        }
+        let results: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        let shared = results[0].0.clone();
+        for (vault, sealed, index) in results {
+            assert_eq!(
+                vault.open("org", "pm", &sealed).unwrap().expose(),
+                format!("tok_{index}")
+            );
+            assert_eq!(
+                shared.open("org", "pm", &sealed).unwrap().expose(),
+                format!("tok_{index}"),
+                "every first-use process must share one key"
+            );
+        }
     }
 
     #[test]

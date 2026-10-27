@@ -1,0 +1,19 @@
+{
+  "id": "INV-SITE-BILLING-INVOICE-PAGE-CURSOR",
+  "surface": "payments.billing",
+  "file": "crates/site/src/routes/account.rs",
+  "find": "    let page = state.payments.invoices(&org, query.since.as_deref(), 100)?;\n",
+  "replace": "    let page = state.payments.invoices(&org, None, 100)?;\n",
+  "gate": "cargo test -p faktor-site invoice_list_paginates_with_an_exclusive_cursor_and_truthful_bounds",
+  "expect": "FAILED",
+  "note": "Ignoring the site cursor makes every older-invoice link repeat the newest 100 rows.",
+  "capabilities": [
+    "site.billing_invoice_pages"
+  ],
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

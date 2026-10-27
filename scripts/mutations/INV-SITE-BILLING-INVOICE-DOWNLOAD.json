@@ -1,0 +1,20 @@
+{
+  "id": "INV-SITE-BILLING-INVOICE-DOWNLOAD",
+  "surface": "payments.billing",
+  "file": "crates/site/src/routes/account.rs",
+  "find": "    let org = org_id(&auth)?;\n    let invoice = state.payments.invoice(&org, &id)?;\n    invoice_attachment(&state.payments, &invoice, &query.format)\n",
+  "replace": "    let org = org_id(&auth)?;\n    let invoice = state.payments.invoice(&org, \"inv_missing\")?;\n    invoice_attachment(&state.payments, &invoice, &query.format)\n",
+  "gate": "cargo test -p faktor-site invoice_download_is_attachment_bounded_and_tenant_scoped",
+  "expect": "FAIL",
+  "timeout_ms": 600000,
+  "note": "Dropping the real scoped read makes the own-invoice download fail (and a wrong id can never reach a real attachment).",
+  "capabilities": [
+    "site.billing_download"
+  ],
+  "oracle": "mutation",
+  "isolation": [
+    "isolated-worktree",
+    "isolated-data-dir",
+    "read-only-artifacts"
+  ]
+}

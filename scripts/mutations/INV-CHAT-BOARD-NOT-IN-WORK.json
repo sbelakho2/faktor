@@ -1,0 +1,12 @@
+{
+  "id": "INV-CHAT-BOARD-NOT-IN-WORK",
+  "file": "apps/vscode/src/webview.ts",
+  "find": "      <details id=\"board-card\" class=\"coordination-drawer\" hidden>",
+  "replace": "      <section id=\"board-card\" class=\"card\" hidden>",
+  "gate": "node --no-warnings apps/vscode/scripts/selftest.mjs",
+  "expect": "FAIL",
+  "timeout_ms": 180000,
+  "note": "The board regresses to a persistent card instead of a collapsed Inspect drawer.",
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+}

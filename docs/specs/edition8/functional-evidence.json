@@ -73,7 +73,7 @@
           "live": {
             "test_id": "control.exercise.M-01",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#M-01",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -142,7 +142,7 @@
           "live": {
             "test_id": "control.exercise.M-02",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#M-02",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -211,7 +211,7 @@
           "live": {
             "test_id": "control.exercise.M-03",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#M-03",
-            "observed": "effective: Host — Favorites and recent models",
+            "observed": "effective: Host \u2014 Favorites and recent models",
             "passed": true
           }
         },
@@ -280,7 +280,7 @@
           "live": {
             "test_id": "control.exercise.M-04",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#M-04",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -349,7 +349,7 @@
           "live": {
             "test_id": "control.exercise.M-05",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#M-05",
-            "observed": "effective: Read — /native/providers",
+            "observed": "effective: Read \u2014 /native/providers",
             "passed": true
           }
         },
@@ -418,7 +418,7 @@
           "live": {
             "test_id": "control.exercise.M-06",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#M-06",
-            "observed": "effective: Read — /native/providers",
+            "observed": "effective: Read \u2014 /native/providers",
             "passed": true
           }
         },
@@ -487,7 +487,7 @@
           "live": {
             "test_id": "control.exercise.M-07",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#M-07",
-            "observed": "effective: Read — /native/models",
+            "observed": "effective: Read \u2014 /native/models",
             "passed": true
           }
         },
@@ -556,7 +556,7 @@
           "live": {
             "test_id": "control.exercise.M-08",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#M-08",
-            "observed": "effective: Read — /native/providers",
+            "observed": "effective: Read \u2014 /native/providers",
             "passed": true
           }
         },
@@ -625,7 +625,7 @@
           "live": {
             "test_id": "control.exercise.M-09",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#M-09",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -694,7 +694,7 @@
           "live": {
             "test_id": "control.exercise.M-10",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#M-10",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -763,7 +763,7 @@
           "live": {
             "test_id": "control.exercise.M-11",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#M-11",
-            "observed": "effective: Read — /native/call-receipts?session=1&limit=50",
+            "observed": "effective: Read \u2014 /native/call-receipts?session=1&limit=50",
             "passed": true
           }
         },
@@ -832,7 +832,7 @@
           "live": {
             "test_id": "control.exercise.M-12",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#M-12",
-            "observed": "effective: Read — /native/config/provenance?limit=500",
+            "observed": "effective: Read \u2014 /native/config/provenance?limit=500",
             "passed": true
           }
         },
@@ -901,7 +901,7 @@
           "live": {
             "test_id": "control.exercise.M-13",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#M-13",
-            "observed": "effective: Read — /native/usage",
+            "observed": "effective: Read \u2014 /native/usage",
             "passed": true
           }
         },
@@ -970,7 +970,7 @@
           "live": {
             "test_id": "control.exercise.M-14",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#M-14",
-            "observed": "effective: Read — /native/providers",
+            "observed": "effective: Read \u2014 /native/providers",
             "passed": true
           }
         },
@@ -1039,7 +1039,7 @@
           "live": {
             "test_id": "control.exercise.P-01",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#P-01",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -1109,7 +1109,7 @@
           "live": {
             "test_id": "control.exercise.P-02",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#P-02",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -1179,7 +1179,7 @@
           "live": {
             "test_id": "control.exercise.P-03",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#P-03",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -1249,7 +1249,7 @@
           "live": {
             "test_id": "control.exercise.P-04",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#P-04",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -1319,7 +1319,7 @@
           "live": {
             "test_id": "control.exercise.P-05",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#P-05",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -1389,7 +1389,7 @@
           "live": {
             "test_id": "control.exercise.P-06",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#P-06",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -1459,7 +1459,7 @@
           "live": {
             "test_id": "control.exercise.P-07",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#P-07",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -1529,7 +1529,7 @@
           "live": {
             "test_id": "control.exercise.P-08",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#P-08",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -1599,7 +1599,7 @@
           "live": {
             "test_id": "control.exercise.P-09",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#P-09",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -1669,7 +1669,7 @@
           "live": {
             "test_id": "control.exercise.P-10",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#P-10",
-            "observed": "effective: Read — /native/providers",
+            "observed": "effective: Read \u2014 /native/providers",
             "passed": true
           }
         },
@@ -1739,7 +1739,7 @@
           "live": {
             "test_id": "control.exercise.P-11",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#P-11",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -1809,7 +1809,7 @@
           "live": {
             "test_id": "control.exercise.P-12",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#P-12",
-            "observed": "effective: Read — /native/providers",
+            "observed": "effective: Read \u2014 /native/providers",
             "passed": true
           }
         },
@@ -1879,7 +1879,7 @@
           "live": {
             "test_id": "control.exercise.P-13",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#P-13",
-            "observed": "effective: Read — /native/runtime/status",
+            "observed": "effective: Read \u2014 /native/runtime/status",
             "passed": true
           }
         },
@@ -1949,7 +1949,7 @@
           "live": {
             "test_id": "control.exercise.P-14",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#P-14",
-            "observed": "effective: Read — /native/providers",
+            "observed": "effective: Read \u2014 /native/providers",
             "passed": true
           }
         },
@@ -2019,7 +2019,7 @@
           "live": {
             "test_id": "control.exercise.P-15",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#P-15",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -2089,7 +2089,7 @@
           "live": {
             "test_id": "control.exercise.G-01",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#G-01",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -2156,7 +2156,7 @@
           "live": {
             "test_id": "control.exercise.G-02",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#G-02",
-            "observed": "effective: Read — /native/session/1/task-runs",
+            "observed": "effective: Read \u2014 /native/session/1/task-runs",
             "passed": true
           }
         },
@@ -2223,7 +2223,7 @@
           "live": {
             "test_id": "control.exercise.G-03",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#G-03",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -2290,7 +2290,7 @@
           "live": {
             "test_id": "control.exercise.G-04",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#G-04",
-            "observed": "effective: Read — /native/config/snapshot",
+            "observed": "effective: Read \u2014 /native/config/snapshot",
             "passed": true
           }
         },
@@ -2357,7 +2357,7 @@
           "live": {
             "test_id": "control.exercise.G-05",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#G-05",
-            "observed": "effective: Read — /native/config/snapshot",
+            "observed": "effective: Read \u2014 /native/config/snapshot",
             "passed": true
           }
         },
@@ -2424,7 +2424,7 @@
           "live": {
             "test_id": "control.exercise.G-06",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#G-06",
-            "observed": "effective: Read — /native/session/1/task-runs",
+            "observed": "effective: Read \u2014 /native/session/1/task-runs",
             "passed": true
           }
         },
@@ -2491,7 +2491,7 @@
           "live": {
             "test_id": "control.exercise.G-07",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#G-07",
-            "observed": "effective: Read — /native/session/1/task-runs",
+            "observed": "effective: Read \u2014 /native/session/1/task-runs",
             "passed": true
           }
         },
@@ -2558,7 +2558,7 @@
           "live": {
             "test_id": "control.exercise.G-08",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#G-08",
-            "observed": "effective: Read — /native/session/1/task-runs",
+            "observed": "effective: Read \u2014 /native/session/1/task-runs",
             "passed": true
           }
         },
@@ -2625,7 +2625,7 @@
           "live": {
             "test_id": "control.exercise.G-09",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#G-09",
-            "observed": "effective: Read — /native/session/1/task-runs",
+            "observed": "effective: Read \u2014 /native/session/1/task-runs",
             "passed": true
           }
         },
@@ -2692,7 +2692,7 @@
           "live": {
             "test_id": "control.exercise.G-10",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#G-10",
-            "observed": "effective: Read — /native/session/1/task-runs",
+            "observed": "effective: Read \u2014 /native/session/1/task-runs",
             "passed": true
           }
         },
@@ -2759,7 +2759,7 @@
           "live": {
             "test_id": "control.exercise.G-11",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#G-11",
-            "observed": "effective: Read — /native/session/1/task-runs",
+            "observed": "effective: Read \u2014 /native/session/1/task-runs",
             "passed": true
           }
         },
@@ -2826,7 +2826,7 @@
           "live": {
             "test_id": "control.exercise.G-12",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#G-12",
-            "observed": "effective: Read — /native/session/1/task-runs",
+            "observed": "effective: Read \u2014 /native/session/1/task-runs",
             "passed": true
           }
         },
@@ -2893,7 +2893,7 @@
           "live": {
             "test_id": "control.exercise.G-13",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#G-13",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -2960,7 +2960,7 @@
           "live": {
             "test_id": "control.exercise.G-14",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#G-14",
-            "observed": "effective: Read — /native/session/1/task-runs",
+            "observed": "effective: Read \u2014 /native/session/1/task-runs",
             "passed": true
           }
         },
@@ -3027,7 +3027,7 @@
           "live": {
             "test_id": "control.exercise.A-01",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#A-01",
-            "observed": "effective: Read — /native/presets?limit=200",
+            "observed": "effective: Read \u2014 /native/presets?limit=200",
             "passed": true
           }
         },
@@ -3095,7 +3095,7 @@
           "live": {
             "test_id": "control.exercise.A-02",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#A-02",
-            "observed": "effective: Read — /native/agents?session=1",
+            "observed": "effective: Read \u2014 /native/agents?session=1",
             "passed": true
           }
         },
@@ -3163,7 +3163,7 @@
           "live": {
             "test_id": "control.exercise.A-03",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#A-03",
-            "observed": "effective: Read — /native/agents?session=1",
+            "observed": "effective: Read \u2014 /native/agents?session=1",
             "passed": true
           }
         },
@@ -3231,7 +3231,7 @@
           "live": {
             "test_id": "control.exercise.A-04",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#A-04",
-            "observed": "effective: Read — /native/agents?session=1",
+            "observed": "effective: Read \u2014 /native/agents?session=1",
             "passed": true
           }
         },
@@ -3299,7 +3299,7 @@
           "live": {
             "test_id": "control.exercise.A-05",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#A-05",
-            "observed": "effective: Read — /native/agents?session=1",
+            "observed": "effective: Read \u2014 /native/agents?session=1",
             "passed": true
           }
         },
@@ -3367,7 +3367,7 @@
           "live": {
             "test_id": "control.exercise.A-06",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#A-06",
-            "observed": "effective: Read — /native/presets?limit=200",
+            "observed": "effective: Read \u2014 /native/presets?limit=200",
             "passed": true
           }
         },
@@ -3435,7 +3435,7 @@
           "live": {
             "test_id": "control.exercise.A-07",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#A-07",
-            "observed": "effective: Read — /native/agents?session=1",
+            "observed": "effective: Read \u2014 /native/agents?session=1",
             "passed": true
           }
         },
@@ -3503,7 +3503,7 @@
           "live": {
             "test_id": "control.exercise.A-08",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#A-08",
-            "observed": "effective: Read — /native/agents?session=1",
+            "observed": "effective: Read \u2014 /native/agents?session=1",
             "passed": true
           }
         },
@@ -3571,7 +3571,7 @@
           "live": {
             "test_id": "control.exercise.A-09",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#A-09",
-            "observed": "effective: Read — /native/agents?session=1",
+            "observed": "effective: Read \u2014 /native/agents?session=1",
             "passed": true
           }
         },
@@ -3639,7 +3639,7 @@
           "live": {
             "test_id": "control.exercise.A-10",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#A-10",
-            "observed": "effective: Read — /native/agents?session=1",
+            "observed": "effective: Read \u2014 /native/agents?session=1",
             "passed": true
           }
         },
@@ -3707,7 +3707,7 @@
           "live": {
             "test_id": "control.exercise.A-11",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#A-11",
-            "observed": "effective: Read — /native/agents?session=1",
+            "observed": "effective: Read \u2014 /native/agents?session=1",
             "passed": true
           }
         },
@@ -3775,7 +3775,7 @@
           "live": {
             "test_id": "control.exercise.A-12",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#A-12",
-            "observed": "effective: Read — /native/presets?limit=200",
+            "observed": "effective: Read \u2014 /native/presets?limit=200",
             "passed": true
           }
         },
@@ -3843,7 +3843,7 @@
           "live": {
             "test_id": "control.exercise.C-01",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#C-01",
-            "observed": "effective: Read — /native/context/manifests?session=1",
+            "observed": "effective: Read \u2014 /native/context/manifests?session=1",
             "passed": true
           }
         },
@@ -3908,7 +3908,7 @@
           "live": {
             "test_id": "control.exercise.C-02",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#C-02",
-            "observed": "effective: Read — /native/context/manifests?session=1",
+            "observed": "effective: Read \u2014 /native/context/manifests?session=1",
             "passed": true
           }
         },
@@ -3973,7 +3973,7 @@
           "live": {
             "test_id": "control.exercise.C-03",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#C-03",
-            "observed": "effective: Read — /native/index/coverage?session=1",
+            "observed": "effective: Read \u2014 /native/index/coverage?session=1",
             "passed": true
           }
         },
@@ -4037,7 +4037,7 @@
           "live": {
             "test_id": "control.exercise.C-04",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#C-04",
-            "observed": "effective: Host — Current editor context",
+            "observed": "effective: Host \u2014 Current editor context",
             "passed": true
           }
         },
@@ -4101,7 +4101,7 @@
           "live": {
             "test_id": "control.exercise.C-05",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#C-05",
-            "observed": "effective: Read — /native/index/coverage?session=1",
+            "observed": "effective: Read \u2014 /native/index/coverage?session=1",
             "passed": true
           }
         },
@@ -4166,7 +4166,7 @@
           "live": {
             "test_id": "control.exercise.C-06",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#C-06",
-            "observed": "effective: Read — /native/index/coverage?session=1",
+            "observed": "effective: Read \u2014 /native/index/coverage?session=1",
             "passed": true
           }
         },
@@ -4230,7 +4230,7 @@
           "live": {
             "test_id": "control.exercise.C-07",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#C-07",
-            "observed": "effective: Read — /native/index/coverage?session=1",
+            "observed": "effective: Read \u2014 /native/index/coverage?session=1",
             "passed": true
           }
         },
@@ -4305,7 +4305,7 @@
           "live": {
             "test_id": "control.exercise.C-08",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#C-08",
-            "observed": "effective: Read — /native/index/coverage?session=1",
+            "observed": "effective: Read \u2014 /native/index/coverage?session=1",
             "passed": true
           }
         },
@@ -4375,7 +4375,7 @@
           "live": {
             "test_id": "control.exercise.C-09",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#C-09",
-            "observed": "effective: Read — /native/config/snapshot",
+            "observed": "effective: Read \u2014 /native/config/snapshot",
             "passed": true
           }
         },
@@ -4445,7 +4445,7 @@
           "live": {
             "test_id": "control.exercise.C-10",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#C-10",
-            "observed": "effective: Read — /native/config/snapshot",
+            "observed": "effective: Read \u2014 /native/config/snapshot",
             "passed": true
           }
         },
@@ -4515,7 +4515,7 @@
           "live": {
             "test_id": "control.exercise.C-11",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#C-11",
-            "observed": "effective: Read — /native/index/coverage?session=1",
+            "observed": "effective: Read \u2014 /native/index/coverage?session=1",
             "passed": true
           }
         },
@@ -4585,7 +4585,7 @@
           "live": {
             "test_id": "control.exercise.C-12",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#C-12",
-            "observed": "effective: Read — /native/index/coverage?session=1",
+            "observed": "effective: Read \u2014 /native/index/coverage?session=1",
             "passed": true
           }
         },
@@ -4655,7 +4655,7 @@
           "live": {
             "test_id": "control.exercise.C-13",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#C-13",
-            "observed": "effective: Read — /native/context/manifest?session=1",
+            "observed": "effective: Read \u2014 /native/context/manifest?session=1",
             "passed": true
           }
         },
@@ -4725,7 +4725,7 @@
           "live": {
             "test_id": "control.exercise.C-14",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#C-14",
-            "observed": "effective: Read — /native/context/export?session=1",
+            "observed": "effective: Read \u2014 /native/context/export?session=1",
             "passed": true
           }
         },
@@ -4800,7 +4800,7 @@
           "live": {
             "test_id": "control.exercise.K-01",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#K-01",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -4868,7 +4868,7 @@
           "live": {
             "test_id": "control.exercise.K-02",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#K-02",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -4936,7 +4936,7 @@
           "live": {
             "test_id": "control.exercise.K-03",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#K-03",
-            "observed": "effective: Read — /native/semantic/status",
+            "observed": "effective: Read \u2014 /native/semantic/status",
             "passed": true
           }
         },
@@ -5000,7 +5000,7 @@
           "live": {
             "test_id": "control.exercise.K-04",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#K-04",
-            "observed": "effective: Read — /native/session/1/context/compaction",
+            "observed": "effective: Read \u2014 /native/session/1/context/compaction",
             "passed": true
           }
         },
@@ -5064,7 +5064,7 @@
           "live": {
             "test_id": "control.exercise.K-05",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#K-05",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -5132,7 +5132,7 @@
           "live": {
             "test_id": "control.exercise.K-06",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#K-06",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -5200,7 +5200,7 @@
           "live": {
             "test_id": "control.exercise.K-07",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#K-07",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -5268,7 +5268,7 @@
           "live": {
             "test_id": "control.exercise.K-08",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#K-08",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -5336,7 +5336,7 @@
           "live": {
             "test_id": "control.exercise.K-09",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#K-09",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -5404,7 +5404,7 @@
           "live": {
             "test_id": "control.exercise.K-10",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#K-10",
-            "observed": "effective: Read — /native/config/snapshot",
+            "observed": "effective: Read \u2014 /native/config/snapshot",
             "passed": true
           }
         },
@@ -5468,7 +5468,7 @@
           "live": {
             "test_id": "control.exercise.K-11",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#K-11",
-            "observed": "effective: Read — /native/semantic/status",
+            "observed": "effective: Read \u2014 /native/semantic/status",
             "passed": true
           }
         },
@@ -5532,7 +5532,7 @@
           "live": {
             "test_id": "control.exercise.K-12",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#K-12",
-            "observed": "effective: Read — /native/session/1/efficiency",
+            "observed": "effective: Read \u2014 /native/session/1/efficiency",
             "passed": true
           }
         },
@@ -5605,7 +5605,7 @@
           "live": {
             "test_id": "control.exercise.I-01",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#I-01",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -5672,7 +5672,7 @@
           "live": {
             "test_id": "control.exercise.I-02",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#I-02",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -5739,7 +5739,7 @@
           "live": {
             "test_id": "control.exercise.I-03",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#I-03",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -5806,7 +5806,7 @@
           "live": {
             "test_id": "control.exercise.I-04",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#I-04",
-            "observed": "effective: Read — /native/instructions/records?limit=200",
+            "observed": "effective: Read \u2014 /native/instructions/records?limit=200",
             "passed": true
           }
         },
@@ -5873,7 +5873,7 @@
           "live": {
             "test_id": "control.exercise.I-05",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#I-05",
-            "observed": "effective: Read — /native/instructions/records",
+            "observed": "effective: Read \u2014 /native/instructions/records",
             "passed": true
           }
         },
@@ -5940,7 +5940,7 @@
           "live": {
             "test_id": "control.exercise.I-06",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#I-06",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -6007,7 +6007,7 @@
           "live": {
             "test_id": "control.exercise.I-07",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#I-07",
-            "observed": "effective: Read — /native/instructions/records/preview",
+            "observed": "effective: Read \u2014 /native/instructions/records/preview",
             "passed": true
           }
         },
@@ -6074,7 +6074,7 @@
           "live": {
             "test_id": "control.exercise.I-08",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#I-08",
-            "observed": "effective: Read — /native/instructions/records",
+            "observed": "effective: Read \u2014 /native/instructions/records",
             "passed": true
           }
         },
@@ -6141,7 +6141,7 @@
           "live": {
             "test_id": "control.exercise.I-09",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#I-09",
-            "observed": "effective: Read — /native/instructions/preview",
+            "observed": "effective: Read \u2014 /native/instructions/preview",
             "passed": true
           }
         },
@@ -6208,7 +6208,7 @@
           "live": {
             "test_id": "control.exercise.I-10",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#I-10",
-            "observed": "effective: Read — /native/instructions/records",
+            "observed": "effective: Read \u2014 /native/instructions/records",
             "passed": true
           }
         },
@@ -6275,7 +6275,7 @@
           "live": {
             "test_id": "control.exercise.I-11",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#I-11",
-            "observed": "effective: Read — /native/instructions/bindings",
+            "observed": "effective: Read \u2014 /native/instructions/bindings",
             "passed": true
           }
         },
@@ -6342,7 +6342,7 @@
           "live": {
             "test_id": "control.exercise.Q-01",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#Q-01",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -6380,10 +6380,10 @@
       "status": "exists",
       "note": "Implemented in both hosts and the daemon; live receipts pass (cfg).",
       "route": {
-        "kind": "cfg",
-        "method": "POST",
-        "path": "/native/config/commit",
-        "config_key": "faktor.permissions.allowedTools"
+        "kind": "read",
+        "method": "GET",
+        "path": "/native/permissions/policy",
+        "config_key": null
       },
       "hosts": {
         "vscode": {
@@ -6392,7 +6392,7 @@
             "file": "apps/vscode/src/edition8/routes.ts",
             "line": 165,
             "note": "VS Code route binding (cfg).",
-            "line_text": "  'Q-02': cfg('faktor.permissions.allowedTools'),"
+            "line_text": "  'Q-02': read('/native/permissions/policy'),"
           },
           "live": {
             "test_id": "control.exercise.Q-02",
@@ -6412,7 +6412,7 @@
           "live": {
             "test_id": "control.exercise.Q-02",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#Q-02",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -6450,10 +6450,10 @@
       "status": "exists",
       "note": "Implemented in both hosts and the daemon; live receipts pass (cfg).",
       "route": {
-        "kind": "cfg",
-        "method": "POST",
-        "path": "/native/config/commit",
-        "config_key": "faktor.sandbox.shell"
+        "kind": "read",
+        "method": "GET",
+        "path": "/native/permissions/policy",
+        "config_key": null
       },
       "hosts": {
         "vscode": {
@@ -6462,7 +6462,7 @@
             "file": "apps/vscode/src/edition8/routes.ts",
             "line": 166,
             "note": "VS Code route binding (cfg).",
-            "line_text": "  'Q-03': cfg('faktor.sandbox.shell'),"
+            "line_text": "  'Q-03': read('/native/permissions/policy'),"
           },
           "live": {
             "test_id": "control.exercise.Q-03",
@@ -6482,7 +6482,7 @@
           "live": {
             "test_id": "control.exercise.Q-03",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#Q-03",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -6520,10 +6520,10 @@
       "status": "exists",
       "note": "Implemented in both hosts and the daemon; live receipts pass (cfg).",
       "route": {
-        "kind": "cfg",
-        "method": "POST",
-        "path": "/native/config/commit",
-        "config_key": "faktor.sandbox.shell"
+        "kind": "read",
+        "method": "GET",
+        "path": "/native/permissions/policy",
+        "config_key": null
       },
       "hosts": {
         "vscode": {
@@ -6532,7 +6532,7 @@
             "file": "apps/vscode/src/edition8/routes.ts",
             "line": 167,
             "note": "VS Code route binding (cfg).",
-            "line_text": "  'Q-04': cfg('faktor.sandbox.shell'),"
+            "line_text": "  'Q-04': read('/native/permissions/policy'),"
           },
           "live": {
             "test_id": "control.exercise.Q-04",
@@ -6552,7 +6552,7 @@
           "live": {
             "test_id": "control.exercise.Q-04",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#Q-04",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -6622,7 +6622,7 @@
           "live": {
             "test_id": "control.exercise.Q-05",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#Q-05",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -6692,7 +6692,7 @@
           "live": {
             "test_id": "control.exercise.Q-06",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#Q-06",
-            "observed": "effective: Read — /native/permissions?session=1",
+            "observed": "effective: Read \u2014 /native/permissions?session=1",
             "passed": true
           }
         },
@@ -6756,7 +6756,7 @@
           "live": {
             "test_id": "control.exercise.Q-07",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#Q-07",
-            "observed": "effective: Read — /native/permissions?session=1",
+            "observed": "effective: Read \u2014 /native/permissions?session=1",
             "passed": true
           }
         },
@@ -6820,7 +6820,7 @@
           "live": {
             "test_id": "control.exercise.Q-08",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#Q-08",
-            "observed": "effective: Read — /native/permissions?session=1",
+            "observed": "effective: Read \u2014 /native/permissions?session=1",
             "passed": true
           }
         },
@@ -6884,7 +6884,7 @@
           "live": {
             "test_id": "control.exercise.Q-09",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#Q-09",
-            "observed": "effective: Read — /native/permissions?session=1",
+            "observed": "effective: Read \u2014 /native/permissions?session=1",
             "passed": true
           }
         },
@@ -6949,7 +6949,7 @@
           "live": {
             "test_id": "control.exercise.Q-10",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#Q-10",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -7019,7 +7019,7 @@
           "live": {
             "test_id": "control.exercise.Q-11",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#Q-11",
-            "observed": "effective: Host — Sandbox setup choice",
+            "observed": "effective: Host \u2014 Sandbox setup choice",
             "passed": true
           }
         },
@@ -7089,7 +7089,7 @@
           "live": {
             "test_id": "control.exercise.Q-12",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#Q-12",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -7159,7 +7159,7 @@
           "live": {
             "test_id": "control.exercise.Q-13",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#Q-13",
-            "observed": "effective: Read — /native/permissions/audit?limit=50",
+            "observed": "effective: Read \u2014 /native/permissions/audit?limit=50",
             "passed": true
           }
         },
@@ -7229,7 +7229,7 @@
           "live": {
             "test_id": "control.exercise.Q-14",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#Q-14",
-            "observed": "effective: Read — /native/permissions/policy",
+            "observed": "effective: Read \u2014 /native/permissions/policy",
             "passed": true
           }
         },
@@ -7299,7 +7299,7 @@
           "live": {
             "test_id": "control.exercise.T-01",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#T-01",
-            "observed": "effective: Read — /native/tools",
+            "observed": "effective: Read \u2014 /native/tools",
             "passed": true
           }
         },
@@ -7367,7 +7367,7 @@
           "live": {
             "test_id": "control.exercise.T-02",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#T-02",
-            "observed": "effective: Read — /native/config/snapshot",
+            "observed": "effective: Read \u2014 /native/config/snapshot",
             "passed": true
           }
         },
@@ -7435,7 +7435,7 @@
           "live": {
             "test_id": "control.exercise.T-03",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#T-03",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -7499,7 +7499,7 @@
           "live": {
             "test_id": "control.exercise.T-04",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#T-04",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -7563,7 +7563,7 @@
           "live": {
             "test_id": "control.exercise.T-05",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#T-05",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -7631,7 +7631,7 @@
           "live": {
             "test_id": "control.exercise.T-06",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#T-06",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -7695,7 +7695,7 @@
           "live": {
             "test_id": "control.exercise.T-07",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#T-07",
-            "observed": "effective: Read — /native/mcp/servers",
+            "observed": "effective: Read \u2014 /native/mcp/servers",
             "passed": true
           }
         },
@@ -7763,7 +7763,7 @@
           "live": {
             "test_id": "control.exercise.T-08",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#T-08",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -7831,7 +7831,7 @@
           "live": {
             "test_id": "control.exercise.T-09",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#T-09",
-            "observed": "unavailable: Disabled — contract-required: no readable native route named for T-09 (Rev8 screen/native/state contract is not complete; the control is not evidence that the specified screen is implemented.)",
+            "observed": "unavailable: Disabled \u2014 contract-required: no readable native route named for T-09 (Rev8 screen/native/state contract is not complete; the control is not evidence that the specified screen is implemented.)",
             "passed": true
           }
         },
@@ -7899,7 +7899,7 @@
           "live": {
             "test_id": "control.exercise.T-10",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#T-10",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -7967,7 +7967,7 @@
           "live": {
             "test_id": "control.exercise.T-11",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#T-11",
-            "observed": "effective: Read — /native/tools",
+            "observed": "effective: Read \u2014 /native/tools",
             "passed": true
           }
         },
@@ -8035,7 +8035,7 @@
           "live": {
             "test_id": "control.exercise.T-12",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#T-12",
-            "observed": "unavailable: Disabled — no MCP server is configured",
+            "observed": "unavailable: Disabled \u2014 no MCP server is configured",
             "passed": true
           }
         },
@@ -8108,7 +8108,7 @@
           "live": {
             "test_id": "control.exercise.T-13",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#T-13",
-            "observed": "effective: Read — /native/providers",
+            "observed": "effective: Read \u2014 /native/providers",
             "passed": true
           }
         },
@@ -8176,7 +8176,7 @@
           "live": {
             "test_id": "control.exercise.T-14",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#T-14",
-            "observed": "effective: Read — /native/providers",
+            "observed": "effective: Read \u2014 /native/providers",
             "passed": true
           }
         },
@@ -8244,7 +8244,7 @@
           "live": {
             "test_id": "control.exercise.T-15",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#T-15",
-            "observed": "effective: Read — /native/diagnostics/preview",
+            "observed": "effective: Read \u2014 /native/diagnostics/preview",
             "passed": true
           }
         },
@@ -8312,7 +8312,7 @@
           "live": {
             "test_id": "control.exercise.S-01",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#S-01",
-            "observed": "effective: Read — /native/skills",
+            "observed": "effective: Read \u2014 /native/skills",
             "passed": true
           }
         },
@@ -8379,7 +8379,7 @@
           "live": {
             "test_id": "control.exercise.S-02",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#S-02",
-            "observed": "effective: Read — /native/skills",
+            "observed": "effective: Read \u2014 /native/skills",
             "passed": true
           }
         },
@@ -8446,7 +8446,7 @@
           "live": {
             "test_id": "control.exercise.S-03",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#S-03",
-            "observed": "unavailable: Disabled — contract-required: no readable native route named for S-03 (Rev8 screen/native/state contract is not complete; the control is not evidence that the specified screen is implemented.)",
+            "observed": "unavailable: Disabled \u2014 contract-required: no readable native route named for S-03 (Rev8 screen/native/state contract is not complete; the control is not evidence that the specified screen is implemented.)",
             "passed": true
           }
         },
@@ -8513,7 +8513,7 @@
           "live": {
             "test_id": "control.exercise.S-04",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#S-04",
-            "observed": "effective: Read — /native/skills",
+            "observed": "effective: Read \u2014 /native/skills",
             "passed": true
           }
         },
@@ -8580,7 +8580,7 @@
           "live": {
             "test_id": "control.exercise.S-05",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#S-05",
-            "observed": "effective: Host — Slash-command palette",
+            "observed": "effective: Host \u2014 Slash-command palette",
             "passed": true
           }
         },
@@ -8647,7 +8647,7 @@
           "live": {
             "test_id": "control.exercise.S-06",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#S-06",
-            "observed": "effective: Read — /native/skills",
+            "observed": "effective: Read \u2014 /native/skills",
             "passed": true
           }
         },
@@ -8714,7 +8714,7 @@
           "live": {
             "test_id": "control.exercise.S-07",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#S-07",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -8778,7 +8778,7 @@
           "live": {
             "test_id": "control.exercise.S-08",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#S-08",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -8842,7 +8842,7 @@
           "live": {
             "test_id": "control.exercise.S-09",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#S-09",
-            "observed": "effective: Read — /native/hooks",
+            "observed": "effective: Read \u2014 /native/hooks",
             "passed": true
           }
         },
@@ -8914,7 +8914,7 @@
           "live": {
             "test_id": "control.exercise.S-10",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#S-10",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -8981,7 +8981,7 @@
           "live": {
             "test_id": "control.exercise.S-11",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#S-11",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -9048,7 +9048,7 @@
           "live": {
             "test_id": "control.exercise.S-12",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#S-12",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -9115,7 +9115,7 @@
           "live": {
             "test_id": "control.exercise.S-13",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#S-13",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -9179,7 +9179,7 @@
           "live": {
             "test_id": "control.exercise.S-14",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#S-14",
-            "observed": "effective: Read — /native/skills",
+            "observed": "effective: Read \u2014 /native/skills",
             "passed": true
           }
         },
@@ -9246,7 +9246,7 @@
           "live": {
             "test_id": "control.exercise.X-01",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#X-01",
-            "observed": "effective: Read — /native/terminals?session=1",
+            "observed": "effective: Read \u2014 /native/terminals?session=1",
             "passed": true
           }
         },
@@ -9310,7 +9310,7 @@
           "live": {
             "test_id": "control.exercise.X-02",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#X-02",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -9381,7 +9381,7 @@
           "live": {
             "test_id": "control.exercise.X-03",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#X-03",
-            "observed": "unavailable: Disabled — contract-required: no readable native route named for X-03",
+            "observed": "unavailable: Disabled \u2014 contract-required: no readable native route named for X-03",
             "passed": true
           }
         },
@@ -9452,7 +9452,7 @@
           "live": {
             "test_id": "control.exercise.X-04",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#X-04",
-            "observed": "effective: Read — /native/terminals?session=1",
+            "observed": "effective: Read \u2014 /native/terminals?session=1",
             "passed": true
           }
         },
@@ -9523,7 +9523,7 @@
           "live": {
             "test_id": "control.exercise.X-05",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#X-05",
-            "observed": "effective: Read — /native/terminals?session=1",
+            "observed": "effective: Read \u2014 /native/terminals?session=1",
             "passed": true
           }
         },
@@ -9587,7 +9587,7 @@
           "live": {
             "test_id": "control.exercise.X-06",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#X-06",
-            "observed": "effective: Connected — real browser session",
+            "observed": "effective: Connected \u2014 real browser session",
             "passed": true
           }
         },
@@ -9663,7 +9663,7 @@
           "live": {
             "test_id": "control.exercise.X-07",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#X-07",
-            "observed": "effective: Read — /native/terminals?session=1",
+            "observed": "effective: Read \u2014 /native/terminals?session=1",
             "passed": true
           }
         },
@@ -9734,7 +9734,7 @@
           "live": {
             "test_id": "control.exercise.X-08",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#X-08",
-            "observed": "unavailable: Disabled — no live browser session is attached; connect it first",
+            "observed": "unavailable: Disabled \u2014 no live browser session is attached; connect it first",
             "passed": true
           }
         },
@@ -9810,7 +9810,7 @@
           "live": {
             "test_id": "control.exercise.X-09",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#X-09",
-            "observed": "unavailable: Disabled — no live browser session is attached; connect it first",
+            "observed": "unavailable: Disabled \u2014 no live browser session is attached; connect it first",
             "passed": true
           }
         },
@@ -9886,7 +9886,7 @@
           "live": {
             "test_id": "control.exercise.X-10",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#X-10",
-            "observed": "effective: Host — Language-server diagnostics",
+            "observed": "effective: Host \u2014 Language-server diagnostics",
             "passed": true
           }
         },
@@ -9957,7 +9957,7 @@
           "live": {
             "test_id": "control.exercise.X-11",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#X-11",
-            "observed": "effective: Host — inline code actions",
+            "observed": "effective: Host \u2014 inline code actions",
             "passed": true
           }
         },
@@ -9996,19 +9996,19 @@
       "status": "exists",
       "note": "Implemented in both hosts and the daemon; live receipts pass (cfg).",
       "route": {
-        "kind": "cfg",
-        "method": "POST",
-        "path": "/native/config/commit",
-        "config_key": "faktor.sandbox.shell"
+        "kind": "read",
+        "method": "GET",
+        "path": "/native/permissions/policy",
+        "config_key": null
       },
       "hosts": {
         "vscode": {
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 224,
+            "line": 226,
             "note": "VS Code route binding (cfg).",
-            "line_text": "  'X-12': cfg('faktor.sandbox.shell'),"
+            "line_text": "  'X-12': read('/native/permissions/policy'),"
           },
           "live": {
             "test_id": "control.exercise.X-12",
@@ -10028,7 +10028,7 @@
           "live": {
             "test_id": "control.exercise.X-12",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#X-12",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -10077,7 +10077,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 225,
+            "line": 227,
             "note": "VS Code route binding (read).",
             "line_text": "  'X-13': read('/native/runtime/status'),"
           },
@@ -10099,7 +10099,7 @@
           "live": {
             "test_id": "control.exercise.X-13",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#X-13",
-            "observed": "effective: Read — /native/runtime/status",
+            "observed": "effective: Read \u2014 /native/runtime/status",
             "passed": true
           }
         },
@@ -10148,7 +10148,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 228,
+            "line": 230,
             "note": "VS Code route binding (cfg).",
             "line_text": "  'B-01': cfg('faktor.budget.maxTokens'),"
           },
@@ -10170,7 +10170,7 @@
           "live": {
             "test_id": "control.exercise.B-01",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#B-01",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -10212,7 +10212,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 229,
+            "line": 231,
             "note": "VS Code route binding (cfg).",
             "line_text": "  'B-02': cfg('faktor.budget.maxCostMicro'),"
           },
@@ -10234,7 +10234,7 @@
           "live": {
             "test_id": "control.exercise.B-02",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#B-02",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -10276,7 +10276,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 230,
+            "line": 232,
             "note": "VS Code route binding (cfg).",
             "line_text": "  'B-03': cfg('faktor.budget.warnAtPercent'),"
           },
@@ -10298,7 +10298,7 @@
           "live": {
             "test_id": "control.exercise.B-03",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#B-03",
-            "observed": "effective: Read — /native/config/snapshot",
+            "observed": "effective: Read \u2014 /native/config/snapshot",
             "passed": true
           }
         },
@@ -10341,7 +10341,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 231,
+            "line": 233,
             "note": "VS Code route binding (read).",
             "line_text": "  'B-04': read('/native/session/:session/usage'),"
           },
@@ -10363,7 +10363,7 @@
           "live": {
             "test_id": "control.exercise.B-04",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#B-04",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -10412,7 +10412,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 232,
+            "line": 234,
             "note": "VS Code route binding (act).",
             "line_text": "  'B-05': act('PUT', '/native/session/:session/budget'),"
           },
@@ -10434,7 +10434,7 @@
           "live": {
             "test_id": "control.exercise.B-05",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#B-05",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -10483,7 +10483,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 233,
+            "line": 235,
             "note": "VS Code route binding (cfg).",
             "line_text": "  'B-06': cfg('faktor.retry.maxAttempts'),"
           },
@@ -10505,7 +10505,7 @@
           "live": {
             "test_id": "control.exercise.B-06",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#B-06",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -10554,7 +10554,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 234,
+            "line": 236,
             "note": "VS Code route binding (cfg).",
             "line_text": "  'B-07': cfg('faktor.retry.baseDelayMs'),"
           },
@@ -10576,7 +10576,7 @@
           "live": {
             "test_id": "control.exercise.B-07",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#B-07",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -10625,7 +10625,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 235,
+            "line": 237,
             "note": "VS Code route binding (read).",
             "line_text": "  'B-08': read('/native/session/:session/efficiency'),"
           },
@@ -10647,7 +10647,7 @@
           "live": {
             "test_id": "control.exercise.B-08",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#B-08",
-            "observed": "effective: Read — /native/session/1/efficiency",
+            "observed": "effective: Read \u2014 /native/session/1/efficiency",
             "passed": true
           }
         },
@@ -10686,9 +10686,9 @@
       "status": "exists",
       "note": "Implemented in both hosts and the daemon; live receipts pass (act).",
       "route": {
-        "kind": "act",
-        "method": "POST",
-        "path": "/native/config/commit",
+        "kind": "read",
+        "method": "GET",
+        "path": "/native/config/snapshot",
         "config_key": null
       },
       "hosts": {
@@ -10696,9 +10696,9 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 236,
+            "line": 240,
             "note": "VS Code route binding (act).",
-            "line_text": "  'B-09': act('POST', '/native/config/commit'),"
+            "line_text": "  'B-09': read('/native/config/snapshot'),"
           },
           "live": {
             "test_id": "control.exercise.B-09",
@@ -10718,7 +10718,7 @@
           "live": {
             "test_id": "control.exercise.B-09",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#B-09",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -10759,7 +10759,7 @@
       "route": {
         "kind": "read",
         "method": "GET",
-        "path": "/native/config/descriptors",
+        "path": "/native/session/:session/task-runs",
         "config_key": null
       },
       "hosts": {
@@ -10767,9 +10767,9 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 237,
+            "line": 243,
             "note": "VS Code route binding (read).",
-            "line_text": "  'B-10': read('/native/config/descriptors'),"
+            "line_text": "  'B-10': read('/native/session/:session/task-runs'),"
           },
           "live": {
             "test_id": "control.exercise.B-10",
@@ -10789,7 +10789,7 @@
           "live": {
             "test_id": "control.exercise.B-10",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#B-10",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -10838,7 +10838,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 238,
+            "line": 244,
             "note": "VS Code route binding (read).",
             "line_text": "  'B-11': read('/native/health'),"
           },
@@ -10860,7 +10860,7 @@
           "live": {
             "test_id": "control.exercise.B-11",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#B-11",
-            "observed": "effective: Read — /native/health",
+            "observed": "effective: Read \u2014 /native/health",
             "passed": true
           }
         },
@@ -10901,7 +10901,7 @@
       "route": {
         "kind": "read",
         "method": "GET",
-        "path": "/native/outcomes?limit=50",
+        "path": "/native/session/:session/tasks",
         "config_key": null
       },
       "hosts": {
@@ -10909,9 +10909,9 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 239,
+            "line": 247,
             "note": "VS Code route binding (read).",
-            "line_text": "  'B-12': read('/native/outcomes?limit=50'),"
+            "line_text": "  'B-12': read('/native/session/:session/tasks'),"
           },
           "live": {
             "test_id": "control.exercise.B-12",
@@ -10931,7 +10931,7 @@
           "live": {
             "test_id": "control.exercise.B-12",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#B-12",
-            "observed": "effective: Read — /native/outcomes?limit=50",
+            "observed": "effective: Read \u2014 /native/outcomes?limit=50",
             "passed": true
           }
         },
@@ -10974,7 +10974,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 242,
+            "line": 250,
             "note": "VS Code route binding (read).",
             "line_text": "  'V-01': read('/native/session/:session/verification'),"
           },
@@ -10996,7 +10996,7 @@
           "live": {
             "test_id": "control.exercise.V-01",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#V-01",
-            "observed": "effective: Read — /native/session/1/verification",
+            "observed": "effective: Read \u2014 /native/session/1/verification",
             "passed": true
           }
         },
@@ -11045,7 +11045,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 243,
+            "line": 251,
             "note": "VS Code route binding (act).",
             "line_text": "  'V-02': act('POST', '/native/session/:session/review/comments'),"
           },
@@ -11067,7 +11067,7 @@
           "live": {
             "test_id": "control.exercise.V-02",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#V-02",
-            "observed": "effective: Read — /native/session/1/checkpoints",
+            "observed": "effective: Read \u2014 /native/session/1/checkpoints",
             "passed": true
           }
         },
@@ -11116,7 +11116,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 244,
+            "line": 252,
             "note": "VS Code route binding (act).",
             "line_text": "  'V-03': act('POST', '/native/session/:session/changes/accept'),"
           },
@@ -11138,7 +11138,7 @@
           "live": {
             "test_id": "control.exercise.V-03",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#V-03",
-            "observed": "effective: Read — /native/session/1/checkpoints",
+            "observed": "effective: Read \u2014 /native/session/1/checkpoints",
             "passed": true
           }
         },
@@ -11187,7 +11187,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 245,
+            "line": 253,
             "note": "VS Code route binding (read).",
             "line_text": "  'V-04': read('/native/session/:session/checkpoints'),"
           },
@@ -11209,7 +11209,7 @@
           "live": {
             "test_id": "control.exercise.V-04",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#V-04",
-            "observed": "effective: Read — /native/session/1/checkpoints",
+            "observed": "effective: Read \u2014 /native/session/1/checkpoints",
             "passed": true
           }
         },
@@ -11251,7 +11251,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 246,
+            "line": 254,
             "note": "VS Code route binding (act).",
             "line_text": "  'V-05': act('POST', '/native/session/:session/checkpoints/:sequence/restore/preview'),"
           },
@@ -11273,7 +11273,7 @@
           "live": {
             "test_id": "control.exercise.V-05",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#V-05",
-            "observed": "effective: Read — /native/session/1/checkpoints",
+            "observed": "effective: Read \u2014 /native/session/1/checkpoints",
             "passed": true
           }
         },
@@ -11315,7 +11315,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 247,
+            "line": 255,
             "note": "VS Code route binding (act).",
             "line_text": "  'V-06': act('POST', '/native/session/:session/fork'),"
           },
@@ -11337,7 +11337,7 @@
           "live": {
             "test_id": "control.exercise.V-06",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#V-06",
-            "observed": "effective: Read — /native/session/1/checkpoints",
+            "observed": "effective: Read \u2014 /native/session/1/checkpoints",
             "passed": true
           }
         },
@@ -11380,7 +11380,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 248,
+            "line": 256,
             "note": "VS Code route binding (act).",
             "line_text": "  'V-07': act('POST', '/native/session/:session/task-runs'),"
           },
@@ -11402,7 +11402,7 @@
           "live": {
             "test_id": "control.exercise.V-07",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#V-07",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -11444,7 +11444,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 249,
+            "line": 257,
             "note": "VS Code route binding (read).",
             "line_text": "  'V-08': read('/native/session/:session/verification'),"
           },
@@ -11466,7 +11466,7 @@
           "live": {
             "test_id": "control.exercise.V-08",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#V-08",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -11515,7 +11515,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 250,
+            "line": 258,
             "note": "VS Code route binding (read).",
             "line_text": "  'V-09': read('/native/tasks/:task/proof?session=:session'),"
           },
@@ -11537,7 +11537,7 @@
           "live": {
             "test_id": "control.exercise.V-09",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#V-09",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -11580,7 +11580,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 251,
+            "line": 259,
             "note": "VS Code route binding (act).",
             "line_text": "  'V-10': act('POST', '/native/session/:session/task-runs'),"
           },
@@ -11602,7 +11602,7 @@
           "live": {
             "test_id": "control.exercise.V-10",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#V-10",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -11644,7 +11644,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 252,
+            "line": 260,
             "note": "VS Code route binding (read).",
             "line_text": "  'V-11': read('/native/repositories'),"
           },
@@ -11666,7 +11666,7 @@
           "live": {
             "test_id": "control.exercise.V-11",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#V-11",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -11715,7 +11715,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 253,
+            "line": 261,
             "note": "VS Code route binding (act).",
             "line_text": "  'V-12': act('POST', '/native/session/:session/checkpoints/:sequence/restore'),"
           },
@@ -11737,7 +11737,7 @@
           "live": {
             "test_id": "control.exercise.V-12",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#V-12",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -11779,7 +11779,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 256,
+            "line": 264,
             "note": "VS Code route binding (read).",
             "line_text": "  'D-01': read('/native/sessions?limit=200'),"
           },
@@ -11801,7 +11801,7 @@
           "live": {
             "test_id": "control.exercise.D-01",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#D-01",
-            "observed": "effective: Read — /native/sessions?limit=200",
+            "observed": "effective: Read \u2014 /native/sessions?limit=200",
             "passed": true
           }
         },
@@ -11847,7 +11847,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 257,
+            "line": 265,
             "note": "VS Code route binding (read).",
             "line_text": "  'D-02': read('/native/sessions?query=:query&limit=200'),"
           },
@@ -11869,7 +11869,7 @@
           "live": {
             "test_id": "control.exercise.D-02",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#D-02",
-            "observed": "unavailable: Disabled — contract-required: no readable native route named for D-02",
+            "observed": "unavailable: Disabled \u2014 contract-required: no readable native route named for D-02",
             "passed": true
           }
         },
@@ -11915,7 +11915,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 258,
+            "line": 266,
             "note": "VS Code route binding (read).",
             "line_text": "  'D-03': read('/native/transcript/search?session=:session&q=:query&regex=false&case=false'),"
           },
@@ -11937,7 +11937,7 @@
           "live": {
             "test_id": "control.exercise.D-03",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#D-03",
-            "observed": "unavailable: Disabled — contract-required: no readable native route named for D-03 (Rev8 screen/native/state contract is not complete; the control is not evidence that the specified screen is implemented.)",
+            "observed": "unavailable: Disabled \u2014 contract-required: no readable native route named for D-03 (Rev8 screen/native/state contract is not complete; the control is not evidence that the specified screen is implemented.)",
             "passed": true
           }
         },
@@ -11979,7 +11979,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 259,
+            "line": 267,
             "note": "VS Code route binding (act).",
             "line_text": "  'D-04': act('POST', '/native/sessions/:session/meta'),"
           },
@@ -12001,7 +12001,7 @@
           "live": {
             "test_id": "control.exercise.D-04",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#D-04",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -12047,7 +12047,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 260,
+            "line": 268,
             "note": "VS Code route binding (act).",
             "line_text": "  'D-05': act('POST', '/native/session/:session/prompt'),"
           },
@@ -12069,7 +12069,7 @@
           "live": {
             "test_id": "control.exercise.D-05",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#D-05",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -12115,7 +12115,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 261,
+            "line": 269,
             "note": "VS Code route binding (act).",
             "line_text": "  'D-06': act('POST', '/native/session/:session/export'),"
           },
@@ -12137,7 +12137,7 @@
           "live": {
             "test_id": "control.exercise.D-06",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#D-06",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -12183,7 +12183,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 263,
+            "line": 271,
             "note": "VS Code route binding (read).",
             "line_text": "  'D-07': read('/native/session/:session/events'),"
           },
@@ -12205,7 +12205,7 @@
           "live": {
             "test_id": "control.exercise.D-07",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#D-07",
-            "observed": "effective: Read — /native/session/1/events",
+            "observed": "effective: Read \u2014 /native/session/1/events",
             "passed": true
           }
         },
@@ -12273,7 +12273,7 @@
           "live": {
             "test_id": "control.exercise.D-08",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#D-08",
-            "observed": "effective: Host — Focus/verbose display",
+            "observed": "effective: Host \u2014 Focus/verbose display",
             "passed": true
           }
         },
@@ -12341,7 +12341,7 @@
           "live": {
             "test_id": "control.exercise.D-09",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#D-09",
-            "observed": "effective: Host — Theme, zoom and density",
+            "observed": "effective: Host \u2014 Theme, zoom and density",
             "passed": true
           }
         },
@@ -12409,7 +12409,7 @@
           "live": {
             "test_id": "control.exercise.D-10",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#D-10",
-            "observed": "effective: Host — Composer send behavior",
+            "observed": "effective: Host \u2014 Composer send behavior",
             "passed": true
           }
         },
@@ -12477,7 +12477,7 @@
           "live": {
             "test_id": "control.exercise.D-11",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#D-11",
-            "observed": "effective: Host — Keymap/commands and discovery",
+            "observed": "effective: Host \u2014 Keymap/commands and discovery",
             "passed": true
           }
         },
@@ -12513,19 +12513,19 @@
       "status": "exists",
       "note": "Implemented in both hosts and the daemon; live receipts pass (cfg).",
       "route": {
-        "kind": "cfg",
-        "method": "POST",
-        "path": "/native/config/commit",
-        "config_key": "faktor.telemetry.categories"
+        "kind": "host",
+        "method": "GET",
+        "path": "host",
+        "config_key": null
       },
       "hosts": {
         "vscode": {
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 268,
+            "line": 276,
             "note": "VS Code route binding (cfg).",
-            "line_text": "  'D-12': cfg('faktor.telemetry.categories'),"
+            "line_text": "  'D-12': host('Permission, failure and completion notices are host-local; the daemon telemetry category list is a different effect and is not reused here.'),"
           },
           "live": {
             "test_id": "control.exercise.D-12",
@@ -12545,7 +12545,7 @@
           "live": {
             "test_id": "control.exercise.D-12",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#D-12",
-            "observed": "effective: Read — /native/config/snapshot",
+            "observed": "effective: Read \u2014 /native/config/snapshot",
             "passed": true
           }
         },
@@ -12591,7 +12591,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 269,
+            "line": 277,
             "note": "VS Code route binding (read).",
             "line_text": "  'D-13': read('/native/session/:session/events'),"
           },
@@ -12613,7 +12613,7 @@
           "live": {
             "test_id": "control.exercise.D-13",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#D-13",
-            "observed": "effective: Read — /native/session/1/events",
+            "observed": "effective: Read \u2014 /native/session/1/events",
             "passed": true
           }
         },
@@ -12677,7 +12677,7 @@
           "live": {
             "test_id": "control.exercise.D-14",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#D-14",
-            "observed": "effective: Host — Accessibility and reduced motion",
+            "observed": "effective: Host \u2014 Accessibility and reduced motion",
             "passed": true
           }
         },
@@ -12719,7 +12719,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 271,
+            "line": 279,
             "note": "VS Code route binding (read).",
             "line_text": "  'D-15': read('/native/sessions/parallel'),"
           },
@@ -12741,7 +12741,7 @@
           "live": {
             "test_id": "control.exercise.D-15",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#D-15",
-            "observed": "effective: Read — /native/sessions/parallel",
+            "observed": "effective: Read \u2014 /native/sessions/parallel",
             "passed": true
           }
         },
@@ -12787,7 +12787,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 274,
+            "line": 282,
             "note": "VS Code route binding (read).",
             "line_text": "  'O-01': read('/native/config/search?q=:query'),"
           },
@@ -12809,7 +12809,7 @@
           "live": {
             "test_id": "control.exercise.O-01",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#O-01",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -12857,7 +12857,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 275,
+            "line": 283,
             "note": "VS Code route binding (read).",
             "line_text": "  'O-02': read('/native/runtime/status'),"
           },
@@ -12879,7 +12879,7 @@
           "live": {
             "test_id": "control.exercise.O-02",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#O-02",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -12927,7 +12927,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 276,
+            "line": 284,
             "note": "VS Code route binding (act).",
             "line_text": "  'O-03': act('POST', '/native/diagnostics/export'),"
           },
@@ -12949,7 +12949,7 @@
           "live": {
             "test_id": "control.exercise.O-03",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#O-03",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -12997,7 +12997,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 277,
+            "line": 285,
             "note": "VS Code route binding (read).",
             "line_text": "  'O-04': read('/native/runtime/status'),"
           },
@@ -13019,7 +13019,7 @@
           "live": {
             "test_id": "control.exercise.O-04",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#O-04",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -13067,7 +13067,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 278,
+            "line": 286,
             "note": "VS Code route binding (act).",
             "line_text": "  'O-05': act('POST', '/native/updater/check'),"
           },
@@ -13089,7 +13089,7 @@
           "live": {
             "test_id": "control.exercise.O-05",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#O-05",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -13137,7 +13137,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 279,
+            "line": 287,
             "note": "VS Code route binding (read).",
             "line_text": "  'O-06': read('/native/usage'),"
           },
@@ -13159,7 +13159,7 @@
           "live": {
             "test_id": "control.exercise.O-06",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#O-06",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -13207,7 +13207,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 280,
+            "line": 288,
             "note": "VS Code route binding (read).",
             "line_text": "  'O-07': read('/native/identity'),"
           },
@@ -13229,7 +13229,7 @@
           "live": {
             "test_id": "control.exercise.O-07",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#O-07",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -13277,7 +13277,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 281,
+            "line": 289,
             "note": "VS Code route binding (act).",
             "line_text": "  'O-08': act('POST', '/native/enterprise/effective-config'),"
           },
@@ -13299,7 +13299,7 @@
           "live": {
             "test_id": "control.exercise.O-08",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#O-08",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -13347,7 +13347,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 282,
+            "line": 290,
             "note": "VS Code route binding (act).",
             "line_text": "  'O-09': act('POST', '/native/memory/records/retention'),"
           },
@@ -13369,7 +13369,7 @@
           "live": {
             "test_id": "control.exercise.O-09",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#O-09",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -13417,7 +13417,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 283,
+            "line": 291,
             "note": "VS Code route binding (cfg).",
             "line_text": "  'O-10': cfg('faktor.telemetry.enabled'),"
           },
@@ -13439,7 +13439,7 @@
           "live": {
             "test_id": "control.exercise.O-10",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#O-10",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -13492,7 +13492,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 284,
+            "line": 292,
             "note": "VS Code route binding (read).",
             "line_text": "  'O-11': read('/native/workers'),"
           },
@@ -13514,7 +13514,7 @@
           "live": {
             "test_id": "control.exercise.O-11",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#O-11",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -13562,7 +13562,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 285,
+            "line": 293,
             "note": "VS Code route binding (act).",
             "line_text": "  'O-12': act('POST', '/native/config/import'),"
           },
@@ -13584,7 +13584,7 @@
           "live": {
             "test_id": "control.exercise.O-12",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#O-12",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },
@@ -13632,7 +13632,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/edition8/routes.ts",
-            "line": 286,
+            "line": 294,
             "note": "VS Code route binding (read).",
             "line_text": "  'O-13': read('/native/semantic/capabilities'),"
           },
@@ -13654,7 +13654,7 @@
           "live": {
             "test_id": "control.exercise.O-13",
             "evidence": "target/certification/edition8/control-exercise-jetbrains.raw.json#O-13",
-            "observed": "effective: Staged — not applied",
+            "observed": "effective: Staged \u2014 not applied",
             "passed": true
           }
         },

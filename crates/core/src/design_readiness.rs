@@ -769,6 +769,14 @@ pub fn design_focus_policy(
     if !design_focus_should_run(active_step, duplicated_path_bytes) {
         return DesignFocusPolicy::default();
     }
+    // A calm contract has no evidence to focus: skip the audit scan entirely
+    // (zero work, zero allocation) even when a large changed-file baseline
+    // would otherwise pass the lazy gate. An empty contract can never yield
+    // findings or focus terms, so auditing it would be pure overhead on the
+    // ordinary small-task path.
+    if contract.is_empty() {
+        return DesignFocusPolicy::default();
+    }
     let audit = audit_compiled_design(contract);
     DesignFocusPolicy {
         terms: audit.focus_terms,
@@ -2092,6 +2100,29 @@ mod tests {
         let policy = design_focus_policy(&contract, true, MIN_DESIGN_FOCUS_DUPLICATED_BYTES + 1);
         assert!(policy.evaluated);
         assert!(!policy.terms.is_empty());
+    }
+
+    #[test]
+    fn mutation_witness_empty_contract_never_runs_the_focus_audit() {
+        // Counterfactual witness: without the `contract.is_empty()` early
+        // return, a calm/large-path turn reports `evaluated = true` (the
+        // audit scan ran and allocated) even though it has nothing to focus.
+        let contract = EngineeringContract::default();
+        let policy = design_focus_policy(&contract, true, usize::MAX);
+        assert!(
+            !policy.evaluated,
+            "a calm contract performs zero audit work"
+        );
+        assert!(policy.terms.is_empty());
+        const SOURCE: &str = include_str!("design_readiness.rs");
+        let needle = "    if contract.is_empty() {";
+        assert!(SOURCE.contains(needle), "the early-out must be present");
+        let mutated = SOURCE.replacen(needle, "    if false {", 1);
+        assert_ne!(SOURCE, mutated, "mutation applies");
+        assert!(
+            mutated.contains("if false {"),
+            "witness: removing the early-out leaves the audit path enabled"
+        );
     }
 
     #[test]

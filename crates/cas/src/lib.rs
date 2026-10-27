@@ -417,7 +417,7 @@ impl Cas {
             cas.governor = Some(std::sync::Arc::new(governor));
             cas.install_governor_backends();
             if let Some(governor) = &cas.governor {
-                let _ = governor.reconcile();
+                let _ = governor.reconcile_if_stale(60_000);
             }
         }
         Ok(cas)
@@ -564,7 +564,10 @@ impl Cas {
         let path = self.blob_path(hash);
         if self.blob_is_valid(hash, &path) {
             // Dedup hit on a verified-healthy blob: never rewrite, never
-            // spend admission on bytes that do not grow the store.
+            // spend admission on bytes that do not grow the store. The hit
+            // still claims the blob for its logical class so archive /
+            // checkpoint / capture retention survives dedup.
+            self.note_class_claim(class, hash);
             return Ok(hash);
         }
         // Compress to memory first so the temp-file write is one syscall
@@ -623,6 +626,7 @@ impl Cas {
         let path = self.blob_path(hash);
         if self.blob_is_valid(hash, &path) {
             let _ = fs::remove_file(&tmp);
+            self.note_class_claim(class, hash);
             return Ok(hash);
         }
         // The temp file is fully written but NOT published: admission is
@@ -722,6 +726,46 @@ impl Cas {
     /// daemon); bare test stores run ungoverned.
     pub fn governor_attached(&self) -> bool {
         self.governor.is_some()
+    }
+
+    /// A dedup hit is still a reference by `class`. Promote the durable owner
+    /// when the referencing class retains more strongly (archive, then
+    /// checkpoint, then terminal capture, then main CAS), otherwise refresh
+    /// its LRU stamp. An unindexed blob (crash after rename) is adopted from
+    /// disk truth.
+    fn note_class_claim(&self, class: StorageClass, hash: FileHash) {
+        let Some(governor) = &self.governor else {
+            return;
+        };
+        let hex = hash.to_hex();
+        let owner = governor
+            .object_class_of_digest_in_family(&hex, class.family())
+            .ok()
+            .flatten();
+        match owner {
+            Some(owner) if owner.retention_rank() >= class.retention_rank() => {
+                let _ = governor.touch(owner, &hex);
+            }
+            _ => {
+                if let Ok(bytes) = self.stored_size(hash) {
+                    let recovered = owner.is_none();
+                    let changed = governor
+                        .register_object(class, &hex, bytes, Some(&hex))
+                        .unwrap_or(false);
+                    if changed {
+                        // Promotion only moves bytes between class quotas:
+                        // enforce THIS class, never a full O(classes) pass
+                        // per chunk (archive floods promote every chunk).
+                        let _ = governor.enforce_class(class);
+                    }
+                    if recovered {
+                        // Crash between rename and commit adopts bytes nobody
+                        // admitted; that can move the aggregate, so enforce.
+                        let _ = governor.enforce();
+                    }
+                }
+            }
+        }
     }
 
     /// True iff the blob at `path` decompresses and rehashes to `hash`. Any
