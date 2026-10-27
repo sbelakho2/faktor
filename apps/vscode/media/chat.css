@@ -2553,3 +2553,11 @@ button.intent-option:focus-visible {
     align-items: start;
   }
 }
+
+/* The embedded settings screen is hosted INSIDE the chat surface: the one
+   chat header (with Back to chat) stays above it. Hide the settings app's own
+   header/destination chrome so there is never a tiny second settings bar. */
+#app > header { position: relative; z-index: 40; background: var(--vscode-sideBar-background, var(--vscode-editor-background)); }
+#settings-panel .e8-header,
+#settings-panel .e8-destination { display: none; }
+#settings-panel { padding-top: var(--space-2); }

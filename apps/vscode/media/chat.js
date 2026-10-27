@@ -1042,6 +1042,7 @@
     if (back) {
       back.hidden = key === 'work';
     }
+    document.body.setAttribute('data-mode', key === 'settings' ? 'settings' : 'chat');
     setOverflowOpen(false);
   }
 

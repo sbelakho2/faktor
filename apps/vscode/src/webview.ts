@@ -764,7 +764,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 ${settingsMarkup}
   </section>
 </div>
-<script nonce="${nonce}">document.body.setAttribute('data-mode', 'settings'); window.__faktorE8Initial = "S29";</script>
+<script nonce="${nonce}">document.body.setAttribute('data-mode', 'chat');</script>
 <script nonce="${nonce}" src="${settingsScriptUri}"></script>
 <script nonce="${nonce}" src="${boardUri}"></script>
 <script nonce="${nonce}" src="${historyUri}"></script>
