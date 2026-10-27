@@ -9,8 +9,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use faktor_storage::{
-    StorageClass, StorageGovernor, StorageGovernorConfig, DEFAULT_RESERVATION_LEASE_MS,
-    DEFAULT_TOTAL_BUDGET_BYTES, DEFAULT_WATERMARK_PERMILLE,
+    StorageClass, StorageGovernor, StorageGovernorConfig, DEFAULT_CAPACITY_PERMILLE,
+    DEFAULT_MIN_INSTALL_ALLOWANCE_BYTES, DEFAULT_RESERVATION_LEASE_MS, DEFAULT_RESERVE_BYTES,
+    DEFAULT_RESERVE_PERMILLE, DEFAULT_TOTAL_BUDGET_BYTES, DEFAULT_WATERMARK_PERMILLE,
 };
 
 /// Default age after which updater staging files are removed as remnants.
@@ -19,9 +20,20 @@ pub const DEFAULT_UPDATE_REMNANT_STALE_MS: i64 = 60 * 60 * 1000;
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StorageCfg {
+    /// Operator cap. The default is unlimited; the capacity-relative cap and
+    /// the free-space reserve are always applied on top.
     pub total_budget_bytes: u64,
     pub watermark_permille: u16,
     pub reservation_lease_ms: i64,
+    /// Capacity-relative hard cap in permille of the backing filesystem(s).
+    pub capacity_permille: u16,
+    /// Free-space reserve share in permille of capacity (floored by
+    /// `reserve_bytes`).
+    pub reserve_permille: u16,
+    /// Absolute free-space reserve floor.
+    pub reserve_bytes: u64,
+    /// Minimum installation allowance for the capacity-relative cap.
+    pub min_install_allowance_bytes: u64,
     pub main_cas_bytes: Option<u64>,
     pub evidence_cas_bytes: Option<u64>,
     pub compaction_archive_bytes: Option<u64>,
@@ -42,6 +54,10 @@ impl Default for StorageCfg {
             total_budget_bytes: DEFAULT_TOTAL_BUDGET_BYTES,
             watermark_permille: DEFAULT_WATERMARK_PERMILLE,
             reservation_lease_ms: DEFAULT_RESERVATION_LEASE_MS,
+            capacity_permille: DEFAULT_CAPACITY_PERMILLE,
+            reserve_permille: DEFAULT_RESERVE_PERMILLE,
+            reserve_bytes: DEFAULT_RESERVE_BYTES,
+            min_install_allowance_bytes: DEFAULT_MIN_INSTALL_ALLOWANCE_BYTES,
             main_cas_bytes: None,
             evidence_cas_bytes: None,
             compaction_archive_bytes: None,
@@ -82,6 +98,10 @@ impl StorageCfg {
             total_budget_bytes: self.total_budget_bytes,
             watermark_permille: self.watermark_permille,
             reservation_lease_ms: self.reservation_lease_ms,
+            capacity_permille: self.capacity_permille,
+            reserve_permille: self.reserve_permille,
+            reserve_bytes: self.reserve_bytes,
+            min_install_allowance_bytes: self.min_install_allowance_bytes,
             quotas: std::collections::BTreeMap::new(),
         };
         for (class, bytes) in self.overrides() {

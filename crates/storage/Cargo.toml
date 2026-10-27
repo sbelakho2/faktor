@@ -16,7 +16,17 @@ tracing.workspace = true
 uuid.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1.1", features = ["process"] }
+# `fs` exposes safe `statvfs` (the workspace denies unsafe code); `process`
+# backs the governor's liveness probe.
+rustix = { version = "1.1", features = ["process", "fs"] }
+
+[target.'cfg(windows)'.dependencies]
+# Same windows-sys revision the workspace already locks. Capacity is measured
+# with GetDiskFreeSpaceExW (the only unsafe wrapper, scoped to that function).
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }
 
 [dev-dependencies]
 tempfile.workspace = true

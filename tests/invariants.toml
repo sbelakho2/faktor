@@ -381,6 +381,54 @@ release_critical = true
 platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
+id = "INV-VSCODE-ASK-ISOLATION"
+statement = "Ask is the default composer intent and runs one plain conversational turn over POST /native/session/{id}/prompt; it constructs no engineering/completion contract, task-run object, proof/verification read, repo scan or billing/control-plane request, while Task still carries the checked contract."
+owner = "apps/vscode composer + extension Ask path"
+authority = "apps/vscode/src/askFlow.ts sendAskTurn/loadConversation; src/extension.ts sendAskTurnFromComposer"
+script_check = "Ask sends hello as a plain conversational turn with no contract or task options"
+mutation_witness = "Ask sends hello as a plain conversational turn with no contract or task options"
+mutation_command = "node scripts/mutation-run.mjs INV-VSCODE-ASK-ISOLATION"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-VSCODE-NO-BILLING-REFRESH"
+statement = "Normal chat/run refresh never reads billing, account, subscription or entitlement data; the only commercial reader is the explicit lazy Account/Usage surface, which reports Account not connected without network work when absent."
+owner = "apps/vscode refresh + Account surface"
+authority = "apps/vscode/src/refreshReads.ts refreshReadPlan; extension.ts readAccountSurface"
+script_check = "run refresh never reads billing and Ask reads conversation only"
+mutation_witness = "run refresh never reads billing and Ask reads conversation only"
+mutation_command = "node scripts/mutation-run.mjs INV-VSCODE-NO-BILLING-REFRESH"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-VSCODE-ATTENTION-AGGREGATION"
+statement = "Needs attention aggregates served approvals, failed checks, missing credentials, ambiguous requirements and repository limitations into at most three grouped rows; absent groups are omitted and unknown checks never become a disclosure item."
+owner = "apps/vscode shared UX model"
+authority = "apps/vscode/src/uxState.ts aggregateAttention/projectUx"
+script_check = "attention is aggregated to at most three grouped rows and absent groups are omitted"
+mutation_witness = "attention is aggregated to at most three grouped rows and absent groups are omitted"
+mutation_command = "node scripts/mutation-run.mjs INV-VSCODE-ATTENTION-AGGREGATION"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-VSCODE-STATE-MAPPING"
+statement = "Served machine/run conditions map to cause-specific user labels and actions: provider credential, transient provider retry, daemon reconnect, network interruption, durable pause (Resume, never resend), pre-run failure, user input, failed check and unrecoverable diagnostics; raw machine terms stay under Advanced diagnostics."
+owner = "apps/vscode shared UX model"
+authority = "apps/vscode/src/uxState.ts failureCause/projectUx; media/chat.js runStateSpec"
+script_check = "run state uses the shared cause-specific labels and never says resend"
+mutation_witness = "run state uses the shared cause-specific labels and never says resend"
+mutation_command = "node scripts/mutation-run.mjs INV-VSCODE-STATE-MAPPING"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
 id = "INV-PROMPT-START-IDEMPOTENT"
 statement = "An ordinary prompt carries a client submission id; a repeated key with the same body replays the stored receipt byte-for-byte (no second prompt/queue/journal row), a pending or completed key with a different body is the typed KeyReused (never a lease-long in-flight answer), and a byte-identical live pending key is a typed in-flight 409 claimed before any mutation; lease liveness is MONOTONIC within one daemon generation (wall-clock jumps never move it)."
 owner = "crates/store + crates/server prompt admission"

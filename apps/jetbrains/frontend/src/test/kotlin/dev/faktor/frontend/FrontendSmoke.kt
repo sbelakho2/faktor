@@ -1270,8 +1270,8 @@ object FrontendSmoke {
         step("run-state copy: T06-T26 exact labels render only under their served conditions") {
             // Verbatim transcription guards: the state-matrix copy is exact.
             assertEquals("Ready", RunStateCopy.READY_LABEL)
-            assertEquals("Describe a task or ask a question.", RunStateCopy.READY_COPY)
-            assertEquals("Run task", RunStateCopy.READY_ACTION)
+            assertEquals("Ask a question, or choose Task for an isolated run.", RunStateCopy.READY_COPY)
+            assertEquals("Send", RunStateCopy.READY_ACTION)
             assertEquals("Starting the run", RunStateCopy.STARTING_LABEL)
             assertEquals("Your captured draft is being admitted once.", RunStateCopy.STARTING_COPY)
             assertEquals("Wait", RunStateCopy.STARTING_ACTION)
@@ -1518,14 +1518,18 @@ object FrontendSmoke {
                     panel.composerReadyForTest()?.second,
                     "clearing the draft restores the ready state"
                 )
-                assertEquals(false, panel.askModeSelected(), "Task mode stays the default")
-                panel.selectModeForTest(true)
-                assertEquals(true, panel.askModeSelected(), "the Ask mode control must keep working")
+                assertEquals(true, panel.askModeSelected(), "Ask is the default intent")
+                assertEquals("Send", panel.submitLabelForTest(), "the ONE submit action is Send")
+                assertEquals(false, panel.taskOptionsVisibleForTest(), "Ask hides Task options")
                 panel.selectModeForTest(false)
+                assertEquals(false, panel.askModeSelected())
+                assertEquals("Send", panel.submitLabelForTest())
+                assertEquals(true, panel.taskOptionsVisibleForTest(), "Task exposes ONE disclosure")
                 panel.openTaskOptionsForTest()
                 assertEquals(true, panel.taskOptionsOpenForTest())
                 panel.backTaskOptionsForTest()
                 assertEquals(false, panel.taskOptionsOpenForTest())
+                panel.selectModeForTest(true)
 
                 // The strip renders each served run state with its exact
                 // label+copy; states that are not served never bleed through.
@@ -1648,17 +1652,13 @@ object FrontendSmoke {
                 )
                 val pendingModel = TaskTree.build(task = pendingCompletion)
                 assertEquals(true, pendingModel.completion?.finishActionPending)
+                // Overview is a concise summary: the full finish-action /
+                // contract / proof detail belongs to Verification/Advanced.
                 val overview = OverviewPanel()
                 overview.updateModel(pendingModel)
-                val finishRow = overview.summaryText("Finish actions")
-                assertTrue(
-                    finishRow.startsWith(
-                        RunStateCopy.FINISH_ACTION_PENDING_LABEL + " — " +
-                            RunStateCopy.FINISH_ACTION_PENDING_COPY
-                    ),
-                    finishRow
-                )
-                assertTrue(finishRow.contains("commit pending"), finishRow)
+                assertEquals(false, overview.hasSummaryRowForTest("Finish actions"))
+                assertEquals(false, overview.hasSummaryRowForTest("Integration"))
+                assertEquals(false, overview.hasSummaryRowForTest("Acceptance criteria"))
                 val doneCompletion = task.copy(
                     completion = NativeTaskCompletion(
                         NativeCompletionContract(true, true, false),
@@ -1671,12 +1671,7 @@ object FrontendSmoke {
                 val doneModel = TaskTree.build(task = doneCompletion)
                 assertEquals(false, doneModel.completion?.finishActionPending)
                 overview.updateModel(doneModel)
-                val doneRow = overview.summaryText("Finish actions")
-                assertTrue(
-                    !doneRow.contains(RunStateCopy.FINISH_ACTION_PENDING_LABEL),
-                    doneRow
-                )
-                assertTrue(doneRow.contains("commit succeeded"), doneRow)
+                assertEquals(false, overview.hasSummaryRowForTest("Finish actions"))
                 // The derived rows of a still-running contract are pending
                 // too; the durable gate-certified (done) rows are not.
                 assertEquals(
@@ -1739,15 +1734,10 @@ object FrontendSmoke {
             )
             val overview = OverviewPanel()
             overview.updateModel(conflicted)
-            val integrationRow = overview.summaryText("Integration")
-            assertTrue(integrationRow.contains("! Conflict"), integrationRow)
-            assertTrue(
-                integrationRow.contains(RunStateCopy.WORKSPACE_CHANGED_LABEL),
-                integrationRow
-            )
-            assertTrue(
-                integrationRow.contains(RunStateCopy.WORKSPACE_CHANGED_COPY),
-                integrationRow
+            assertEquals(
+                false,
+                overview.hasSummaryRowForTest("Integration"),
+                "full proof/integration facts stay in Verification"
             )
             // Negative: a clean served integration never renders the copy.
             val clean = TaskTree.build(task = task, proof = parseNativeTaskProof(TASK_PROOF_JSON))
@@ -2762,83 +2752,73 @@ object FrontendSmoke {
             assertEquals(listOf("41", "42", "43", "44"), panel.evidenceButtonIds())
         }
 
-        step("overview keeps proof, spend and completed states honest") {
+        step("overview is concise; proof honesty stays in Verification/Advanced") {
             val task = parseNativeTaskViews(TASK_JSON)[0]
             val records = parseNativeTaskVerification(TASK_VERIFICATION_JSON)
-            val panel = OverviewPanel()
-            // A passing record without a strict verified proof is candidate
-            // level only: the verified wording never appears.
-            panel.updateModel(TaskTree.build(task = task, taskVerification = records))
-            val candidateRow = panel.summaryText("Verification")
-            assertTrue(candidateRow.startsWith("Candidate checks passed"), candidateRow)
-            assertTrue(!candidateRow.contains("Verified"), candidateRow)
-            // I04/VAL-LAND-2: with no proof read the integration row stays an
-            // explicit missing value, never a positive fact.
-            assertEquals(
-                "No integration facts are served for this run yet",
-                panel.summaryText("Integration")
-            )
-            // A served but unverified proof keeps the candidate wording and
-            // never borrows the verified one.
-            panel.updateModel(
-                TaskTree.build(
-                    task = task,
-                    taskVerification = records,
-                    proof = parseNativeTaskProof(
-                        TASK_PROOF_JSON.replace(
-                            "\"proofState\":\"verified\"",
-                            "\"proofState\":\"unverified\""
-                        )
-                    )
+            val candidateModel = TaskTree.build(task = task, taskVerification = records)
+            val overview = OverviewPanel()
+            overview.updateModel(candidateModel)
+            // Overview is a summary: Verification/Integration/Finish actions
+            // are deliberately absent (full proof lives in Verification).
+            assertTrue(!overview.hasSummaryRowForTest("Verification"))
+            assertTrue(!overview.hasSummaryRowForTest("Integration"))
+            assertTrue(!overview.hasSummaryRowForTest("Finish actions"))
+            assertTrue(!overview.hasSummaryRowForTest("Acceptance criteria"))
+            if (candidateModel.verification.checksPlanned > 0) {
+                assertEquals(
+                    "Checks to run · " + candidateModel.verification.checksPlanned,
+                    overview.summaryText("Checks to run")
                 )
-            )
-            val unverifiedRow = panel.summaryText("Verification")
-            assertTrue(unverifiedRow.startsWith("Candidate checks passed"), unverifiedRow)
-            assertTrue(!unverifiedRow.contains("Verified"), unverifiedRow)
-            // An unavailable proof names itself and its served reason.
-            panel.updateModel(
-                TaskTree.build(
-                    task = task,
-                    taskVerification = records,
-                    proof = parseNativeTaskProof(TASK_PROOF_UNAVAILABLE_JSON)
-                )
-            )
-            val unavailableRow = panel.summaryText("Verification")
-            assertTrue(unavailableRow.startsWith("Verification unavailable"), unavailableRow)
-            assertTrue(unavailableRow.contains("landed_snapshot mismatch"), unavailableRow)
-            // The integration row carries its own fact: the served mismatch
-            // is named, never collapsed into the verification wording.
-            assertEquals("✗ Mismatch", panel.summaryText("Integration"))
-            // Only the strict verified proof renders the verified wording.
-            panel.updateModel(
-                TaskTree.build(
-                    task = task,
-                    taskVerification = records,
-                    proof = parseNativeTaskProof(TASK_PROOF_JSON)
-                )
-            )
+            }
+            // A passing record without a strict verified proof never claims
+            // VERIFIED in the Verification summary.
+            val candidatePanel = VerificationPanel()
+            candidatePanel.updateModel(candidateModel)
             assertTrue(
-                panel.summaryText("Verification").startsWith("Verified"),
-                panel.summaryText("Verification")
+                candidatePanel.summaryText().startsWith("Not verified yet"),
+                candidatePanel.summaryText()
             )
+            assertTrue(!candidatePanel.summaryText().contains("Verified"))
+            // An unavailable proof is an attention cause, not a fabricated row.
+            val unavailable = TaskTree.build(
+                task = task,
+                taskVerification = records,
+                proof = parseNativeTaskProof(TASK_PROOF_UNAVAILABLE_JSON)
+            )
+            overview.updateModel(unavailable)
+            assertTrue(
+                overview.summaryText("Needs attention").contains("Verification unavailable"),
+                overview.summaryText("Needs attention")
+            )
+            // Only the strict verified proof renders the verified wording, in
+            // the Verification surface (Advanced), never in Overview.
+            val verified = TaskTree.build(
+                task = task,
+                taskVerification = records,
+                proof = parseNativeTaskProof(TASK_PROOF_JSON)
+            )
+            val verifiedPanel = VerificationPanel()
+            verifiedPanel.updateModel(verified)
+            assertTrue(verifiedPanel.summaryText().startsWith("Verified"), verifiedPanel.summaryText())
+            assertTrue(!overview.hasSummaryRowForTest("Verification"))
             assertEquals(
                 "✓ Landed state matches verified state",
-                panel.summaryText("Integration")
+                verified.proof!!.integrationFacts().first()
             )
             // A completed run without verified proof stays neutral: the bare
             // state token never derives the positive tint.
             val completedTask = task.copy(state = "completed", blockers = emptyList())
-            panel.updateModel(TaskTree.build(task = completedTask))
+            overview.updateModel(TaskTree.build(task = completedTask))
             assertEquals(
                 SemanticState.DIM,
-                panel.runStateOfForTest(TaskTree.build(task = completedTask))
+                overview.runStateOfForTest(TaskTree.build(task = completedTask))
             )
-            assertTrue(panel.stateLabelText().contains("completed"), panel.stateLabelText())
-            assertTrue(!panel.stateLabelText().contains("Verified"), panel.stateLabelText())
-            // Missing spend is explicitly unavailable; a known zero is not.
-            panel.updateModel(TaskTree.build(taskVerification = records))
-            assertEquals("Cost unavailable", panel.summaryText("Spend"))
-            panel.updateModel(
+            assertTrue(overview.stateLabelText().contains("completed"), overview.stateLabelText())
+            assertTrue(!overview.stateLabelText().contains("Verified"))
+            // Missing spend is omitted; a known zero is rendered exactly.
+            overview.updateModel(TaskTree.build(taskVerification = records))
+            assertTrue(!overview.hasSummaryRowForTest("Spend"))
+            overview.updateModel(
                 TaskTree.build(
                     usage = parseNativeSessionUsage(
                         "{\"sessionId\":\"1\",\"providerCalls\":{\"tokens\":0}," +
@@ -2848,13 +2828,10 @@ object FrontendSmoke {
                 )
             )
             assertTrue(
-                panel.summaryText("Spend").startsWith("\$0.0000"),
-                panel.summaryText("Spend")
+                overview.summaryText("Spend").startsWith("\$0.0000"),
+                overview.summaryText("Spend")
             )
-            assertTrue(
-                !panel.summaryText("Spend").contains("unavailable"),
-                panel.summaryText("Spend")
-            )
+            assertTrue(!overview.summaryText("Spend").contains("unavailable"))
         }
 
         step("task tree spend and child rows keep missing values missing") {
@@ -4440,7 +4417,7 @@ object FrontendSmoke {
                 assertTrue(!panel.utilityOpenForTest(), "Back must return to the clusters")
                 assertTrue(panel.openUtilityForTest("Settings"), "Settings must be reachable")
                 panel.closeUtilityForTest()
-                assertTrue(panel.openUtilityForTest("Usage"), "Usage must be reachable")
+                assertTrue(panel.openUtilityForTest("Account"), "Account must be reachable")
                 panel.closeUtilityForTest()
                 ParityAwt.layout(panel, 800, 600)
                 assertTrue(
@@ -4462,6 +4439,10 @@ object FrontendSmoke {
                 assertEquals(false, panel.taskOptionsOpenForTest())
                 panel.setTaskFieldsForTest("draft goal", "c1")
                 panel.setBudgetFieldsForTest("", "")
+                assertEquals(true, panel.askModeSelected(), "Ask is the default intent")
+                assertEquals(false, panel.taskOptionsVisibleForTest())
+                assertEquals(false, panel.taskOptionsOpenForTest(), "Ask never opens Task options")
+                panel.selectModeForTest(ask = false)
                 assertEquals("Task options ▾", panel.toggleTaskOptionsForTest())
                 assertEquals(true, panel.taskOptionsOpenForTest())
                 // The sheet body is the scrollable column inside a scroll pane.
@@ -4480,11 +4461,10 @@ object FrontendSmoke {
                 panel.triggerEscapeForTest()
                 assertEquals(false, panel.taskOptionsOpenForTest(), "Escape closes the sheet")
                 assertEquals("draft goal", panel.goalTextForTest())
-                assertEquals(false, panel.askModeSelected(), "Task mode is the default")
+                assertEquals(false, panel.askModeSelected(), "Task intent remains selectable")
                 panel.selectModeForTest(ask = true)
                 assertEquals(true, panel.askModeSelected())
-                panel.selectModeForTest(ask = false)
-                assertEquals(false, panel.askModeSelected())
+                assertEquals("Send", panel.submitLabelForTest())
             } finally {
                 panel.shutdown()
             }

@@ -8,6 +8,7 @@
 // bound every free-form JSON blob; deltas past the cap are truncated, never
 // accumulated forever.
 
+import { emptyUx, projectUx, type UxProjection } from './uxState.ts';
 import { foldPixelPresence, pixelPresence } from './pixelAgents.ts';
 import type { PixelPresence } from './pixelAgents.ts';
 import type { EngineeringContractView } from './contract.ts';
@@ -15,6 +16,11 @@ import type { CockpitSection, CockpitTournamentView, CockpitUsagePanel, CockpitV
 import type { ChangesSummary } from './changeReview.ts';
 import type { OutcomesView } from './outcomes.ts';
 import type { PreflightView } from './preflight.ts';
+import type {
+  ConnectionNotice,
+  ServiceAuthority,
+  ServiceDiagnosticsView,
+} from './serviceLifecycle.ts';
 import type {
   NativeBoardPage,
   NativeIndexCoverageSnapshot,
@@ -564,6 +570,19 @@ export interface FaktorSnapshot {
   readonly transcriptRevision: string;
   readonly streamStatus: string;
   /**
+   * Transient normal-UI connection notice only ("Connecting…"/"Reconnecting…").
+   * Null while healthy: the normal surface never shows service state.
+   */
+  readonly connectionNotice: ConnectionNotice;
+  /**
+   * Genuine authority that requires the operator (missing binary, changed
+   * identity, exhausted restart budget, invalid configuration, ...). The
+   * normal surface renders exactly this row; null means stay quiet.
+   */
+  readonly serviceAuthority: ServiceAuthority | null;
+  /** Diagnostics → Service rows (path, trust, readiness, port, pid, restarts). */
+  readonly service: ServiceDiagnosticsView | null;
+  /**
    * The ONE preflight/readiness presentation state (I06): the same view the
    * Work empty-state card and the Diagnostics mirror render. Null only
    * before the host publishes it (the panel then renders no card and never
@@ -572,6 +591,10 @@ export interface FaktorSnapshot {
   readonly preflight: PreflightView | null;
   readonly lastError: string | null;
   readonly busy: boolean;
+  /** Explicit Account/Usage surface state; never read by a run refresh. */
+  readonly accountStatus: 'not_read' | 'not_connected' | 'read' | 'unavailable';
+  /** The shared composer/run UX projection (both hosts use this vocabulary). */
+  readonly ux: UxProjection;
 }
 
 export function emptySnapshot(): FaktorSnapshot {
@@ -604,9 +627,14 @@ export function emptySnapshot(): FaktorSnapshot {
     transcript: [],
     transcriptRevision: '',
     streamStatus: 'stopped',
+    connectionNotice: null,
+    serviceAuthority: null,
+    service: null,
     preflight: null,
     lastError: null,
     busy: false,
+    accountStatus: 'not_read',
+    ux: emptyUx(),
   };
 }
 
@@ -663,7 +691,11 @@ export class FaktorStore {
     if (stopped) {
       next.usagePanel = null;
       next.outcomes = null;
+      next.accountStatus = 'not_read';
     }
+    // The shared UX projection is derived from the same served fields on
+    // every patch, so the webview never re-invents labels or attention rules.
+    next.ux = projectUx(nextState as FaktorSnapshot);
     this.state = nextState;
     this.emit();
   }

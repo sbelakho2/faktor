@@ -1461,6 +1461,7 @@ mod writer_service_tests {
                     )
                 })
                 .collect(),
+            ..Default::default()
         }
         .validated()
         .unwrap();
@@ -1509,6 +1510,7 @@ mod writer_service_tests {
                     )
                 })
                 .collect(),
+            ..Default::default()
         }
         .validated()
         .unwrap();

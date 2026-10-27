@@ -328,29 +328,42 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   </header>
   <section id="diagnostics" class="card diagnostics" hidden>
     <h2>Diagnostics</h2>
-    <section id="meta">
+    <section id="service-diagnostics" class="service-diagnostics" aria-labelledby="service-diagnostics-title">
+      <h3 id="service-diagnostics-title">Service</h3>
+      <section id="meta">
+        <div class="meta-row"><span class="meta-key">State</span><span id="machine-label">service stopped</span></div>
+        <div class="meta-row"><span class="meta-key">Executable</span><span id="svc-executable">—</span></div>
+        <div class="meta-row"><span class="meta-key">Trust</span><span id="trust-label">—</span></div>
+        <div class="meta-row"><span class="meta-key">Readiness</span><span id="readiness-label">not requested</span></div>
+        <div class="meta-row"><span class="meta-key">Address</span><span id="daemon-url">—</span></div>
+        <div class="meta-row"><span class="meta-key">Port</span><span id="svc-port">—</span></div>
+        <div class="meta-row"><span class="meta-key">Process</span><span id="svc-process">—</span></div>
+        <div class="meta-row"><span class="meta-key">Restarts</span><span id="svc-restarts">0 / 0</span></div>
+        <div class="meta-row"><span class="meta-key">Last failure</span><span id="svc-last-failure">—</span></div>
+      </section>
+      <section id="diagnostics-preflight" class="preflight diag-preflight" hidden aria-label="Preflight state">
+        <div class="preflight-head">
+          <span id="diag-preflight-dot" class="dot dot-stopped" aria-hidden="true"></span>
+          <span id="diag-preflight-label" class="preflight-label">—</span>
+        </div>
+        <p id="diag-preflight-copy" class="preflight-copy muted"></p>
+        <div id="diag-preflight-detail" class="muted preflight-detail" hidden></div>
+        <div id="diag-preflight-actions" class="composer-actions preflight-actions"></div>
+      </section>
+      <div class="composer-actions">
+        <button id="btn-start" class="secondary" type="button" title="Start the Faktor service explicitly">Start service</button>
+        <button id="btn-stop" class="secondary" type="button" title="Stop the Faktor service (auto-start stays off until Start)">Stop service</button>
+      </div>
+    </section>
+    <section id="session-diagnostics" aria-labelledby="session-diagnostics-title">
+      <h3 id="session-diagnostics-title">Session</h3>
       <div class="meta-row"><span class="meta-key">Session</span><span id="session-title">none</span></div>
-      <div class="meta-row"><span class="meta-key">State</span><span id="machine-label">service stopped</span></div>
-      <div class="meta-row"><span class="meta-key">Service</span><span id="daemon-url">—</span></div>
-      <div class="meta-row"><span class="meta-key">Readiness</span><span id="readiness-label">not requested</span></div>
       <div class="meta-row"><span class="meta-key">Live updates</span><span id="stream-status">stopped</span></div>
       <div class="meta-row"><span class="meta-key">Index coverage</span><span id="index-coverage">not reported</span></div>
-      <div class="meta-row"><span class="meta-key">Trust</span><span id="trust-label">—</span></div>
-    </section>
-    <section id="diagnostics-preflight" class="preflight diag-preflight" hidden aria-label="Preflight state">
-      <div class="preflight-head">
-        <span id="diag-preflight-dot" class="dot dot-stopped" aria-hidden="true"></span>
-        <span id="diag-preflight-label" class="preflight-label">—</span>
+      <div class="composer-actions">
+        <button id="btn-refresh" class="secondary" type="button" title="Refresh state">Refresh</button>
       </div>
-      <p id="diag-preflight-copy" class="preflight-copy muted"></p>
-      <div id="diag-preflight-detail" class="muted preflight-detail" hidden></div>
-      <div id="diag-preflight-actions" class="composer-actions preflight-actions"></div>
     </section>
-    <div class="composer-actions">
-      <button id="btn-refresh" class="secondary" type="button" title="Refresh state">Refresh</button>
-      <button id="btn-stop" class="secondary" type="button" title="Stop the Faktor service">Stop</button>
-      <button id="btn-start" class="secondary" type="button" title="Start the Faktor service">Start</button>
-    </div>
     <div id="stream-cursor" class="muted" hidden></div>
     <section id="sandbox-setup" class="setup-card" aria-labelledby="sandbox-setup-title">
       <h3 id="sandbox-setup-title">Shell execution needs a decision</h3>
@@ -392,6 +405,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       <button id="btn-status-inspect" class="secondary status-inspect" type="button" title="Open the run details in Inspect">Details</button>
       <button id="btn-cancel-run" class="secondary status-stop" type="button">Stop</button>
     </div>
+  </section>
+  <section id="attention-card" class="card attention-card" hidden aria-labelledby="attention-card-title">
+    <h2 id="attention-card-title">Needs attention</h2>
+    <ul id="attention-list" class="attention-list" aria-label="Grouped items that need attention"></ul>
   </section>
   <section id="permission-card" class="card permission-card" hidden aria-labelledby="permission-card-title">
     <h2 id="permission-card-title">Faktor needs your approval</h2>
@@ -442,29 +459,33 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     <div id="entries" role="log" aria-live="polite" aria-relevant="additions" aria-label="Conversation transcript" tabindex="-1"></div>
   </section>
   <form id="composer">
-    <label for="goal" class="composer-label">Ask Faktor…</label>
-    <textarea id="goal" rows="3" placeholder="Describe what you want done."></textarea>
-    <div class="composer-chips">
+    <div class="composer-intent-row">
+      <span class="composer-label" id="composer-intent-label">Intent</span>
+      <div id="composer-intent" class="composer-intent" role="radiogroup" aria-labelledby="composer-intent-label">
+        <button id="btn-intent-ask" class="intent-option" type="button" role="radio" aria-checked="true" data-intent="ask" title="Ask a question without starting a task">Ask</button>
+        <button id="btn-intent-task" class="intent-option" type="button" role="radio" aria-checked="false" data-intent="task" title="Start a task run with the options below">Task</button>
+      </div>
       <span id="composer-model" class="chip chip-model" hidden></span>
+    </div>
+    <label for="goal" class="composer-label">Ask Faktor…</label>
+    <textarea id="goal" rows="3" placeholder="Ask anything, or switch to Task for a full run."></textarea>
+    <div class="composer-chips">
       <button id="btn-attach" class="chip chip-action" type="button" title="Attach files through the host file picker">Attach files…</button>
       <button id="btn-clear-attachments" class="chip chip-action" type="button" hidden>Clear all</button>
       <span id="attachment-hint" class="chip-hint muted">Drop files here or paste an image (Ctrl/Cmd+V).</span>
     </div>
     <ul id="attachment-list" aria-label="Attached files"></ul>
     <div id="attachment-notice" class="muted" hidden role="status"></div>
-    <details id="finish-options" class="finish-options">
-      <summary>Finish when done</summary>
+    <details id="contract-options" class="contract-options task-options">
+      <summary>Task options</summary>
+      <p class="muted">These apply only in Task mode. Ask sends a plain message and never attaches them.</p>
       <fieldset id="completion-contract" class="completion-contract">
-        <legend>Finish actions for this run (Run task only; plain chat never sends this)</legend>
+        <legend>Finish actions for this task run</legend>
         <label><input type="radio" name="finish-level" id="contract-local" value="local" checked /> Leave changes locally</label>
         <label><input type="radio" name="finish-level" id="contract-commit" value="commit" /> Commit changes <span class="finish-implied muted">when verification passes</span></label>
         <label><input type="radio" name="finish-level" id="contract-push" value="push" /> Push branch <span class="finish-implied muted">also commits when verification passes</span></label>
         <label><input type="radio" name="finish-level" id="contract-pr" value="pr" /> Open pull request <span class="finish-implied muted">also commits and pushes</span></label>
       </fieldset>
-    </details>
-    <details id="contract-options" class="contract-options">
-      <summary>Acceptance &amp; contract</summary>
-      <p class="muted">The run must respect these. One entry per line; at most 64 lines of 512 bytes each, sent with this task start.</p>
       <label for="contract-constraints" class="composer-label">Constraints — conditions that cannot be violated</label>
       <textarea id="contract-constraints" class="contract-rows" rows="2" spellcheck="false" placeholder="One constraint per line"></textarea>
       <label for="contract-invariants" class="composer-label">Invariants — properties that must remain true</label>
@@ -473,11 +494,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       <textarea id="contract-risks" class="contract-rows" rows="2" spellcheck="false" placeholder="One risk per line"></textarea>
       <label for="contract-obligations" class="composer-label">Proof obligations — claims verification must evaluate</label>
       <textarea id="contract-obligations" class="contract-rows" rows="2" spellcheck="false" placeholder="One claim per line"></textarea>
-      <p class="muted">Optional budget for THIS task start only. Empty uses the Faktor setting; an invalid value refuses the start and keeps the draft.</p>
+      <p class="muted">Optional budget for this task run only. Empty uses the Faktor setting; an invalid value keeps the draft.</p>
       <label for="contract-budget-tokens" class="composer-label">Per-run token budget — non-negative integer, empty uses the setting</label>
       <input id="contract-budget-tokens" class="contract-budget" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" placeholder="e.g. 200000" />
-      <label for="contract-budget-cost" class="composer-label">Per-run cost budget — micro-USD, exact non-negative integer, empty uses the setting</label>
-      <input id="contract-budget-cost" class="contract-budget" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" placeholder="e.g. 5000000" />
+      <label for="contract-budget-cost" class="composer-label">Per-run cost budget — dollars, empty uses the setting</label>
+      <input id="contract-budget-cost" class="contract-budget" type="text" inputmode="decimal" autocomplete="off" spellcheck="false" placeholder="e.g. $5.00" />
     </details>
     <div id="composer-state" class="state-strip composer-state" role="status" hidden>
       <span id="composer-state-glyph" class="state-strip-glyph" aria-hidden="true"></span>
@@ -485,8 +506,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       <span id="composer-state-copy" class="state-strip-copy muted"></span>
     </div>
     <div class="composer-actions">
-      <button id="btn-send" class="primary-action" type="submit">Run task</button>
-      <button id="btn-new-task" class="secondary" type="button">New task…</button>
+      <button id="btn-send" class="primary-action" type="submit">Send</button>
     </div>
   </form>
   </main>
@@ -509,6 +529,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       </div>
     </div>
     <div id="inspect-subpanel-overview" class="inspect-subpanel" role="tabpanel" aria-labelledby="subtab-overview">
+      <section id="overview-summary" class="card overview-summary" aria-labelledby="overview-summary-title">
+        <h2 id="overview-summary-title">Overview</h2>
+        <div id="overview-status" class="overview-status state-strip" role="status" hidden>
+          <span id="overview-status-label" class="state-strip-label"></span>
+          <span id="overview-status-copy" class="state-strip-copy muted"></span>
+        </div>
+        <dl id="overview-summary-list" class="overview-summary-list"></dl>
+        <details id="overview-advanced" class="technical-disclosure">
+          <summary>Advanced diagnostics</summary>
+          <div id="overview-advanced-body" class="muted"></div>
+        </details>
+      </section>
       <section id="inspect-card" class="card">
         <div id="task-completion" class="completion"></div>
         <section id="run-details" class="run-details" aria-label="Run details">
@@ -522,6 +554,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             <span id="run-state-glyph" class="state-strip-glyph" aria-hidden="true"></span>
             <span id="run-state-label" class="state-strip-label"></span>
             <span id="run-state-copy" class="state-strip-copy muted"></span>
+            <span id="run-state-action" hidden></span>
           </div>
           <div id="task-goal" class="run-goal"></div>
         </section>
@@ -586,6 +619,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     <div id="history-tabs" class="tablist history-tabs" role="tablist" aria-label="History surfaces">
       <button id="history-tab-conversations" class="tab" type="button" role="tab" aria-selected="true" tabindex="0" aria-controls="history-conversations">Conversations</button>
       <button id="history-tab-outcomes" class="tab" type="button" role="tab" aria-selected="false" tabindex="-1" aria-controls="history-outcomes">Outcomes</button>
+      <button id="history-tab-account" class="tab" type="button" role="tab" aria-selected="false" tabindex="-1" aria-controls="history-account">Account</button>
     </div>
     <section id="history-conversations" role="tabpanel" aria-labelledby="history-tab-conversations">
     <section id="history-card" class="card">
@@ -603,6 +637,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         <button id="btn-history-refresh-unavailable" type="button">Refresh history</button>
       </section>
     </section>
+    </section>
+    <section id="history-account" role="tabpanel" aria-labelledby="history-tab-account" hidden>
+      <section id="account-card" class="card">
+        <h2>Account &amp; usage</h2>
+        <p id="account-copy" class="muted">Account not connected.</p>
+        <div class="composer-actions">
+          <button id="btn-account-read" class="secondary" type="button" title="Read the optional account and usage surface">Check account</button>
+          <button id="btn-account-settings" class="secondary" type="button" title="Open the optional control-plane account settings">Account settings…</button>
+        </div>
+        <dl id="account-lines" class="overview-summary-list"></dl>
+        <details class="technical-disclosure">
+          <summary>Advanced diagnostics</summary>
+          <div id="account-advanced" class="muted"></div>
+        </details>
+      </section>
     </section>
     <section id="history-outcomes" role="tabpanel" aria-labelledby="history-tab-outcomes" hidden>
       <section id="outcomes-card" class="card">

@@ -35,6 +35,7 @@ fn governor(dir: &std::path::Path, class: StorageClass, class_bytes: u64) -> Arc
                 )
             })
             .collect(),
+        ..Default::default()
     }
     .validated()
     .unwrap();

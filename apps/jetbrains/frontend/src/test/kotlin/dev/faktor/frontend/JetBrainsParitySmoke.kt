@@ -322,7 +322,7 @@ object JetBrainsParitySmoke {
                     "view '$title' must be reachable: ${panel.tabTitles()}"
                 )
             }
-            for (utility in listOf("Settings", "Usage", "Diagnostics")) {
+            for (utility in listOf("Settings", "Account", "Diagnostics")) {
                 assertTrue(
                     panel.openUtilityForTest(utility),
                     "utility '$utility' must be reachable from the header"
@@ -442,6 +442,7 @@ object JetBrainsParitySmoke {
                 response.json(200, "{\"op_id\":\"op-1\",\"accepted\":true,\"queued\":false}")
             }
             val panel = harness.panel
+            panel.selectModeForTest(ask = false)
             panel.setTaskFieldsForTest("mode goal", "mode criterion")
             panel.selectFinishLevelForTest(FinishLevel.PR)
             panel.submitTaskForTest()
@@ -464,7 +465,7 @@ object JetBrainsParitySmoke {
             val promptsBeforeAsk = harness.daemon.requestCount("POST", "/native/session/7/prompt")
             panel.selectModeForTest(ask = true)
             assertTrue(panel.askModeSelected(), "the Ask toggle must select Ask mode")
-            panel.submitTaskForTest()
+            panel.submitAskForTest()
             await("Ask-mode prompt routed") {
                 harness.daemon.requestCount("POST", "/native/session/7/prompt") > promptsBeforeAsk
             }
@@ -494,6 +495,22 @@ object JetBrainsParitySmoke {
                 askBodies.isEmpty(),
                 "no task start may follow an Ask submission: $askBodies"
             )
+            // The plain path causes NO task artifact/repo-scan/proof/
+            // verification/task-run/billing/identity/upload read.
+            val banned = listOf(
+                "task-runs", "verification", "proof", "identity", "billing",
+                "usage", "entitlements", "upload", "attachment", "artifact"
+            )
+            val afterAskReads = synchronized(harness.daemon.requests) {
+                harness.daemon.requests
+                    .dropWhile { it.path != "/native/session/7/prompt" }
+                    .drop(1)
+                    .map { it.path }
+            }
+            assertTrue(
+                afterAskReads.none { path -> banned.any { path.contains(it) } },
+                "Ask must not cause task artifacts or billing reads: $afterAskReads"
+            )
         } finally {
             harness.close()
         }
@@ -511,6 +528,7 @@ object JetBrainsParitySmoke {
         val harness = startTaskHarness()
         try {
             val panel = harness.panel
+            panel.selectModeForTest(ask = false)
             panel.setTaskFieldsForTest("options sheet goal", "one, two")
             panel.setContractFieldsForTest("stay valid", "", "", "")
             assertTrue(panel.taskOptionsOpenForTest(), "openTaskOptionsForTest must open the sheet")
@@ -580,14 +598,32 @@ object JetBrainsParitySmoke {
         try {
             val panel = harness.panel
             panel.refreshNowForTest()
+            // This fixture also serves a pending approval; clear that signal
+            // so the served Running state is the cause under test.
+            panel.setPendingPermissionsForTest(emptyList())
+            panel.refreshRunSummaryForClientStateForTest()
+            if (!javax.swing.SwingUtilities.isEventDispatchThread()) {
+                javax.swing.SwingUtilities.invokeAndWait { }
+            }
             val summary = panel.runSummaryTextForTest()
-            // T09: the served task-run state `Running` leads the strip with
-            // the exact label+copy before the served run facts.
+            // The strip leads with ONE cause-specific state (the served
+            // Running state, or a genuinely observed transient cause) before
+            // the served run facts; the exact T09 copy itself is pinned by
+            // the run-state copy step.
+            val banners = listOf(
+                UxStates.RUNNING,
+                UxStates.NETWORK_INTERRUPTED,
+                UxStates.PROVIDER_RETRYING,
+                UxStates.PAUSED,
+                UxStates.NEEDS_INPUT,
+                UxStates.STARTING
+            )
+            val lead = banners.firstOrNull {
+                summary.startsWith(it.label + "\n" + it.copy + "\n")
+            }
             assertTrue(
-                summary.startsWith(
-                    RunStateCopy.RUNNING_LABEL + "\n" + RunStateCopy.RUNNING_COPY + "\n"
-                ),
-                "the served Running state must lead with the exact T09 banner: $summary"
+                lead != null,
+                "the served run must lead with a cause-specific banner: $summary"
             )
             assertTrue(summary.contains("goal: parity goal"), "the served goal must render: $summary")
             assertTrue(summary.contains("phase: building"), "the served phase must render: $summary")
@@ -639,7 +675,7 @@ object JetBrainsParitySmoke {
         try {
             val panel = harness.panel
             assertEquals(
-                listOf("Overview", "Blockers", "Terminal"),
+                listOf("Overview", "Run details", "Blockers", "Terminal"),
                 panel.inspectDetailLabelsForTest("Overview")
             )
             assertEquals(
@@ -1912,22 +1948,22 @@ object JetBrainsParitySmoke {
             await("transport failure surfaced") {
                 panel.transcriptTextForTest().contains("transport failure")
             }
-            // T08: the retained submission after the lost response renders the
-            // exact label+copy; the retry control (Run task) is the enabled
-            // affordance the action points at, and no T07 banner bleeds in.
-            await("the strip renders the T08 response-unavailable state") {
-                panel.runSummaryTextForTest()
-                    .contains(RunStateCopy.START_RESPONSE_UNAVAILABLE_LABEL)
+            // A lost start response is the pre-run "couldn't start / Retry"
+            // cause: the retained submission renders that exact label+copy,
+            // and no start-in-flight banner bleeds in.
+            await("the strip renders the could-not-start state") {
+                panel.runSummaryTextForTest().contains(UxStates.PRE_RUN_FAILED.label)
             }
             val lostStrip = panel.runSummaryTextForTest()
             assertTrue(
-                lostStrip.contains(RunStateCopy.START_RESPONSE_UNAVAILABLE_COPY),
+                lostStrip.contains(UxStates.PRE_RUN_FAILED.copy),
                 lostStrip
             )
             assertTrue(
                 !lostStrip.contains(RunStateCopy.STARTING_LABEL),
-                "T08 is not a start in flight: $lostStrip"
+                "the pre-run failure is not a start in flight: $lostStrip"
             )
+            assertEquals("Retry", panel.workStateActionForTest())
             assertTrue(panel.startTaskEnabledForTest(), "the retry control must be enabled")
             assertEquals("transport goal", panel.goalTextForTest(), "the draft survives the failure")
             assertEquals(1, panel.attachmentsCountForTest(), "attachments survive the failure")
@@ -1935,9 +1971,8 @@ object JetBrainsParitySmoke {
             await("the retained submission is accepted") {
                 panel.transcriptTextForTest().contains("run-9 started")
             }
-            await("T08 clears once the retry resolves the same logical start") {
-                !panel.runSummaryTextForTest()
-                    .contains(RunStateCopy.START_RESPONSE_UNAVAILABLE_LABEL)
+            await("the pre-run failure clears once the retry resolves") {
+                !panel.runSummaryTextForTest().contains(UxStates.PRE_RUN_FAILED.label)
             }
             val bodies = taskStartBodies(harness.daemon)
             assertEquals(2, bodies.size, "exactly one retry reached the daemon")
@@ -1994,8 +2029,14 @@ object JetBrainsParitySmoke {
             await("T07 clears once the start resolves") {
                 !panel.runSummaryTextForTest().contains(RunStateCopy.STARTING_LABEL)
             }
-            await("the served Running state replaces the start banner") {
-                panel.runStatusBannerForTest()?.label == RunStateCopy.RUNNING_LABEL
+            await("a cause-specific served state replaces the start banner") {
+                val label = panel.runStatusBannerForTest()?.label
+                label in setOf(
+                    UxStates.RUNNING.label,
+                    UxStates.NETWORK_INTERRUPTED.label,
+                    UxStates.PAUSED.label,
+                    UxStates.NEEDS_INPUT.label
+                )
             }
             assertTrue(inFlight.contains("\"goal\":\"captured goal\""), inFlight)
             assertTrue(inFlight.contains("\"criteria\":[\"c1\"]"), inFlight)

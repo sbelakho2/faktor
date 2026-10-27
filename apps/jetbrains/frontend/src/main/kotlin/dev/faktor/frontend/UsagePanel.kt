@@ -465,7 +465,7 @@ class UsagePanel : JPanel(BorderLayout()) {
         fun onExportUsage() {}
     }
 
-    private val statusLabel = WrappedLabel("usage: -")
+    private val statusLabel = WrappedLabel("Account not connected")
 
     private val periodLabel = WrappedLabel("No period is served yet.")
 
@@ -576,6 +576,33 @@ class UsagePanel : JPanel(BorderLayout()) {
             )
         )
     }
+
+    /**
+     * The lazy Account empty state: no control-plane credential is configured
+     * (or the daemon is not running), so no identity/billing read was made and
+     * no number is rendered.
+     */
+    fun setNotConnected() {
+        applied = true
+        model = null
+        linesArea.text = "Account not connected. Sign in from Settings to use billing and usage."
+        statusLabel.text = "Account not connected"
+        statusLabel.foreground = mutedForeground()
+        periodLabel.fullText = "No account is connected; no period numbers are served."
+        tokenLabel.fullText = "Tokens — not reported"
+        tokenBar.isVisible = false
+        spendLabel.fullText = "Managed spend — not reported"
+        creditsLabel.fullText = "Credits — not reported"
+        planLabel.fullText = "Plan — not reported"
+        previousButton.isEnabled = false
+        nextButton.isEnabled = false
+        grantButton.isEnabled = false
+        exportButton.isEnabled = false
+        changePlanButton.isEnabled = false
+        cancelButton.isEnabled = false
+    }
+
+    fun statusText(): String = statusLabel.fullText
 
     fun model(): UsagePanelModel? = model
 

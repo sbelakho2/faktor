@@ -29,7 +29,7 @@ import {
   DaemonSettingScopes,
   applyMachineScopedWrite,
   binaryTrust,
-  isDaemonStartCancelled,
+  installRootFor,
   machineScopedSetting,
   resolveDaemon,
   startDaemon,
@@ -41,7 +41,18 @@ import {
   PreflightView,
   derivePreflight,
 } from './preflight';
-import { ReadinessCancelledError, awaitReady } from './readiness';
+import {
+  ServiceAuthority,
+  ServiceConnection,
+  ServiceLaunchPlan,
+  ServiceLifecycle,
+  ServiceLifecycleView,
+  ServicePreparation,
+  ServiceStartRequest,
+  servicePlanAuthority,
+  validateServiceConfiguration,
+} from './serviceLifecycle';
+import { awaitReady } from './readiness';
 import { LifecycleFence } from './lifecycleFence';
 import {
   CoalescingRefreshScheduler,
@@ -73,7 +84,6 @@ import {
   NativeVerificationView,
   ResponseLike,
   classifyPermissionReplyFailure,
-  indexCoverageLabel,
   permissionReplyFailureMessage,
 } from './nativeClient';
 import {
@@ -105,7 +115,10 @@ import {
   transcriptSignature,
   unavailableBoardState,
 } from './state';
-import { CockpitTaskVerification, CockpitUsagePanel, buildUsagePanel, projectCockpit, tournamentViewOf, usagePanelSections } from './cockpit';
+import { CockpitTaskVerification, CockpitUsagePanel, buildUsagePanel, projectCockpit, tournamentViewOf } from './cockpit';
+import { loadConversation, sendAskTurn } from './askFlow.ts';
+import { composerIntentOf } from './uxState.ts';
+import { refreshReadPlan } from './refreshReads.ts';
 import { Edition5Client } from './edition5/client.ts';
 import { Edition5Panel } from './edition5/panel.ts';
 import { Edition8Client } from './edition8/client.ts';
@@ -228,6 +241,12 @@ interface ActiveSession {
   stream: EventStream | null;
   sessionId: string | null;
   activeRunId: string | null;
+  /** TRUE after an Ask turn until a Task starts or the user switches
+   * conversations: stream-driven refreshes stay conversational and never
+   * read task/proof/billing state. */
+  askOnly: boolean;
+  /** One plain prompt at a time (Ask single-flight). */
+  conversationInFlight: boolean;
   refreshing: boolean;
   refreshTimer: NodeJS.Timeout | null;
   /** Reuse the last task-verification read while its authority key is
@@ -266,6 +285,8 @@ const active: ActiveSession = {
   stream: null,
   sessionId: null,
   activeRunId: null,
+  askOnly: false,
+  conversationInFlight: false,
   refreshing: false,
   refreshTimer: null,
   taskVerificationCache: new EvidenceAuthorityCache<NativeTaskVerification>(),
@@ -334,20 +355,7 @@ const taskStartGate = new TaskStartGate();
 const composerAttachments = new ComposerAttachmentStore();
 let composerAttachmentsSessionId: string | null = null;
 
-// ---------------------------------------------- preflight + start attempt I06
-
-interface HostStartAttempt {
-  readonly controller: AbortController;
-  daemon: DaemonHandle | null;
-}
-
-/**
- * The ONE in-flight explicit start attempt. Non-null exactly while
- * `startServer` is running; `cancelStart` aborts it, and the unwind path
- * stops whatever the attempt produced (never an orphan) before publishing
- * the stopped T01 state.
- */
-let startAttempt: HostStartAttempt | null = null;
+// ---------------------------------------------- preflight + service authority
 
 /**
  * Host state behind the single preflight/readiness presentation (I06): the
@@ -365,6 +373,26 @@ const preflightHost = {
   readinessDetail: null as string | null,
   failureDetail: null as string | null,
 };
+
+/**
+ * The supervised service connection: the native client is created only after
+ * the daemon claimed the exact health identity, and readiness has passed.
+ */
+interface HostServiceConnection extends ServiceConnection {
+  readonly daemon: DaemonHandle;
+  readonly client: NativeClient;
+}
+
+/**
+ * The ONE service lifecycle. Null before activation; every command, the
+ * auto-open path and the Diagnostics Start/Stop buttons use this same
+ * instance, so concurrent triggers share one launch.
+ */
+let serviceLifecycle: ServiceLifecycle<HostServiceConnection> | null = null;
+/** Journal position to resume after a crash; never reset by a manual stop. */
+let resumeCursor = 0;
+/** Dedupe authority notices: the same cause interrupts once, not per tick. */
+let lastServiceAuthorityKey: string | null = null;
 
 // ------------------------------------------------------------------ helpers
 
@@ -426,13 +454,22 @@ function refreshPreflightResolution(context: vscode.ExtensionContext): void {
 }
 
 /**
- * Derive and publish the ONE preflight view. The webview renders the SAME
- * object in the Work empty state and in Diagnostics, so the two surfaces can
- * never disagree about the state, the resolved path or the trust wording.
+ * Derive and publish the ONE Diagnostics preflight view. The normal surface
+ * does NOT render this matrix: it renders only a service authority row (or
+ * the transient connection notice), so healthy/starting service vocabulary
+ * stays inside Diagnostics.
  */
 function publishPreflight(context: vscode.ExtensionContext | null = activeContext): void {
   const snapshot = store.snapshot();
-  if (context !== null && !preflightHost.startingAttempt && snapshot.daemon !== 'running') {
+  const keepTrustAuthority =
+    snapshot.serviceAuthority?.kind === 'trust_changed' ||
+    snapshot.serviceAuthority?.kind === 'trust_unverified';
+  if (
+    context !== null &&
+    !preflightHost.startingAttempt &&
+    snapshot.daemon !== 'running' &&
+    !keepTrustAuthority
+  ) {
     refreshPreflightResolution(context);
   }
   const view: PreflightView = derivePreflight({
@@ -450,10 +487,343 @@ function publishPreflight(context: vscode.ExtensionContext | null = activeContex
 }
 
 /**
- * The exact canonical workspace identity of THIS window: the first folder
- * URI string (or the extension root for a folderless window). Never an
- * index into a session list, never a filesystem case-fold.
+ * The ONE service preparation path: validate machine-scoped settings, resolve
+ * the executable without consulting the workspace, compute its trust and
+ * refuse anything that is not a verified installed executable. Every start
+ * (auto, restart, explicit) passes through this gate before a spawn.
  */
+function prepareService(
+  context: vscode.ExtensionContext,
+  mode: 'auto' | 'restart' | 'explicit',
+  request: ServiceStartRequest,
+): Promise<ServicePreparation> | ServicePreparation {
+  if ((vscode.workspace.workspaceFolders?.length ?? 0) === 0) {
+    return {
+      ok: false,
+      failure: {
+        kind: 'workspace_unavailable',
+        detail: 'this window has no project folder; no service was started against the extension directory',
+      },
+    };
+  }
+  const binaryPath = machineSetting('binaryPath', '');
+  const dataDir = machineSetting('dataDir', '');
+  const installRoot = machineSetting('installRoot', '');
+  const extraArgs = machineSetting<string[]>('extraArgs', []);
+  const startupTimeoutMs = machineSetting('startupTimeoutMs', 45_000);
+  const invalid = validateServiceConfiguration({
+    binaryPath,
+    dataDir,
+    installRoot,
+    startupTimeoutMs,
+    extraArgs,
+  });
+  if (invalid !== null) {
+    return { ok: false, failure: { kind: 'configuration_invalid', detail: invalid } };
+  }
+  const root = workspaceRoot(context);
+  let resolved: ReturnType<typeof resolveDaemon>;
+  try {
+    resolved = resolveDaemon({
+      workspaceRoot: root,
+      binaryPath: binaryPath.length > 0 ? binaryPath : undefined,
+      dataDir: dataDir.length > 0 ? dataDir : undefined,
+      installRoot: installRoot.length > 0 ? installRoot : undefined,
+    });
+  } catch (error) {
+    preflightHost.resolution = null;
+    preflightHost.trust = null;
+    preflightHost.resolveError = messageOf(error);
+    return { ok: false, failure: { kind: 'binary_missing', detail: messageOf(error) } };
+  }
+  const trust = binaryTrust(resolved);
+  preflightHost.resolution = resolved;
+  preflightHost.trust = trust;
+  preflightHost.resolveError = null;
+  const plan: ServiceLaunchPlan = {
+    executable: resolved.executable,
+    source: resolved.source,
+    trust,
+    installRoot: installRootFor({
+      workspaceRoot: root,
+      dataDir: dataDir.length > 0 ? dataDir : undefined,
+      installRoot: installRoot.length > 0 ? installRoot : undefined,
+    }),
+    dataDir: dataDir.length > 0 ? dataDir : undefined,
+    extraArgs,
+    startupTimeoutMs,
+  };
+  let allowUnverified = request.allowUnverified;
+  if (trust.state === 'unverified' && mode === 'explicit' && !allowUnverified) {
+    // Explicit Diagnostics start may confirm the exact machine-scoped path;
+    // automatic starts never do.
+    const choice = vscode.window.showWarningMessage(
+      `Faktor: unverified service executable ${resolved.executable}`,
+      {
+        modal: true,
+        detail: `${trust.detail}\n\nStart this exact executable anyway?`,
+      },
+      'Start anyway',
+    );
+    return Promise.resolve(choice).then((picked) => {
+      if (picked !== 'Start anyway') {
+        return {
+          ok: false as const,
+          failure: {
+            kind: 'trust_unverified' as const,
+            detail: 'the unverified executable was not confirmed; nothing was started',
+          },
+        };
+      }
+      allowUnverified = true;
+      return finishServicePreparation(context, plan, mode, allowUnverified);
+    });
+  }
+  return finishServicePreparation(context, plan, mode, allowUnverified);
+}
+
+function finishServicePreparation(
+  context: vscode.ExtensionContext,
+  plan: ServiceLaunchPlan,
+  mode: 'auto' | 'restart' | 'explicit',
+  allowUnverified: boolean,
+): ServicePreparation {
+  const authority = servicePlanAuthority({
+    plan,
+    mode,
+    workspaceTrusted: vscode.workspace.isTrusted,
+    workspaceRoot: workspaceRoot(context),
+    allowUnverified,
+  });
+  if (authority !== null) {
+    return { ok: false, failure: { kind: authority.kind, detail: authority.detail } };
+  }
+  return { ok: true, plan };
+}
+
+/**
+ * The spawn + identity + readiness half. The supervisor owns WHEN this runs;
+ * this function owns exactly which executable and connection is accepted.
+ */
+async function launchService(
+  context: vscode.ExtensionContext,
+  plan: ServiceLaunchPlan,
+  signal: AbortSignal,
+): Promise<HostServiceConnection> {
+  const daemon = await startDaemon({
+    workspaceRoot: workspaceRoot(context),
+    // The already-verified path is passed explicitly so the spawn cannot
+    // re-resolve to a different file between the gate and the launch.
+    binaryPath: plan.executable,
+    dataDir: plan.dataDir,
+    installRoot: plan.installRoot,
+    extraArgs: plan.extraArgs,
+    startupTimeoutMs: plan.startupTimeoutMs,
+    signal,
+  });
+  const client = new NativeClient({
+    baseUrl: daemon.baseUrl,
+    bearerToken: daemon.bearerToken,
+    fetch: fetchAdapter(),
+  });
+  try {
+    await applyControlPlaneCredential(client, context);
+    const health = await client.health();
+    const readiness = await awaitReady(client, {
+      timeoutMs: plan.startupTimeoutMs,
+      signal,
+    });
+    if (readiness.state !== 'ready') {
+      throw new Error(readiness.detail);
+    }
+    active.daemon = daemon;
+    active.client = client;
+    bumpLifecycle();
+    store.patch({
+      daemon: 'running',
+      daemonDetail: health.version,
+      baseUrl: daemon.baseUrl,
+      lastError: null,
+      streamStatus: 'connecting',
+    });
+    return {
+      daemon,
+      client,
+      port: daemon.port,
+      pid: daemon.pid,
+      baseUrl: daemon.baseUrl,
+      version: health.version,
+      alive: () => daemon.alive(),
+    };
+  } catch (error) {
+    await stopDaemon(daemon);
+    throw error;
+  }
+}
+
+/** Reconcile/rebind/resume after every successful connection (once). */
+async function resumeService(
+  context: vscode.ExtensionContext,
+  connection: HostServiceConnection,
+): Promise<void> {
+  const cursor = resumeCursor;
+  resumeCursor = 0;
+  await ensureSession(connection.client, context);
+  startStream(cursor);
+  scheduleRefresh(0);
+  publishPreflight(context);
+}
+
+/** Drop a supervised connection; crash keeps the durable session binding. */
+async function shutdownService(
+  context: vscode.ExtensionContext,
+  connection: HostServiceConnection,
+  reason: 'crash' | 'stop' | 'dispose',
+): Promise<void> {
+  const current = active.daemon === connection.daemon;
+  if (current) {
+    if (reason === 'crash') {
+      resumeCursor = active.stream?.cursor ?? resumeCursor;
+      active.stream?.stop();
+      active.stream = null;
+      active.daemon = null;
+      active.client = null;
+      // The durable workspace binding rebinds the SAME conversation after
+      // restart; clearing the in-memory id forces the listing/binding path.
+      active.sessionId = null;
+      active.activeRunId = null;
+      bumpLifecycle();
+      store.patch({
+        daemon: 'starting',
+        daemonDetail: 'reconnecting',
+        connectionNotice: 'reconnecting',
+        streamStatus: 'stopped',
+        busy: false,
+      });
+    } else {
+      resetHostState(context);
+    }
+  }
+  await stopDaemon(connection.daemon);
+}
+
+/**
+ * Publish the supervisor view into the ONE snapshot. The normal surface only
+ * reads `connectionNotice`/`serviceAuthority`; every service detail lands in
+ * the Diagnostics mirror.
+ */
+function publishServiceView(context: vscode.ExtensionContext, view: ServiceLifecycleView): void {
+  const phase = view.phase;
+  preflightHost.startingAttempt = phase === 'connecting' || phase === 'reconnecting';
+  preflightHost.readiness =
+    phase === 'running'
+      ? 'ready'
+      : phase === 'connecting' || phase === 'reconnecting'
+        ? 'waiting'
+        : 'idle';
+  preflightHost.readinessDetail = view.diagnostics.readinessDetail;
+  preflightHost.failureDetail = view.diagnostics.lastFailure;
+  if (view.authority !== null && view.authority.kind === 'trust_changed') {
+    preflightHost.trust = {
+      state: 'refused',
+      source: preflightHost.trust?.source ?? 'install-layout',
+      detail: view.authority.detail,
+    };
+  } else if (view.authority !== null && view.authority.kind === 'trust_unverified') {
+    preflightHost.trust = {
+      state: 'unverified',
+      source: preflightHost.trust?.source ?? 'install-layout',
+      detail: view.authority.detail,
+    };
+  }
+  if (phase === 'running') {
+    lastServiceAuthorityKey = null;
+  }
+  store.patch({
+    daemon:
+      phase === 'running'
+        ? 'running'
+        : phase === 'connecting' || phase === 'reconnecting'
+          ? 'starting'
+          : phase === 'blocked'
+            ? 'error'
+            : 'stopped',
+    daemonDetail:
+      view.diagnostics.baseUrl ??
+      view.diagnostics.lastFailure ??
+      '',
+    baseUrl: view.diagnostics.baseUrl,
+    connectionNotice: view.connectionNotice,
+    serviceAuthority: view.authority,
+    service: view.diagnostics,
+    lastError: view.diagnostics.lastFailure,
+  });
+  publishPreflight(context);
+}
+
+function authorityErrorKind(kind: ServiceAuthority['kind']): UserErrorKind {
+  switch (kind) {
+    case 'binary_missing':
+      return 'service_binary_missing';
+    case 'trust_changed':
+      return 'service_trust_changed';
+    case 'trust_unverified':
+      return 'service_trust_unverified';
+    case 'startup_budget_exhausted':
+      return 'service_budget_exhausted';
+    case 'configuration_invalid':
+      return 'service_configuration_invalid';
+    case 'outside_trusted_install':
+      return 'service_untrusted_install';
+    default:
+      return 'unexpected';
+  }
+}
+
+/** Only genuine authority reaches the native chrome; deduped per cause. */
+function handleServiceAuthority(authority: ServiceAuthority): void {
+  const key = `${authority.kind}:${authority.detail}`;
+  if (key === lastServiceAuthorityKey) {
+    return;
+  }
+  lastServiceAuthorityKey = key;
+  if (authority.kind === 'workspace_untrusted' || authority.kind === 'workspace_unavailable') {
+    chatProvider?.postNotice('info', authority.copy);
+    return;
+  }
+  if (authority.kind === 'user_action_required') {
+    chatProvider?.postNotice('error', authority.copy);
+    return;
+  }
+  recordError(
+    projectError({
+      kind: authorityErrorKind(authority.kind),
+      message: authority.detail,
+      code: authority.kind,
+    }),
+    true,
+  );
+}
+
+function ensureServiceLifecycle(
+  context: vscode.ExtensionContext,
+): ServiceLifecycle<HostServiceConnection> {
+  if (serviceLifecycle !== null) {
+    return serviceLifecycle;
+  }
+  serviceLifecycle = new ServiceLifecycle<HostServiceConnection>({
+    prepare: (mode, request) => prepareService(context, mode, request),
+    launch: (plan, signal) => launchService(context, plan, signal),
+    probe: (connection) => connection.daemon.alive(),
+    shutdown: (connection, reason) => shutdownService(context, connection, reason),
+    resume: (connection) => resumeService(context, connection),
+    publish: (view) => publishServiceView(context, view),
+    onAuthority: (authority) => handleServiceAuthority(authority),
+  });
+  return serviceLifecycle;
+}
+
+
 function canonicalWorkspace(context: vscode.ExtensionContext): {
   key: string | null;
   fsPath: string | undefined;
@@ -851,6 +1221,8 @@ async function controlPlaneSignOut(context: vscode.ExtensionContext): Promise<vo
     return;
   }
   active.client?.setControlToken(null);
+  // Commercial data is lazy and must not survive a sign-out.
+  store.patch({ usagePanel: null, accountStatus: 'not_connected' });
   // The session id is dead with the session (and useless without a stored
   // credential); clear the non-secret coordinate so a stale id is never
   // presented for a future credential.
@@ -951,258 +1323,36 @@ function completionSummaryOf(
 
 // ------------------------------------------------------------ daemon + session
 
+/**
+ * Diagnostics → Service "Start service" (and any legacy panel start action).
+ * Normal users never see this: the same supervisor auto-starts on open.
+ */
 async function startServer(
   context: vscode.ExtensionContext,
   options: { readonly confirmUnverified?: boolean } = {},
 ): Promise<void> {
-  if (active.daemon && (await active.daemon.alive()) && active.client) {
-    if (!active.sessionId) {
-      await ensureSession(active.client, context);
-      startStream();
-    }
-    return;
-  }
-  if (startAttempt !== null) {
-    chatProvider?.postNotice('info', 'a daemon start is already in flight');
-    return;
-  }
-  if ((vscode.workspace.workspaceFolders?.length ?? 0) === 0) {
-    // T00: this window cannot choose where a run works. No implicit start is
-    // offered against the extension's own directory.
-    store.patch({ daemon: 'stopped', daemonDetail: '', baseUrl: null, lastError: null });
-    publishPreflight(context);
-    chatProvider?.postNotice('info', 'open a project folder before starting the Faktor service');
-    return;
-  }
-  const attempt: HostStartAttempt = { controller: new AbortController(), daemon: null };
-  startAttempt = attempt;
-  let published = false;
-  preflightHost.startingAttempt = true;
-  preflightHost.readiness = 'waiting';
-  preflightHost.readinessDetail = null;
-  preflightHost.failureDetail = null;
-  store.patch({ daemon: 'starting', daemonDetail: 'resolving the daemon', lastError: null });
-  publishPreflight(context);
-  try {
-    // Machine-scoped daemon inputs only: a workspace/workspace-folder value is
-    // ignored and surfaced typed (never silently honoured).
-    const binaryPath = machineSetting('binaryPath', '');
-    const dataDir = machineSetting('dataDir', '');
-    const installRoot = machineSetting('installRoot', '');
-    const extraArgs = machineSetting<string[]>('extraArgs', []);
-    // The default exceeds the bootstrap launcher's ~30 s launch window: the
-    // supervisor must not declare failure while the updater launcher may still
-    // be bringing the release to readiness (and may still be adoptable). The
-    // SAME bound is reused as the post-health readiness deadline.
-    const startupTimeoutMs = machineSetting('startupTimeoutMs', 45_000);
-    // Resolve FIRST and show exactly which executable would run. The
-    // resolution never consults the workspace (no target/ lookup); a missing
-    // daemon is the actionable refusal below.
-    const resolved = resolveDaemon({
-      workspaceRoot: workspaceRoot(context),
-      binaryPath: binaryPath.length > 0 ? binaryPath : undefined,
-      dataDir: dataDir.length > 0 ? dataDir : undefined,
-      installRoot: installRoot.length > 0 ? installRoot : undefined,
-      extraArgs,
-      startupTimeoutMs,
-    });
-    const trust = binaryTrust(resolved);
-    preflightHost.resolution = resolved;
-    preflightHost.trust = trust;
-    preflightHost.resolveError = null;
-    if (trust.state === 'refused') {
-      // T04: the only offered action is Locate daemon… — never a start.
-      store.patch({ daemon: 'error', daemonDetail: trust.detail, baseUrl: null });
-      preflightHost.startingAttempt = false;
-      preflightHost.failureDetail = trust.detail;
-      publishPreflight(context);
-      throw new Error(`refusing to start the daemon: ${trust.detail}`);
-    }
-    if (trust.state === 'unverified' && options.confirmUnverified !== true) {
-      // No checksum/signature record exists: documented warn + explicit
-      // confirm naming the exact resolved path (never a silent execution of a
-      // path the operator did not confirm). The card's exact T03 row offers
-      // the same Start anyway / Cancel decision.
-      const choice = await vscode.window.showWarningMessage(
-        `Faktor: unverified daemon binary ${resolved.executable}`,
-        {
-          modal: true,
-          detail: `${trust.detail}\n\nStart this exact executable anyway?`,
-        },
-        'Start anyway',
-      );
-      if (choice !== 'Start anyway') {
-        preflightHost.startingAttempt = false;
-        preflightHost.readiness = 'idle';
-        store.patch({ daemon: 'stopped', daemonDetail: '', baseUrl: null, lastError: null });
-        publishPreflight(context);
-        chatProvider?.postNotice(
-          'info',
-          `daemon start cancelled: ${resolved.executable} was not confirmed`,
-        );
-        return;
-      }
-    }
-    store.patch({
-      daemon: 'starting',
-      daemonDetail: `starting ${resolved.executable} (${resolved.source})`,
-      lastError: null,
-    });
-    publishPreflight(context);
-    chatProvider?.postNotice(
-      'info',
-      `daemon start requested: ${resolved.executable} (${resolved.source}) — ${trust.detail}`,
-    );
-    const daemon = await startDaemon({
-      workspaceRoot: workspaceRoot(context),
-      // The confirmed path is passed explicitly so the spawn can never
-      // re-resolve to a different file between confirmation and launch.
-      binaryPath: resolved.executable,
-      dataDir: dataDir.length > 0 ? dataDir : undefined,
-      // When an immutable install layout exists at this root, the daemon is
-      // spawned through its stable bootstrap launcher so the activated release
-      // (and only that release) runs.
-      installRoot: installRoot.length > 0 ? installRoot : undefined,
-      extraArgs,
-      startupTimeoutMs,
-      signal: attempt.controller.signal,
-    });
-    attempt.daemon = daemon;
-    const client = new NativeClient({
-      baseUrl: daemon.baseUrl,
-      bearerToken: daemon.bearerToken,
-      fetch: fetchAdapter(),
-    });
-    // The control-plane credential is resolved from the OS/IDE secret store
-    // (never from the deprecated plaintext setting) before the first read.
-    await applyControlPlaneCredential(client, context);
-    const health = await client.health();
-    active.daemon = daemon;
-    active.client = client;
-    published = true;
-    // A new daemon authority invalidates every read started under the old one.
-    bumpLifecycle();
-    store.patch({
-      daemon: 'running',
-      // Exact advanced diagnostics: the served version and the base URL.
-      daemonDetail: `${health.version} · ${daemon.baseUrl}`,
-      baseUrl: daemon.baseUrl,
-      lastError: null,
-    });
-    // Liveness is not readiness: the service must explicitly report ready on
-    // GET /native/ready within the bounded startup deadline before the
-    // preflight state may become `ready`.
-    publishPreflight(context);
-    const readiness = await awaitReady(client, {
-      timeoutMs: startupTimeoutMs,
-      signal: attempt.controller.signal,
-    });
-    preflightHost.readiness = readiness.state === 'ready' ? 'ready' : readiness.state;
-    preflightHost.readinessDetail = readiness.detail;
-    // The startup outcome is now decided: a late cancel is a documented
-    // no-op, never a teardown of a running service.
-    preflightHost.startingAttempt = false;
-    if (startAttempt === attempt) {
-      startAttempt = null;
-    }
-    if (readiness.state !== 'ready') {
-      // Typed and visible: a readiness timeout/failure is never an implicit
-      // success. The daemon keeps running (health is the liveness gate) and
-      // the Diagnostics Readiness row carries this exact detail.
-      recordError(
-        projectError({
-          kind: 'service_not_ready',
-          message: readiness.detail,
-          code: readiness.state === 'timeout' ? 'readiness_timeout' : 'readiness_failed',
-        }),
-      );
-    } else {
-      chatProvider?.postNotice('info', `Faktor ${health.version} is ready`);
-    }
-    await ensureSession(client, context);
+  lastServiceAuthorityKey = null;
+  await ensureServiceLifecycle(context).startExplicit(options.confirmUnverified === true);
+  if (active.client && !active.sessionId) {
+    // Already-running service: resume the bound conversation for callers that
+    // arrived before the supervisor's resume callback completed.
+    await ensureSession(active.client, context);
     startStream();
-    scheduleRefresh(0);
-    publishPreflight(context);
-  } catch (error) {
-    const cancelled =
-      attempt.controller.signal.aborted ||
-      isDaemonStartCancelled(error) ||
-      error instanceof ReadinessCancelledError;
-    // Never leak a spawned daemon when the start is cancelled or post-spawn
-    // setup fails.
-    if (attempt.daemon !== null) {
-      await stopDaemon(attempt.daemon);
-    }
-    if (published) {
-      active.stream?.stop();
-      active.stream = null;
-      active.daemon = null;
-      active.client = null;
-      active.sessionId = null;
-    }
-    preflightHost.startingAttempt = false;
-    preflightHost.readiness = 'idle';
-    preflightHost.readinessDetail = null;
-    if (cancelled) {
-      preflightHost.failureDetail = null;
-      store.patch({
-        daemon: 'stopped',
-        daemonDetail: '',
-        baseUrl: null,
-        session: null,
-        streamStatus: 'stopped',
-        machineState: 'unknown',
-        machineLabel: 'Daemon stopped',
-        lastError: null,
-      });
-      // Exact T01 state: Faktor is stopped / Start the service when you are
-      // ready. / Start service.
-      publishPreflight(context);
-      chatProvider?.postNotice('info', 'daemon start cancelled; nothing is running');
-      return;
-    }
-    preflightHost.failureDetail = messageOf(error);
-    store.patch({ daemon: 'error', daemonDetail: messageOf(error), baseUrl: null });
-    publishPreflight(context);
-    throw error;
-  } finally {
-    if (startAttempt === attempt) {
-      startAttempt = null;
-    }
-    if (preflightHost.startingAttempt) {
-      preflightHost.startingAttempt = false;
-      publishPreflight(context);
-    }
   }
 }
 
-/**
- * `Cancel startup` (T05). Cancels ONLY the in-flight attempt: the abort
- * signal stops a still-starting child through the owned kill path and the
- * unwind stops a published daemon before the UI lands in T01. A cancel after
- * the start succeeded (or with nothing starting) is a no-op with a notice.
- */
+/** Abort one in-flight start; auto-restart stays off until an explicit start. */
 function cancelStart(): void {
-  const attempt = startAttempt;
-  if (attempt === null) {
-    chatProvider?.postNotice(
-      'info',
-      active.daemon && active.client
-        ? 'the Faktor service is already running; there is nothing to cancel'
-        : 'no Faktor startup is in flight',
-    );
+  if (serviceLifecycle === null) {
     return;
   }
-  attempt.controller.abort();
-  chatProvider?.postNotice('info', 'cancelling the Faktor startup; any spawned process is stopped');
+  serviceLifecycle.cancel();
+  chatProvider?.postNotice('info', 'service start cancelled; nothing is running');
 }
 
 /** T03 `Cancel`: keep the service stopped and dismiss the confirmation. */
 function dismissUnverifiedStart(context: vscode.ExtensionContext): void {
-  if (startAttempt !== null) {
-    cancelStart();
-    return;
-  }
+  cancelStart();
   preflightHost.failureDetail = null;
   publishPreflight(context);
   chatProvider?.postNotice(
@@ -1271,17 +1421,31 @@ async function locateDaemon(context: vscode.ExtensionContext): Promise<void> {
     'info',
     `faktor.binaryPath now points at ${target.fsPath} (machine/user scope)`,
   );
-  publishPreflight(context);
+  const authority = store.snapshot().serviceAuthority;
+  if (authority !== null && authority.kind !== 'startup_budget_exhausted') {
+    // Choosing the executable is the user action the authority row asked
+    // for; re-run the same strict gate instead of making them find Start.
+    void serviceLifecycle?.startExplicit();
+  } else {
+    publishPreflight(context);
+  }
 }
 
+/** Diagnostics → Service "Stop service": explicit, sticky until Start. */
 function stopServer(context: vscode.ExtensionContext | null = activeContext): void {
+  if (serviceLifecycle === null) {
+    resetHostState(context);
+    return;
+  }
+  void serviceLifecycle.stopExplicit();
+}
+
+/** Clear every host/session surface without touching the owned process. */
+function resetHostState(context: vscode.ExtensionContext | null = activeContext): void {
   // Any in-flight refresh captured the previous generation: fence it out and
   // disarm the flag before the state reset below.
   bumpLifecycle();
-  // A stop owns the start attempt: any in-flight attempt is cancelled through
-  // its abort signal so a concurrently-starting daemon cannot be leaked.
-  startAttempt?.controller.abort();
-  startAttempt = null;
+  resumeCursor = 0;
   streamRefresh?.reset();
   if (active.refreshTimer !== null) {
     clearTimeout(active.refreshTimer);
@@ -1291,13 +1455,8 @@ function stopServer(context: vscode.ExtensionContext | null = activeContext): vo
   preflightHost.readiness = 'idle';
   preflightHost.readinessDetail = null;
   preflightHost.failureDetail = null;
-  if (active.refreshTimer !== null) {
-    clearTimeout(active.refreshTimer);
-    active.refreshTimer = null;
-  }
   active.stream?.stop();
   active.stream = null;
-  stopDaemon(active.daemon);
   active.daemon = null;
   active.client = null;
   active.sessionId = null;
@@ -1310,6 +1469,7 @@ function stopServer(context: vscode.ExtensionContext | null = activeContext): vo
   active.tournamentId = null;
   active.pixelPresence = new Map();
   active.completionContract = null;
+  active.askOnly = false;
   active.boardSeenRevision = 0;
   active.billingIdentity = null;
   active.billingEntitlements = null;
@@ -1345,6 +1505,9 @@ function stopServer(context: vscode.ExtensionContext | null = activeContext): vo
     tournament: null,
     transcript: [],
     streamStatus: 'stopped',
+    connectionNotice: null,
+    serviceAuthority: null,
+    service: null,
     lastError: null,
     busy: false,
   });
@@ -1515,6 +1678,7 @@ async function switchSession(
   active.tournamentId = null;
   active.pixelPresence = new Map();
   active.completionContract = null;
+  active.askOnly = false;
   active.boardSeenRevision = 0;
   active.billingCursor = null;
   active.billingPrevCursors = [];
@@ -1665,7 +1829,7 @@ function transcriptOf(page: NativeMessagePage): TranscriptEntry[] {
   return transcriptFromMessages(page.messages as unknown as Json[]);
 }
 
-function startStream(): void {
+function startStream(cursor = 0): void {
   const daemon = active.daemon;
   const sessionId = active.sessionId;
   if (!daemon || !sessionId) {
@@ -1676,6 +1840,7 @@ function startStream(): void {
     baseUrl: daemon.baseUrl,
     bearerToken: daemon.bearerToken,
     sessionId,
+    cursor: Number.isInteger(cursor) && cursor > 0 ? cursor : undefined,
     fetch: sseAdapter(),
     onEvent: (frame) => {
       // The journal stream is a LIVENESS signal only: its `EventKind` frames
@@ -1723,21 +1888,13 @@ function startStream(): void {
         chatProvider?.postStreamBlocked(reason, active.stream?.blocked?.cursor ?? null);
       } else {
         store.patch({ streamStatus: status });
-        // The daemon line must not keep saying "Running" after the process
-        // is gone. The SSE status is the liveness signal the UI actually
-        // gets; map a retrying stream to the typed unavailable service
-        // state, and restore running only when the stream reopens. A
-        // session-switch stop is not a daemon death and leaves the line.
+        // The stream is a transport signal, not process ownership: a
+        // retrying SSE connection does not mean the daemon died. The
+        // supervisor owns restart. Only the transient notice changes here.
         if (status === 'retrying') {
-          store.patch({
-            daemon: 'error',
-            daemonDetail: detail ?? 'the daemon connection was lost; retrying',
-          });
+          store.patch({ connectionNotice: 'reconnecting' });
         } else if (status === 'open') {
-          store.patch({
-            daemon: active.daemon !== null ? 'running' : 'stopped',
-            daemonDetail: '',
-          });
+          store.patch({ connectionNotice: null });
         }
         if (status === 'open' || status === 'stopped') {
           // A recovered/stopped stream leaves the T27 reconnecting state.
@@ -1803,6 +1960,11 @@ async function refresh(): Promise<void> {
     lifecycle.isCurrent(generation) &&
     active.client === client &&
     active.sessionId === sessionId;
+  const plan = refreshReadPlan({ askOnly: active.askOnly });
+  if (plan.includes('conversation')) {
+    await refreshConversation();
+    return;
+  }
   active.refreshing = true;
   try {
     // The board read is OPTIONAL and never rejects: an older daemon records
@@ -1896,9 +2058,10 @@ async function refresh(): Promise<void> {
     // else the newest summary. A missing listing/state is a null block, never
     // a fabricated tournament.
     const tournament = tournamentViewOf(await tournamentFor(client, sessionId));
-    // The commercial-metering panel is best-effort like the board: a refusal
-    // becomes an explicit disabled/unavailable panel, never a snapshot error.
-    const usagePanel = await billingPanelFor(client);
+    // Commercial data is deliberately NOT read here. The run cockpit and
+    // normal refresh never touch billing, account, subscription or
+    // entitlement routes; the explicit Account/Usage surface is the only
+    // reader.
     // The cockpit projection is FAILURE-ISOLATED: a malformed verification
     // or cockpit payload degrades the cockpit panel to an explicit error
     // while every other snapshot field still patches.
@@ -1943,11 +2106,7 @@ async function refresh(): Promise<void> {
       activeRunId,
       busy: activeRunId !== null,
       cockpit: cockpitProjection.cockpit,
-      cockpitSections: [
-        ...cockpitProjection.sections,
-        ...usagePanelSections(usagePanel),
-      ],
-      usagePanel,
+      cockpitSections: cockpitProjection.sections,
       tournament: cockpitProjection.cockpit?.tournament ?? null,
       board,
       // I03: the served candidate-change view. Only served relationships
@@ -1984,6 +2143,56 @@ async function refresh(): Promise<void> {
   } finally {
     // Only the generation that armed the flag may clear it; a transition
     // already disarmed it (bumpLifecycle) and may have armed a newer refresh.
+    if (lifecycle.isCurrent(generation)) {
+      active.refreshing = false;
+    }
+    updateStatusBar();
+  }
+}
+
+/**
+ * The Ask/conversational refresh: transcript, session listing and pending
+ * approvals only. Deliberately no task, task-run, verification, proof,
+ * tournament or billing read. The shared `loadConversation` helper is the
+ * executable boundary and the live harness drives the same helper.
+ */
+async function refreshConversation(): Promise<void> {
+  const client = active.client;
+  const sessionId = active.sessionId;
+  if (!client || !sessionId || active.refreshing) {
+    return;
+  }
+  const generation = lifecycle.current();
+  const current = (): boolean =>
+    lifecycle.isCurrent(generation) &&
+    active.client === client &&
+    active.sessionId === sessionId;
+  active.refreshing = true;
+  try {
+    const read = await loadConversation(client, sessionId, HISTORY_PAGE_LIMIT);
+    if (!current()) {
+      return;
+    }
+    const transcript = transcriptOf(read.messages);
+    const transcriptRevision = transcriptSignature(transcript);
+    const previous = store.snapshot();
+    store.patch({
+      sessions: read.sessions,
+      sessionsUnavailable: null,
+      permissions:
+        read.permissions === null
+          ? previous.permissions
+          : permissionSummaries(read.permissions as NativePermissionEntry[]),
+      ...(transcriptRevision !== previous.transcriptRevision ||
+      !transcriptContentEqual(transcript, previous.transcript)
+        ? { transcript, transcriptRevision }
+        : {}),
+    });
+  } catch (error) {
+    if (current()) {
+      recordBackgroundError(error);
+    }
+  } finally {
     if (lifecycle.isCurrent(generation)) {
       active.refreshing = false;
     }
@@ -2140,6 +2349,59 @@ async function billingPanelFor(client: NativeClient): Promise<CockpitUsagePanel>
       cursor,
       hasPrev,
     });
+  }
+}
+
+/**
+ * The explicit Account/Usage surface. This is the ONLY billing/entitlement
+ * reader: it is never called by `refresh()` or by any chat/run path. With no
+ * control-plane credential it reports `Account not connected` and performs
+ * no network work at all.
+ */
+async function readAccountSurface(): Promise<void> {
+  const client = active.client;
+  if (!client) {
+    store.patch({ usagePanel: null, accountStatus: 'not_connected' });
+    return;
+  }
+  if (!client.hasControlToken()) {
+    store.patch({ usagePanel: null, accountStatus: 'not_connected' });
+    return;
+  }
+  const panel = await billingPanelFor(client);
+  store.patch({
+    usagePanel: panel,
+    accountStatus: panel.state === 'ok' ? 'read' : 'unavailable',
+  });
+}
+
+/**
+ * The cause-specific recovery actions from the shared UX model. Only the
+ * host-owned actions land here; local view actions (focus composer, switch
+ * to checks, open diagnostics) stay in the webview.
+ */
+async function handleUxAction(raw: unknown): Promise<void> {
+  const action = typeof raw === 'string' ? raw : '';
+  if (action === 'openProviderSettings') {
+    await vscode.commands.executeCommand('faktor.openProviders8');
+    return;
+  }
+  if (action === 'reconnect') {
+    if (active.stream?.blocked != null) {
+      recoverEventStream();
+    } else {
+      await refreshFromUserGesture();
+    }
+    return;
+  }
+  if (action === 'resumeRun') {
+    // A durable run is resumed from its checkpoint; it is NEVER re-sent.
+    if (active.stream?.blocked != null) {
+      recoverEventStream();
+    } else {
+      chatProvider?.postNotice('info', 'resuming the saved run from its durable checkpoint');
+      await refreshFromUserGesture();
+    }
   }
 }
 
@@ -2618,12 +2880,73 @@ function recoverEventStream(): void {
   scheduleRefresh(0);
 }
 
+/**
+ * ONE plain conversational turn. Ask is not a task: this path posts only the
+ * ordinary prompt (plus workspace-relative files) and reads conversation
+ * data. It never mints a contract, task-run object, proof read, verification
+ * gate or billing/control-plane request.
+ */
+async function sendAskTurnFromComposer(
+  message: ChatMessage,
+  goal: string,
+  context: vscode.ExtensionContext,
+): Promise<void> {
+  if (active.conversationInFlight) {
+    return;
+  }
+  const { files, refused } = boundedWebviewFiles(message.files);
+  if (refused.length > 0) {
+    const reasons = refused.map((entry) => `#${entry.index}: ${entry.reason}`);
+    chatProvider?.postUserError(
+      attachmentRefusalProjection(reasons, {
+        summary: 'Some files were left out',
+        hint: 'The message uses the accepted files; add the refused ones and try again if they matter.',
+      }),
+    );
+  }
+  active.conversationInFlight = true;
+  try {
+    if (!active.client || !active.sessionId) {
+      await startServer(context);
+    }
+    const client = active.client;
+    const sessionId = active.sessionId;
+    if (!client || !sessionId) {
+      throw new Error('the Faktor service is not running; the message was kept');
+    }
+    await sendAskTurn(client, {
+      sessionId,
+      prompt: goal,
+      files,
+      submissionId: randomUUID(),
+    });
+    // Ask owns the conversation from here: subsequent stream-driven
+    // refreshes read conversation state only until an explicit Task start.
+    active.askOnly = true;
+    active.activeRunId = null;
+    active.completionContract = null;
+    store.patch({ activeRunId: null, busy: false, lastError: null });
+    chatProvider?.postStartResult(goal, true);
+    await refreshConversation();
+  } catch (error) {
+    const retryable = error instanceof NativeApiError ? error.retryable : true;
+    const reason = messageOf(error);
+    store.patch({ lastError: reason });
+    reportError(error, 'run_failure');
+    chatProvider?.postStartResult(goal, false, retryable);
+  } finally {
+    active.conversationInFlight = false;
+  }
+}
+
 async function startTask(
   snapshot: StartSubmissionSnapshot,
   context: vscode.ExtensionContext,
 ): Promise<void> {
   const { submissionId, pending, files, contract, contractRows } = snapshot;
   const goal = pending.text;
+  // An explicit Task start leaves the conversational-only refresh mode.
+  active.askOnly = false;
   const restore = (failure: AdmitFailure, enriched: PendingSubmission): void => {
     // Audit 29: the enriched envelope keeps every successful upload, so a
     // retry resolves the durable ids first and uploads only absent
@@ -3041,7 +3364,7 @@ async function controlUsage(message: ChatMessage): Promise<void> {
     }
     active.billingPrevCursors.push(active.billingCursor ?? '');
     active.billingCursor = next;
-    await refresh();
+    await readAccountSurface();
     return;
   }
   if (action === 'usage-prev') {
@@ -3051,7 +3374,7 @@ async function controlUsage(message: ChatMessage): Promise<void> {
     }
     const previous = active.billingPrevCursors.pop() ?? '';
     active.billingCursor = previous.length > 0 ? previous : null;
-    await refresh();
+    await readAccountSurface();
     return;
   }
   if (action === 'grant-credits') {
@@ -3726,31 +4049,25 @@ function updateStatusBar(): void {
     return;
   }
   const snapshot = store.snapshot();
-  const icons: Record<string, string> = {
-    running: '$(pulse)',
-    starting: '$(sync~spin)',
-    error: '$(error)',
-    stopped: '$(circle-slash)',
-  };
-  const icon = icons[snapshot.daemon] ?? '$(circle-slash)';
-  const task = snapshot.task ? ` · task ${snapshot.task.state}` : '';
-  // Audit 5/6: the durable index coverage is displayed honestly — a PARTIAL
-  // or stale-while-rebuilding generation is named, never flattened to
-  // "ready"; an unhosted index is omitted (not faked as current).
-  const index = snapshot.indexCoverage ? ` · ${indexCoverageLabel(snapshot.indexCoverage)}` : '';
-  statusBar.text = `${icon} Faktor: ${snapshot.daemon}${task}${index}`;
-  const indexTooltip = snapshot.indexCoverage
-    ? ` · ${indexCoverageLabel(snapshot.indexCoverage)}`
-    : '';
-  const stoppedTooltip =
-    snapshot.daemon === 'starting'
-      ? 'Faktor daemon starting'
-      : snapshot.daemon === 'error'
-        ? 'Faktor daemon failed to start'
-        : 'Faktor daemon stopped';
-  statusBar.tooltip = snapshot.baseUrl
-    ? `Faktor daemon ${snapshot.daemon} at ${snapshot.baseUrl}${snapshot.session ? ` · session ${snapshot.session.title}` : ''}${indexTooltip}`
-    : stoppedTooltip;
+  // The status bar is product surface: it never names the daemon, a port,
+  // readiness or a process. Only the transient connection notice and genuine
+  // authority are allowed to interrupt the headline.
+  if (snapshot.connectionNotice === 'connecting') {
+    statusBar.text = '$(sync~spin) Connecting to Faktor…';
+    statusBar.tooltip = 'Opening Faktor';
+  } else if (snapshot.connectionNotice === 'reconnecting') {
+    statusBar.text = '$(sync~spin) Reconnecting…';
+    statusBar.tooltip = 'Restoring the Faktor connection';
+  } else if (snapshot.serviceAuthority !== null) {
+    statusBar.text = '$(error) Faktor needs attention';
+    statusBar.tooltip = snapshot.serviceAuthority.copy;
+  } else if (snapshot.task) {
+    statusBar.text = `$(sync~spin) Faktor: ${snapshot.task.state}`;
+    statusBar.tooltip = 'Faktor is working';
+  } else {
+    statusBar.text = '$(pulse) Faktor';
+    statusBar.tooltip = 'Open Faktor';
+  }
   statusBar.show();
 }
 
@@ -3795,6 +4112,20 @@ async function handleWebviewMessage(
     // starts a service against a folderless window.
     case 'openProject':
       await vscode.commands.executeCommand('workbench.action.files.openFolder');
+      return;
+    // Explicit authority actions (Diagnostics or the normal attention row).
+    case 'retryStart':
+      try {
+        await startServer(context);
+      } catch (error) {
+        reportError(error, 'daemon_start_failed');
+      }
+      return;
+    case 'reviewTrust':
+      await vscode.commands.executeCommand('workbench.action.openSettings', 'faktor.binaryPath');
+      return;
+    case 'manageWorkspaceTrust':
+      await vscode.commands.executeCommand('workbench.trust.manage');
       return;
     case 'stopDaemon':
       stopServer(context);
@@ -3843,6 +4174,13 @@ async function handleWebviewMessage(
     case 'sendGoal': {
       const goal = typeof message.goal === 'string' ? message.goal.trim() : '';
       if (goal.length === 0) {
+        return;
+      }
+      // The ONE composer carries an explicit Ask|Task intent. Ask is the
+      // default and is a plain conversational turn; it returns BEFORE any
+      // task contract, task-run, proof, verification or billing path runs.
+      if (composerIntentOf(message.intent) === 'ask') {
+        await sendAskTurnFromComposer(message, goal, context);
         return;
       }
       // Host single-flight (audit 32): while one logical submission is in
@@ -4005,9 +4343,6 @@ async function handleWebviewMessage(
       await startTask(snapshot, context);
       return;
     }
-    case 'newTask':
-      await newTaskFromCommand(context);
-      return;
     case 'cancelRun':
       await cancelActiveRun();
       return;
@@ -4019,6 +4354,21 @@ async function handleWebviewMessage(
       return;
     case 'usageControl':
       await controlUsage(message);
+      return;
+    case 'readAccount':
+      await readAccountSurface();
+      return;
+    case 'openProviderSettings':
+      await vscode.commands.executeCommand('faktor.openProviders8');
+      return;
+    case 'openAccountSettings':
+      await vscode.commands.executeCommand(
+        'workbench.action.openSettings',
+        'faktor.controlPlane',
+      );
+      return;
+    case 'uxAction':
+      await handleUxAction(message.action);
       return;
     case 'retrieveEvidence':
       await retrieveEvidence(message);
@@ -4235,7 +4585,13 @@ export function activate(context: vscode.ExtensionContext): void {
 
   chatProvider = new ChatViewProvider(context.extensionUri, {
     handle: (message) => handleWebviewMessage(message, context),
-    onViewResolved: () => postHostOwnedViewState(),
+    onViewResolved: () => {
+      postHostOwnedViewState();
+      // Opening Faktor is the ONE automatic trigger: a verified installed
+      // executable starts without a Start-service decision. The supervisor
+      // dedupes this with command/task triggers.
+      void ensureServiceLifecycle(context).open();
+    },
   });
 
   // EXTERNAL SecretStorage changes (another window, the OS keychain UI, an
@@ -4349,17 +4705,39 @@ export function activate(context: vscode.ExtensionContext): void {
         event.affectsConfiguration('faktor.installRoot') ||
         event.affectsConfiguration('faktor.dataDir')
       ) {
-        publishPreflight(context);
+        const authority = store.snapshot().serviceAuthority;
+        if (
+          authority !== null &&
+          authority.kind !== 'startup_budget_exhausted' &&
+          authority.kind !== 'workspace_untrusted' &&
+          authority.kind !== 'workspace_unavailable'
+        ) {
+          // Fixing the machine-scoped configuration is an explicit operator
+          // action: retry the same strict gate once, without bypassing the
+          // restart budget.
+          void serviceLifecycle?.startExplicit();
+        } else {
+          publishPreflight(context);
+        }
+      }
+    }),
+    // Granting trust is an explicit operator decision: the paused automatic
+    // start may now proceed without asking the user to find a Start button.
+    vscode.workspace.onDidGrantWorkspaceTrust(() => {
+      if (store.snapshot().serviceAuthority?.kind === 'workspace_untrusted') {
+        void serviceLifecycle?.startExplicit();
       }
     }),
     { dispose: () => stopServer() },
   );
 
-  // No daemon start on activation: the daemon starts ONLY on an explicit
-  // user action (Start Service command/panel gesture or a task submission),
-  // and that path resolves and shows the exact machine-scoped binary first.
+  // Opening the Faktor view (or any Faktor command that activates the
+  // extension) auto-starts the verified installed service. The supervisor
+  // waits for the short connecting threshold before showing anything, and an
+  // explicit Diagnostics stop keeps auto-start off until Start is pressed.
+  void ensureServiceLifecycle(context).open();
 }
 
-export function deactivate(): void {
-  stopServer();
+export async function deactivate(): Promise<void> {
+  await serviceLifecycle?.dispose();
 }

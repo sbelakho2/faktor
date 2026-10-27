@@ -22,6 +22,7 @@ import * as es from '../src/eventStream.ts';
 import * as st from '../src/state.ts';
 import * as rs from '../src/refreshScheduler.ts';
 import * as dm from '../src/daemon.ts';
+import * as sl from '../src/serviceLifecycle.ts';
 import * as lf from '../src/lifecycleFence.ts';
 import * as ts from '../src/taskStart.ts';
 import * as wb from '../src/workspaceBinding.ts';
@@ -39,6 +40,8 @@ import * as cr from '../src/changeReview.ts';
 import * as e5commands from '../src/edition5/commands.ts';
 import * as e8approval from '../src/edition8/approval.ts';
 import * as oc from '../src/outcomes.ts';
+import * as ux from '../src/uxState.ts';
+import * as rr from '../src/refreshReads.ts';
 import { renderEdition8Html, scriptJson } from '../src/edition8/html.ts';
 import { loadEdition8Snapshot } from '../src/edition8/source.ts';
 import { controlView, screenView } from '../src/edition8/view.ts';
@@ -3105,10 +3108,19 @@ const digest = 'a'.repeat(64);
 const noDigest = process.env.FAKE_RELEASE_NO_DIGEST === '1';
 const version = noDigest ? '9.9.9' : '9.9.9+release.selftest.' + digest;
 const server = http.createServer((req, res) => {
+  if (process.env.FAKE_RELEASE_REQUEST_LOG) {
+    fs.appendFileSync(process.env.FAKE_RELEASE_REQUEST_LOG, String(req.url) + '\\n');
+  }
   if (req.method === 'GET' && req.url === '/native/health' &&
       req.headers.authorization === 'Bearer ' + process.env.FAKTOR_SERVER_PASSWORD) {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ ok: true, version: version }));
+    return;
+  }
+  if (req.method === 'GET' && req.url === '/native/ready' &&
+      req.headers.authorization === 'Bearer ' + process.env.FAKTOR_SERVER_PASSWORD) {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ready: true }));
     return;
   }
   res.writeHead(401, { 'content-type': 'application/json' });
@@ -3675,6 +3687,525 @@ async function daemonTests() {
   });
 }
 
+// ---------------------------------------- 6b. transparent service lifecycle
+
+function servicePlan(executable, overrides = {}) {
+  return {
+    executable,
+    source: 'binaryPath-setting',
+    trust: {
+      state: 'verified',
+      source: 'binaryPath-setting',
+      detail: 'sha256 matches the recorded checksum',
+    },
+    installRoot: dirname(executable),
+    extraArgs: [],
+    startupTimeoutMs: 20_000,
+    ...overrides,
+  };
+}
+
+function fakeService(overrides = {}) {
+  let alive = true;
+  return {
+    port: 1234,
+    pid: 4321,
+    baseUrl: 'http://127.0.0.1:1234',
+    version: '9.9.9',
+    alive: async () => alive,
+    crash() {
+      alive = false;
+    },
+    ...overrides,
+  };
+}
+
+function serviceHarness(options = {}) {
+  const launches = [];
+  const resumes = [];
+  const generations = [];
+  const views = [];
+  const authorities = [];
+  const shutdowns = [];
+  let billingCalls = 0;
+  const lifecycle = new sl.ServiceLifecycle({
+    prepare: async (mode) =>
+      options.prepare ? options.prepare(mode) : { ok: true, plan: servicePlan(options.binaryPath || '/fake/faktor-cli') },
+    launch: async (plan) => {
+      launches.push(plan);
+      if (options.launch) return options.launch(plan, launches.length);
+      return fakeService();
+    },
+    probe: async (connection) => (options.probe ? options.probe(connection) : connection.alive()),
+    shutdown: async (connection, reason) => {
+      shutdowns.push({ connection, reason });
+      if (options.shutdown) await options.shutdown(connection, reason);
+      else connection.crash();
+    },
+    resume: async (connection, generation) => {
+      resumes.push(connection);
+      generations.push(generation);
+      if (options.resume) await options.resume(connection, generation);
+    },
+    publish: (view) => views.push(view),
+    onAuthority: (authority) => authorities.push(authority),
+    config: {
+      connectingNoticeMs: 5,
+      probeIntervalMs: 10,
+      backoffBaseMs: 5,
+      backoffMaxMs: 20,
+      maxRestarts: 4,
+      restartWindowMs: 60_000,
+      stableResetMs: 600_000,
+      jitter: () => 0,
+      ...(options.config || {}),
+    },
+  });
+  return {
+    lifecycle,
+    launches,
+    resumes,
+    generations,
+    views,
+    authorities,
+    shutdowns,
+    billing() {
+      billingCalls += 1;
+    },
+    billingCalls: () => billingCalls,
+  };
+}
+
+async function serviceLifecycleTests() {
+  await test('opening Faktor auto-starts a verified fake executable with no normal-UI service notice', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'faktor-autostart-'));
+    const release = join(root, 'fake-release.cjs');
+    const bin = join(root, 'installed-faktor-cli.sh');
+    const pidfile = join(root, 'release.pid');
+    const requestLog = join(root, 'requests.log');
+    writeExecutable(release, FAKE_RELEASE_SOURCE);
+    writeExecutable(
+      bin,
+      `#!/bin/sh\nFAKE_RELEASE_PIDFILE='${pidfile}' FAKE_RELEASE_REQUEST_LOG='${requestLog}' exec node '${release}' "$@"\n`,
+    );
+    const harness = serviceHarness();
+    const handles = [];
+    harness.lifecycle = new sl.ServiceLifecycle({
+      prepare: async () => ({ ok: true, plan: servicePlan(bin, { installRoot: root }) }),
+      launch: async (plan, signal) => {
+        const handle = await dm.startDaemon({
+          workspaceRoot: '/nonexistent',
+          binaryPath: plan.executable,
+          env: { FAKE_RELEASE_PIDFILE: pidfile },
+          resolveReleasePid: () => releasePidFrom(pidfile),
+          startupTimeoutMs: plan.startupTimeoutMs,
+          signal,
+        });
+        handles.push(handle);
+        return {
+          daemon: handle,
+          port: handle.port,
+          pid: handle.pid,
+          baseUrl: handle.baseUrl,
+          version: '9.9.9',
+          alive: () => handle.alive(),
+        };
+      },
+      probe: (connection) => connection.daemon.alive(),
+      shutdown: async (connection) => {
+        await dm.stopDaemon(connection.daemon);
+      },
+      resume: async () => {
+        harness.resumes.push('resume');
+      },
+      publish: (view) => harness.views.push(view),
+      onAuthority: (authority) => harness.authorities.push(authority),
+      config: {
+        connectingNoticeMs: 5,
+        probeIntervalMs: 25,
+        backoffBaseMs: 5,
+        maxRestarts: 2,
+        jitter: () => 0,
+      },
+    });
+    try {
+      await harness.lifecycle.open();
+      await waitFor(
+        () => harness.views.some((view) => view.phase === 'running'),
+        8_000,
+        'the fake daemon to reach running',
+      );
+      const running = harness.views[harness.views.length - 1];
+      assertEqual(running.connectionNotice, null, 'healthy state hides the service notice');
+      assertEqual(harness.authorities.length, 0, 'auto-start is not an interruption');
+      assertEqual(harness.resumes.length, 1, 'the existing session resumes exactly once');
+      assertEqual(harness.billingCalls(), 0, 'startup never bills');
+      const requests = existsSync(requestLog) ? readFileSync(requestLog, 'utf8') : '';
+      assert(
+        !/billing|usage|credits|entitlement/i.test(requests),
+        `startup made no billing read: ${requests}`,
+      );
+      // Opening again must never spawn a second daemon or re-resume.
+      await harness.lifecycle.open();
+      assertEqual(harness.resumes.length, 1, 'a second open does not resume twice');
+    } finally {
+      await harness.lifecycle.dispose();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  await test('crash → bounded restart → session resumed exactly once per new connection', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'faktor-crash-resume-'));
+    const release = join(root, 'fake-release.cjs');
+    const bin = join(root, 'installed-faktor-cli.sh');
+    const pidfile = join(root, 'release.pid');
+    writeExecutable(release, FAKE_RELEASE_SOURCE);
+    writeExecutable(
+      bin,
+      `#!/bin/sh\nFAKE_RELEASE_PIDFILE='${pidfile}' exec node '${release}' "$@"\n`,
+    );
+    const launches = [];
+    const generations = [];
+    const views = [];
+    let pid = null;
+    const lifecycle = new sl.ServiceLifecycle({
+      prepare: async () => ({ ok: true, plan: servicePlan(bin, { installRoot: root }) }),
+      launch: async (plan, signal) => {
+        const handle = await dm.startDaemon({
+          workspaceRoot: '/nonexistent',
+          binaryPath: plan.executable,
+          env: { FAKE_RELEASE_PIDFILE: pidfile },
+          resolveReleasePid: () => releasePidFrom(pidfile),
+          startupTimeoutMs: plan.startupTimeoutMs,
+          signal,
+        });
+        launches.push(handle);
+        pid = handle.pid ?? null;
+        return {
+          daemon: handle,
+          port: handle.port,
+          pid: handle.pid,
+          baseUrl: handle.baseUrl,
+          version: '9.9.9',
+          alive: () => handle.alive(),
+        };
+      },
+      probe: (connection) => connection.daemon.alive(),
+      shutdown: async (connection) => {
+        await dm.stopDaemon(connection.daemon);
+      },
+      resume: async (_connection, generation) => {
+        generations.push(generation);
+      },
+      publish: (view) => views.push(view),
+      config: {
+        connectingNoticeMs: 5,
+        probeIntervalMs: 20,
+        backoffBaseMs: 5,
+        backoffMaxMs: 20,
+        maxRestarts: 3,
+        jitter: () => 0,
+      },
+    });
+    try {
+      await lifecycle.open();
+      await waitFor(() => generations.length === 1 && pid !== null, 8_000, 'first connection');
+      process.kill(pid, 'SIGKILL');
+      await waitFor(
+        () => generations.length === 2 && launches.length === 2,
+        8_000,
+        'one bounded restart and one resume for the new connection',
+      );
+      assertDeepEqual(generations, [1, 2], 'resume runs once per connection generation');
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      assertEqual(generations.length, 2, 'the restarted connection is not resumed again');
+      assertEqual(launches.length, 2, 'exactly one restart was spawned');
+    } finally {
+      await lifecycle.dispose();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  await test('restart budget exhaustion is typed and stops spawning', async () => {
+    const harness = serviceHarness({
+      probe: () => false,
+      config: { maxRestarts: 2, probeIntervalMs: 5, backoffBaseMs: 2, backoffMaxMs: 5 },
+    });
+    await harness.lifecycle.open();
+    await waitFor(
+      () => harness.authorities.some((entry) => entry.kind === 'startup_budget_exhausted'),
+      3_000,
+      'the restart budget to be exhausted',
+    );
+    const authority = harness.authorities.find(
+      (entry) => entry.kind === 'startup_budget_exhausted',
+    );
+    assert(authority.copy.includes('stopped trying'), authority.copy);
+    assertDeepEqual(
+      authority.actions.map((action) => action.key),
+      ['retryStart', 'openDiagnostics'],
+    );
+    assertEqual(harness.launches.length, 3, 'initial launch + exactly the configured restarts');
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assertEqual(harness.launches.length, 3, 'an exhausted budget never spawns again');
+    await harness.lifecycle.open();
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    assertEqual(harness.launches.length, 3, 'opening again cannot bypass the exhausted budget');
+    await harness.lifecycle.startExplicit();
+    await waitFor(() => harness.launches.length === 4, 1_000, 'the explicit retry');
+    await harness.lifecycle.dispose();
+  });
+
+  await test('a launcher signature/digest refusal is classified as changed identity', () => {
+    assertEqual(
+      sl.launchFailureAuthority(new Error('daemon exited before the startup line (code=3 signal=null)')),
+      'trust_changed',
+    );
+    assertEqual(
+      sl.launchFailureAuthority(new Error('release digest mismatch for pid 42')),
+      'trust_changed',
+    );
+    assertEqual(sl.launchFailureAuthority(new Error('timed out waiting for the daemon startup line')), null);
+  });
+
+  await test('a checksum/identity change refuses before launch (no process, typed authority)', async () => {
+    let launchCount = 0;
+    const lifecycle = new sl.ServiceLifecycle({
+      prepare: async () => ({
+        ok: false,
+        failure: { kind: 'trust_changed', detail: 'checksum mismatch for /opt/faktor/bin/faktor-cli' },
+      }),
+      launch: async () => {
+        launchCount += 1;
+        return fakeService();
+      },
+      probe: async () => true,
+      shutdown: async () => {},
+      resume: async () => {},
+      publish: () => {},
+      onAuthority: () => {},
+      config: { connectingNoticeMs: 1 },
+    });
+    await lifecycle.open();
+    await waitFor(() => launchCount === 0, 50, 'the refusal to settle');
+    assertEqual(launchCount, 0, 'a changed executable is never spawned');
+    assertEqual(lifecycle.view().authority?.kind, 'trust_changed');
+    assert(lifecycle.view().authority?.copy.includes('did not start'), lifecycle.view().authority?.copy);
+    await lifecycle.dispose();
+  });
+
+  await test('invalid service configuration is typed before resolution or launch', async () => {
+    assert(
+      sl.validateServiceConfiguration({
+        binaryPath: 'relative/faktor-cli',
+        dataDir: '',
+        installRoot: '',
+        startupTimeoutMs: 45_000,
+        extraArgs: [],
+      })?.includes('absolute path'),
+      'a relative executable path is invalid',
+    );
+    assert(
+      sl.validateServiceConfiguration({
+        binaryPath: '',
+        dataDir: '',
+        installRoot: '',
+        startupTimeoutMs: 10,
+        extraArgs: [],
+      })?.includes('startupTimeoutMs'),
+      'out-of-range timeout is invalid',
+    );
+    let launchCount = 0;
+    const lifecycle = new sl.ServiceLifecycle({
+      prepare: async () => ({
+        ok: false,
+        failure: { kind: 'configuration_invalid', detail: 'faktor.startupTimeoutMs must be an integer' },
+      }),
+      launch: async () => {
+        launchCount += 1;
+        return fakeService();
+      },
+      probe: async () => true,
+      shutdown: async () => {},
+      resume: async () => {},
+      publish: () => {},
+      onAuthority: () => {},
+      config: { connectingNoticeMs: 1 },
+    });
+    await lifecycle.open();
+    await waitFor(() => lifecycle.view().authority !== null, 50, 'the config failure');
+    assertEqual(lifecycle.view().authority?.kind, 'configuration_invalid');
+    assertEqual(launchCount, 0, 'invalid configuration never launches');
+    await lifecycle.dispose();
+  });
+
+  await test('explicit stop disables auto-restart until an explicit start', async () => {
+    const harness = serviceHarness();
+    await harness.lifecycle.open();
+    await waitFor(() => harness.views.some((view) => view.phase === 'running'), 1_000, 'running');
+    await harness.lifecycle.stopExplicit();
+    assertEqual(harness.lifecycle.view().phase, 'stopped_by_user');
+    assertEqual(harness.shutdowns.length, 1, 'stop shuts the owned connection down');
+    await harness.lifecycle.open();
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    assertEqual(harness.launches.length, 1, 'opening after a user stop never auto-restarts');
+    await harness.lifecycle.startExplicit();
+    await waitFor(() => harness.launches.length === 2, 1_000, 'the explicit start');
+    await harness.lifecycle.dispose();
+  });
+
+  await test('concurrent open/start triggers spawn at most one daemon', async () => {
+    const harness = serviceHarness({
+      launch: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        return fakeService();
+      },
+    });
+    await Promise.all([
+      ...Array.from({ length: 25 }, () => harness.lifecycle.open()),
+      ...Array.from({ length: 25 }, () => harness.lifecycle.startExplicit()),
+    ]);
+    assertEqual(harness.launches.length, 1, 'single-flight covers every concurrent trigger');
+    assertEqual(harness.resumes.length, 1, 'one connection → one resume');
+    await harness.lifecycle.dispose();
+  });
+
+  await test('plan gate: workspace trust, installed-only auto-start and repo paths', () => {
+    const trusted = servicePlan('/home/operator/.faktor/install/launcher', {
+      source: 'install-layout',
+      installRoot: '/home/operator/.faktor/install',
+    });
+    assertEqual(
+      sl.servicePlanAuthority({
+        plan: trusted,
+        mode: 'auto',
+        workspaceTrusted: true,
+        workspaceRoot: '/repo',
+        allowUnverified: false,
+      }),
+      null,
+      'a signed install launcher auto-starts in a trusted workspace',
+    );
+    assertEqual(
+      sl.servicePlanAuthority({
+        plan: trusted,
+        mode: 'auto',
+        workspaceTrusted: false,
+        workspaceRoot: '/repo',
+        allowUnverified: false,
+      })?.kind,
+      'workspace_untrusted',
+      'an untrusted workspace never auto-starts',
+    );
+    const repoPlan = servicePlan('/repo/target/debug/faktor-cli');
+    assertEqual(
+      sl.servicePlanAuthority({
+        plan: repoPlan,
+        mode: 'explicit',
+        workspaceTrusted: true,
+        workspaceRoot: '/repo',
+        allowUnverified: true,
+      })?.kind,
+      'outside_trusted_install',
+      'a repository-supplied executable is refused even explicitly',
+    );
+    const outside = servicePlan('/tmp/downloaded/faktor-cli', {
+      installRoot: '/home/operator/.faktor/install',
+    });
+    assertEqual(
+      sl.servicePlanAuthority({
+        plan: outside,
+        mode: 'auto',
+        workspaceTrusted: true,
+        workspaceRoot: '/repo',
+        allowUnverified: true,
+      })?.kind,
+      'outside_trusted_install',
+      'an automatic start requires the trusted install',
+    );
+    const envPlan = servicePlan('/home/operator/.faktor/install/launcher', {
+      source: 'environment',
+      installRoot: '/home/operator/.faktor/install',
+    });
+    assertEqual(
+      sl.servicePlanAuthority({
+        plan: envPlan,
+        mode: 'auto',
+        workspaceTrusted: true,
+        workspaceRoot: '/repo',
+        allowUnverified: true,
+      })?.kind,
+      'outside_trusted_install',
+      'the process environment is never an automatic-start authority',
+    );
+    const unverified = servicePlan('/home/operator/.faktor/install/launcher', {
+      source: 'install-layout',
+      installRoot: '/home/operator/.faktor/install',
+      trust: { state: 'unverified', source: 'install-layout', detail: 'no record' },
+    });
+    assertEqual(
+      sl.servicePlanAuthority({
+        plan: unverified,
+        mode: 'auto',
+        workspaceTrusted: true,
+        workspaceRoot: '/repo',
+        allowUnverified: false,
+      })?.kind,
+      'trust_unverified',
+      'automatic start never confirms an unverified executable',
+    );
+    assertEqual(
+      sl.servicePlanAuthority({
+        plan: unverified,
+        mode: 'explicit',
+        workspaceTrusted: true,
+        workspaceRoot: '/repo',
+        allowUnverified: true,
+      }),
+      null,
+      'an explicit confirmed start may use the verified machine-scoped path',
+    );
+  });
+
+  await test('mutation witnesses: normal UI is silent, Diagnostics owns service controls', () => {
+    const chat = readFileSync(new URL('../media/chat.js', import.meta.url), 'utf8');
+    assert(chat.includes('Connecting to Faktor…'), 'the transient connecting notice ships');
+    assert(chat.includes('Reconnecting…'), 'the transient reconnecting notice ships');
+    assert(!chat.includes('Starting service…'), 'no normal "Starting service" vocabulary');
+    assert(!chat.includes('Service unavailable'), 'no normal "Service unavailable" vocabulary');
+    assert(chat.includes('renderServiceAuthority'), 'authority is the only normal card source');
+    const markup = readFileSync(new URL('../src/webview.ts', import.meta.url), 'utf8');
+    for (const id of [
+      'svc-executable',
+      'svc-port',
+      'svc-process',
+      'svc-restarts',
+      'svc-last-failure',
+    ]) {
+      assert(markup.includes(`id="${id}"`), `Diagnostics → Service carries ${id}`);
+    }
+    assert(markup.includes('Start service'), 'Diagnostics keeps an explicit Start service');
+    assert(markup.includes('Stop service'), 'Diagnostics keeps an explicit Stop service');
+    const edition8 = readFileSync(new URL('../src/edition8/html.ts', import.meta.url), 'utf8');
+    assert(!edition8.includes('Start the Faktor service'), 'the Edition 8 normal banner has no Start policy');
+    assert(edition8.includes('>Stop service<'), 'Edition 8 Diagnostics keeps an explicit Stop service');
+    const edition8Panel = readFileSync(new URL('../src/edition8/panel.ts', import.meta.url), 'utf8');
+    assert(!edition8Panel.includes('Service unavailable'), 'the Edition 8 normal header has no service state');
+    assert(edition8Panel.includes('Reconnecting…'), 'the Edition 8 normal header shows the transient notice');
+    const extension = readFileSync(new URL('../src/extension.ts', import.meta.url), 'utf8');
+    assert(
+      extension.includes('ensureServiceLifecycle(context).open()'),
+      'opening Faktor triggers the automatic start path',
+    );
+    assert(
+      !/function startServer[\s\S]{0,400}startDaemon\(/.test(extension),
+      'normal start policy does not spawn directly',
+    );
+    const source = readFileSync(new URL('../src/serviceLifecycle.ts', import.meta.url), 'utf8');
+    assert(!/billing|startTask|\/native\/usage/.test(source), 'startup has no billing surface');
+  });
+}
+
 // ---------------------------------------- 7. VS Code product defect fixes
 
 async function shadowDefaultTests() {
@@ -4032,7 +4563,7 @@ async function completionContractTests() {
       taskVerification: null,
     });
     const empty = cp.cockpitSections(bare).find((entry) => entry.key === 'completion');
-    assert(empty && empty.present === false && empty.lines[0].includes('none'));
+    assertEqual(empty, undefined, 'an absent completion contract is omitted, never rendered as none');
   });
 
   await test('T22: a requested PR step blocked by SCM config renders the exact copy and the guidance action', () => {
@@ -4152,7 +4683,7 @@ async function completionContractTests() {
     // Plain start: no contract field at all (chat never carries one).
     dom.document.getElementById('goal').value = 'plain goal';
     dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
-    assertDeepEqual(posted[posted.length - 1], { type: 'sendGoal', goal: 'plain goal' });
+    assertDeepEqual(posted[posted.length - 1], { type: 'sendGoal', goal: 'plain goal', intent: 'task' });
     // The explicit result releases the single-flight lock before the next
     // logical submission (the lock itself is covered separately).
     deliver({ type: 'startResult', goal: 'plain goal', ok: true });
@@ -4164,6 +4695,7 @@ async function completionContractTests() {
     assertDeepEqual(posted[posted.length - 1], {
       type: 'sendGoal',
       goal: 'contracted goal',
+      intent: 'task',
       completionContract: { include_commit: true, include_push: true, include_pr: true },
     });
     // A successful start resets the choice to "Leave changes locally".
@@ -4199,7 +4731,7 @@ async function completionContractTests() {
     // Leave changes locally (the default) sends no contract at all.
     goal.value = 'local only';
     submit();
-    assertDeepEqual(posted[posted.length - 1], { type: 'sendGoal', goal: 'local only' });
+    assertDeepEqual(posted[posted.length - 1], { type: 'sendGoal', goal: 'local only', intent: 'task' });
     deliver({ type: 'startResult', goal: 'local only', ok: true });
     // Push branch implies commit.
     dom.document.getElementById('contract-push').checked = true;
@@ -6545,7 +7077,7 @@ async function cockpitTests() {
     const sections = cp.cockpitSections(view);
     assertDeepEqual(
       sections.map((section) => section.key),
-      ['acceptance', 'proof', 'integration', 'plan', 'completion', 'children', 'tournament', 'phase', 'blockers', 'verification', 'evidence', 'spend'],
+      ['acceptance', 'integration', 'plan', 'children', 'phase', 'blockers', 'verification', 'evidence', 'spend'],
     );
     const byKey = Object.fromEntries(sections.map((section) => [section.key, section]));
     assert(byKey.acceptance.present && byKey.acceptance.lines.some((line) => line.includes('build passes')));
@@ -6577,7 +7109,7 @@ async function cockpitTests() {
         byKey.verification.lines[1].includes('tree ver1234') &&
         byKey.verification.lines[1].includes('commit abcdef12') &&
         byKey.verification.lines[1].includes('head refs/9') &&
-        byKey.verification.lines[1].includes('cost 12\u00b5$'),
+        byKey.verification.lines[1].includes('cost under $0.01'),
       JSON.stringify(byKey.verification.lines),
     );
     assert(
@@ -6593,8 +7125,8 @@ async function cockpitTests() {
       JSON.stringify(byKey.evidence),
     );
     assert(byKey.spend.present && byKey.spend.lines[0].includes('tokens 130'));
-    assertEqual(byKey.spend.lines[1], 'cost 12\u00b5$', 'one unit per money value');
-    assertEqual(byKey.spend.lines[2], 'reserved 0\u00b5$', 'one unit per reserved value');
+    assertEqual(byKey.spend.lines[1], 'cost under $0.01', 'human money units');
+    assertEqual(byKey.spend.lines[2], 'reserved $0.00', 'human money units');
     assertEqual(
       byKey.verification.lines[1].includes('\u00b5$\u00b5$'),
       false,
@@ -6898,7 +7430,7 @@ async function contractTests() {
     assert(!contract.contractNeedsDisclosure(quiet), 'satisfied claims and low risks owe no disclosure');
   });
 
-  await test('the cockpit renders the Contract section and leads with Needs disclosure', () => {
+  await test('the cockpit renders the Contract section without a disclosure wall', () => {
     const view = cp.buildCockpit({
       task: contractTask(contract.readEngineeringContract(clone(CONTRACT_WIRE)).contract),
       agents: [],
@@ -6908,17 +7440,14 @@ async function contractTests() {
     });
     const sections = cp.cockpitSections(view);
     assertDeepEqual(
-      sections.slice(0, 3).map((section) => section.key),
-      ['disclosure', 'acceptance', 'contract'],
+      sections.slice(0, 2).map((section) => section.key),
+      ['contract', 'integration'],
     );
-    const disclosure = sections[0];
-    assertEqual(disclosure.title, 'Needs disclosure');
     assert(
-      disclosure.lines.some((line) => line.includes('risk:high') && line.includes('race conditions')),
-      JSON.stringify(disclosure.lines),
+      !sections.some((section) => section.key === 'disclosure'),
+      'risk/obligation detail lives in Verification, not a Needs disclosure wall',
     );
-    assert(disclosure.lines.some((line) => line.includes('inferred')));
-    const section = sections[2];
+    const section = sections[0];
     assertEqual(section.title, 'Contract');
     assert(section.contract, 'the contract section must carry structured rows');
     assertEqual(section.contract.constraints[0].origin, 'user');
@@ -6984,7 +7513,7 @@ async function contractTests() {
       taskVerification: null,
     });
     const malformedSections = cp.cockpitSections(malformed);
-    assertEqual(malformedSections[0].key, 'disclosure');
+    assertEqual(malformedSections[0].key, 'contract');
     assert(malformedSections[0].lines[0].includes('unreadable'));
     // A legacy daemon: neither section exists.
     const legacy = cp.buildCockpit({
@@ -7062,7 +7591,7 @@ async function contractTests() {
     assert(ts.sameContractRows(null, null));
   });
 
-  await test('webview: contract rows render with state/confidence/provenance and the disclosure block leads', () => {
+  await test('webview: contract rows render with state/confidence/provenance under Verification', () => {
     const view = cp.buildCockpit({
       task: contractTask(contract.readEngineeringContract(clone(CONTRACT_WIRE)).contract),
       agents: [],
@@ -7074,11 +7603,12 @@ async function contractTests() {
     snapshot.cockpit = view;
     snapshot.cockpitSections = cp.cockpitSections(view);
     const { posted, dom, deliver } = runChatWebview(snapshot);
+    dom.document.getElementById('subtab-verification').click();
     const cockpit = dom.document.getElementById('cockpit');
-    const warning = findFake(cockpit, (node) => String(node.className).includes('cockpit-disclosure'));
-    assert(warning, 'the Needs disclosure block must lead the run details');
-    assert(fakeText(warning).includes('risk:high'), fakeText(warning));
-    assert(fakeText(warning).includes('inferred'));
+    assert(
+      !findFake(cockpit, (node) => String(node.className).includes('cockpit-disclosure')),
+      'the contract surface omits the old Needs disclosure wall',
+    );
     const contractSection = findFake(
       cockpit,
       (node) => node.tagName === 'section' && fakeText(node).includes('Contract'),
@@ -7106,6 +7636,7 @@ async function contractTests() {
     assertDeepEqual(posted[posted.length - 1], {
       type: 'sendGoal',
       goal: 'contracted composer goal',
+      intent: 'task',
       contractRows: {
         constraints: ['keep sessions valid', 'never break clients'],
         invariants: [],
@@ -7538,6 +8069,7 @@ async function acceptanceProofTests() {
     snapshot.cockpit = cockpit;
     snapshot.cockpitSections = cp.cockpitSections(cockpit);
     const { posted, dom } = runChatWebview(snapshot);
+    dom.document.getElementById('subtab-verification').click();
     const cockpitNode = dom.document.getElementById('cockpit');
     const rowFor = (verdict) =>
       findFake(cockpitNode, (node) => node.getAttribute('data-verdict') === verdict);
@@ -7624,6 +8156,7 @@ async function acceptanceProofTests() {
     snapshot.cockpit = hostile;
     snapshot.cockpitSections = cp.cockpitSections(hostile);
     const { dom } = runChatWebview(snapshot);
+    dom.document.getElementById('subtab-verification').click();
     const text = fakeText(dom.document.getElementById('cockpit'));
     assert(text.includes('verification timestamp unavailable'), text);
     assert(!text.includes('Invalid Date'), text);
@@ -8093,6 +8626,9 @@ function webviewSnapshot(agents) {
     tournament: null,
     transcript: [],
     streamStatus: 'open',
+    connectionNotice: null,
+    serviceAuthority: null,
+    service: null,
     lastError: null,
     busy: false,
   };
@@ -8156,6 +8692,10 @@ function runChatWebview(snapshot) {
   vm.runInContext(source, sandbox);
   assert(messageHandler, 'chat.js must register a window message listener');
   messageHandler({ data: { type: 'snapshot', snapshot } });
+  // The production composer defaults to Ask. The historical suite here drives
+  // task starts; new Ask-first tests explicitly select Ask through the same
+  // control. Selecting Task here keeps the task-start assertions honest.
+  dom.document.getElementById('btn-intent-task').click();
   return {
     posted,
     dom,
@@ -8813,7 +9353,6 @@ async function composerAttachmentTests() {
       'attachment-list',
       'attachment-notice',
       'btn-send',
-      'btn-new-task',
       'stream-recovery',
       'btn-refresh-snapshot',
       'btn-reconnect-stream',
@@ -8919,7 +9458,6 @@ async function composerAttachmentTests() {
       'id="contract-push"',
       'id="contract-pr"',
       'id="btn-send"',
-      'id="btn-new-task"',
     ].map((needle) => composer.indexOf(needle));
     for (let i = 0; i < order.length; i += 1) {
       assert(order[i] >= 0, `composer control ${i} must exist in the markup`);
@@ -9663,6 +10201,7 @@ async function composerAttachmentTests() {
     assertDeepEqual(harness.posted[harness.posted.length - 1], {
       type: 'sendGoal',
       goal: 'keyboard task',
+      intent: 'task',
     });
     // The single-flight lock holds for keyboard starts too.
     goal.dispatch('keydown', { key: 'Enter', metaKey: true, preventDefault() {} });
@@ -9675,10 +10214,6 @@ async function composerAttachmentTests() {
     assertEqual(harness.dom.document.getElementById('attachment-notice').hidden, false);
     harness.keydown({ key: 'Escape' });
     assertEqual(harness.dom.document.getElementById('attachment-notice').hidden, true);
-    // New task returns focus to the composer as well.
-    goal.focused = false;
-    harness.dom.document.getElementById('btn-new-task').click();
-    assertEqual(goal.focused, true, 'New task returns focus to the composer');
   });
 }
 
@@ -10217,8 +10752,8 @@ async function navigationWebviewTests() {
     );
     assertEqual(
       (source.match(/startServer\(/g) || []).length,
-      5,
-      'the daemon-start call sites are pinned (definition + Start action + confirmed Start anyway + task submit + command)',
+      7,
+      'the daemon-start call sites are pinned (definition + Start + confirmed Start + retry + two task paths + command)',
     );
   });
 }
@@ -11377,14 +11912,12 @@ async function transcriptScrollTests() {
     const goal = dom.document.getElementById('goal');
     const composer = dom.document.getElementById('composer');
     const send = dom.document.getElementById('btn-send');
-    const newTask = dom.document.getElementById('btn-new-task');
     goal.value = 'first goal';
     composer.dispatch('submit', { preventDefault() {} });
     // posted[0] is the initial ready message.
     assertEqual(posted.length, 2, 'the first submit posts exactly one sendGoal');
-    assertDeepEqual(posted[1], { type: 'sendGoal', goal: 'first goal' });
+    assertDeepEqual(posted[1], { type: 'sendGoal', goal: 'first goal', intent: 'task' });
     assertEqual(send.disabled, true, 'Run task is disabled while submitting');
-    assertEqual(newTask.disabled, true, 'New task is disabled while submitting');
     assertEqual(
       dom.document.getElementById('contract-commit').disabled,
       true,
@@ -11399,7 +11932,6 @@ async function transcriptScrollTests() {
     dom.document.getElementById('contract-commit').checked = true;
     deliver({ type: 'startResult', goal: 'first goal', ok: false });
     assertEqual(send.disabled, false, 'a failure re-enables Run task');
-    assertEqual(newTask.disabled, false, 'a failure re-enables New task');
     assertEqual(
       goal.value,
       'second goal typed while pending',
@@ -12491,6 +13023,7 @@ async function proofSummaryTests() {
     verifiedSnapshot.cockpit = verified;
     verifiedSnapshot.cockpitSections = cp.cockpitSections(verified);
     const harness = runChatWebview(verifiedSnapshot);
+    harness.dom.document.getElementById('subtab-verification').click();
     const cockpitNode = harness.dom.document.getElementById('cockpit');
     assert(fakeText(cockpitNode).includes('VERIFIED'), fakeText(cockpitNode));
     // The refresh's proof read failed: the cockpit is replaced with the
@@ -13466,13 +13999,11 @@ async function moneyTests() {
     });
     const lines = cp.usagePanelLines(panel);
     assert(
-      lines.some((line) => line.includes('managed 9223372036854775807\u00b5$')),
+      lines.some((line) => line.includes('managed $9223372036854.78')),
       JSON.stringify(lines),
     );
     assert(
-      lines.some((line) =>
-        line.includes('credits balance 9223372036854775807\u00b5$'),
-      ),
+      lines.some((line) => line.includes('credits balance $9223372036854.78')),
       JSON.stringify(lines),
     );
   });
@@ -13727,26 +14258,22 @@ async function preflightTests() {
       assertDeepEqual(view.actions, row.copy.actions, `${row.copy.state} actions`);
       const harness = runChatWebview({ ...webviewSnapshot([]), preflight: view });
       const { dom } = harness;
+      // The normal surface never renders the service matrix: only genuine
+      // authority gets a card. The exact T00-T05 rows live in Diagnostics.
       assertEqual(
         dom.document.getElementById('preflight-card').hidden,
-        false,
-        `${row.copy.state} card visible`,
+        true,
+        `${row.copy.state} normal card stays hidden`,
       );
-      assertEqual(dom.document.getElementById('preflight-label').textContent, row.copy.label);
-      assertEqual(dom.document.getElementById('preflight-copy').textContent, row.copy.copy);
       assertEqual(dom.document.getElementById('diag-preflight-label').textContent, row.copy.label);
       assertEqual(dom.document.getElementById('diag-preflight-copy').textContent, row.copy.copy);
-      assertDeepEqual(
-        actionLabels(dom.document.getElementById('preflight-actions')),
-        row.copy.actions.map((action) => action.label),
-        `${row.copy.state} card actions`,
-      );
       assertDeepEqual(
         actionLabels(dom.document.getElementById('diag-preflight-actions')),
         row.copy.actions.map((action) => action.label),
         `${row.copy.state} Diagnostics mirror actions`,
       );
-      // Every card action posts its typed host message and nothing implicit.
+      // Every Diagnostics action posts its typed host message and nothing
+      // implicit.
       const postFor = {
         openProject: 'openProject',
         startService: 'startDaemon',
@@ -13756,7 +14283,7 @@ async function preflightTests() {
         cancelStart: 'cancelStart',
       };
       const buttons = dom.document
-        .getElementById('preflight-actions')
+        .getElementById('diag-preflight-actions')
         .children.filter((child) => child.tagName === 'button');
       for (let b = 0; b < buttons.length; b += 1) {
         buttons[b].click();
@@ -13817,7 +14344,12 @@ async function preflightTests() {
       harness.dom.document.getElementById('readiness-label').textContent.includes('did not report ready'),
       harness.dom.document.getElementById('readiness-label').textContent,
     );
-    assertEqual(harness.dom.document.getElementById('preflight-card').hidden, false);
+    assertEqual(
+      harness.dom.document.getElementById('preflight-card').hidden,
+      true,
+      'a not-ready service is Diagnostics detail, not a normal service card',
+    );
+    assertEqual(harness.dom.document.getElementById('diag-preflight-label').textContent, pf.T05_STARTING.label);
   });
 
   await test('a refused trust state offers ONLY Locate daemon and never a start action', () => {
@@ -13832,12 +14364,13 @@ async function preflightTests() {
     );
     assert(!view.actions.some((action) => /start/i.test(action.label)), 'no start action');
     const harness = runChatWebview({ ...webviewSnapshot([]), preflight: view });
-    const labels = actionLabels(harness.dom.document.getElementById('preflight-actions'));
+    assertEqual(harness.dom.document.getElementById('preflight-card').hidden, true);
+    const labels = actionLabels(harness.dom.document.getElementById('diag-preflight-actions'));
     assertDeepEqual(labels, ['Locate daemon…']);
-    assert(!labels.some((label) => /start/i.test(label)), 'the rendered card never offers a start');
+    assert(!labels.some((label) => /start/i.test(label)), 'the rendered Diagnostics row never offers a start');
   });
 
-  await test('unverified shows the exact resolved path, the D10 wording and both Start anyway / Cancel', () => {
+  await test('unverified is explicit in Diagnostics; normal authority never offers an implicit start', () => {
     const view = pf.derivePreflight(
       preflightInput({ resolution: resolvedFixture, trust: unverifiedTrustFixture }),
     );
@@ -13850,20 +14383,37 @@ async function preflightTests() {
     );
     const harness = runChatWebview({ ...webviewSnapshot([]), preflight: view });
     const { dom } = harness;
-    assertEqual(dom.document.getElementById('preflight-path-row').hidden, false);
-    assertEqual(dom.document.getElementById('preflight-path').textContent, '/opt/faktor/bin/faktor-cli');
-    assertEqual(dom.document.getElementById('preflight-trust-row').hidden, false);
-    assertEqual(dom.document.getElementById('preflight-trust').textContent, 'No checksum record');
-    assertDeepEqual(actionLabels(dom.document.getElementById('preflight-actions')), [
+    assertEqual(dom.document.getElementById('preflight-card').hidden, true);
+    const detail = dom.document.getElementById('diag-preflight-detail').textContent;
+    assert(detail.includes('/opt/faktor/bin/faktor-cli'), detail);
+    assert(detail.includes('No checksum record'), detail);
+    // Diagnostics keeps the explicit confirmation path.
+    assertDeepEqual(actionLabels(dom.document.getElementById('diag-preflight-actions')), [
       'Start anyway',
       'Cancel',
     ]);
-    // Neither action starts implicitly: the card actions post the typed
-    // confirmation/cancel messages and nothing else.
-    dom.document.getElementById('preflight-actions').children[0].click();
+    dom.document.getElementById('diag-preflight-actions').children[0].click();
     assertDeepEqual(harness.posted[harness.posted.length - 1], { type: 'confirmStart' });
-    dom.document.getElementById('preflight-actions').children[1].click();
+    dom.document.getElementById('diag-preflight-actions').children[1].click();
     assertDeepEqual(harness.posted[harness.posted.length - 1], { type: 'cancelConfirm' });
+    // The normal card renders authority, not a Start-service decision.
+    const authority = sl.serviceAuthority(
+      'trust_unverified',
+      'no checksum record exists for /opt/faktor/bin/faktor-cli',
+    );
+    const normal = runChatWebview({ ...webviewSnapshot([]), serviceAuthority: authority });
+    assertEqual(normal.dom.document.getElementById('preflight-card').hidden, false);
+    assertEqual(normal.dom.document.getElementById('preflight-label').textContent, authority.label);
+    assertEqual(normal.dom.document.getElementById('preflight-copy').textContent, authority.copy);
+    assertDeepEqual(actionLabels(normal.dom.document.getElementById('preflight-actions')), [
+      'Review in Diagnostics',
+    ]);
+    assert(
+      !actionLabels(normal.dom.document.getElementById('preflight-actions')).some((label) =>
+        /start/i.test(label),
+      ),
+      'the normal authority row never offers Start anyway',
+    );
   });
 
   await test('D10: the bare checksum check never claims a signature; launcher wording stays scoped', () => {
@@ -14088,41 +14638,29 @@ async function preflightTests() {
     assert(locateSlice.includes('inspectScopes()'), 'the effective scopes are re-validated');
     assert(locateSlice.includes('workspaceScopedSettingRefusal('), 'D11 refusal is reused');
     const cancelSlice = sourceFunctionSlice(source, 'function cancelStart');
-    assert(cancelSlice.includes('.abort()'), 'cancel aborts the in-flight attempt');
-    const noAttemptIndex = cancelSlice.indexOf('attempt === null');
-    const abortIndex = cancelSlice.indexOf('.abort()');
-    assert(noAttemptIndex >= 0 && noAttemptIndex < abortIndex, 'a missing attempt is checked first');
-    assert(
-      cancelSlice.includes('already running; there is nothing to cancel'),
-      'a late cancel (start succeeded) is a no-op with a notice',
-    );
-    assert(
-      cancelSlice.indexOf('already running; there is nothing to cancel') < abortIndex,
-      'the no-op notice precedes any abort',
-    );
+    assert(cancelSlice.includes('serviceLifecycle.cancel()'), 'cancel aborts through the supervisor');
     const startSlice = sourceFunctionSlice(source, 'async function startServer');
-    assert(startSlice.includes('await awaitReady('), 'readiness is awaited after health');
-    assert(
-      startSlice.indexOf('awaitReady(') < startSlice.indexOf('ensureSession(client, context)'),
-      'readiness precedes session creation and any ready notice',
-    );
-    assert(startSlice.includes('readiness_timeout'), 'the readiness timeout is typed');
-    assert(startSlice.includes('service_not_ready'), 'the readiness outcome has its own kind');
-    assert(
-      startSlice.includes('signal: attempt.controller.signal'),
-      'the start attempt carries the abort signal',
-    );
+    assert(startSlice.includes('startExplicit('), 'the explicit start is the supervisor path');
+    const launchSlice = sourceFunctionSlice(source, 'async function launchService');
+    assert(launchSlice.includes('await awaitReady('), 'readiness is awaited after health');
+    assert(launchSlice.includes('stopDaemon(daemon)'), 'a failed readiness never leaks the child');
+    assert(launchSlice.includes('signal'), 'the launch carries the abort signal');
+    const prepareSlice = sourceFunctionSlice(source, 'function prepareService');
+    assert(prepareSlice.includes('validateServiceConfiguration('), 'configuration is typed before resolution');
+    const finishSlice = sourceFunctionSlice(source, 'function finishServicePreparation');
+    assert(finishSlice.includes('servicePlanAuthority('), 'the trusted-install gate runs before every spawn');
     const daemonSource = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
     assert(daemonSource.includes('DaemonStartCancelledError'), 'daemon.ts types the cancellation');
     assert(
       daemonSource.includes("addEventListener('abort'"),
       'the spawn/handshake observes the abort signal',
     );
-    // Diagnostics rows: the exact advanced row set.
+    // Diagnostics rows: the exact Service detail set plus session metadata.
     const markup = readFileSync(new URL('../src/webview.ts', import.meta.url), 'utf8');
-    for (const row of ['Readiness', 'Index coverage', 'Trust']) {
+    for (const row of ['Readiness', 'Index coverage', 'Trust', 'Executable', 'Port', 'Process', 'Restarts']) {
       assert(markup.includes(`>${row}</span>`), `the ${row} Diagnostics row exists`);
     }
+    assert(markup.includes('>Service</h3>'), 'Diagnostics groups the service controls');
   });
 }
 
@@ -14249,11 +14787,11 @@ async function approvedStateCopyTests() {
     assertEqual(dom.document.getElementById('composer-state').hidden, false);
     assertEqual(
       dom.document.getElementById('composer-state-label').textContent,
-      'Start response unavailable',
+      "Couldn't start",
     );
     assertEqual(
       dom.document.getElementById('composer-state-copy').textContent,
-      'The draft was kept. Retry checks the same logical submission.',
+      'The draft was kept. Retry uses the same request.',
     );
     assertEqual(dom.document.getElementById('goal').value, 'keep my draft', 'the draft is kept');
     // The useful action is the EXISTING Review and retry control of the
@@ -14672,11 +15210,7 @@ async function approvedStateCopyTests() {
     );
     // Negative: no contract renders nothing new.
     const bare = completionSection(completionTask(null));
-    assert(!bare.present, 'no completion contract: the section stays empty');
-    assert(
-      !bare.lines.some((line) => line.includes('Finish action pending')),
-      JSON.stringify(bare.lines),
-    );
+    assertEqual(bare, undefined, 'no completion contract: the section is omitted entirely');
   });
 }
 
@@ -14987,6 +15521,7 @@ async function runBudgetTests() {
     assertDeepEqual(posted[posted.length - 1], {
       type: 'sendGoal',
       goal: 'budgeted goal',
+      intent: 'task',
       budgetTokens: '120000',
       budgetCostMicro: '5000000',
     });
@@ -14997,10 +15532,214 @@ async function runBudgetTests() {
     cost.value = '';
     goal.value = 'plain goal';
     dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
-    assertDeepEqual(posted[posted.length - 1], { type: 'sendGoal', goal: 'plain goal' });
+    assertDeepEqual(posted[posted.length - 1], { type: 'sendGoal', goal: 'plain goal', intent: 'task' });
     deliver({ type: 'startResult', goal: 'plain goal', ok: true });
     assertEqual(tokens.value, '', 'durable acceptance clears the token override');
     assertEqual(cost.value, '', 'durable acceptance clears the cost override');
+  });
+}
+
+// ------------------------------------------------- Ask-first UX (P0/P1)
+
+async function askFirstUxTests() {
+  await test('the ONE composer defaults to Ask and hides every task option behind one disclosure', () => {
+    const markup = readFileSync(new URL('../src/webview.ts', import.meta.url), 'utf8');
+    assert(/id="btn-intent-ask"[^>]*aria-checked="true"/.test(markup), 'Ask is the default intent');
+    assert(/id="btn-intent-task"[^>]*aria-checked="false"/.test(markup), 'Task is explicit, not default');
+    assert(markup.includes('<summary>Task options</summary>'), 'one Task options disclosure');
+    const composerStart = markup.indexOf('<form id="composer">');
+    const composerEnd = markup.indexOf('</form>', composerStart);
+    const composerMarkup = markup.slice(composerStart, composerEnd);
+    assertEqual((composerMarkup.match(/<details /g) || []).length, 1, 'the composer has one disclosure');
+    assert(!markup.includes('btn-new-task'), 'no second Run task control');
+    assert(!/id="btn-(run-task|ask-task)"/.test(markup), 'no separate Run task/Ask buttons');
+    assert(markup.includes('id="btn-send"'), 'one Send control');
+    assert(markup.includes('id="btn-attach"'), 'attachments stay in the simple composer');
+    assert(markup.includes('id="composer-model"'), 'model stays in the simple composer');
+  });
+
+  await test('Ask sends hello as a plain conversational turn with no contract or task options', () => {
+    const { posted, dom, deliver } = runChatWebview(webviewSnapshot([]));
+    dom.document.getElementById('btn-intent-ask').click();
+    assertEqual(dom.document.getElementById('btn-intent-ask').getAttribute('aria-checked'), 'true');
+    dom.document.getElementById('goal').value = 'hello';
+    // Even if a Task option was left populated, Ask must not attach it.
+    dom.document.getElementById('contract-pr').checked = true;
+    dom.document.getElementById('contract-risks').value = 'must not leak';
+    dom.document.getElementById('contract-budget-tokens').value = '500';
+    dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
+    assertDeepEqual(posted[posted.length - 1], {
+      type: 'sendGoal',
+      goal: 'hello',
+      intent: 'ask',
+    });
+    deliver({ type: 'startResult', goal: 'hello', ok: true });
+    assertEqual(dom.document.getElementById('goal').value, '', 'a successful Ask clears the draft');
+  });
+
+  await test('Task intent still posts the checked contract after an Ask turn', () => {
+    const { posted, dom, deliver } = runChatWebview(webviewSnapshot([]));
+    dom.document.getElementById('btn-intent-ask').click();
+    dom.document.getElementById('goal').value = 'hello';
+    dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
+    deliver({ type: 'startResult', goal: 'hello', ok: true });
+    dom.document.getElementById('btn-intent-task').click();
+    dom.document.getElementById('contract-pr').checked = true;
+    dom.document.getElementById('goal').value = 'ship it';
+    dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
+    const sent = posted[posted.length - 1];
+    assertEqual(sent.intent, 'task');
+    assertEqual(sent.goal, 'ship it');
+    assertDeepEqual(sent.completionContract, {
+      include_commit: true,
+      include_push: true,
+      include_pr: true,
+    });
+  });
+
+  await test('run state uses the shared cause-specific labels and never says resend', () => {
+    const render = (input) => {
+      const snapshot = webviewSnapshot([]);
+      snapshot.ux = ux.projectUx(input);
+      return runChatWebview(snapshot).dom;
+    };
+    const credentialSnapshot = webviewSnapshot([]);
+    credentialSnapshot.ux = ux.projectUx({
+      machineState: 'failed_recoverable',
+      lastError: 'provider 401 invalid api key',
+      activeRunId: 'r1',
+    });
+    const credentialHarness = runChatWebview(credentialSnapshot);
+    const credential = credentialHarness.dom;
+    assertEqual(credential.document.getElementById('run-state-label').textContent, 'Provider setup needed');
+    assertEqual(credential.document.getElementById('run-state-label').textContent.includes('recovery'), false);
+    const providerAction = findFake(
+      credential.document.getElementById('run-state'),
+      (node) => node.tagName === 'button' && node.textContent === 'Open provider settings',
+    );
+    assert(providerAction, 'the credential cause offers one provider-settings action');
+    providerAction.click();
+    assert(
+      credentialHarness.posted.some((message) => message.type === 'openProviderSettings'),
+      'the action is wired to the host',
+    );
+    const paused = render({ runs: [{ state: 'paused' }], task: { state: 'paused', goal: 'g' } });
+    assertEqual(paused.document.getElementById('run-state-label').textContent, 'Paused');
+    assert(!paused.document.getElementById('run-state-copy').textContent.includes('send'));
+    assert(
+      findFake(
+        paused.document.getElementById('run-state'),
+        (node) => node.tagName === 'button' && node.textContent === 'Resume',
+      ),
+      'a durable pause offers Resume, never resend',
+    );
+    const transient = render({
+      machineState: 'failed_recoverable',
+      lastError: 'provider 503 overloaded',
+      activeRunId: 'r1',
+    });
+    assertEqual(transient.document.getElementById('run-state-label').textContent, 'Retrying automatically');
+    const preRun = render({
+      machineState: 'failed_recoverable',
+      lastError: 'admission refused before the run',
+      errorKind: 'run_failure',
+      activeRunId: null,
+    });
+    assertEqual(preRun.document.getElementById('run-state-label').textContent, "Couldn't start");
+  });
+
+  await test('attention is aggregated to at most three grouped rows and absent groups are omitted', () => {
+    const snapshot = webviewSnapshot([]);
+    snapshot.ux = ux.projectUx({
+      permissions: [{ id: 'p1' }, { id: 'p2' }],
+      activeRunId: 'r1',
+      verification: { status: 'failed', checksFailed: 1 },
+      task: {
+        goal: 'ship',
+        blockers: ['which file?', 'clarify the requirement', 'the repository is read-only'],
+      },
+    });
+    const { dom } = runChatWebview(snapshot);
+    const card = dom.document.getElementById('attention-card');
+    assertEqual(card.hidden, false);
+    const items = dom.document.getElementById('attention-list').children;
+    assertEqual(items.length, 3, 'never more than three grouped items');
+    assert(fakeText(items[0]).includes('2 approvals waiting'), fakeText(items[0]));
+    const empty = runChatWebview(webviewSnapshot([]));
+    assertEqual(empty.dom.document.getElementById('attention-card').hidden, true, 'absence is omitted');
+  });
+
+  await test('Overview answers five questions and omits absent rows; money is human', () => {
+    const snapshot = webviewSnapshot([]);
+    snapshot.ux = ux.projectUx({
+      task: {
+        goal: 'close the audit',
+        state: 'running',
+        acceptanceCriteria: ['build passes'],
+      },
+      changes: { rows: [{ path: 'a.ts' }, { path: 'b.ts' }] },
+      spend: { spentCostMicro: '5000000' },
+    });
+    const { dom } = runChatWebview(snapshot);
+    const list = dom.document.getElementById('overview-summary-list');
+    const text = fakeText(list);
+    for (const question of [
+      'What it is doing',
+      'What changed',
+      'Checks',
+      'Cost',
+    ]) {
+      assert(text.includes(question), `${question} renders`);
+    }
+    assert(!text.includes('Anything wrong'), 'an absent attention row is omitted');
+    assert(text.includes('2 files changed'));
+    assert(text.includes('$5.00'), text);
+    assert(!text.includes('\u00b5$'), 'never micro units in normal UI');
+    const empty = runChatWebview(webviewSnapshot([]));
+    const emptyText = fakeText(empty.dom.document.getElementById('overview-summary-list'));
+    assertEqual(emptyText.trim(), '', 'no absent-section placeholders');
+  });
+
+  await test('the Account/Usage surface is lazy and honest when absent', () => {
+    const snapshot = webviewSnapshot([]);
+    snapshot.accountStatus = 'not_connected';
+    const { posted, dom } = runChatWebview(snapshot);
+    dom.document.getElementById('history-tab-account').click();
+    assert(posted.some((message) => message.type === 'readAccount'), 'opening Account is the explicit read');
+    assert(
+      dom.document.getElementById('account-copy').textContent.includes('Account not connected'),
+    );
+    const extensionSource = readFileSync(new URL('../src/extension.ts', import.meta.url), 'utf8');
+    assert(!extensionSource.includes('...usagePanelSections('), 'run cockpit never appends usage sections');
+  });
+
+  await test('run refresh never reads billing and Ask reads conversation only', () => {
+    const extensionSource = readFileSync(new URL('../src/extension.ts', import.meta.url), 'utf8');
+    const refreshBody = sourceFunctionSlice(extensionSource, 'async function refresh(');
+    assert(!refreshBody.includes('billingPanelFor('), 'run refresh must not read billing');
+    assert(!refreshBody.includes('usagePanelSections('), 'run cockpit must not append usage');
+    assert(refreshBody.includes('refreshReadPlan('), 'refresh branches on the shared read plan');
+    const askBody = sourceFunctionSlice(extensionSource, 'async function sendAskTurnFromComposer(');
+    for (const forbidden of ['billingPanelFor(', 'taskStartGate', 'proofFor(', 'startTask(']) {
+      assert(!askBody.includes(forbidden), `Ask must not reach ${forbidden}`);
+    }
+    assert(askBody.includes('sendAskTurn('), 'Ask posts the plain prompt helper');
+    assert(askBody.includes('refreshConversation('), 'Ask refreshes conversation data only');
+    for (const askOnly of [true, false]) {
+      const plan = rr.refreshReadPlan({ askOnly });
+      assert(!plan.includes('account'), 'no automatic account read');
+    }
+    assert(rr.refreshReadPlan({ askOnly: true }).includes('conversation'));
+    assert(!rr.refreshReadPlan({ askOnly: true }).includes('tasks'));
+  });
+
+  await test('narrow layout has no prose wall and ellipsizes identifiers', () => {
+    const css = readFileSync(new URL('../media/chat.css', import.meta.url), 'utf8');
+    assert(!css.includes('overflow-wrap: anywhere'), 'no global anywhere wrapping for prose');
+    assert(!css.includes('word-break: break-all'), 'no broken-word prose walls');
+    assert(css.includes('overflow-wrap: break-word'), 'prose wraps at word boundaries');
+    assert(css.includes('@media (max-width: 320px)'), 'the 240-320px layout is explicit');
+    assert(/text-overflow: ellipsis/.test(css), 'identifiers ellipsize instead of stacking');
   });
 }
 
@@ -16183,8 +16922,8 @@ async function capabilityMatrixTests() {
     // the capability actually performs. This is the matrix that makes a
     // renamed/removed service seam fail instead of silently no-oping.
     const matrix = {
-      'faktor.startServer': ['startServer(', ['startServer', ['startDaemon(', 'resolveDaemon(']]],
-      'faktor.stopServer': ['stopServer(', ['stopServer', ['stopDaemon(']]],
+      'faktor.startServer': ['startServer(', ['startServer', ['startExplicit(']]],
+      'faktor.stopServer': ['stopServer(', ['stopServer', ['stopExplicit(']]],
       'faktor.openChat': ['chatProvider?.focus(', null],
       'faktor.newTask': ['newTaskFromCommand(', ['newTaskFromCommand', ['startTask(']]],
       'faktor.cancelTask': ['cancelActiveRun(', ['cancelActiveRun', ['cancelTaskRun(']]],
@@ -16524,12 +17263,12 @@ async function edition8HtmlSafetyTests() {
     const end = html.indexOf('<section class="e8-screen"', start + 1);
     const section = html.slice(start, end === -1 ? undefined : end);
     assert(section.includes('Served S53 state'), 'S53 served state is absent');
-    assert(section.includes('Control provenance (read-only)'), 'read-only provenance is not disclosed');
+    assert(section.includes('Advanced diagnostics (read-only)'), 'read-only diagnostics are not disclosed');
     assert(
-      section.indexOf('Served S53 state') < section.indexOf('Control provenance (read-only)'),
+      section.indexOf('Served S53 state') < section.indexOf('Advanced diagnostics (read-only)'),
       'read-only controls precede the served cohort',
     );
-    assert(!section.slice(0, section.indexOf('Control provenance')).includes('e8-control-grid'), 'controls are not collapsed');
+    assert(!section.slice(0, section.indexOf('Advanced diagnostics')).includes('e8-control-grid'), 'controls are not collapsed');
   });
 
   await test('edition8: inline state serialization cannot terminate the script element', () => {
@@ -16563,6 +17302,7 @@ async function main() {
   await eventStreamTests();
   await stateTests();
   await daemonTests();
+  await serviceLifecycleTests();
   await daemonCancelTests();
   await preflightTests();
   await approvedStateCopyTests();
@@ -16590,6 +17330,7 @@ async function main() {
   await attentionWebviewTests();
   await navigationWebviewTests();
   await composerAttachmentTests();
+  await askFirstUxTests();
   await submissionSingleFlightTests();
   await runBudgetTests();
   await changeReviewTests();

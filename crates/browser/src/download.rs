@@ -1213,6 +1213,7 @@ mod tests {
                 .into_iter()
                 .map(|class| (class, 1_000_000))
                 .collect(),
+            ..Default::default()
         }
         .validated()
         .unwrap();

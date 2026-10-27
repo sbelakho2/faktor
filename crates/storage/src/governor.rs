@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use serde::{Deserialize, Serialize};
 
+use crate::capacity::{CapacityProbe, CapacitySnapshot, SystemCapacityProbe};
 use crate::class::StorageClass;
 use crate::config::StorageGovernorConfig;
 use crate::directory::{object_row, DirectoryBackend, SqliteBackend};
@@ -102,6 +103,10 @@ struct Inner {
     maintenance_gate: Mutex<()>,
     sqlite_maintenance_runs: AtomicU64,
     family_index_loads: AtomicU64,
+    capacity_probe: Arc<dyn CapacityProbe>,
+    /// Extra roots (CAS roots register themselves) measured in addition to
+    /// every directory backend root and the data directory.
+    capacity_roots: RwLock<std::collections::BTreeSet<PathBuf>>,
 }
 
 /// SQLite/WAL admission debt shared by all governor instances of one ledger.
@@ -190,6 +195,16 @@ impl StorageGovernor {
         data_dir: impl Into<PathBuf>,
         config: StorageGovernorConfig,
     ) -> GovernorResult<Self> {
+        Self::open_with_capacity_probe(data_dir, config, Arc::new(SystemCapacityProbe))
+    }
+
+    /// Open with an injected capacity probe (deterministic low-capacity /
+    /// low-free tests, and hosts that already know their backing volume).
+    pub fn open_with_capacity_probe(
+        data_dir: impl Into<PathBuf>,
+        config: StorageGovernorConfig,
+        capacity_probe: Arc<dyn CapacityProbe>,
+    ) -> GovernorResult<Self> {
         let data_dir = data_dir.into();
         let config = config.validated().map_err(GovernorError::Malformed)?;
         let root = Self::governor_dir(&data_dir);
@@ -204,7 +219,7 @@ impl StorageGovernor {
         // the budget for the whole lease. Same-process instances share the
         // boot id and keep each other's reservations.
         let _ = ledger.expire_foreign_reservations(crate::ledger::process_boot_id());
-        Self::assemble(root, data_dir, config, ledger)
+        Self::assemble(root, data_dir, config, ledger, capacity_probe)
     }
 
     /// Open only when the governor database already exists (production CAS
@@ -230,7 +245,14 @@ impl StorageGovernor {
             .unwrap_or_default()
             .validated()
             .map_err(GovernorError::Corrupt)?;
-        Self::assemble(root, data_dir.to_path_buf(), config, ledger).map(Some)
+        Self::assemble(
+            root,
+            data_dir.to_path_buf(),
+            config,
+            ledger,
+            Arc::new(SystemCapacityProbe),
+        )
+        .map(Some)
     }
 
     /// Discover a governor from any path whose ancestors contain a
@@ -255,6 +277,7 @@ impl StorageGovernor {
         data_dir: PathBuf,
         config: StorageGovernorConfig,
         ledger: Ledger,
+        capacity_probe: Arc<dyn CapacityProbe>,
     ) -> GovernorResult<Self> {
         let persisted_degraded = ledger
             .meta("degraded")
@@ -293,6 +316,8 @@ impl StorageGovernor {
                 maintenance_gate: Mutex::new(()),
                 sqlite_maintenance_runs: AtomicU64::new(0),
                 family_index_loads: AtomicU64::new(0),
+                capacity_probe,
+                capacity_roots: RwLock::new(std::collections::BTreeSet::new()),
             }),
         };
         governor.install_default_backends(&GovernorRoots::under(data_dir));
@@ -332,6 +357,47 @@ impl StorageGovernor {
 
     pub fn config(&self) -> &StorageGovernorConfig {
         &self.inner.config
+    }
+
+    /// Register another backing root (a CAS root outside `data_dir`) whose
+    /// filesystem must be measured. Roots on the same volume are deduplicated
+    /// by filesystem identity, never double counted.
+    pub fn register_capacity_root(&self, root: impl Into<PathBuf>) {
+        self.inner
+            .capacity_roots
+            .write()
+            .unwrap()
+            .insert(root.into());
+    }
+
+    /// The current capacity-aware budget. Free space is measured on every
+    /// call so admission follows actual disk headroom, not only the nominal
+    /// quota.
+    pub fn capacity_snapshot(&self) -> CapacitySnapshot {
+        let mut paths: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+        paths.insert(self.inner.data_dir.clone());
+        paths.insert(self.inner.root.clone());
+        for root in self.inner.capacity_roots.read().unwrap().iter() {
+            paths.insert(root.clone());
+        }
+        {
+            let backends = self.inner.backends.read().unwrap();
+            for backend in backends.values() {
+                if let Some((roots, _)) = backend.directory_roots() {
+                    for root in roots {
+                        paths.insert(root.clone());
+                    }
+                }
+            }
+        }
+        let spaces = paths
+            .iter()
+            .filter_map(|path| self.inner.capacity_probe.space(path));
+        CapacitySnapshot::evaluate(&self.inner.config, spaces)
+    }
+
+    fn effective_budget(&self) -> u64 {
+        self.capacity_snapshot().effective_budget_bytes
     }
 
     pub fn register_backend(&self, backend: Arc<dyn StorageBackend>) -> GovernorResult<()> {
@@ -567,9 +633,12 @@ impl StorageGovernor {
         self.inner.ledger.lock().unwrap().is_pinned(class, key)
     }
 
-    /// Reserve `bytes` BEFORE publishing. Performs eviction by class/age when
-    /// the class quota or the aggregate budget would be exceeded, and refuses
-    /// typed (recording the refusal) when the budget cannot be met.
+    /// Reserve `bytes` BEFORE publishing. The admission checks the
+    /// capacity-aware hard budget (operator cap vs measured capacity),
+    /// per-class quota, and actual disk headroom (free space above the
+    /// always-preserved reserve). When headroom is short, noncritical classes
+    /// are evicted; if the reserve still cannot be preserved the admission is
+    /// refused typed and health degrades — the disk is never filled.
     pub fn reserve(
         &self,
         class: StorageClass,
@@ -581,28 +650,6 @@ impl StorageGovernor {
                 "storage reservation requires a non-empty key".into(),
             ));
         }
-        let quota = self.inner.config.quota(class);
-        let total = self.inner.config.total_budget_bytes;
-        if bytes > quota {
-            return self.refuse(
-                class,
-                key,
-                bytes,
-                0,
-                RefusalReason::ClassQuota,
-                format!("object alone exceeds the {} byte class quota", quota),
-            );
-        }
-        if bytes > total {
-            return self.refuse(
-                class,
-                key,
-                bytes,
-                0,
-                RefusalReason::AggregateBudget,
-                format!("object alone exceeds the {total} byte aggregate budget"),
-            );
-        }
         // Always-on tick: directory classes (profiles/caches/agent homes) grow
         // outside reservations, so they are re-indexed and enforced on a
         // bounded cadence. Non-blocking when another thread is already
@@ -610,11 +657,44 @@ impl StorageGovernor {
         let _ = self.maintain_if_due(300_000, 30_000);
         let mut last_available = 0u64;
         let mut last_reason = RefusalReason::NoEvictableObjects;
-        // At most three admission rounds: each round either admits, or makes
-        // one bounded eviction pass. The old four-round loop could evict
-        // unrelated classes against a pure class-quota deficit and thrash.
-        for _attempt in 0..3 {
-            match self.try_reserve(class, key, bytes)? {
+        // At most four admission rounds: each round either admits, or makes
+        // one bounded eviction pass. Capacity headroom is re-measured every
+        // round, so eviction only counts when the filesystem really freed it.
+        for _attempt in 0..4 {
+            let capacity = self.capacity_snapshot();
+            let total = capacity.effective_budget_bytes;
+            let quota = self.inner.config.quota_for(class, total);
+            if bytes > quota {
+                return self.refuse(
+                    class,
+                    key,
+                    bytes,
+                    0,
+                    RefusalReason::ClassQuota,
+                    format!("object alone exceeds the {quota} byte class quota"),
+                );
+            }
+            if bytes > total {
+                return self.refuse(
+                    class,
+                    key,
+                    bytes,
+                    0,
+                    RefusalReason::AggregateBudget,
+                    format!("object alone exceeds the {total} byte effective aggregate budget"),
+                );
+            }
+            let capacity_deficit = capacity.admission_deficit(bytes);
+            if capacity_deficit > 0 {
+                last_available = capacity.headroom_bytes;
+                last_reason = RefusalReason::FreeSpaceReserve;
+                let freed = self.evict_global_for(capacity_deficit)?;
+                if freed == 0 {
+                    break;
+                }
+                continue;
+            }
+            match self.try_reserve(class, key, bytes, quota, total)? {
                 Admit::Reserved(reservation) => {
                     self.maintain_watermark()?;
                     self.clear_degraded_if_healthy()?;
@@ -648,15 +728,21 @@ impl StorageGovernor {
             bytes,
             last_available,
             last_reason,
-            "eviction could not free enough bytes; the hard budget is not met".into(),
+            "eviction could not free enough bytes; the hard budget or free-space reserve is not met"
+                .into(),
         )
     }
 
-    fn try_reserve(&self, class: StorageClass, key: &str, bytes: u64) -> GovernorResult<Admit> {
+    fn try_reserve(
+        &self,
+        class: StorageClass,
+        key: &str,
+        bytes: u64,
+        quota: u64,
+        total: u64,
+    ) -> GovernorResult<Admit> {
         let now = now_ms();
         let lease = self.inner.config.reservation_lease_ms.max(1);
-        let quota = self.inner.config.quota(class);
-        let total = self.inner.config.total_budget_bytes;
         let row = {
             let mut ledger = self.inner.ledger.lock().unwrap();
             ledger.try_reserve_atomic(
@@ -712,11 +798,12 @@ impl StorageGovernor {
             let ledger = self.inner.ledger.lock().unwrap();
             (ledger.sum_usage()?, ledger.sum_pinned()?)
         };
+        let effective_budget = self.effective_budget();
         let health = DegradedHealth {
             code: format!("storage_{}", reason.as_str()),
             detail: detail.clone(),
             total_bytes,
-            total_budget_bytes: self.inner.config.total_budget_bytes,
+            total_budget_bytes: effective_budget,
             required_bytes,
             class: Some(class),
             at_ms: now_ms(),
@@ -910,8 +997,10 @@ impl StorageGovernor {
         self.evict_row(&object)
     }
 
-    /// Enforce every class quota and the aggregate budget. Returns the bytes
-    /// freed; when the budget still cannot be met health is degraded typed.
+    /// Enforce every class quota, the capacity-aware aggregate budget, and
+    /// the always-preserved free-space reserve. Returns the bytes freed.
+    /// When the reserve still cannot be preserved after evicting noncritical
+    /// classes, health is degraded typed.
     pub fn enforce(&self) -> GovernorResult<u64> {
         self.record_maintenance()?;
         let now = now_ms();
@@ -922,18 +1011,34 @@ impl StorageGovernor {
             .lock()
             .unwrap()
             .set_meta("last_enforce_ms", &now.to_string());
+        let capacity = self.capacity_snapshot();
+        let effective_budget = capacity.effective_budget_bytes;
         let mut freed = 0u64;
         let usage = self.inner.ledger.lock().unwrap().usage()?;
         for class in StorageClass::ALL {
             let used = usage.get(&class).map(|row| row.bytes).unwrap_or(0);
-            let quota = self.inner.config.quota(class);
+            let quota = self.inner.config.quota_for(class, effective_budget);
             if used > quota {
                 freed += self.evict_class_for(class, used - quota)?;
             }
         }
         let total_used = self.inner.ledger.lock().unwrap().sum_usage()?;
-        if total_used > self.inner.config.total_budget_bytes {
-            freed += self.evict_global_for(total_used - self.inner.config.total_budget_bytes)?;
+        if total_used > effective_budget {
+            freed += self.evict_global_for(total_used - effective_budget)?;
+        }
+        // Actual disk headroom: if free space has fallen into the reserve,
+        // reclaim noncritical classes until the reserve is whole again.
+        for _attempt in 0..3 {
+            let capacity = self.capacity_snapshot();
+            let deficit = capacity.reserve_deficit();
+            if deficit == 0 {
+                break;
+            }
+            let reclaimed = self.evict_global_for(deficit)?;
+            if reclaimed == 0 {
+                break;
+            }
+            freed = freed.saturating_add(reclaimed);
         }
         self.clear_degraded_if_healthy()?;
         self.evaluate_degraded()?;
@@ -954,7 +1059,10 @@ impl StorageGovernor {
             .get(&class)
             .map(|row| row.bytes)
             .unwrap_or(0);
-        let quota = self.inner.config.quota(class);
+        let quota = self
+            .inner
+            .config
+            .quota_for(class, self.capacity_snapshot().effective_budget_bytes);
         if used > quota {
             let freed = self.evict_class_for(class, used - quota)?;
             self.clear_degraded_if_healthy()?;
@@ -1048,6 +1156,8 @@ impl StorageGovernor {
                 ledger.pending_count()?,
             )
         };
+        let capacity = self.capacity_snapshot();
+        let effective_budget = capacity.effective_budget_bytes;
         let mut per_class = BTreeMap::new();
         for class in StorageClass::ALL {
             let usage = usage.get(&class).cloned().unwrap_or_else(UsageRow::default);
@@ -1057,25 +1167,29 @@ impl StorageGovernor {
                     class,
                     bytes: usage.bytes,
                     objects: usage.objects,
-                    quota_bytes: self.inner.config.quota(class),
+                    quota_bytes: self.inner.config.quota_for(class, effective_budget),
                     pinned_bytes: usage.pinned_bytes,
                     pending_reservation_bytes: pending.get(&class).copied().unwrap_or(0),
                 },
             );
         }
-        let watermark_floor = self
-            .inner
-            .config
-            .total_budget_bytes
-            .saturating_mul(self.inner.config.watermark_permille as u64)
-            / 1000;
+        let watermark_floor =
+            effective_budget.saturating_mul(self.inner.config.watermark_permille as u64) / 1000;
         Ok(StorageMetrics {
             total_bytes: total,
-            total_budget_bytes: self.inner.config.total_budget_bytes,
+            total_budget_bytes: effective_budget,
+            configured_budget_bytes: self.inner.config.total_budget_bytes,
+            capacity_bytes: capacity.capacity_bytes,
+            available_bytes: capacity.available_bytes,
+            reserve_bytes: capacity.reserve_bytes,
+            effective_budget_bytes: effective_budget,
+            headroom_bytes: capacity.headroom_bytes,
+            capacity_measured: capacity.measured,
+            filesystems: capacity.filesystems,
             total_objects: objects,
             used_permille_of_budget: total
                 .saturating_mul(1000)
-                .checked_div(self.inner.config.total_budget_bytes)
+                .checked_div(effective_budget)
                 .unwrap_or(0),
             watermark_permille: self.inner.config.watermark_permille,
             above_watermark: total >= watermark_floor,
@@ -1181,19 +1295,12 @@ impl StorageGovernor {
     /// policy, not a refusal threshold: the hard budget remains the limit.
     fn maintain_watermark(&self) -> GovernorResult<()> {
         let total = self.inner.ledger.lock().unwrap().sum_usage()?;
-        let floor = self
-            .inner
-            .config
-            .total_budget_bytes
-            .saturating_mul(self.inner.config.watermark_permille as u64)
-            / 1000;
+        let effective_budget = self.effective_budget();
+        let floor =
+            effective_budget.saturating_mul(self.inner.config.watermark_permille as u64) / 1000;
         if total > floor {
             let low = floor.saturating_sub(
-                self.inner
-                    .config
-                    .total_budget_bytes
-                    .saturating_mul(WATERMARK_HYSTERESIS_PERMILLE)
-                    / 1000,
+                effective_budget.saturating_mul(WATERMARK_HYSTERESIS_PERMILLE) / 1000,
             );
             let _ = self.evict_global_for(total - low)?;
         }
@@ -1224,54 +1331,73 @@ impl StorageGovernor {
             let ledger = self.inner.ledger.lock().unwrap();
             (ledger.usage()?, ledger.sum_usage()?, ledger.sum_pinned()?)
         };
-        let structural = if total > self.inner.config.total_budget_bytes {
-            Some(DegradedHealth {
-                code: "aggregate_budget_exceeded".into(),
+        let capacity = self.capacity_snapshot();
+        let effective_budget = capacity.effective_budget_bytes;
+        let reserve_pressure = capacity.measured.then(|| {
+            let deficit = capacity.reserve_deficit();
+            (deficit > 0).then(|| DegradedHealth {
+                code: "free_space_reserve_unmet".into(),
                 detail: format!(
-                    "{} bytes exceed the hard {} byte aggregate budget and no evictable object remains",
-                    total, self.inner.config.total_budget_bytes
+                    "{} bytes of free space remain but the {} byte reserve must be preserved; no evictable noncritical object remains",
+                    capacity.available_bytes, capacity.reserve_bytes
                 ),
                 total_bytes: total,
-                total_budget_bytes: self.inner.config.total_budget_bytes,
-                required_bytes: pinned,
+                total_budget_bytes: effective_budget,
+                required_bytes: pinned.saturating_add(deficit),
                 class: None,
                 at_ms: now_ms(),
             })
-        } else {
-            usage
-                .iter()
-                .find_map(|(class, row)| {
-                    let quota = self.inner.config.quota(*class);
-                    (row.bytes > quota).then(|| DegradedHealth {
-                        code: "class_quota_exceeded".into(),
-                        detail: format!(
-                            "{} holds {} bytes over its {} byte quota and no evictable object remains",
-                            class.as_str(),
-                            row.bytes - quota,
-                            quota
-                        ),
-                        total_bytes: total,
-                        total_budget_bytes: self.inner.config.total_budget_bytes,
-                        required_bytes: row.pinned_bytes,
-                        class: Some(*class),
-                        at_ms: now_ms(),
-                    })
+        });
+        let structural = reserve_pressure.flatten().or_else(|| {
+            if total > effective_budget {
+                Some(DegradedHealth {
+                    code: "aggregate_budget_exceeded".into(),
+                    detail: format!(
+                        "{} bytes exceed the hard {} byte effective aggregate budget and no evictable object remains",
+                        total, effective_budget
+                    ),
+                    total_bytes: total,
+                    total_budget_bytes: effective_budget,
+                    required_bytes: pinned,
+                    class: None,
+                    at_ms: now_ms(),
                 })
-                .or_else(|| {
-                    (pinned > self.inner.config.total_budget_bytes).then(|| DegradedHealth {
-                        code: "required_bytes_exceed_budget".into(),
-                        detail: format!(
-                            "{} required bytes exceed the hard {} byte aggregate budget",
-                            pinned, self.inner.config.total_budget_bytes
-                        ),
-                        total_bytes: total,
-                        total_budget_bytes: self.inner.config.total_budget_bytes,
-                        required_bytes: pinned,
-                        class: None,
-                        at_ms: now_ms(),
+            } else {
+                usage
+                    .iter()
+                    .find_map(|(class, row)| {
+                        let quota = self.inner.config.quota_for(*class, effective_budget);
+                        (row.bytes > quota).then(|| DegradedHealth {
+                            code: "class_quota_exceeded".into(),
+                            detail: format!(
+                                "{} holds {} bytes over its {} byte quota and no evictable object remains",
+                                class.as_str(),
+                                row.bytes - quota,
+                                quota
+                            ),
+                            total_bytes: total,
+                            total_budget_bytes: effective_budget,
+                            required_bytes: row.pinned_bytes,
+                            class: Some(*class),
+                            at_ms: now_ms(),
+                        })
                     })
-                })
-        };
+                    .or_else(|| {
+                        (pinned > effective_budget).then(|| DegradedHealth {
+                            code: "required_bytes_exceed_budget".into(),
+                            detail: format!(
+                                "{} required bytes exceed the hard {} byte aggregate budget",
+                                pinned, effective_budget
+                            ),
+                            total_bytes: total,
+                            total_budget_bytes: effective_budget,
+                            required_bytes: pinned,
+                            class: None,
+                            at_ms: now_ms(),
+                        })
+                    })
+            }
+        });
         let scan_error =
             self.inner
                 .scan_errors
@@ -1283,7 +1409,7 @@ impl StorageGovernor {
                     code: "storage_scan_failed".into(),
                     detail: format!("{} scan failed: {detail}", class.as_str()),
                     total_bytes: total,
-                    total_budget_bytes: self.inner.config.total_budget_bytes,
+                    total_budget_bytes: effective_budget,
                     required_bytes: pinned,
                     class: Some(*class),
                     at_ms: now_ms(),
@@ -1316,10 +1442,13 @@ impl StorageGovernor {
         let total = ledger.sum_usage()?;
         let usage = ledger.usage()?;
         drop(ledger);
-        if total <= self.inner.config.total_budget_bytes
-            && usage
-                .iter()
-                .all(|(class, row)| row.bytes <= self.inner.config.quota(*class))
+        let capacity = self.capacity_snapshot();
+        let effective_budget = capacity.effective_budget_bytes;
+        if total <= effective_budget
+            && usage.iter().all(|(class, row)| {
+                row.bytes <= self.inner.config.quota_for(*class, effective_budget)
+            })
+            && capacity.reserve_deficit() == 0
         {
             *self.inner.degraded.lock().unwrap() = None;
             let _ = self.inner.ledger.lock().unwrap().set_meta("degraded", "");
@@ -1414,7 +1543,10 @@ impl StorageGovernor {
             .get(&StorageClass::SqliteWal)
             .map(|row| row.bytes)
             .unwrap_or(0);
-        let quota = self.inner.config.quota(StorageClass::SqliteWal);
+        let quota = self.inner.config.quota_for(
+            StorageClass::SqliteWal,
+            self.capacity_snapshot().effective_budget_bytes,
+        );
         if used > quota {
             // A live database cannot be deleted; only the WAL can shrink. If
             // the database alone exceeds the quota the budget cannot be met
@@ -1497,8 +1629,12 @@ impl StorageGovernor {
         tracked: bool,
     ) -> GovernorResult<Option<SqliteAdmission>> {
         let bound = sqlite_growth_bound(incoming_bytes);
-        let quota = self.inner.config.quota(StorageClass::SqliteWal);
-        let total = self.inner.config.total_budget_bytes;
+        let capacity = self.capacity_snapshot();
+        if capacity.measured && bound > capacity.headroom_bytes {
+            return Ok(None);
+        }
+        let total = capacity.effective_budget_bytes;
+        let quota = self.inner.config.quota_for(StorageClass::SqliteWal, total);
         loop {
             if self.sqlite_room(incoming_bytes, quota, total)?.is_none() {
                 break;
@@ -1602,6 +1738,16 @@ impl StorageGovernor {
                 return Ok(Some(admission));
             }
         }
+        // Actual disk headroom: reclaim noncritical classes before refusing
+        // an append that would consume the free-space reserve.
+        let capacity = self.capacity_snapshot();
+        let headroom_deficit = capacity.admission_deficit(sqlite_growth_bound(incoming_bytes));
+        if headroom_deficit > 0 {
+            let _ = self.evict_global_for(headroom_deficit);
+            if let Some(admission) = self.charge_sqlite_growth(incoming_bytes, tracked)? {
+                return Ok(Some(admission));
+            }
+        }
         let now = now_ms();
         let snapshot = self
             .inner
@@ -1609,8 +1755,9 @@ impl StorageGovernor {
             .lock()
             .unwrap()
             .budget_snapshot(StorageClass::SqliteWal, now)?;
-        let quota = self.inner.config.quota(StorageClass::SqliteWal);
-        let total = self.inner.config.total_budget_bytes;
+        let capacity = self.capacity_snapshot();
+        let total = capacity.effective_budget_bytes;
+        let quota = self.inner.config.quota_for(StorageClass::SqliteWal, total);
         let debt = self.inner.wal_debt.admitted.load(Ordering::Acquire);
         let class_used = snapshot
             .class_bytes
@@ -1622,14 +1769,17 @@ impl StorageGovernor {
             .saturating_add(debt);
         let pinned = snapshot.total_pinned;
         let bound = sqlite_growth_bound(incoming_bytes);
-        let reason = if class_used.saturating_add(bound) > quota {
+        let reason = if capacity.measured && bound > capacity.headroom_bytes {
+            RefusalReason::FreeSpaceReserve
+        } else if class_used.saturating_add(bound) > quota {
             RefusalReason::ClassQuota
         } else {
             RefusalReason::AggregateBudget
         };
         let available = quota
             .saturating_sub(class_used)
-            .min(total.saturating_sub(total_used));
+            .min(total.saturating_sub(total_used))
+            .min(capacity.headroom_bytes);
         {
             let mut ledger = self.inner.ledger.lock().unwrap();
             ledger.record_refusal(
@@ -1814,39 +1964,50 @@ impl Reservation {
                 false,
             )?;
             let total = self.governor.inner.ledger.lock().unwrap().sum_usage()?;
-            if total > self.governor.inner.config.total_budget_bytes {
+            let capacity = self.governor.capacity_snapshot();
+            let effective_budget = capacity.effective_budget_bytes;
+            if total > effective_budget {
                 let pinned = self.governor.inner.ledger.lock().unwrap().sum_pinned()?;
                 self.governor.record_degraded(DegradedHealth {
                     code: "reservation_lease_expired_over_budget".into(),
                     detail: format!(
                         "publish of {} bytes committed after its reservation expired and took total usage to {total} (hard {} bytes)",
-                        actual_bytes, self.governor.inner.config.total_budget_bytes
+                        actual_bytes, effective_budget
                     ),
                     total_bytes: total,
-                    total_budget_bytes: self.governor.inner.config.total_budget_bytes,
+                    total_budget_bytes: effective_budget,
                     required_bytes: pinned,
                     class: Some(self.class),
                     at_ms: now_ms(),
                 })?;
                 let _ = self.governor.enforce();
+            } else if capacity.reserve_deficit() > 0 {
+                let _ = self.governor.enforce();
             }
             return Ok(());
         }
         let total = self.governor.inner.ledger.lock().unwrap().sum_usage()?;
-        if total > self.governor.inner.config.total_budget_bytes {
+        let capacity = self.governor.capacity_snapshot();
+        let effective_budget = capacity.effective_budget_bytes;
+        if total > effective_budget {
             let pinned = self.governor.inner.ledger.lock().unwrap().sum_pinned()?;
             self.governor.record_degraded(DegradedHealth {
                 code: "aggregate_budget_exceeded".into(),
                 detail: format!(
                     "commit of {} bytes made total usage {total} exceed the hard {} byte budget",
-                    actual_bytes, self.governor.inner.config.total_budget_bytes
+                    actual_bytes, effective_budget
                 ),
                 total_bytes: total,
-                total_budget_bytes: self.governor.inner.config.total_budget_bytes,
+                total_budget_bytes: effective_budget,
                 required_bytes: pinned,
                 class: Some(self.class),
                 at_ms: now_ms(),
             })?;
+        }
+        if capacity.reserve_deficit() > 0 {
+            // Another process may have consumed the reserve while this
+            // reservation was in flight; reclaim before reporting success.
+            let _ = self.governor.enforce();
         }
         Ok(())
     }

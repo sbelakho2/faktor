@@ -85,6 +85,9 @@ pub fn install_backends(cas: &Arc<Cas>) -> GovernorResult<()> {
     let Some(governor) = cas.governor() else {
         return Ok(());
     };
+    // The CAS root can live outside the data directory; measure its backing
+    // filesystem too (deduplicated with every other root on that volume).
+    governor.register_capacity_root(cas.root());
     let classes: &[StorageClass] = match cas.storage_class() {
         StorageClass::EvidenceCas => &[StorageClass::EvidenceCas],
         _ => &[

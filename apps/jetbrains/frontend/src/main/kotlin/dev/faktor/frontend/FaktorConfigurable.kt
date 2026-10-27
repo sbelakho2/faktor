@@ -198,33 +198,12 @@ class FaktorConfigurable : Configurable {
                 )
             )
         }
-        val screensButton = secondaryButton("Open Revision 8 screens…")
-        screensButton.toolTipText = "Open the 72 Revision 8 Work, Inspect and History screens"
-        screensButton.a11y(
-            "Open Revision 8 screens",
-            "Opens the registry-driven screen browser for providers, context, tools, usage and setup."
-        )
-        screensButton.addActionListener {
-            Edition8ScreenBrowser(edition8Host()).show(component, settingsHome = true)
-        }
-        val screensBody = pageColumn(gap = Spacing.XS, padding = 0).apply {
-            add(actionRow(screensButton))
-            add(
-                wrappedMutedLabel(
-                    "The screens are the host presentation of the same native contracts used by the " +
-                        "tool window. Secrets stay in PasswordSafe; no screen fabricates a Saved, " +
-                        "Connected or Verified state."
-                )
-            )
-        }
         val body = pageColumn().apply {
             add(card("Service", serviceBody))
             add(vSpace(Spacing.M))
             add(card("Run defaults", runBody))
             add(vSpace(Spacing.M))
             add(card("Optional control plane", controlPlaneBody))
-            add(vSpace(Spacing.M))
-            add(card("Revision 8 screens", screensBody))
         }
         // The Edition 5 settings tree: General (the host-local application
         // settings above) plus every daemon-backed category. The same panel

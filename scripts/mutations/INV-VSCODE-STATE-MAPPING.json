@@ -1,0 +1,14 @@
+{
+  "id": "INV-VSCODE-STATE-MAPPING",
+  "file": "apps/vscode/src/uxState.ts",
+  "find": "  if (CREDENTIAL_PATTERN.test(raw)) {",
+  "replace": "  if (false && CREDENTIAL_PATTERN.test(raw)) {",
+  "gate": "node apps/vscode/scripts/ux-state.mjs",
+  "expect": "FAILED",
+  "note": "Dropping the credential cause makes the run fall back to a generic failure instead of provider settings.",
+  "capabilities": [
+    "vscode.state.cause_specific"
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+}

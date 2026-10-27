@@ -1,0 +1,14 @@
+{
+  "id": "INV-VSCODE-ATTENTION-AGGREGATION",
+  "file": "apps/vscode/src/uxState.ts",
+  "find": "const MAX_ATTENTION_GROUPS = 3;",
+  "replace": "const MAX_ATTENTION_GROUPS = 5;",
+  "gate": "node apps/vscode/scripts/ux-state.mjs",
+  "expect": "FAILED",
+  "note": "Raising the group cap renders a wall of attention rows instead of the at-most-three summary.",
+  "capabilities": [
+    "vscode.attention.aggregated"
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+}

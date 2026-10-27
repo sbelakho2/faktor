@@ -12,8 +12,8 @@
 
 import type { AgentSummary, TaskSummary, UsageSummary, VerificationSummary } from './state';
 import { safeSlice, stripDisplayControls } from './displayText.ts';
+import { humanUsd } from './uxState.ts';
 import {
-  contractDisclosureLines,
   contractOriginLabel,
   engineeringContractIsEmpty,
   evidenceKindLabel,
@@ -1164,7 +1164,7 @@ export function buildUsagePanel(input: CockpitUsageInput): CockpitUsagePanel {
 
 /** Exact micro-USD display of one canonical decimal money string. */
 function microText(value: string): string {
-  return `${value}\u00b5$`;
+  return humanUsd(value) ?? `${value}\u00b5$`;
 }
 
 /** Exact minor-unit money display; never converts through a float. */
@@ -2547,44 +2547,13 @@ function completionPending(completion: CockpitCompletionView | null): boolean {
 /** The render plan of the persistent cockpit panel, in fixed order. */
 export function cockpitSections(view: CockpitView): CockpitSection[] {
   const sections: CockpitSection[] = [];
-  // "Needs disclosure" leads the run details whenever the served contract
-  // owes one: a high/unknown risk, an unsatisfied proof obligation, or a
-  // contract member that exists but could not be read. Text-first; the
-  // state token is the core's own (`risk:high`, `inferred`, ...).
-  const disclosureLines: string[] = [];
-  if (view.contractMalformed !== null) {
-    disclosureLines.push(`contract unreadable · ${view.contractMalformed}`);
-  }
-  if (view.contractDroppedRows > 0) {
-    disclosureLines.push(
-      `contract incomplete · ${view.contractDroppedRows} ${
-        view.contractDroppedRows === 1 ? 'entry' : 'entries'
-      } could not be read and are not rendered`,
-    );
-  }
-  if (view.contract !== null) {
-    disclosureLines.push(
-      ...contractDisclosureLines(view.contract).map((line) => `${line.state} · ${line.summary}`),
-    );
-  }
-  if (disclosureLines.length > 0) {
-    sections.push({
-      key: 'disclosure',
-      title: 'Needs disclosure',
-      present: true,
-      lines: disclosureLines.slice(0, MAX_LINES),
-      evidence: [],
-    });
-  }
   const proofLines = view.criteriaProof
     .slice(0, MAX_CRITERIA_PROOF)
     .map((row) => criterionProofLine(row));
   const acceptanceLines =
     proofLines.length > 0
       ? proofLines
-      : view.acceptanceCriteria.length > 0
-        ? view.acceptanceCriteria.map((criterion) => `• ${criterion}`)
-        : ['none'];
+      : view.acceptanceCriteria.map((criterion) => `• ${criterion}`);
   sections.push({
     key: 'acceptance',
     title: 'Acceptance criteria · proof',
@@ -2691,7 +2660,7 @@ export function cockpitSections(view: CockpitView): CockpitSection[] {
             const kids = step.childIds.length > 0 ? ` → ${step.childIds.join(', ')}` : '';
             return `[${step.status}] ${step.id}: ${step.summary}${deps}${kids}`;
           })
-        : ['none'],
+        : [],
     evidence: [],
   });
   const completionLines =
@@ -2857,5 +2826,12 @@ export function cockpitSections(view: CockpitView): CockpitSection[] {
       : ['none'],
     evidence: [],
   });
-  return sections;
+  // Absent sections are OMITTED entirely: the UI never renders `none`,
+  // `0µ$` or `not integrated` cards for unserved domains.
+  return sections.filter(
+    (section) =>
+      section.present ||
+      (section.criteria !== undefined && section.criteria.length > 0) ||
+      (section.actions !== undefined && section.actions.length > 0),
+  );
 }

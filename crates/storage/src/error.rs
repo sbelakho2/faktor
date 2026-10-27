@@ -18,6 +18,9 @@ pub enum RefusalReason {
     RequiredBytes,
     /// The class has no registered eviction backend.
     NoBackend,
+    /// Admitting the bytes would consume the always-preserved free-space
+    /// reserve (measured free space, not only the nominal quota).
+    FreeSpaceReserve,
     /// A backend refused the eviction (integrity failure, active file, ...).
     BackendRefused,
     /// The request itself is malformed (zero length, invalid key, ...).
@@ -32,6 +35,7 @@ impl RefusalReason {
             RefusalReason::NoEvictableObjects => "no_evictable_objects",
             RefusalReason::RequiredBytes => "required_bytes",
             RefusalReason::NoBackend => "no_backend",
+            RefusalReason::FreeSpaceReserve => "free_space_reserve",
             RefusalReason::BackendRefused => "backend_refused",
             RefusalReason::InvalidRequest => "invalid_request",
         }

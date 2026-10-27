@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::capacity::FilesystemCapacity;
 use crate::class::StorageClass;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -22,7 +23,25 @@ pub struct ClassUsage {
 #[serde(rename_all = "camelCase")]
 pub struct StorageMetrics {
     pub total_bytes: u64,
+    /// The EFFECTIVE hard budget (min of the operator cap and the measured
+    /// capacity-relative cap); class quotas and watermarks use this number.
     pub total_budget_bytes: u64,
+    /// The operator cap as configured (before capacity clamping).
+    pub configured_budget_bytes: u64,
+    /// Total capacity of the distinct backing filesystems (shared volumes
+    /// counted once).
+    pub capacity_bytes: u64,
+    /// Free bytes available to an unprivileged writer right now.
+    pub available_bytes: u64,
+    /// Always-preserved free-space reserve: max(reserve_bytes, 5% capacity).
+    pub reserve_bytes: u64,
+    pub effective_budget_bytes: u64,
+    /// Free bytes above the reserve (`available - reserve`).
+    pub headroom_bytes: u64,
+    /// False when capacity could not be measured; the operator cap alone
+    /// applies and no capacity number is fabricated.
+    pub capacity_measured: bool,
+    pub filesystems: Vec<FilesystemCapacity>,
     pub total_objects: u64,
     /// Aggregate usage in permille of the hard budget (can exceed 1000 only
     /// when a class could not be evicted; health then names it degraded).

@@ -125,10 +125,10 @@ class Edition8Controller {
         this.state = {
           ...this.state,
           loading: false,
-          error: 'The Faktor service is not running. Start it to read the served state; the previous snapshot is preserved.',
+          error: 'Faktor is reconnecting. Open Diagnostics if this persists; the previous snapshot is preserved.',
         };
         this.post({ type: 'e8Error', message: this.state.error });
-        this.post({ type: 'e8Header', status: 'Service unavailable', level: 'error' });
+        this.post({ type: 'e8Header', status: 'Reconnecting…', level: 'waiting' });
         return;
       }
       const binding = this.deps.workspace();
@@ -205,6 +205,7 @@ class Edition8Controller {
         if (
           command === 'faktor.openChat' ||
           command === 'faktor.startServer' ||
+          command === 'faktor.stopServer' ||
           command === 'faktor.trustExecutable8' ||
           command === 'faktor.controlPlaneSignIn'
         ) {

@@ -1837,10 +1837,17 @@ pub(crate) fn doctor_storage_governor_line(
                 .collect::<Vec<_>>()
                 .join(" ");
             lines.push(format!(
-                "storage-governor: total={}/{} bytes ({} permille) objects={} evictions={} refusals={} pending={} loss-markers={} watermark={} permille above-watermark={} last-maintenance-ms={} classes=[{}]",
+                "storage-governor: total={}/{} bytes ({} permille) capacity={} free={} reserve={} effective-budget={} headroom={} measured={} filesystems={} objects={} evictions={} refusals={} pending={} loss-markers={} watermark={} permille above-watermark={} last-maintenance-ms={} classes=[{}]",
                 metrics.total_bytes,
                 metrics.total_budget_bytes,
                 metrics.used_permille_of_budget,
+                metrics.capacity_bytes,
+                metrics.available_bytes,
+                metrics.reserve_bytes,
+                metrics.effective_budget_bytes,
+                metrics.headroom_bytes,
+                metrics.capacity_measured,
+                metrics.filesystems.len(),
                 metrics.total_objects,
                 metrics.evictions,
                 metrics.refusals,

@@ -214,6 +214,7 @@ fn compaction_archive_store_is_classified_evictable_and_leaves_a_loss_marker() {
                 )
             })
             .collect(),
+        ..Default::default()
     }
     .validated()
     .unwrap();

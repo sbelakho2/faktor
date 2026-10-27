@@ -1634,6 +1634,7 @@ async fn terminal_capture_is_refused_before_publish_when_its_class_budget_is_ful
                 )
             })
             .collect(),
+        ..Default::default()
     }
     .validated()
     .unwrap();

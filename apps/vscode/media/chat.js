@@ -101,8 +101,8 @@
     },
     startUnavailable: {
       glyph: '!',
-      label: 'Start response unavailable',
-      copy: 'The draft was kept. Retry checks the same logical submission.',
+      label: "Couldn't start",
+      copy: 'The draft was kept. Retry uses the same request.',
     },
     needsInput: {
       glyph: '!',
@@ -121,10 +121,10 @@
       label: 'Checking the change',
       copy: 'Required results remain attached to this candidate.',
     },
-    providerFailed: {
-      glyph: '!',
-      label: 'Run needs recovery',
-      copy: 'The durable run is preserved as recoverable. Read the error, then send the task again; nothing was marked complete.',
+    paused: {
+      glyph: '\u23f8',
+      label: 'Paused',
+      copy: 'Your task is saved. Resume it when you are ready; nothing needs to be sent again.',
     },
     cancelled: {
       glyph: '\u2298',
@@ -154,6 +154,8 @@
   // post, so a double click / Enter+click race can never emit a second
   // sendGoal; it is released ONLY by an explicit host result.
   var submitting = false;
+  /** The ONE composer's explicit intent. Ask is the product default. */
+  var composerIntent = 'ask';
   /**
    * True after the host explicitly reported a RETRYABLE failed start
    * (`startResult` ok false with `retryable: true`): the draft was kept and
@@ -899,20 +901,30 @@
       key: 'overview',
       label: 'Overview',
       tab: 'subtab-overview',
-      sections: ['disclosure', 'acceptance', 'contract', 'proof', 'integration', 'completion', 'phase', 'spend', 'usage'],
+      sections: [],
     },
     {
       key: 'plan',
       label: 'Plan',
       tab: 'subtab-plan',
-      sections: ['plan', 'children', 'tournament', 'blockers'],
+      sections: ['plan', 'children', 'tournament', 'phase'],
     },
     { key: 'changes', label: 'Changes', tab: 'subtab-changes', sections: [] },
     {
       key: 'verification',
       label: 'Verification',
       tab: 'subtab-verification',
-      sections: ['verification', 'evidence'],
+      sections: [
+        'verification',
+        'evidence',
+        'acceptance',
+        'contract',
+        'proof',
+        'integration',
+        'phase',
+        'spend',
+        'blockers',
+      ],
     },
     { key: 'agents', label: 'Agents', tab: 'subtab-agents', sections: [] },
   ];
@@ -937,6 +949,7 @@
   var HISTORY_TABS = [
     { key: 'conversations', tab: 'history-tab-conversations', panel: 'history-conversations' },
     { key: 'outcomes', tab: 'history-tab-outcomes', panel: 'history-outcomes' },
+    { key: 'account', tab: 'history-tab-account', panel: 'history-account' },
   ];
 
   function subviewOf(key) {
@@ -1162,6 +1175,7 @@
     if (!snapshot) {
       return;
     }
+    renderCompletion(snapshot.task);
     renderCockpit(snapshot.cockpit, sectionsForSubview(activeSubview, snapshot.cockpitSections));
     renderChanges(snapshot);
     renderAgents(snapshot.agents);
@@ -1202,6 +1216,7 @@
     select.className = 'change-select';
     select.setAttribute('aria-pressed', selected ? 'true' : 'false');
     select.textContent = String(row.path);
+    select.title = String(row.path);
     select.addEventListener('click', function () {
       selectChange(index, rowsFromSnapshot());
     });
@@ -1908,6 +1923,10 @@
       updateOutcomesControls(lastSnapshot ? lastSnapshot.outcomes : null);
       vscode.postMessage({ type: 'readOutcomes' });
       renderOutcomes(lastSnapshot);
+    } else if (spec.key === 'account') {
+      // Commercial data is lazy: this explicit open is the only trigger.
+      vscode.postMessage({ type: 'readAccount' });
+      renderAccount(lastSnapshot);
     }
   }
 
@@ -1920,6 +1939,8 @@
     // A stream delta that only grows transcript text must not rebuild it.
     var guardKey =
       (spec === null ? 'none' : spec.label) +
+      '#' +
+      (spec && spec.action ? spec.action.key : 'none') +
       '#' +
       hash128(jsonForHash(task)) +
       '#' +
@@ -1945,6 +1966,7 @@
     }
     renderRunStrip(task, snapshot);
     writeStateStrip(RUN_STATE_IDS, spec);
+    renderRunStateAction(spec === null ? null : spec.action || null);
     renderTaskProgress(task);
     renderStatusTokens(snapshot);
     renderStatusApprovals(snapshot);
@@ -2105,6 +2127,35 @@
   }
 
   /**
+   * The ONE action the shared state points at (Resume, Open provider
+   * settings, Reconnect, Retry, Reply, View checks, Diagnostics). It is
+   * rendered beside the run strip, never as a second competing control.
+   */
+  function renderRunStateAction(action) {
+    var container = byId('run-state');
+    if (!container) {
+      return;
+    }
+    var existing = byId('run-state-action');
+    if (existing && existing.parentNode === container) {
+      container.removeChild(existing);
+    }
+    if (!action || typeof action.key !== 'string' || !action.label) {
+      return;
+    }
+    var button = document.createElement('button');
+    button.id = 'run-state-action';
+    button.type = 'button';
+    button.className = 'secondary state-strip-action';
+    button.textContent = String(action.label);
+    button.setAttribute('data-ux-action', String(action.key));
+    button.addEventListener('click', function () {
+      dispatchUxAction(action);
+    });
+    container.appendChild(button);
+  }
+
+  /**
    * The served run-state strip (T09/T12/T25/T26). Every source is genuinely
    * served, and no source can fabricate a row:
    *   - the newest durable task-run row (`snapshot.runs[0]`, the same row the
@@ -2121,30 +2172,29 @@
    * controls (Inspect, Cancel run, the conversation and New task).
    */
   function runStateSpec(snapshot) {
+    var ux = snapshot && snapshot.ux ? snapshot.ux : null;
+    if (ux) {
+      return {
+        glyph: glyphForPresentation(ux.presentation),
+        label: ux.presentationLabel,
+        copy: ux.presentationDetail,
+        action: ux.presentationAction || null,
+      };
+    }
+    // Compatibility for snapshots produced before the shared UX projection
+    // exists (older harnesses and cached snapshots). The served run sources
+    // and precedence are unchanged; provider failure never says "resend".
     var runs = snapshot && Array.isArray(snapshot.runs) ? snapshot.runs : [];
     var newest = runs.length > 0 ? runs[0] : null;
     var runState =
       newest && newest.state != null ? String(newest.state).trim().toLowerCase() : '';
-    var machineState =
-      snapshot && snapshot.machineState != null
-        ? String(snapshot.machineState).trim().toLowerCase()
-        : '';
-    if (machineState === 'failed_recoverable' || machineState === 'failed') {
-      return RUN_STATES.providerFailed;
-    }
-    if (runState === 'cancelled') {
-      return RUN_STATES.cancelled;
-    }
-    if (runState === 'failed') {
-      return RUN_STATES.failed;
-    }
+    if (runState === 'cancelled') return RUN_STATES.cancelled;
+    if (runState === 'failed') return RUN_STATES.failed;
     var proofState = String(
       snapshot && snapshot.proofTaskState != null ? snapshot.proofTaskState : '',
     )
       .trim()
       .toLowerCase();
-    // T12 (docs/specs/edition8): both served proof states mean checking, and
-    // the same states on a run row are the fallback when the proof is absent.
     if (proofState === 'verifying' || proofState === 'needs_verification') {
       return RUN_STATES.checking;
     }
@@ -2154,18 +2204,34 @@
     if (runState === 'blocked' || runState === 'waiting' || runState === 'pending') {
       return RUN_STATES.needsInput;
     }
-    if (runState === 'running') {
-      return RUN_STATES.running;
-    }
+    if (runState === 'paused') return RUN_STATES.paused;
+    if (runState === 'running') return RUN_STATES.running;
     var tag = String(
       snapshot && snapshot.task && snapshot.task.state != null ? snapshot.task.state : '',
     )
       .trim()
       .toLowerCase();
-    if (tag === 'running') {
-      return RUN_STATES.running;
-    }
+    if (tag === 'running') return RUN_STATES.running;
     return null;
+  }
+
+  function glyphForPresentation(presentation) {
+    switch (String(presentation || '')) {
+      case 'Starting':
+      case 'Planning':
+      case 'Working':
+        return '\u25b6';
+      case 'AwaitingUser':
+      case 'Paused':
+      case 'Failed':
+        return '!';
+      case 'Checking':
+        return '\u2026';
+      case 'Done':
+        return '\u2713';
+      default:
+        return '\u2713';
+    }
   }
 
   /**
@@ -2662,6 +2728,9 @@
     if (!node) {
       return;
     }
+    // Completion is Verification material, never part of the Overview
+    // summary. The old duplicated contract wall is gone from Work/Overview.
+    node.hidden = activeSubview !== 'verification';
     clear(node);
     var completion = task && task.completion ? task.completion : null;
     if (!completion) {
@@ -4487,13 +4556,16 @@
     summary.setAttribute('aria-label', 'Tool activity: ' + parts.join(', '));
   }
 
-  function setDaemon(status, detail) {
+  function setDaemon(status, detail, notice) {
     var dot = byId('daemon-dot');
     if (dot) {
       var dotClass = 'dot dot-' + (status || 'stopped');
       if (dot.className !== dotClass) {
         dot.className = dotClass;
       }
+      // Healthy service state is invisible in the product surface. The dot
+      // appears only with the two transient connection notices.
+      dot.hidden = !notice;
     }
     // The service URL/detail is diagnostics: it renders only inside the
     // Diagnostics card, never in the product header.
@@ -4502,19 +4574,16 @@
 
   /**
    * The product status line of the header: `Ready · <model>` while idle,
-   * `Running · <n> agents · <state>` while a run is active. Service
-   * start/stop vocabulary stays in Diagnostics.
+   * `Running · <n> agents · <state>` while a run is active. Service state is
+   * invisible when healthy; only the two transient connection notices show.
    */
   function headerStatusText(snapshot) {
-    var daemon = snapshot && snapshot.daemon ? String(snapshot.daemon) : 'stopped';
-    if (daemon === 'starting') {
-      return 'Starting service…';
+    var notice = snapshot && snapshot.connectionNotice;
+    if (notice === 'connecting') {
+      return 'Connecting to Faktor…';
     }
-    if (daemon === 'error') {
-      return 'Service unavailable';
-    }
-    if (daemon !== 'running') {
-      return 'Ready';
+    if (notice === 'reconnecting') {
+      return 'Reconnecting…';
     }
     var task = snapshot.task;
     var hasActiveRun = snapshot.busy === true || snapshot.activeRunId != null;
@@ -4604,6 +4673,7 @@
         label.className = 'attachment-label';
         label.textContent =
           (item.filename || '(unnamed)') + ' · ' + item.mime + ' · ' + formatBytes(item.bytes);
+        label.title = label.textContent;
         row.appendChild(label);
         var status = document.createElement('span');
         status.className = 'attachment-status ' + (item.refusal ? 'status-refused' : 'status-ready');
@@ -5015,6 +5085,14 @@
       vscode.postMessage({ type: 'startDaemon' });
     } else if (key === 'locateDaemon') {
       vscode.postMessage({ type: 'locateDaemon' });
+    } else if (key === 'retryStart') {
+      vscode.postMessage({ type: 'retryStart' });
+    } else if (key === 'reviewTrust') {
+      vscode.postMessage({ type: 'reviewTrust' });
+    } else if (key === 'manageWorkspaceTrust') {
+      vscode.postMessage({ type: 'manageWorkspaceTrust' });
+    } else if (key === 'openDiagnostics') {
+      setDiagnosticsOpen(true);
     } else if (key === 'startAnyway') {
       vscode.postMessage({ type: 'confirmStart' });
     } else if (key === 'cancelConfirm') {
@@ -5134,58 +5212,63 @@
   }
 
   /**
-   * Render the ONE preflight view: the Work empty-state card and the
-   * Diagnostics mirror share this exact state, label, copy and actions.
+   * The normal surface shows ONLY genuine authority. Healthy, connecting and
+   * reconnecting states use the transient header line instead, so a normal
+   * user never sees daemon/readiness vocabulary.
    */
-  function renderPreflight(view) {
-    lastPreflight = view && typeof view.state === 'string' ? view : null;
+  function renderServiceAuthority(authority) {
     var card = byId('preflight-card');
-    if (card) {
-      if (lastPreflight === null) {
-        card.hidden = true;
-      } else {
-        card.hidden = false;
-        card.className = 'preflight preflight-' + lastPreflight.state;
-        var dot = byId('preflight-dot');
-        if (dot) {
-          dot.className = 'dot ' + preflightDotClass(lastPreflight.state);
-        }
-        setText('preflight-label', lastPreflight.label);
-        setText('preflight-copy', lastPreflight.copy);
-        var hasPath =
-          typeof lastPreflight.executable === 'string' && lastPreflight.executable.length > 0;
-        var pathRow = byId('preflight-path-row');
-        if (pathRow) {
-          pathRow.hidden = !hasPath;
-        }
-        if (hasPath) {
-          var pathNode = byId('preflight-path');
-          if (pathNode) {
-            pathNode.textContent = lastPreflight.executable;
-          }
-        }
-        var hasTrust =
-          typeof lastPreflight.trustLabel === 'string' && lastPreflight.trustLabel.length > 0;
-        var trustRow = byId('preflight-trust-row');
-        if (trustRow) {
-          trustRow.hidden = !hasTrust;
-        }
-        if (hasTrust) {
-          setText('preflight-trust', lastPreflight.trustLabel);
-        }
-        var detail = preflightDetailText(lastPreflight);
-        var detailNode = byId('preflight-detail');
-        if (detailNode) {
-          detailNode.hidden = detail === null;
-          detailNode.textContent = detail === null ? '' : detail;
-        }
-        renderPreflightActions('preflight-actions', lastPreflight);
-      }
+    if (!card) {
+      return;
     }
-    renderPreflightMirror(lastPreflight);
+    if (!authority) {
+      card.hidden = true;
+      return;
+    }
+    card.hidden = false;
+    card.className = 'preflight preflight-attention';
+    var dot = byId('preflight-dot');
+    if (dot) {
+      dot.className = 'dot dot-error';
+    }
+    setText('preflight-label', authority.label);
+    setText('preflight-copy', authority.copy);
+    var pathRow = byId('preflight-path-row');
+    if (pathRow) {
+      pathRow.hidden = true;
+    }
+    var trustRow = byId('preflight-trust-row');
+    if (trustRow) {
+      trustRow.hidden = true;
+    }
+    var detailNode = byId('preflight-detail');
+    if (detailNode) {
+      detailNode.hidden = true;
+      detailNode.textContent = '';
+    }
+    renderPreflightActions('preflight-actions', authority);
+  }
+
+  /** Diagnostics → Service: the exact supervised lifecycle detail. */
+  function renderServiceDiagnostics(service) {
+    if (service) {
+      setText('machine-label', service.phase);
+    }
+    setText('svc-executable', service && service.executable ? service.executable : null);
+    setText('svc-port', service && service.port != null ? String(service.port) : null);
+    setText('svc-process', service && service.pid != null ? 'pid ' + service.pid : null);
+    setText(
+      'svc-restarts',
+      service
+        ? String(service.restarts) + ' / ' + String(service.restartBudget)
+        : null,
+    );
+    setText('svc-last-failure', service && service.lastFailure ? service.lastFailure : null);
   }
 
   function renderPreflightMirror(view) {
+    lastPreflight = view && typeof view.state === 'string' ? view : null;
+    view = lastPreflight;
     var mirror = byId('diagnostics-preflight');
     if (!mirror) {
       return;
@@ -5228,6 +5311,185 @@
       detailNode.textContent = lines.join('\n');
     }
     renderPreflightActions('diag-preflight-actions', view);
+  }
+
+  function usdMicro(value) {
+    var raw = String(value === null || value === undefined ? '' : value);
+    if (!/^[0-9]+$/.test(raw)) {
+      return null;
+    }
+    var micro = BigInt(raw);
+    if (micro === 0n) return '$0.00';
+    if (micro < 10000n) return 'under $0.01';
+    var whole = micro / 1000000n;
+    var remainder = micro % 1000000n;
+    var cents = (remainder + 5000n) / 10000n;
+    if (cents >= 100n) {
+      whole += 1n;
+      cents -= 100n;
+    }
+    return '$' + whole.toString() + '.' + cents.toString().padStart(2, '0');
+  }
+
+  function dispatchUxAction(action) {
+    if (!action || typeof action.key !== 'string') return;
+    if (action.key === 'openProviderSettings') {
+      vscode.postMessage({ type: 'openProviderSettings' });
+      return;
+    }
+    if (action.key === 'reconnect' || action.key === 'resumeRun') {
+      vscode.postMessage({ type: 'uxAction', action: action.key });
+      return;
+    }
+    if (action.key === 'retryStart') {
+      requestStart();
+      return;
+    }
+    if (action.key === 'openChecks') {
+      selectTopTab('nav-inspect');
+      selectSubviewTab('subtab-verification');
+      return;
+    }
+    if (action.key === 'openDiagnostics') {
+      var diagnostics = byId('diagnostics');
+      if (diagnostics) diagnostics.hidden = false;
+      return;
+    }
+    if (action.key === 'reply') {
+      var goal = byId('goal');
+      if (goal && typeof goal.focus === 'function') goal.focus();
+    }
+  }
+
+  function renderAttention(snapshot) {
+    var card = byId('attention-card');
+    var list = byId('attention-list');
+    if (!card || !list) return;
+    var items = snapshot && snapshot.ux && Array.isArray(snapshot.ux.attention)
+      ? snapshot.ux.attention.slice(0, 3)
+      : [];
+    clear(list);
+    card.hidden = items.length === 0;
+    if (items.length === 0) return;
+    for (var i = 0; i < items.length; i++) {
+      var item = items[i];
+      var row = document.createElement('li');
+      row.className = 'attention-item';
+      row.setAttribute('data-kind', String(item.kind || ''));
+      var label = document.createElement('span');
+      label.className = 'attention-label';
+      label.textContent = String(item.label || '');
+      row.appendChild(label);
+      if (item.detail) {
+        var detail = document.createElement('span');
+        detail.className = 'attention-detail muted';
+        detail.textContent = String(item.detail);
+        row.appendChild(detail);
+      }
+      if (item.action && item.action.label) {
+        var button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'secondary attention-action';
+        button.textContent = String(item.action.label);
+        (function (action) {
+          button.addEventListener('click', function () {
+            dispatchUxAction(action);
+          });
+        })(item.action);
+        row.appendChild(button);
+      }
+      list.appendChild(row);
+    }
+  }
+
+  function renderOverviewSummary(snapshot) {
+    var ux = snapshot && snapshot.ux ? snapshot.ux : null;
+    var list = byId('overview-summary-list');
+    if (!list) return;
+    var status = byId('overview-status');
+    if (status) {
+      status.hidden = ux === null;
+      if (ux !== null) {
+        setText('overview-status-label', ux.presentationLabel);
+        setText('overview-status-copy', ux.presentationDetail);
+      }
+    }
+    clear(list);
+    if (ux === null) return;
+    var rows = [
+      ['What it is doing', ux.summary.doing],
+      ['Anything wrong', ux.summary.wrong],
+      ['What changed', ux.summary.changed],
+      ['Checks', ux.summary.checks],
+      ['Cost', ux.summary.cost],
+    ];
+    for (var i = 0; i < rows.length; i++) {
+      if (rows[i][1] === null || rows[i][1] === undefined || String(rows[i][1]).length === 0) {
+        continue;
+      }
+      var dt = document.createElement('dt');
+      dt.textContent = rows[i][0];
+      var dd = document.createElement('dd');
+      dd.textContent = String(rows[i][1]);
+      list.appendChild(dt);
+      list.appendChild(dd);
+    }
+    var advancedBody = byId('overview-advanced-body');
+    if (advancedBody) {
+      clear(advancedBody);
+      var lines = Array.isArray(ux.advanced) ? ux.advanced : [];
+      advancedBody.textContent = lines.join('\n');
+    }
+  }
+
+  function renderAccount(snapshot) {
+    var panel = snapshot ? snapshot.usagePanel : null;
+    var status = snapshot && typeof snapshot.accountStatus === 'string' ? snapshot.accountStatus : 'not_read';
+    var copy = byId('account-copy');
+    var lines = byId('account-lines');
+    var advanced = byId('account-advanced');
+    if (!copy || !lines) return;
+    clear(lines);
+    if (status === 'not_read' || (status === 'not_connected' && (panel === null || panel === undefined))) {
+      copy.textContent = 'Account not connected. Billing and usage are optional and only load when you check.';
+      if (advanced) advanced.textContent = 'No account credential is configured for this machine.';
+      return;
+    }
+    if (status === 'unavailable' || panel === null || panel === undefined || panel.state !== 'ok') {
+      copy.textContent = 'Account not connected.';
+      if (advanced) {
+        advanced.textContent = panel && panel.reason ? String(panel.reason) : 'The account read was refused.';
+      }
+      return;
+    }
+    copy.textContent = 'Account connected.';
+    var rows = [];
+    if (panel.planId) rows.push(['Plan', String(panel.planId)]);
+    if (panel.subscription && panel.subscription.state) {
+      rows.push(['Subscription', String(panel.subscription.state)]);
+    }
+    if (panel.period && typeof panel.period.totalTokens === 'number') {
+      rows.push(['Tokens this period', formatCount(panel.period.totalTokens)]);
+    }
+    if (panel.period && panel.period.managedCostMicro) {
+      var managed = usdMicro(panel.period.managedCostMicro);
+      if (managed !== null) rows.push(['Managed spend', managed]);
+    }
+    if (panel.credits && panel.credits.balanceMicro) {
+      var balance = usdMicro(panel.credits.balanceMicro);
+      if (balance !== null) rows.push(['Credits', balance]);
+    }
+    for (var i = 0; i < rows.length; i++) {
+      var dt = document.createElement('dt');
+      dt.textContent = rows[i][0];
+      var dd = document.createElement('dd');
+      dd.textContent = rows[i][1];
+      lines.appendChild(dt);
+      lines.appendChild(dd);
+    }
+    if (advanced) {
+      advanced.textContent = panel.reason ? String(panel.reason) : 'Served by the optional control-plane account.';
+    }
   }
 
   function renderSnapshot(snapshot) {
@@ -5273,14 +5535,19 @@
       // A settled status re-arms the T27 card after an explicit Wait.
       recoveryWaitDismissed = false;
     }
-    setDaemon(snapshot.daemon, snapshot.daemonDetail);
+    setDaemon(snapshot.daemon, snapshot.daemonDetail, snapshot.connectionNotice);
     setText('daemon-text', headerStatusText(snapshot));
     setText('session-title', snapshot.session ? snapshot.session.title : 'none');
     setText('machine-label', snapshot.machineLabel || snapshot.machineState);
     setText('stream-status', streamStatusLabel(snapshot.streamStatus));
     setText('index-coverage', indexCoverageText(snapshot));
     renderComposerModel(snapshot.session);
-    renderPreflight(snapshot.preflight);
+    renderAttention(snapshot);
+    renderOverviewSummary(snapshot);
+    renderAccount(snapshot);
+    renderServiceAuthority(snapshot.serviceAuthority || null);
+    renderServiceDiagnostics(snapshot.service || null);
+    renderPreflightMirror(snapshot.preflight);
     renderComposerState();
     renderStreamRecovery(streamStatusValue);
     renderTask(snapshot);
@@ -5362,7 +5629,7 @@
    * (the operator must see the next step); only the identity list is capped.
    */
   function dispatchUserErrorAction(key) {
-    if (key === 'startService') {
+    if (key === 'startService' || key === 'retryStart') {
       vscode.postMessage({ type: 'startDaemon' });
     } else if (key === 'reconnectStream') {
       vscode.postMessage({ type: 'recoverStream' });
@@ -5370,6 +5637,14 @@
       vscode.postMessage({ type: 'refresh' });
     } else if (key === 'attachFiles') {
       vscode.postMessage({ type: 'attachPick' });
+    } else if (key === 'openDiagnostics') {
+      setDiagnosticsOpen(true);
+    } else if (key === 'locateDaemon') {
+      vscode.postMessage({ type: 'locateDaemon' });
+    } else if (key === 'reviewTrust') {
+      vscode.postMessage({ type: 'reviewTrust' });
+    } else if (key === 'manageWorkspaceTrust') {
+      vscode.postMessage({ type: 'manageWorkspaceTrust' });
     } else if (key === 'focusComposer') {
       var goalNode = byId('goal');
       if (goalNode && typeof goalNode.focus === 'function') {
@@ -5513,7 +5788,8 @@
     submitting = value;
     var ids = [
       'btn-send',
-      'btn-new-task',
+      'btn-intent-ask',
+      'btn-intent-task',
       'contract-local',
       'contract-commit',
       'contract-push',
@@ -5813,7 +6089,17 @@
       budget.tokens = tokens;
     }
     if (cost.length > 0) {
-      budget.cost = cost;
+      // Human money in the composer, exact micro on the wire. `$5.00` and
+      // `5.00` mean five dollars; an explicit `5000000µ$` (or a bare
+      // integer) stays exact micro for compatibility.
+      var dollars = /^\$?([0-9]+)(?:\.([0-9]{1,6}))?$/.exec(cost);
+      if (dollars && (cost.charAt(0) === '$' || cost.indexOf('.') !== -1)) {
+        var whole = BigInt(dollars[1]);
+        var fraction = (dollars[2] || '').padEnd(6, '0');
+        budget.cost = (whole * 1000000n + BigInt(fraction || '0')).toString();
+      } else {
+        budget.cost = cost;
+      }
     }
     return budget;
   }
@@ -5847,12 +6133,10 @@
     }
     // Draft preservation: the goal is NOT cleared here. The extension posts
     // a startResult; only a successful start clears the (unchanged) draft.
-    // The Task-mode completion contract rides only THIS task start; plain
-    // chat never carries it.
-    var contract = completionContractFromControls();
-    var contractRows = contractRowsFromControls();
-    var budget = runBudgetFromControls();
-    var message = { type: 'sendGoal', goal: goal };
+    // Ask is a plain conversational turn: no contract, rows, budget or
+    // completion member is ever attached. Task carries only what the user
+    // authored in the ONE Task options disclosure.
+    var message = { type: 'sendGoal', goal: goal, intent: composerIntent };
     if (attachments.length > 0) {
       var ids = [];
       for (var i = 0; i < attachments.length; i++) {
@@ -5860,17 +6144,22 @@
       }
       message.attachmentIds = ids;
     }
-    if (contract) {
-      message.completionContract = contract;
-    }
-    if (contractRows) {
-      message.contractRows = contractRows;
-    }
-    if (budget.tokens !== undefined) {
-      message.budgetTokens = budget.tokens;
-    }
-    if (budget.cost !== undefined) {
-      message.budgetCostMicro = budget.cost;
+    if (composerIntent === 'task') {
+      var contract = completionContractFromControls();
+      var contractRows = contractRowsFromControls();
+      var budget = runBudgetFromControls();
+      if (contract) {
+        message.completionContract = contract;
+      }
+      if (contractRows) {
+        message.contractRows = contractRows;
+      }
+      if (budget.tokens !== undefined) {
+        message.budgetTokens = budget.tokens;
+      }
+      if (budget.cost !== undefined) {
+        message.budgetCostMicro = budget.cost;
+      }
     }
     transcriptPinRequested = true;
     transcriptPinned = true;
@@ -5886,6 +6175,26 @@
     }
     vscode.postMessage(message);
   }
+
+  function setComposerIntent(intent) {
+    composerIntent = intent === 'task' ? 'task' : 'ask';
+    var form = byId('composer');
+    if (form && typeof form.setAttribute === 'function') {
+      form.setAttribute('data-intent', composerIntent);
+    }
+    var ask = byId('btn-intent-ask');
+    var task = byId('btn-intent-task');
+    if (ask) ask.setAttribute('aria-checked', composerIntent === 'ask' ? 'true' : 'false');
+    if (task) task.setAttribute('aria-checked', composerIntent === 'task' ? 'true' : 'false');
+  }
+
+  byId('btn-intent-ask').addEventListener('click', function () {
+    setComposerIntent('ask');
+  });
+  byId('btn-intent-task').addEventListener('click', function () {
+    setComposerIntent('task');
+  });
+  setComposerIntent('ask');
 
   byId('composer').addEventListener('submit', function (event) {
     event.preventDefault();
@@ -6015,6 +6324,13 @@
     dismissTransient();
   });
 
+  byId('btn-account-read').addEventListener('click', function () {
+    vscode.postMessage({ type: 'readAccount' });
+  });
+  byId('btn-account-settings').addEventListener('click', function () {
+    vscode.postMessage({ type: 'openAccountSettings' });
+  });
+
   byId('btn-attach').addEventListener('click', function () {
     if (submitting) {
       return;
@@ -6063,16 +6379,6 @@
   }
   // The guidance disclosure starts closed in every rendering context.
   setSandboxGuidanceOpen(false);
-  byId('btn-new-task').addEventListener('click', function () {
-    if (submitting) {
-      return;
-    }
-    vscode.postMessage({ type: 'newTask' });
-    var goalNode = byId('goal');
-    if (goalNode && typeof goalNode.focus === 'function') {
-      goalNode.focus();
-    }
-  });
   byId('btn-cancel-run').addEventListener('click', function () {
     vscode.postMessage({ type: 'cancelRun' });
   });
@@ -6101,9 +6407,18 @@
     ['subtab-overview', 'subtab-plan', 'subtab-changes', 'subtab-verification', 'subtab-agents'],
     selectSubviewTab,
   );
-  wireTablist(['history-tab-conversations', 'history-tab-outcomes'], function (tabId, focusTab) {
-    setHistoryTab(tabId === 'history-tab-outcomes' ? 'outcomes' : 'conversations', focusTab);
-  });
+  wireTablist(
+    ['history-tab-conversations', 'history-tab-outcomes', 'history-tab-account'],
+    function (tabId, focusTab) {
+      var key =
+        tabId === 'history-tab-outcomes'
+          ? 'outcomes'
+          : tabId === 'history-tab-account'
+            ? 'account'
+            : 'conversations';
+      setHistoryTab(key, focusTab);
+    },
+  );
   setActiveView('work');
   setActiveSubview('overview');
   setHistoryTab('conversations', false);

@@ -153,7 +153,7 @@ const PRIMARY_SCREEN_ACTIONS: Readonly<
 };
 
 const HOST_PRIMARY: Readonly<Record<string, { readonly command: string; readonly label: string }>> = {
-  S34: { command: 'faktor.startServer', label: 'Start Faktor' },
+  S34: { command: 'faktor.startServer', label: 'Start service' },
   S35: { command: 'faktor.trustExecutable8', label: 'Confirm Path' },
   // Spec S55 primary: the optional control-plane sign-in. It opens the
   // endpoint/organization prompt; it never claims a connection before the
@@ -359,7 +359,7 @@ function controlMarkup(view: E8ControlView): string {
       </div>
     </div>
     <details class="e8-control-details">
-      <summary><span>Details and states</span><span class="e8-control-id">${control.id}</span></summary>
+      <summary>Details and states</summary>
       <p class="e8-behavior">${esc(control.behavior)}</p>
       <dl class="e8-contract">
         <div><dt>Default</dt><dd>${esc(control.defaultState)}</dd></div>
@@ -377,7 +377,6 @@ function controlMarkup(view: E8ControlView): string {
         <div><dt>Stale</dt><dd>${esc(control.staleState)}</dd></div>
         <div><dt>Pending</dt><dd>${esc(control.pendingState)}</dd></div>
       </dl>
-      <p class="e8-trace">Trace: ${esc(control.classification)} · ${esc(control.currentStatus)} · ${control.acceptanceIds.join(', ')} · spec p.${control.specPage}</p>
       ${resetMarkup(view)}
     </details>
   </article>`;
@@ -394,22 +393,6 @@ function rowMarkup(row: E8ScreenView['rows'][number]): string {
     <span class="e8-row-label">${esc(row.label)}</span>
     <span class="e8-row-value" data-state="${row.state}">${esc(row.value)}</span>
   </div>`;
-}
-
-function surfaceNote(screen: E8ScreenView): string {
-  const surface = screen.screen.surface;
-  const notes: Record<string, string> = {
-    sidebar: 'VS Code surface: Activity view webview.',
-    settings: 'VS Code surface: editor-tab settings webview.',
-    modal: 'VS Code surface: native modal message (host-ordered buttons).',
-    quickpick: 'VS Code surface: native Quick Pick; this semantic card keeps the control contract inspectable.',
-    'native-settings': 'VS Code surface: native Settings editor; persistent settings are never duplicated in a webview.',
-    diff: 'VS Code surface: vscode.diff with immutable base/candidate titles (read-only).',
-    terminal: 'VS Code surface: integrated terminal in the Panel; output stays bounded and is never redrawn here.',
-    browser: 'VS Code surface: native Simple Browser; external page tokens are not imposed.',
-    narrow: 'VS Code surface: 320 px sidebar reference; labels stack and the composer stays reachable.',
-  };
-  return notes[surface] ?? notes.sidebar;
 }
 
 function primaryMarkup(primary: PrimaryAction, screen: E8ScreenView, host: 'vscode' | 'jetbrains', mode: 'shell' | 'settings'): string {
@@ -441,9 +424,15 @@ function primaryMarkup(primary: PrimaryAction, screen: E8ScreenView, host: 'vsco
 }
 
 function secondaryMarkup(screenId: string): string {
+  // S34 is the Service diagnostics screen: keep the explicit stop control
+  // next to the primary start action.
+  const stop =
+    screenId === 'S34'
+      ? '<button type="button" class="e8-secondary" data-host-command="faktor.stopServer">Stop service</button>'
+      : '';
   const link = SECONDARY_SCREEN_LINKS[screenId];
-  if (link === undefined) return '';
-  return `<button type="button" class="e8-secondary" data-open-screen="${esc(link.screen)}">${esc(link.label)}</button>`;
+  if (link === undefined) return stop;
+  return `${stop}<button type="button" class="e8-secondary" data-open-screen="${esc(link.screen)}">${esc(link.label)}</button>`;
 }
 
 function primaryScreenLinkMarkup(screenId: string): string {
@@ -468,7 +457,7 @@ function screenMarkup(screen: E8ScreenView, initial: boolean, host: 'vscode' | '
   const controlsMarkup = !showControls
     ? ''
     : rowsFirst
-      ? `<details class="e8-provenance"><summary>Control provenance (read-only) · ${screen.controls.length}</summary>${groupControls(screen.controls)}</details>`
+      ? `<details class="e8-provenance"><summary>Advanced diagnostics (read-only) · ${screen.controls.length}</summary>${groupControls(screen.controls)}</details>`
       : groupControls(screen.controls);
   return `<section class="e8-screen" id="e8-screen-${screenEntry.id}" data-screen="${screenEntry.id}" data-group="${esc(screenEntry.group)}" data-destination="${destinationOf(screenEntry)}" data-surface="${screenEntry.surface}" data-primary="${primary.kind}"${initial ? '' : ' hidden'} aria-labelledby="e8-screen-title-${screenEntry.id}">
     <header class="e8-screen-head">
@@ -479,21 +468,7 @@ function screenMarkup(screen: E8ScreenView, initial: boolean, host: 'vscode' | '
       </div>
       <p class="e8-purpose">${esc(GROUP_SUMMARY[screenEntry.group] ?? screenEntry.job)}</p>
       <div class="e8-primary-row">${primaryMarkup(primary, screen, host, mode)}${primaryScreenLinkMarkup(screenEntry.id)}${secondaryMarkup(screenEntry.id)}</div>
-      <details class="e8-screen-details">
-        <summary>Screen contract and traceability</summary>
-        <dl class="e8-screen-contract">
-          <div><dt>Purpose</dt><dd>${esc(screenEntry.job)}</dd></div>
-          <div><dt>Primary action</dt><dd>${esc(screenEntry.action)}</dd></div>
-          <div><dt>Layout</dt><dd>${esc(screenEntry.layoutRegions)}</dd></div>
-          <div><dt>Navigation</dt><dd>${esc(screenEntry.navigation)}</dd></div>
-          <div><dt>States</dt><dd>${esc(screenEntry.states)}</dd></div>
-        </dl>
-        <h4 class="e8-details-title">Host variant</h4>
-        <p>${esc(screenEntry.vscodeVariant)}</p>
-        <p class="e8-muted">${esc(screenEntry.jetbrainsVariant)}</p>
-        <p>${esc(surfaceNote(screen))}</p>
-        <p class="e8-trace">${esc(screenEntry.traceability)}</p>
-      </details>
+
     </header>
     ${screen.staleText === null ? '' : `<div class="e8-banner e8-warn" role="alert">${esc(screen.staleText)}</div>`}
     ${screen.emptyText === null || screen.emptyText.startsWith('No served state yet') ? '' : `<div class="e8-banner e8-empty" role="status">${esc(screen.emptyText)}</div>`}
@@ -553,7 +528,6 @@ function settingsRow(screen: E8Screen): string {
   return `<button type="button" class="e8-settings-row" data-settings-open="${esc(screen.id)}" data-settings-search="${esc(search)}" data-settings-row>
     <span class="e8-settings-row-title">${esc(screen.title)}</span>
     <span class="e8-settings-row-desc">${esc(summary)}</span>
-    <span class="e8-settings-row-id">${esc(screen.id)}</span>
   </button>`;
 }
 
@@ -616,7 +590,7 @@ function screenBrowser(destination: E8Destination, initialScreen: string): strin
               <div class="e8-browser-links">${list
                 .map(
                   (screen) =>
-                    `<button type="button" class="e8-screen-link" data-screen-link="${screen.id}" data-screen-search="${esc(`${screen.id} ${screen.title} ${screen.group}`)}" aria-current="${screen.id === initialScreen ? 'page' : 'false'}"><span class="e8-screen-id">${screen.id}</span><span class="e8-screen-name">${esc(screen.title)}</span></button>`,
+                    `<button type="button" class="e8-screen-link" data-screen-link="${screen.id}" data-screen-id="${screen.id}" data-screen-search="${esc(`${screen.id} ${screen.title} ${screen.group}`)}" aria-current="${screen.id === initialScreen ? 'page' : 'false'}"><span class="e8-screen-name">${esc(screen.title)}</span></button>`,
                 )
                 .join('')}</div>
             </section>`,
@@ -686,7 +660,7 @@ export function renderEdition8Html(options: Edition8HtmlOptions): string {
   }
   ${
     noSnapshot
-      ? `<div class="e8-banner e8-empty" role="status"><strong>No served state yet.</strong> Start the Faktor service, then <button type="button" class="e8-link-button" data-retry="true">retry</button>. Nothing on this screen is saved or verified.</div>`
+      ? `<div class="e8-banner e8-empty" role="status"><strong>No served state yet.</strong> Faktor connects automatically; <button type="button" class="e8-link-button" data-retry="true">retry</button> if it does not. Nothing on this screen is saved or verified.</div>`
       : ''
   }
   <main id="e8-main">

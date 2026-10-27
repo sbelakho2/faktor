@@ -199,6 +199,8 @@ data class VerificationSummary(
     val criteriaTotal: Int,
     val failedChecks: Int,
     val owed: Int,
+    /** Checks the run plans to execute (0 = none served yet). */
+    val checksPlanned: Int = 0,
     val recordStatus: String?,
     /**
      * True only when the strict proof is verified AND a served record proves
@@ -248,8 +250,8 @@ data class VerificationSummary(
 object RunStateCopy {
     /** T06 — the composer ready/empty state. */
     const val READY_LABEL = "Ready"
-    const val READY_COPY = "Describe a task or ask a question."
-    const val READY_ACTION = "Run task"
+    const val READY_COPY = "Ask a question, or choose Task for an isolated run."
+    const val READY_ACTION = "Send"
 
     /** T07 — the captured draft is being admitted once. */
     const val STARTING_LABEL = "Starting the run"
@@ -1607,12 +1609,18 @@ object TaskTree {
             proofRefusal == null &&
             proof != null &&
             proof.proofState == "verified"
+        val planned = when {
+            (proof?.checksTotal ?: 0) > 0 -> proof!!.checksTotal
+            (topRecord?.checks?.size ?: 0) > 0 -> topRecord!!.checks.size
+            else -> 0
+        }
         return VerificationSummary(
             status = if (proofRefusal != null) "unavailable" else status,
             criteriaPassed = passed,
             criteriaTotal = total,
             failedChecks = failed,
             owed = owed,
+            checksPlanned = planned,
             recordStatus = recordStatus,
             verified = verified,
             reviewer = topRecord?.reviewer?.takeIf { it.isNotEmpty() },

@@ -1,0 +1,14 @@
+{
+  "id": "INV-VSCODE-ASK-ISOLATION",
+  "file": "apps/vscode/src/askFlow.ts",
+  "find": "  return client.prompt(input.sessionId, input.prompt, {",
+  "replace": "  return client.startTaskRun(input.sessionId, input.prompt, {",
+  "gate": "node apps/vscode/scripts/ask-live.mjs",
+  "expect": "FAILED",
+  "note": "Routing Ask through the task-run member turns a plain prompt into a task and the live harness sees the wrong wire path.",
+  "capabilities": [
+    "vscode.ask.plain"
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+}

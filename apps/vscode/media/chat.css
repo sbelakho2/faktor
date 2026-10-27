@@ -253,7 +253,7 @@ header button {
 .changes-path {
   font-family: var(--vscode-editor-font-family, monospace);
   font-size: 0.9em;
-  word-break: break-all;
+  overflow-wrap: break-word; word-break: normal;
 }
 
 /* I03: the scope toolbar of the selected change. */
@@ -313,7 +313,7 @@ button.change-select {
   text-align: left;
   font-family: var(--vscode-editor-font-family, monospace);
   font-size: 0.9em;
-  word-break: break-all;
+  overflow-wrap: break-word; word-break: normal;
 }
 
 button.change-select:hover:not(:disabled) {
@@ -1493,7 +1493,7 @@ button.chip-action:hover:not(:disabled) {
 
 .attachment-label {
   flex: 1;
-  word-break: break-all;
+  overflow-wrap: break-word; word-break: normal;
   font-size: 0.85em;
 }
 
@@ -1677,6 +1677,170 @@ button.attachment-remove {
 
 .primary-action:focus-visible {
   outline-offset: 2px;
+}
+
+/* ------------------------------------------------ intent and task options
+   ONE composer with one explicit intent (Ask | Task). Task options are a
+   single disclosure: no second composer, no separate Task button. */
+.composer-intent-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.composer-intent {
+  display: inline-flex;
+  border: 1px solid var(--faktor-border);
+  border-radius: var(--faktor-radius-control);
+  overflow: hidden;
+  flex: none;
+}
+
+button.intent-option {
+  min-height: 28px;
+  padding: 2px 12px;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: var(--vscode-foreground);
+  font-size: 0.9em;
+}
+
+button.intent-option[aria-checked='true'] {
+  background: var(--vscode-button-background);
+  color: var(--vscode-button-foreground);
+  font-weight: 600;
+}
+
+button.intent-option:focus-visible {
+  outline-offset: -2px;
+}
+
+#composer[data-intent='ask'] .task-options summary::after {
+  content: ' \00b7 Task only';
+  color: var(--vscode-descriptionForeground);
+  font-weight: 400;
+}
+
+.task-options {
+  border-top: 1px solid var(--faktor-border-quiet);
+  padding-top: var(--space-1);
+}
+
+/* ------------------------------------------------ attention and summary
+   "Needs attention" is aggregated: at most three grouped rows. The Overview
+   answers five user questions with no contract wall. */
+.attention-card {
+  border-left: 3px solid var(--vscode-editorWarning-foreground, #d29922);
+}
+
+.attention-card h2,
+.overview-summary h2 {
+  font-size: 1em;
+  margin: 0 0 var(--space-1);
+}
+
+.attention-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.attention-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 2px var(--space-2);
+  align-items: center;
+  padding: var(--space-1) 0;
+  border-top: 1px solid var(--faktor-border-quiet);
+}
+
+.attention-item:first-child {
+  border-top: none;
+}
+
+.attention-label {
+  font-weight: 600;
+  min-width: 0;
+  overflow-wrap: break-word;
+}
+
+.attention-detail {
+  grid-column: 1;
+  font-size: 0.9em;
+  min-width: 0;
+  overflow-wrap: break-word;
+}
+
+.attention-action {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  align-self: center;
+  flex: none;
+}
+
+.overview-status {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: var(--space-1);
+}
+
+.overview-summary-list {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 2px var(--space-2);
+  margin: 0;
+}
+
+.overview-summary-list dt {
+  color: var(--vscode-descriptionForeground);
+  font-size: 0.9em;
+}
+
+.overview-summary-list dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: break-word;
+}
+
+@media (max-width: 320px) {
+  .overview-summary-list {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .overview-summary-list dd {
+    margin-bottom: var(--space-1);
+  }
+
+  .attention-item {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .attention-action {
+    grid-column: 1;
+    grid-row: auto;
+    justify-self: start;
+  }
+
+  /* Identifiers ellipsize in the narrow layout; details stay reachable
+     through the native title/details affordances. */
+  .preflight-path,
+  .changes-path,
+  .attachment-label,
+  .setup-command code,
+  .meta-row code,
+  .identifier {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    overflow-wrap: normal;
+  }
 }
 
 /* ------------------------------------------------------- pixel agents */
@@ -1887,7 +2051,7 @@ button.attachment-remove {
 
 .disclosure-line {
   color: var(--vscode-editorWarning-foreground, #d29922);
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
 }
 
 .contract-group-label {
@@ -1909,24 +2073,24 @@ button.attachment-remove {
 .contract-statement {
   flex: 1 1 160px;
   min-width: 0;
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
 }
 
 .contract-evidence {
   font-size: 0.85em;
   opacity: 0.85;
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
 }
 
 .contract-disclosure-text {
   font-size: 0.85em;
   color: var(--vscode-editorWarning-foreground, #d29922);
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
 }
 
 .contract-evidence-ref {
   font-size: 0.85em;
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
 }
 
 /* Severity/state chips reuse the shared `.chip` shell; the tone text stays
@@ -2024,7 +2188,7 @@ button.attachment-remove {
 .agent-head,
 .criterion-key,
 .usage-alert {
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
   word-break: break-word;
   min-width: 0;
 }
@@ -2075,7 +2239,7 @@ button.attachment-remove {
   margin: 0;
   font-size: 0.95em;
   font-weight: 600;
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
 }
 
 .preflight-copy {
@@ -2087,7 +2251,7 @@ button.attachment-remove {
   gap: 6px;
   font-size: 0.85em;
   min-width: 0;
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
 }
 
 .preflight-key {
@@ -2096,7 +2260,7 @@ button.attachment-remove {
 }
 
 .preflight-path {
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
 }
 
 .preflight-detail {
@@ -2207,7 +2371,7 @@ button.attachment-remove {
   background: var(--vscode-textCodeBlock-background, rgba(128, 128, 128, 0.12));
   padding: 2px 6px;
   border-radius: var(--faktor-radius-control);
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
 }
 
 .sandbox-guidance p {

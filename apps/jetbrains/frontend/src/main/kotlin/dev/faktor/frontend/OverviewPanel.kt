@@ -1,8 +1,9 @@
-// Overview: the current run at a glance. Renders the plan-derived model as
-// human summary rows (state, goal, phase, plan progress, agents, verification,
-// acceptance criteria, spend and finish actions) instead of a raw dump. Key
-// and value stack vertically so a 240px tool window stays readable; the
-// blocking/approval cards stay on their own actionable surfaces.
+// Overview: a concise, human summary of the current run. It deliberately
+// stops at the at-a-glance facts (state, goal, progress, at most three
+// attention items, the planned check count and spend). Full contract, proof
+// and evidence stay in Verification/Advanced, and absent sections are
+// omitted instead of rendering empty placeholders. Key and value stack
+// vertically so a 240px tool window stays readable.
 package dev.faktor.frontend
 
 import java.awt.BorderLayout
@@ -10,6 +11,35 @@ import java.awt.Component
 import java.awt.Dimension
 import javax.swing.BoxLayout
 import javax.swing.JPanel
+
+/**
+ * Aggregate the served attention causes without inventing any: explicit task
+ * blockers, child blockers, failed/owed checks, an unavailable proof and an
+ * unreadable contract. The result is capped at [max] (including the
+ * "+N more" overflow line).
+ */
+internal fun overviewAttentionItems(model: TaskTreeModel, max: Int = 3): List<String> {
+    val items = ArrayList<String>()
+    fun add(value: String?) {
+        val text = value?.trim()?.takeIf { it.isNotEmpty() } ?: return
+        val bounded = bound(text, 140)
+        if (!items.contains(bounded)) items.add(bounded)
+    }
+    for (blocker in model.taskBlockers) add(blocker)
+    for (blocker in model.blockers) add(blocker.reason)
+    if (model.verification.failedChecks > 0) {
+        add(plural(model.verification.failedChecks, "failed check"))
+    }
+    if (model.verification.owed > 0) add(plural(model.verification.owed, "owed check"))
+    if (model.proof?.state == "unavailable") {
+        add("Verification unavailable" + (model.proof.reason?.let { " — " + bound(it, 80) } ?: ""))
+    }
+    if (model.contract?.malformed != null) add("Contract unreadable")
+    if (items.size <= max) return items
+    val head = items.subList(0, max - 1).toMutableList()
+    head.add("+" + (items.size - (max - 1)) + " more")
+    return head
+}
 
 class OverviewPanel : JPanel(BorderLayout()) {
 
@@ -22,6 +52,8 @@ class OverviewPanel : JPanel(BorderLayout()) {
     }
 
     private val goalLabel = WrappedLabel("No run yet. Describe a task in the composer.")
+
+    private val rowHosts = LinkedHashMap<String, JPanel>()
 
     private val rows = LinkedHashMap<String, WrappedLabel>()
 
@@ -37,15 +69,14 @@ class OverviewPanel : JPanel(BorderLayout()) {
         val summaryBody = pageColumn(gap = Spacing.S, padding = 0)
         summaryBody.add(stateChip)
         summaryBody.add(goalLabel)
-        for (key in listOf(
-            "Phase", "Plan", "Agents", "Verification", "Integration",
-            "Acceptance criteria", "Spend", "Finish actions"
-        )) {
-            val value = WrappedLabel("—")
+        for (key in listOf("Phase", "Plan", "Agents", "Needs attention", "Checks to run", "Spend")) {
+            val value = WrappedLabel("")
             value.font = uiPanelFont()
             value.foreground = textForeground()
             rows[key] = value
-            summaryBody.add(row(key, value))
+            val host = row(key, value)
+            rowHosts[key] = host
+            summaryBody.add(host)
         }
         val body = pageColumn()
         body.add(card("Current run", summaryBody))
@@ -78,84 +109,66 @@ class OverviewPanel : JPanel(BorderLayout()) {
             header.text = "overview: no run yet"
             setChip("No run yet", SemanticState.DIM)
             goalLabel.fullText = "No run yet. Describe a task in the composer."
-            for (value in rows.values) value.fullText = "—"
+            for (key in rowHosts.keys) showRow(key, null)
             refreshChip()
             return
         }
         header.text = "overview: " + humanState(stateLabel(model))
         setChip(stateLabel(model), runStateOf(model))
         goalLabel.fullText = model.goal.ifBlank { "No goal text served for this run." }
-        rows["Phase"]?.fullText = humanState(model.phase.ifBlank { "—" })
+
+        showRow("Phase", model.phase.takeIf { it.isNotBlank() }?.let { humanState(it) })
+
         val done = model.steps.count { it.state == "done" }
-        rows["Plan"]?.fullText = if (model.steps.isEmpty()) {
-            "No plan steps served yet"
-        } else {
-            "$done of ${model.steps.size} steps done"
-        }
+        showRow(
+            "Plan",
+            if (model.steps.isEmpty()) null
+            else humanCount(done, model.steps.size, "step") + " done"
+        )
+
         val active = model.children.count { it.state.lowercase().contains("run") }
         val blocked = model.children.count { it.blocker != null }
-        rows["Agents"]?.fullText = when {
-            model.children.isEmpty() -> "No agents on this run yet"
-            else -> "${plural(model.children.size, "agent")} · $active active · $blocked blocked"
-        }
-        val verification = model.verification
-        val proof = model.proof
-        val verificationDetails = buildString {
-            append("criteria ").append(verification.criteriaPassed)
-            append(" of ").append(verification.criteriaTotal).append(" passed")
-            append(" · ").append(plural(verification.failedChecks, "failed check"))
-            append(" · ").append(plural(verification.owed, "owed check"))
-            verification.reviewer?.let { append(" · reviewer ").append(it) }
-        }
-        val recordPassed = (verification.recordStatus ?: verification.status)
-            .equals("passed", ignoreCase = true)
-        rows["Verification"]?.fullText = when {
-            proof?.verified == true -> "Verified · " + verificationDetails
-            proof?.state == "unavailable" -> "Verification unavailable" +
-                (proof.reason?.takeIf { it.isNotEmpty() }?.let { " — " + it } ?: "")
-            recordPassed -> "Candidate checks passed · " + verificationDetails
-            else -> "Not verified yet · " + verificationDetails
-        }
-        // I04/VAL-LAND-2: the integration domain renders as its own fact row
-        // (text + glyph) from the served proof members only; a run with no
-        // proof keeps an explicit missing value, never a positive fact.
-        rows["Integration"]?.fullText = if (proof == null) {
-            "No integration facts are served for this run yet"
-        } else {
-            proof.integrationFacts().joinToString(" · ")
-        }
-        rows["Acceptance criteria"]?.fullText = if (model.acceptanceCriteria.isEmpty()) {
-            "No acceptance criteria"
-        } else {
-            model.acceptanceCriteria.joinToString(" · ") { bound(it, 120) }
-        }
+        showRow(
+            "Agents",
+            if (model.children.isEmpty()) null
+            else "${plural(model.children.size, "agent")} · $active active · $blocked blocked"
+        )
+
+        val attention = overviewAttentionItems(model)
+        showRow("Needs attention", attention.takeIf { it.isNotEmpty() }?.joinToString(" · "))
+
+        val planned = model.verification.checksPlanned
+        showRow("Checks to run", if (planned <= 0) null else "Checks to run · $planned")
+
         val spend = model.spend
         val spent = spend?.spentCostMicro
-        rows["Spend"]?.fullText = if (spend == null || spent == null) {
-            "Cost unavailable"
-        } else {
-            "$" + FormattedValues.usd(spent) +
+        showRow(
+            "Spend",
+            if (spend == null || spent == null) null
+            else "$" + FormattedValues.usd(spent) +
                 (spend.maxCostMicro?.let { " of $" + FormattedValues.usd(it) } ?: "") +
-                " · " + (spend.spentTokens?.let { "$it tokens" } ?: "tokens unavailable") +
-                (spend.maxTokens?.let { " of $it" } ?: "")
-        }
-        val completion = model.completion
-        rows["Finish actions"]?.fullText = if (completion == null) {
-            "No finish actions recorded yet"
-        } else {
-            val stepRows = completion.steps.joinToString(" · ") { "${it.step} ${it.status}" }
-            if (completion.finishActionPending) {
-                // T21: the requested step lacks a succeeded durable result;
-                // the exact label+copy render on the completion row itself.
-                RunStateCopy.FINISH_ACTION_PENDING_LABEL + " — " +
-                    RunStateCopy.FINISH_ACTION_PENDING_COPY +
-                    (if (stepRows.isEmpty()) "" else " · " + stepRows)
-            } else {
-                stepRows
-            }
-        }
+                " · " + (spend.spentTokens?.let { grouped(it) + " tokens" } ?: "tokens unavailable") +
+                (spend.maxTokens?.let { " of " + grouped(it) } ?: "")
+        )
         refreshChip()
     }
+
+    /** Shows one row with a value, or hides it entirely when absent. */
+    private fun showRow(key: String, value: String?) {
+        val host = rowHosts[key] ?: return
+        val rowValue = rows[key] ?: return
+        val present = value != null && value.isNotBlank()
+        host.isVisible = present
+        if (present) rowValue.fullText = value!! else rowValue.fullText = ""
+        host.revalidate()
+        host.repaint()
+    }
+
+    private fun humanCount(done: Int, total: Int, noun: String): String =
+        "$done of " + plural(total, noun)
+
+    private fun grouped(value: Long): String =
+        java.text.NumberFormat.getIntegerInstance().format(value)
 
     private fun setChip(text: String, state: SemanticState) {
         val signature = Pair(text, state)
@@ -207,7 +220,13 @@ class OverviewPanel : JPanel(BorderLayout()) {
         return words.substring(0, 1).uppercase() + words.substring(1)
     }
 
-    fun summaryText(key: String): String = rows[key]?.fullText ?: ""
+    /** The rendered value of one row, or "" when the section is absent. */
+    fun summaryText(key: String): String =
+        if (rowHosts[key]?.isVisible == true) rows[key]?.fullText ?: "" else ""
+
+    fun hasSummaryRowForTest(key: String): Boolean = rowHosts[key]?.isVisible == true
+
+    fun attentionItemsForTest(model: TaskTreeModel): List<String> = overviewAttentionItems(model)
 
     /** The semantic tone of the run chip for one model (smoke assertions). */
     internal fun runStateOfForTest(model: TaskTreeModel): SemanticState = runStateOf(model)

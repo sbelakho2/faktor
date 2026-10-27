@@ -119,6 +119,7 @@ object JetBrainsHostMatrixSmoke {
         )
         val panel = FaktorChatPanel(service)
         taskPanels.add(panel)
+        panel.selectModeForTest(ask = false)
         panel.setContractFieldsForTest("stay valid", "always true", "drift", "proof")
         panel.setBudgetFieldsForTest("5000", "250000")
         panel.openTaskOptionsForTest()
@@ -349,6 +350,7 @@ object JetBrainsHostMatrixSmoke {
             )
             val chat = FaktorChatPanel(service)
             taskPanels.add(chat)
+            chat.selectModeForTest(ask = false)
             chat.openTaskOptionsForTest()
             ParityAwt.layout(chat, 240, 600)
             val sheet = chat.taskOptionsSheetForTest()
@@ -1296,14 +1298,20 @@ object JetBrainsHostMatrixSmoke {
                 chat.attachmentsCountForTest() == 0,
                 "the empty composer must carry no attachments"
             )
+            requireTrue(chat.askModeSelected(), "Ask must be the default intent")
             requireTrue(
-                textLines(chat).contains("Run task"),
-                "the empty composer must render its Run task action: ${textLines(chat)}"
+                textLines(chat).contains("Send"),
+                "the empty composer must render its ONE Send action: ${textLines(chat)}"
+            )
+            requireTrue(
+                !chat.taskOptionsVisibleForTest(),
+                "Ask must keep Task options behind the Task intent"
             )
             requirePanelRenders("empty task composer", chat)
         }
         check("state/empty/task-options") {
             val chat = newChatPanel("task-options-empty")
+            chat.selectModeForTest(ask = false)
             chat.openTaskOptionsForTest()
             requireTrue(chat.taskOptionsOpenForTest(), "the Task options sheet must open")
             requireTrue(
@@ -1362,8 +1370,8 @@ object JetBrainsHostMatrixSmoke {
             )
             requireTrue(texts.contains("No run yet"), "the empty run chip must name itself: $texts")
             requireTrue(
-                panel.summaryText("Phase") == "—" && panel.summaryText("Spend") == "—",
-                "missing overview values must stay missing"
+                !panel.hasSummaryRowForTest("Phase") && !panel.hasSummaryRowForTest("Spend"),
+                "absent overview sections must be omitted, not rendered as placeholders"
             )
             requirePanelRenders("empty overview", panel)
         }

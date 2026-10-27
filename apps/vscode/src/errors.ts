@@ -16,6 +16,12 @@ export type UserErrorKind =
   | 'daemon_down'
   | 'daemon_start_failed'
   | 'service_not_ready'
+  | 'service_binary_missing'
+  | 'service_trust_changed'
+  | 'service_trust_unverified'
+  | 'service_budget_exhausted'
+  | 'service_configuration_invalid'
+  | 'service_untrusted_install'
   | 'stream_gap'
   | 'run_failure'
   | 'permission_expired'
@@ -27,7 +33,12 @@ export type ErrorActionKey =
   | 'reconnectStream'
   | 'refresh'
   | 'focusComposer'
-  | 'attachFiles';
+  | 'attachFiles'
+  | 'openDiagnostics'
+  | 'retryStart'
+  | 'locateDaemon'
+  | 'reviewTrust'
+  | 'manageWorkspaceTrust';
 
 /** One concrete next step rendered as a real button by the panel. */
 export interface UserErrorAction {
@@ -86,6 +97,36 @@ const KIND_COPY: Record<UserErrorKind, KindCopy> = {
     hint: 'The service is running but has not reported readiness; Diagnostics carries the exact readiness detail.',
     action: null,
   },
+  service_binary_missing: {
+    summary: 'Faktor needs its service',
+    hint: 'Locate the installed executable on this machine to continue.',
+    action: { key: 'locateDaemon', label: 'Locate service…' },
+  },
+  service_trust_changed: {
+    summary: 'Faktor stopped for safety',
+    hint: 'The service executable changed or no longer matches its recorded identity. Review it in Diagnostics.',
+    action: { key: 'reviewTrust', label: 'Review executable' },
+  },
+  service_trust_unverified: {
+    summary: 'Faktor needs a trust decision',
+    hint: 'The installed service has no recorded identity. Review it in Diagnostics before starting it.',
+    action: { key: 'openDiagnostics', label: 'Review in Diagnostics' },
+  },
+  service_budget_exhausted: {
+    summary: 'Faktor could not stay connected',
+    hint: 'The service restarted too many times. Check Diagnostics, then try again.',
+    action: { key: 'retryStart', label: 'Try again' },
+  },
+  service_configuration_invalid: {
+    summary: 'Faktor’s service settings are invalid',
+    hint: 'Fix the service configuration in Diagnostics, then try again.',
+    action: { key: 'openDiagnostics', label: 'Open Diagnostics' },
+  },
+  service_untrusted_install: {
+    summary: 'Faktor refused an untrusted executable',
+    hint: 'The configured executable is outside the trusted install. Choose the installed service.',
+    action: { key: 'locateDaemon', label: 'Locate service…' },
+  },
   stream_gap: {
     summary: 'Live updates paused',
     hint: 'Reconnect to resume from the last event. Nothing is skipped.',
@@ -121,6 +162,12 @@ function kindOf(kind: unknown): UserErrorKind {
   return kind === 'daemon_down' ||
     kind === 'daemon_start_failed' ||
     kind === 'service_not_ready' ||
+    kind === 'service_binary_missing' ||
+    kind === 'service_trust_changed' ||
+    kind === 'service_trust_unverified' ||
+    kind === 'service_budget_exhausted' ||
+    kind === 'service_configuration_invalid' ||
+    kind === 'service_untrusted_install' ||
     kind === 'stream_gap' ||
     kind === 'run_failure' ||
     kind === 'permission_expired' ||

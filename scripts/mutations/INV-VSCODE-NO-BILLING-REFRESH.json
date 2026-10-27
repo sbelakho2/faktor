@@ -1,0 +1,14 @@
+{
+  "id": "INV-VSCODE-NO-BILLING-REFRESH",
+  "file": "apps/vscode/src/refreshReads.ts",
+  "find": "  'tournament',\n];",
+  "replace": "  'tournament',\n  'account',\n];",
+  "gate": "node apps/vscode/scripts/ux-state.mjs",
+  "expect": "FAILED",
+  "note": "Adding account to the automatic refresh plan makes normal chat/run refresh read commercial data, which the boundary tests reject.",
+  "capabilities": [
+    "vscode.refresh.no_billing"
+  ],
+  "oracle": "mutation",
+  "isolation": ["isolated-worktree", "isolated-data-dir", "read-only-artifacts"]
+}

@@ -356,6 +356,7 @@ mod tests {
                     )
                 })
                 .collect(),
+            ..Default::default()
         }
         .validated()
         .unwrap();

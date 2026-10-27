@@ -51,7 +51,7 @@ class ChatSettingsUxTest {
             )
         )
         val texts = panel.workStatusTextForTest()
-        assertEquals("Idle", texts[0])
+        assertEquals("Ready", texts[0])
         assertEquals("No active run", texts[1])
         assertTrue("tokens slot must be explicit: ${texts[2]}", texts[2].startsWith("Tokens"))
         assertEquals("No approvals", texts[3])

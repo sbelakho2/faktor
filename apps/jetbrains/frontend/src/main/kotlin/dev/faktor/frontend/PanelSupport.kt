@@ -1381,3 +1381,17 @@ internal fun bound(text: String?, max: Int): String {
     }
     return clean.substring(0, end) + "..."
 }
+
+/**
+ * Narrow-layout identifier text: keep both ends visible and elide the middle
+ * (a path/commit/id reads as an identifier, unlike a sentence). Never builds
+ * a vertical wall of characters; the bound is exact including the ellipsis.
+ */
+internal fun ellipsizeIdentifier(text: String?, max: Int = 32): String {
+    val clean = DISPLAY_CONTROL_CHARS.replace(text ?: "", "")
+    val limit = max.coerceAtLeast(4)
+    if (clean.length <= limit) return clean
+    val head = (limit - 1) / 2
+    val tail = limit - 1 - head
+    return clean.substring(0, head) + "\u2026" + clean.substring(clean.length - tail)
+}

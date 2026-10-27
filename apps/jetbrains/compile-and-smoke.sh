@@ -297,6 +297,7 @@ $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/ModelPickerDialog.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/FaktorFrontendService.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/ControlPlaneCredentials.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/FaktorChatPanel.kt
+$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/UxStateModel.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/PanelSupport.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/PixelAgents.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/TaskTreeModel.kt

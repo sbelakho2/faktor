@@ -39,6 +39,7 @@ import {
   validateProtocolOutcomesPage,
   validateProtocolTaskRun,
   validateProtocolTaskRunCancelled,
+  validateProtocolSessionPromptReceipt,
   validateProtocolTaskRunStarted,
   validateProtocolValueEntitlementsReport,
   ProtocolDtoError,
@@ -48,6 +49,7 @@ import {
   type ProtocolOutcomesPage,
   type ProtocolTaskRun,
   type ProtocolTaskRunCancelled,
+  type ProtocolSessionPromptReceipt,
   type ProtocolTaskRunStarted,
   type ProtocolValueEntitlementsReport,
 } from './generated/protocolDto.ts';
@@ -470,6 +472,9 @@ export interface NativeSessionSummary {
 }
 
 /** One per-MIME entry of the daemon-advertised attachment limits. */
+/** Strict receipt of one ordinary prompt (submission-keyed replay included). */
+export type NativePromptReceipt = ProtocolSessionPromptReceipt;
+
 export interface NativeAttachmentMimeLimit {
   readonly mime: string;
   readonly maxBytes: number;
@@ -4363,6 +4368,33 @@ export class NativeClient {
 
   listSessions(): Promise<NativeSessionSummary[]> {
     return this.request('GET', '/native/sessions', { validate: validateSessionList });
+  }
+
+  /**
+   * One ordinary conversational prompt (`POST /native/session/{id}/prompt`).
+   * This is the Ask path: the body carries ONLY the session id, the required
+   * submission UUID, the prompt text and optional workspace-relative files.
+   * No task, engineering contract, budget, completion contract or proof
+   * member exists on the wire, so Ask can never become a task run by
+   * accident.
+   */
+  prompt(
+    sessionId: string,
+    prompt: string,
+    options: { readonly files?: readonly string[]; readonly submissionId: string },
+  ): Promise<NativePromptReceipt> {
+    return this.request('POST', `/native/session/${encodeURIComponent(sessionId)}/prompt`, {
+      body: {
+        session_id: sessionId,
+        submission_id: options.submissionId,
+        prompt,
+        ...(options.files !== undefined && options.files.length > 0
+          ? { files: [...options.files] }
+          : {}),
+      },
+      validate: (value, path) =>
+        validateProtocolSessionPromptReceipt(value, path) as NativePromptReceipt,
+    });
   }
 
   projection(sessionId: string): Promise<NativeProjection> {

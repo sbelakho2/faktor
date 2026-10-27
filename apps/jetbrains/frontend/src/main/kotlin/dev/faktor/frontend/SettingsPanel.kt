@@ -258,6 +258,11 @@ class SettingsPanel(
         updateStatus()
     }
 
+    /** The credential state's one action lands on the provider settings. */
+    fun focusProviders() {
+        providerCombo.requestFocusInWindow()
+    }
+
     fun selectedProvider(): String? = providerCombo.selectedItem as? String
 
     fun selectedModel(): String? = modelCombo.selectedItem as? String

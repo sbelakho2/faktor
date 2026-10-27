@@ -9,6 +9,7 @@
 //! refused before an append that would breach the budget. When the budget
 //! cannot be met the health is typed degraded — never a silent success.
 
+pub mod capacity;
 pub mod class;
 pub mod config;
 pub mod directory;
@@ -21,10 +22,16 @@ pub mod object;
 #[cfg(test)]
 mod tests;
 
+pub use capacity::{
+    CapacityProbe, CapacitySnapshot, FilesystemCapacity, FilesystemSpace, SystemCapacityProbe,
+};
 pub use class::StorageClass;
 pub use config::{
-    StorageGovernorConfig, DEFAULT_RESERVATION_LEASE_MS, DEFAULT_TOTAL_BUDGET_BYTES,
-    DEFAULT_WATERMARK_PERMILLE,
+    StorageGovernorConfig, DEFAULT_CAPACITY_PERMILLE, DEFAULT_MIN_INSTALL_ALLOWANCE_BYTES,
+    DEFAULT_RESERVATION_LEASE_MS, DEFAULT_RESERVE_BYTES, DEFAULT_RESERVE_PERMILLE,
+    DEFAULT_TOTAL_BUDGET_BYTES, DEFAULT_WATERMARK_PERMILLE, MAX_CAPACITY_PERMILLE,
+    MAX_INSTALL_ALLOWANCE_BYTES, MAX_RESERVE_BYTES, MAX_RESERVE_PERMILLE, MIN_CAPACITY_PERMILLE,
+    MIN_INSTALL_ALLOWANCE_BYTES, MIN_RESERVE_BYTES, MIN_RESERVE_PERMILLE,
 };
 pub use directory::{DirectoryBackend, SqliteBackend};
 pub use error::{GovernorError, GovernorResult, RefusalReason, StorageRefusal};

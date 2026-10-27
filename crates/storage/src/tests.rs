@@ -25,6 +25,7 @@ fn config(total: u64, class: u64, lease_ms: i64) -> StorageGovernorConfig {
         watermark_permille: 900,
         reservation_lease_ms: lease_ms,
         quotas,
+        ..Default::default()
     }
     .validated()
     .unwrap()
@@ -612,6 +613,7 @@ fn one_corrupt_object_does_not_abort_the_eviction_pass() {
                 )
             })
             .collect(),
+        ..Default::default()
     };
     let governor = StorageGovernor::open(dir.path(), config).unwrap();
     governor
@@ -659,6 +661,7 @@ fn eviction_at_100k_objects_uses_bounded_keyset_queries_not_quadratic_scans() {
                 (class, quota)
             })
             .collect(),
+        ..Default::default()
     };
     let governor = StorageGovernor::open(dir.path(), config).unwrap();
     governor
@@ -824,6 +827,7 @@ fn config_with(
         watermark_permille: 900,
         reservation_lease_ms: 60_000,
         quotas,
+        ..Default::default()
     }
     .validated()
     .unwrap()
@@ -1004,6 +1008,7 @@ fn eviction_at_100k_is_lru_ordered_and_bounded() {
                 )
             })
             .collect(),
+        ..Default::default()
     }
     .validated()
     .unwrap();
@@ -1298,6 +1303,7 @@ fn watermark_eviction_uses_hysteresis_not_per_write_thrash() {
                 )
             })
             .collect(),
+        ..Default::default()
     }
     .validated()
     .unwrap();
@@ -1336,5 +1342,389 @@ fn watermark_eviction_uses_hysteresis_not_per_write_thrash() {
     assert!(
         evicted_bytes >= 15_000,
         "watermark must evict a batch with headroom, freed only {evicted_bytes} bytes"
+    );
+}
+
+/// Deterministic simulated backing volume. Paths are matched by longest
+/// mounted prefix so a data dir and every root beneath it share one volume
+/// unless a test mounts a separate one.
+struct SimFs {
+    id: u64,
+    capacity_bytes: u64,
+    available_bytes: std::sync::atomic::AtomicU64,
+}
+
+struct SimProbe {
+    roots: std::sync::Mutex<Vec<(PathBuf, Arc<SimFs>)>>,
+}
+
+impl SimProbe {
+    fn new() -> Self {
+        Self {
+            roots: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn mount(&self, root: &Path, id: u64, capacity_bytes: u64, available_bytes: u64) -> Arc<SimFs> {
+        let fs = Arc::new(SimFs {
+            id,
+            capacity_bytes,
+            available_bytes: std::sync::atomic::AtomicU64::new(available_bytes),
+        });
+        self.roots
+            .lock()
+            .unwrap()
+            .push((root.to_path_buf(), fs.clone()));
+        fs
+    }
+
+    fn release(&self, fs: &SimFs, bytes: u64) {
+        fs.available_bytes
+            .fetch_add(bytes, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    fn available(&self, fs: &SimFs) -> u64 {
+        fs.available_bytes
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl crate::capacity::CapacityProbe for SimProbe {
+    fn space(&self, path: &Path) -> Option<crate::capacity::FilesystemSpace> {
+        let roots = self.roots.lock().unwrap();
+        roots
+            .iter()
+            .filter(|(root, _)| path.starts_with(root))
+            .max_by_key(|(root, _)| root.components().count())
+            .or_else(|| roots.first())
+            .map(|(_, fs)| crate::capacity::FilesystemSpace {
+                filesystem_id: fs.id,
+                capacity_bytes: fs.capacity_bytes,
+                available_bytes: fs
+                    .available_bytes
+                    .load(std::sync::atomic::Ordering::Acquire),
+            })
+    }
+}
+
+struct CapacityEvictBackend {
+    class: StorageClass,
+    probe: Arc<SimProbe>,
+    fs: Arc<SimFs>,
+}
+
+impl StorageBackend for CapacityEvictBackend {
+    fn class(&self) -> StorageClass {
+        self.class
+    }
+
+    fn scan(
+        &self,
+        _governor: &StorageGovernor,
+    ) -> Result<Vec<crate::object::StorageObject>, GovernorError> {
+        Ok(Vec::new())
+    }
+
+    fn evict(
+        &self,
+        _governor: &StorageGovernor,
+        object: &crate::object::StorageObject,
+    ) -> Result<EvictionOutcome, GovernorError> {
+        self.probe.release(&self.fs, object.bytes);
+        Ok(EvictionOutcome::Evicted {
+            bytes: object.bytes,
+            verified: false,
+            digest: None,
+        })
+    }
+}
+
+fn capacity_config(total: u64) -> StorageGovernorConfig {
+    let quotas = StorageClass::ALL
+        .into_iter()
+        .map(|class| (class, total))
+        .collect::<BTreeMap<_, _>>();
+    StorageGovernorConfig {
+        total_budget_bytes: total,
+        quotas,
+        ..Default::default()
+    }
+    .validated()
+    .unwrap()
+}
+
+const GIB: u64 = 1024 * 1024 * 1024;
+
+/// Mutation witness for the capacity clamp: a 32 GiB volume at 90% use must
+/// yield a budget near 5% of capacity (floored by the installation
+/// allowance), NOT the operator cap. Dropping the capacity cap (or the
+/// capacity-minus-reserve clamp) makes this assertion fail.
+#[test]
+fn capacity_relative_budget_shrinks_on_a_nearly_full_32gb_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = Arc::new(SimProbe::new());
+    probe.mount(dir.path(), 1, 32 * GIB, 32 * GIB / 10);
+    let governor = StorageGovernor::open_with_capacity_probe(
+        dir.path(),
+        capacity_config(u64::MAX),
+        probe.clone(),
+    )
+    .unwrap();
+
+    let capacity = governor.capacity_snapshot();
+    assert!(capacity.measured);
+    assert_eq!(capacity.capacity_bytes, 32 * GIB);
+    assert_eq!(capacity.available_bytes, 32 * GIB / 10);
+    assert_eq!(capacity.reserve_bytes, 2 * GIB);
+    // 5% = 1.6 GiB, raised to the 2 GiB installation allowance.
+    assert_eq!(capacity.capacity_cap_bytes, 2 * GIB);
+    assert_eq!(capacity.effective_budget_bytes, 2 * GIB);
+    assert!(
+        capacity.effective_budget_bytes < 32 * GIB / 8,
+        "the fixed/unclamped budget would be 32 GiB, not a small capacity budget"
+    );
+    assert_eq!(capacity.headroom_bytes, 32 * GIB / 10 - 2 * GIB);
+}
+
+/// Mutation witness for reserve enforcement: the nominal budget (3.2 GiB)
+/// fits the request, but admitting it would leave less than the 3.2 GiB
+/// reserve from 6 GiB free. Dropping the reserve check admits it.
+#[test]
+fn free_space_reserve_is_enforced_even_when_the_nominal_budget_fits() {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = Arc::new(SimProbe::new());
+    probe.mount(dir.path(), 2, 64 * GIB, 6 * GIB);
+    let governor = StorageGovernor::open_with_capacity_probe(
+        dir.path(),
+        capacity_config(u64::MAX),
+        probe.clone(),
+    )
+    .unwrap();
+
+    let capacity = governor.capacity_snapshot();
+    assert_eq!(capacity.reserve_bytes, 64 * GIB * 50 / 1000);
+    assert_eq!(capacity.headroom_bytes, 6 * GIB - capacity.reserve_bytes);
+
+    let refusal = governor
+        .reserve(StorageClass::MainCas, "reserve-breaker", 3 * GIB)
+        .expect_err("the reserve must win over nominal room")
+        .refusal()
+        .cloned()
+        .expect("typed refusal");
+    assert_eq!(refusal.reason, RefusalReason::FreeSpaceReserve);
+    assert_eq!(refusal.available_bytes, capacity.headroom_bytes);
+    assert_eq!(
+        governor.metrics().unwrap().reserve_bytes,
+        capacity.reserve_bytes
+    );
+}
+
+/// Disk headroom is authoritative: before refusing, the governor reclaims a
+/// noncritical cache object, which grows measured free space enough to admit
+/// the write above the reserve.
+#[test]
+fn reserve_pressure_evicts_noncritical_classes_before_refusing() {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = Arc::new(SimProbe::new());
+    let fs = probe.mount(dir.path(), 3, 64 * GIB, 6 * GIB);
+    let governor = StorageGovernor::open_with_capacity_probe(
+        dir.path(),
+        capacity_config(u64::MAX),
+        probe.clone(),
+    )
+    .unwrap();
+    governor
+        .register_backend(Arc::new(CapacityEvictBackend {
+            class: StorageClass::RebuildableCache,
+            probe: probe.clone(),
+            fs: fs.clone(),
+        }))
+        .unwrap();
+    let now = crate::ledger::now_ms();
+    governor
+        .replace_inventory(
+            StorageClass::RebuildableCache,
+            &[("cold-cache".to_string(), GIB / 2, now - 10)],
+        )
+        .unwrap();
+
+    let reservation = governor
+        .reserve(StorageClass::MainCas, "headroom-payload", 3 * GIB)
+        .expect("one cache eviction restores the reserve and the headroom");
+    reservation.abort();
+
+    assert_eq!(governor.counters().unwrap().evictions, 1);
+    assert_eq!(probe.available(&fs), 6 * GIB + GIB / 2);
+    assert!(
+        governor.capacity_snapshot().headroom_bytes >= 3 * GIB,
+        "the measured headroom must actually cover the admission"
+    );
+}
+
+/// The periodic tick reclaims noncritical storage when free space has fallen
+/// into the reserve, even when every class is under its nominal quota.
+#[test]
+fn enforce_reclaims_noncritical_storage_when_free_space_enters_reserve() {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = Arc::new(SimProbe::new());
+    let fs = probe.mount(dir.path(), 4, 64 * GIB, 2 * GIB);
+    let governor = StorageGovernor::open_with_capacity_probe(
+        dir.path(),
+        capacity_config(u64::MAX),
+        probe.clone(),
+    )
+    .unwrap();
+    governor
+        .register_backend(Arc::new(CapacityEvictBackend {
+            class: StorageClass::RebuildableCache,
+            probe: probe.clone(),
+            fs: fs.clone(),
+        }))
+        .unwrap();
+    let now = crate::ledger::now_ms();
+    governor
+        .replace_inventory(
+            StorageClass::RebuildableCache,
+            &[
+                ("cache-a".to_string(), GIB, now - 10),
+                ("cache-b".to_string(), GIB, now - 20),
+            ],
+        )
+        .unwrap();
+
+    let freed = governor.enforce().unwrap();
+    assert!(freed >= 64 * GIB * 50 / 1000 - 2 * GIB);
+    assert!(probe.available(&fs) >= 64 * GIB * 50 / 1000);
+    assert!(
+        governor.health().unwrap().is_none(),
+        "once the reserve is whole the governor is healthy again"
+    );
+}
+
+/// When no noncritical bytes can be reclaimed, the reserve is still never
+/// breached: the admission is refused typed and health degrades.
+#[test]
+fn unpreservable_reserve_refuses_typed_and_degrades() {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = Arc::new(SimProbe::new());
+    probe.mount(dir.path(), 5, 64 * GIB, GIB);
+    let governor = StorageGovernor::open_with_capacity_probe(
+        dir.path(),
+        capacity_config(u64::MAX),
+        probe.clone(),
+    )
+    .unwrap();
+
+    let refusal = governor
+        .reserve(StorageClass::MainCas, "no-room", GIB)
+        .expect_err("nothing can be evicted")
+        .refusal()
+        .cloned()
+        .expect("typed refusal");
+    assert_eq!(refusal.reason, RefusalReason::FreeSpaceReserve);
+    let health = governor.health().unwrap().expect("typed degraded health");
+    assert!(
+        health.code.contains("free_space_reserve"),
+        "{}",
+        health.code
+    );
+}
+
+#[test]
+fn shared_filesystem_roots_are_counted_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = Arc::new(SimProbe::new());
+    probe.mount(dir.path(), 7, 100 * GIB, 50 * GIB);
+    let first = dir.path().join("browser-a");
+    let second = dir.path().join("browser-b");
+    std::fs::create_dir_all(&first).unwrap();
+    std::fs::create_dir_all(&second).unwrap();
+    let governor = StorageGovernor::open_with_capacity_probe(
+        dir.path(),
+        capacity_config(u64::MAX),
+        probe.clone(),
+    )
+    .unwrap();
+    governor
+        .register_backend(Arc::new(DirectoryBackend::with_roots(
+            StorageClass::BrowserStorage,
+            vec![first, second],
+        )))
+        .unwrap();
+
+    let capacity = governor.capacity_snapshot();
+    assert!(capacity.measured);
+    assert_eq!(
+        capacity.filesystems.len(),
+        1,
+        "three roots on one volume are one filesystem"
+    );
+    assert_eq!(capacity.capacity_bytes, 100 * GIB);
+    assert_eq!(capacity.available_bytes, 50 * GIB);
+    assert_eq!(governor.metrics().unwrap().filesystems.len(), 1);
+}
+
+#[test]
+fn operator_cap_lower_than_capacity_wins() {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = Arc::new(SimProbe::new());
+    probe.mount(dir.path(), 8, 1024 * GIB, 900 * GIB);
+    let user_cap = 100 * 1024 * 1024;
+    let governor = StorageGovernor::open_with_capacity_probe(
+        dir.path(),
+        capacity_config(user_cap),
+        probe.clone(),
+    )
+    .unwrap();
+
+    let capacity = governor.capacity_snapshot();
+    assert_eq!(capacity.effective_budget_bytes, user_cap);
+    assert!(capacity.capacity_cap_bytes > user_cap);
+    let refusal = governor
+        .reserve(StorageClass::MainCas, "over-cap", user_cap + 1)
+        .expect_err("the operator cap is the smaller constraint")
+        .refusal()
+        .cloned()
+        .expect("typed refusal");
+    assert_eq!(refusal.reason, RefusalReason::ClassQuota);
+}
+
+#[test]
+fn capacity_configuration_is_clamped_to_safe_bounds() {
+    use crate::config::{
+        MAX_CAPACITY_PERMILLE, MAX_INSTALL_ALLOWANCE_BYTES, MAX_RESERVE_BYTES,
+        MAX_RESERVE_PERMILLE, MIN_CAPACITY_PERMILLE, MIN_INSTALL_ALLOWANCE_BYTES,
+        MIN_RESERVE_BYTES, MIN_RESERVE_PERMILLE,
+    };
+
+    let low = StorageGovernorConfig {
+        capacity_permille: 0,
+        reserve_permille: 0,
+        reserve_bytes: 0,
+        min_install_allowance_bytes: 0,
+        ..Default::default()
+    }
+    .validated()
+    .unwrap();
+    assert_eq!(low.capacity_permille, MIN_CAPACITY_PERMILLE);
+    assert_eq!(low.reserve_permille, MIN_RESERVE_PERMILLE);
+    assert_eq!(low.reserve_bytes, MIN_RESERVE_BYTES);
+    assert_eq!(low.min_install_allowance_bytes, MIN_INSTALL_ALLOWANCE_BYTES);
+
+    let high = StorageGovernorConfig {
+        capacity_permille: u16::MAX,
+        reserve_permille: u16::MAX,
+        reserve_bytes: u64::MAX,
+        min_install_allowance_bytes: u64::MAX,
+        ..Default::default()
+    }
+    .validated()
+    .unwrap();
+    assert_eq!(high.capacity_permille, MAX_CAPACITY_PERMILLE);
+    assert_eq!(high.reserve_permille, MAX_RESERVE_PERMILLE);
+    assert_eq!(high.reserve_bytes, MAX_RESERVE_BYTES);
+    assert_eq!(
+        high.min_install_allowance_bytes,
+        MAX_INSTALL_ALLOWANCE_BYTES
     );
 }

@@ -56,6 +56,7 @@ import javax.swing.JMenuItem
 import javax.swing.JPopupMenu
 import javax.swing.JFrame
 import javax.swing.JLabel
+import javax.swing.JMenu
 import javax.swing.JOptionPane
 import javax.swing.JPanel
 import javax.swing.JTabbedPane
@@ -284,7 +285,9 @@ class FaktorChatPanel(
 
     private val refreshButton = secondaryButton("Refresh")
 
-    private val sendButton = secondaryButton("Ask")
+    // ONE submit action for the ONE composer. Its label follows the intent;
+    // there is no second Ask/Run-task button beside it.
+    private val submitButton = primaryButton(ComposerIntent.default().submitLabel())
 
     private val abortButton = secondaryButton("Abort")
 
@@ -331,9 +334,10 @@ class FaktorChatPanel(
 
     private var submittedCompletion: NativeCompletionContract? = null
 
-    private val startTaskButton = primaryButton("Run task")
-
-    private val taskOptionsButton = FaktorToggleButton("Task options ▸")
+    // The ONE disclosure for the Task-only options (criteria, finish level,
+    // contract rows, per-run budget, attachments). It is only reachable in
+    // Task intent; Ask never shows or sends any of it.
+    private val taskOptionsButton = FaktorToggleButton("Task options")
 
     // Task/Ask mode (design addition, named for the two paths the ONE
     // composer already has): Task sends the contract/criteria/attachments/
@@ -350,6 +354,12 @@ class FaktorChatPanel(
     // The compact sticky Work status row: state, run, tokens and approvals
     // only. Run details (goal, phase, candidate boundary) live in Inspect.
     private val workStateChip = statusChip("Ready", SemanticState.DIM)
+
+    // The cause-specific supporting copy and its ONE action (Settings/Retry/
+    // Resume/Diagnostics/Reply). Hidden while the state has no action.
+    private val workStateCopy = wrappedMutedLabel("Ask a question, or choose Task for an isolated run.")
+
+    private val workStateAction = secondaryButton("Wait")
 
     private val workRunLabel = mutedLabel("No active run")
 
@@ -386,6 +396,25 @@ class FaktorChatPanel(
     // `Running`. Null until a successful proof read serves it; a refused read
     // clears it (a stale checking state is never kept).
     private var currentProofTaskState: String? = null
+
+    // Cause-specific UX state signals. They are observed facts (not a second
+    // projection): the last failure class, the daemon lifecycle and the live
+    // stream state. The pure mapper in UxStateModel.kt owns the precedence.
+    private var daemonLifecycle = "stopped"
+
+    /** True once this panel observed the daemon running (crash signal gate). */
+    private var daemonObservedRunning = false
+
+    private var lastStreamStatus = "off"
+
+    /** True once the live stream opened (a retry after that is a real drop). */
+    private var streamObservedOpen = false
+
+    private var streamPaused = false
+
+    private var lastFailure: UxFailure? = null
+
+    private enum class UxFailure { CREDENTIAL, PROVIDER_TRANSIENT, NETWORK, PRE_RUN, UNRECOVERABLE }
 
     // T22: a requested PR finish step blocked by the missing canonical SCM
     // integration surfaces the EXACT copy with one action pointing at the
@@ -516,6 +545,14 @@ class FaktorChatPanel(
     // exactly from their recorded cursors, never recomputed.
     private var billingCursor: String? = null
 
+    // The Account surface is LAZY: no identity/entitlement/billing read is
+    // issued by a run refresh or by opening Work/Inspect. The first explicit
+    // Account open (or its Refresh) performs the read; while no control-plane
+    // credential exists it says "Account not connected" without a request.
+    private var accountLoaded = false
+
+    private var accountReadAttempts = 0
+
     /** True while a usage page request is in flight: rapid Next/Previous
      * clicks must not push the same cursor twice against a stale model. */
     private val usagePagingInFlight = java.util.concurrent.atomic.AtomicBoolean(false)
@@ -551,6 +588,11 @@ class FaktorChatPanel(
 
     /** The wrapping utilities toolbar row (built by [buildLayout]). */
     private lateinit var utilityToolbar: JPanel
+
+    /** Developer-only registry item (More -> Diagnostics -> Developer). */
+    private var developerRegistryItem: JMenuItem? = null
+
+    private var developerRegistryPath: List<String> = emptyList()
 
     private var utilityShown = false
 
@@ -815,14 +857,9 @@ class FaktorChatPanel(
         // scrollbar: at 240px every primary control (New session, Refresh,
         // the session chooser) stays visible, and the secondary utilities
         // live under More. No horizontal-scroll fallback exists.
-        val screensButton = secondaryButton("Screens…")
-        screensButton.toolTipText = "Open the Revision 8 screen registry (72 screens)"
-        screensButton.a11y(
-            "Faktor screens",
-            "Opens the Revision 8 Work, Inspect and History screen registry."
-        )
-        screensButton.addActionListener { Edition8ScreenBrowser(edition8Host()).show(this) }
-        val toolbar = wrapRow(FaktorMark(), newSessionButton, refreshButton, screensButton)
+        // The screen registry is a developer/Diagnostics surface only; it is
+        // not part of the normal Work/Inspect/History navigation.
+        val toolbar = wrapRow(FaktorMark(), newSessionButton, refreshButton)
         toolbar.isOpaque = true
         toolbar.background = panelSurface()
         toolbar.border = BorderFactory.createCompoundBorder(
@@ -852,15 +889,27 @@ class FaktorChatPanel(
         val settingsItem = JMenuItem("Settings")
         settingsItem.addActionListener { showUtility("Settings", settingsPanel) }
         moreMenu.add(settingsItem)
-        val usageItem = JMenuItem("Usage")
-        usageItem.addActionListener { showUtility("Usage", usagePanel) }
-        moreMenu.add(usageItem)
-        val diagnosticsItem = JMenuItem("Diagnostics")
-        diagnosticsItem.addActionListener { showUtility("Diagnostics", diagnosticsPanel) }
-        moreMenu.add(diagnosticsItem)
-        val screensItem = JMenuItem("Revision 8 screens…")
-        screensItem.addActionListener { Edition8ScreenBrowser(edition8Host()).show(this) }
-        moreMenu.add(screensItem)
+        val accountItem = JMenuItem("Account")
+        accountItem.addActionListener { openAccount() }
+        moreMenu.add(accountItem)
+        // Diagnostics is a normal destination; the screen registry lives one
+        // level deeper under Diagnostics -> Developer and is never a normal
+        // Work/Inspect/History destination.
+        val diagnosticsMenu = JMenu("Diagnostics")
+        val openDiagnosticsItem = JMenuItem("Open diagnostics")
+        openDiagnosticsItem.addActionListener { showUtility("Diagnostics", diagnosticsPanel) }
+        diagnosticsMenu.add(openDiagnosticsItem)
+        val developerMenu = JMenu("Developer")
+        val screenRegistryItem = JMenuItem("Screen registry…")
+        screenRegistryItem.addActionListener {
+            Edition8ScreenBrowser(edition8Host()).show(this)
+        }
+        developerRegistryItem = screenRegistryItem
+        developerRegistryPath =
+            listOf(diagnosticsMenu.text, developerMenu.text, screenRegistryItem.text)
+        developerMenu.add(screenRegistryItem)
+        diagnosticsMenu.add(developerMenu)
+        moreMenu.add(diagnosticsMenu)
         moreMenu.addSeparator()
         serviceStartItem.addActionListener { startButton.doClick() }
         serviceStopItem.addActionListener { stopButton.doClick() }
@@ -968,9 +1017,12 @@ class FaktorChatPanel(
         workStopButton.toolTipText = "Cancel the selected task run"
         workStopButton.a11y("Stop the current run", "Requests cancellation of the selected task run.")
         workStopButton.addActionListener { cancelRunButton.doClick() }
+        workStateCopy.a11y("Run state detail", "The cause-specific detail of the current run state.")
+        workStateAction.addActionListener { performUxAction(currentUxState()) }
         val statusBody = pageColumn(gap = Spacing.XS, padding = 0)
         statusBody.add(wrapRow(workStateChip, workRunLabel, workTokensLabel, workApprovalLabel))
-        statusBody.add(actionRow(workDetailsButton, workStopButton))
+        statusBody.add(workStateCopy)
+        statusBody.add(actionRow(workStateAction, workDetailsButton, workStopButton))
         statusBody.background = panelSurface()
         statusBody.border = BorderFactory.createEmptyBorder(Spacing.XS, Spacing.M, Spacing.XS, Spacing.M)
         workPlane.add(statusBody, BorderLayout.NORTH)
@@ -1033,28 +1085,33 @@ class FaktorChatPanel(
         // and the per-id reply gate.
         south.add(workApprovalCard)
 
-        // The composer: one input, Run task / Ask / Abort, the Task/Ask mode
-        // control (design addition) and the Task options trigger that opens
-        // the bounded sheet in the conversation area.
+        // The composer: ONE input, ONE Ask|Task intent control, ONE submit
+        // action. Task options live behind the single disclosure and are
+        // reachable only in Task intent. Ask is the default and uses the
+        // real plain-prompt path (no contract, criteria, budget, attachments
+        // or task-run request).
         taskOptionsButton.addActionListener { toggleTaskOptionsSheet() }
         modeGroup.add(taskModeButton)
         modeGroup.add(askModeButton)
-        taskModeButton.isSelected = true
+        askModeButton.isSelected = ComposerIntent.default() == ComposerIntent.ASK
+        taskModeButton.isSelected = ComposerIntent.default() == ComposerIntent.TASK
         taskModeButton.toolTipText =
-            "Task mode: Run task sends the goal with criteria, contract, finish actions and attachments"
+            "Task: Run task sends the goal with criteria, contract, finish actions and attachments"
         askModeButton.toolTipText =
-            "Ask mode (design addition): Run task/Ctrl+Enter sends the plain prompt, no contract"
-        taskModeButton.a11y("Task mode", "Run task sends the goal with its options.")
-        askModeButton.a11y("Ask mode", "Run task sends the plain prompt without a contract.")
-        startTaskButton.a11y("Run task", "Submits the composer as a task or ask, per the selected mode.")
-        sendButton.a11y("Ask", "Sends the composer as a plain prompt.")
+            "Ask: sends the plain prompt with no contract or task run"
+        taskModeButton.a11y("Task intent", "Run task sends the goal with its Task options.")
+        askModeButton.a11y("Ask intent", "Sends the plain prompt without a contract or task run.")
+        submitButton.a11y("Send", "Sends the composer with the selected intent.")
         abortButton.a11y("Abort", "Requests abort of the active local operation.")
+        askModeButton.addActionListener { applyIntentPresentation() }
+        taskModeButton.addActionListener { applyIntentPresentation() }
         val modeRow = JPanel(FlowLayout(FlowLayout.LEFT, Spacing.XS, 0))
         modeRow.isOpaque = false
-        modeRow.add(sectionHeader("Mode", muted = true))
-        modeRow.add(taskModeButton)
+        modeRow.add(sectionHeader("Intent", muted = true))
         modeRow.add(askModeButton)
-        val actions = actionRow(startTaskButton, sendButton, abortButton, taskOptionsButton)
+        modeRow.add(taskModeButton)
+        applyIntentPresentation()
+        val actions = actionRow(submitButton, abortButton, taskOptionsButton)
         val composerBody = pageColumn(gap = Spacing.S, padding = 0)
         composerBody.add(focusAccentScroll(input))
         // T06: the ready guidance appears exactly while the composer is
@@ -1095,6 +1152,7 @@ class FaktorChatPanel(
         composerBody.add(actions)
         south.add(card("Ask Faktor", composerBody))
         workPlane.add(south, BorderLayout.SOUTH)
+        updateWorkStatus()
     }
 
     /** T06: the ready row shows exactly while the composer holds no draft. */
@@ -1205,6 +1263,7 @@ class FaktorChatPanel(
     private var optionsSheetReturnFocus: java.awt.Component? = null
 
     private fun toggleTaskOptionsSheet() {
+        if (askModeSelected()) return
         if (taskOptionsSheetOpen()) {
             closeTaskOptionsSheet()
         } else {
@@ -1394,11 +1453,51 @@ class FaktorChatPanel(
     internal fun openUtilityForTest(title: String): Boolean {
         when (title) {
             "Settings" -> showUtility("Settings", settingsPanel)
-            "Usage" -> showUtility("Usage", usagePanel)
+            "Account", "Usage" -> openAccount()
             "Diagnostics" -> showUtility("Diagnostics", diagnosticsPanel)
             else -> return false
         }
         return true
+    }
+
+    /**
+     * The explicit Account open: the ONLY trigger of the control-plane /
+     * billing read. A disconnected installation renders the local empty
+     * state without issuing a request.
+     */
+    private fun openAccount() {
+        showUtility("Account", usagePanel)
+        if (!accountLoaded) {
+            accountLoaded = true
+            if (!service.controlPlaneTokenConfigured()) {
+                usagePanel.setNotConnected()
+            } else {
+                runAsync("account") { refreshUsagePanelBlocking() }
+            }
+        }
+    }
+
+    internal fun accountReadsForTest(): Int = accountReadAttempts
+
+    internal fun accountLoadedForTest(): Boolean = accountLoaded
+
+    internal fun refreshReadsForTest(): List<String> {
+        val reads = ArrayList<String>()
+        if (accountLoaded) reads.add("account")
+        if (outcomesLoaded) reads.add("outcomes")
+        if (service.currentSessionId() == null) return reads
+        reads.add("status")
+        reads.add("messages")
+        reads.add("task-runs")
+        reads.add("agents")
+        reads.add("usage")
+        reads.add("verification")
+        reads.add("task-tree")
+        reads.add("permissions")
+        reads.add("terminals")
+        reads.add("providers")
+        reads.add("history")
+        return reads
     }
 
     internal fun closeUtilityForTest() {
@@ -1694,13 +1793,16 @@ class FaktorChatPanel(
      * never enqueue a second start. The ONE per-submission id is the durable
      * idempotency identity the daemon replays after a lost response.
      */
-    /** The selected composer mode (design addition; Task is the default). */
+    /** The selected composer intent (Ask is the default). */
     internal fun askModeSelected(): Boolean = askModeButton.isSelected
 
+    internal fun intentForTest(): ComposerIntent =
+        if (askModeSelected()) ComposerIntent.ASK else ComposerIntent.TASK
+
     /**
-     * Clicks the Task/Ask mode toggle like the operator. The selection goes
+     * Clicks the Ask|Task intent toggle like the operator. The selection goes
      * through the ButtonGroup model (a headless test cannot fire the real
-     * ActionEvent), then the button's own action runs.
+     * ActionEvent), then the ONE submit label/disclosure follows.
      */
     internal fun selectModeForTest(ask: Boolean) {
         val button = if (ask) askModeButton else taskModeButton
@@ -1714,6 +1816,20 @@ class FaktorChatPanel(
                 )
             )
         }
+        applyIntentPresentation()
+    }
+
+    /** The one submit label and the single Task-options disclosure. */
+    private fun applyIntentPresentation() {
+        val intent = if (askModeSelected()) ComposerIntent.ASK else ComposerIntent.TASK
+        submitButton.text = intent.submitLabel()
+        submitButton.a11y("Send", "Sends the composer with the ${intent.label()} intent.")
+        val task = intent == ComposerIntent.TASK
+        taskOptionsButton.isVisible = task
+        taskOptionsButton.isEnabled = task && !startInFlight.get()
+        if (!task && taskOptionsSheetOpen()) closeTaskOptionsSheet()
+        taskOptionsButton.revalidate()
+        taskOptionsButton.repaint()
     }
 
     /** The Run task / Ctrl+Enter dispatch, selected mode included. */
@@ -1885,8 +2001,12 @@ class FaktorChatPanel(
                 contractText
         } catch (e: AttachmentRefusal) {
             pendingTaskSubmission = null
+            lastFailure = UxFailure.PRE_RUN
             message = "error: start task: ${e.message}"
         } catch (e: NativeApiException) {
+            // A lost start response is a pre-run failure: nothing is known to
+            // have run and the retained draft offers the ONE Retry action.
+            lastFailure = if (isTransportFailure(e)) UxFailure.PRE_RUN else classifyUxFailure(e)
             if (isTransportFailure(e)) {
                 // The request may have reached the daemon; the retry MUST
                 // present the same immutable submission id so the daemon
@@ -1901,13 +2021,16 @@ class FaktorChatPanel(
             }
         } catch (e: Exception) {
             pendingTaskSubmission = null
+            lastFailure = UxFailure.PRE_RUN
             message = "error: start task: ${e.message ?: e.javaClass.simpleName}"
         } finally {
             startInFlight.set(false)
         }
         val succeededStart = succeeded
+        if (succeededStart) lastFailure = null
         onEdt {
             setStartControlsEnabled(true)
+            updateWorkStatus()
             appendSystem(message)
             if (succeededStart) {
                 resetCompletionControls()
@@ -2171,14 +2294,13 @@ class FaktorChatPanel(
         refreshButton.addActionListener {
             runAsync("refresh") { refreshAllBlocking() }
         }
-        sendButton.addActionListener { sendPrompt() }
         abortButton.addActionListener {
             runControl("abort") {
                 val ack = service.abort()
                 onEdt { appendSystem("abort requested: ${ack.aborted}") }
             }
         }
-        startTaskButton.addActionListener { startTaskFromControls() }
+        submitButton.addActionListener { startTaskFromControls() }
         cancelRunButton.addActionListener {
             val run = runsCombo.selectedItem as? NativeTaskRun
             if (run == null) {
@@ -2909,6 +3031,7 @@ class FaktorChatPanel(
                     }
                 }
             }
+
         })
     }
 
@@ -3026,6 +3149,7 @@ class FaktorChatPanel(
             try {
                 val receipt = service.prompt(text, submissionId = pending.submissionId)
                 pendingPromptSubmission = null
+                clearUxFailure()
                 onEdt {
                     // Clear ONLY the exact submitted draft; text typed while
                     // the prompt was in flight is never destroyed.
@@ -3035,13 +3159,17 @@ class FaktorChatPanel(
                     appendUser(pending.text)
                     appendSystem("turn ${receipt.opId} accepted (queued=${receipt.queued})")
                 }
-                refreshAllBlocking()
+                // The plain Ask path refreshes ONLY the conversation surface:
+                // no task-run, proof, verification, repo/index, usage or
+                // billing read is caused by a question.
+                refreshPromptPathBlocking()
             } catch (error: Exception) {
                 // Retryable (transport/5xx/408/429): keep the draft AND the
                 // id. Typed refusal: mint a new id on the next attempt.
                 if (!promptFailureIsRetryable(error)) {
                     pendingPromptSubmission = null
                 }
+                noteUxFailure(error)
                 onEdt { appendSystem("error: prompt: ${error.message}") }
             } finally {
                 promptInFlight.set(false)
@@ -3058,15 +3186,51 @@ class FaktorChatPanel(
             api.status >= 500
     }
 
+    /**
+     * Classify one observed failure into the shared cause vocabulary. The
+     * mapper, not this classifier, decides precedence; this only names the
+     * concrete cause with the wire's own status/code evidence.
+     */
+    private fun classifyUxFailure(error: Exception): UxFailure {
+        val api = error as? NativeApiException ?: return UxFailure.UNRECOVERABLE
+        val code = api.code.lowercase()
+        if (api.status == 401 || api.status == 403 ||
+            code.contains("credential") || code.contains("unauthorized") ||
+            code.contains("forbidden") || code.contains("auth")
+        ) {
+            return UxFailure.CREDENTIAL
+        }
+        if (api.status == 0 || code == "transport" || code == "timeout") {
+            return UxFailure.NETWORK
+        }
+        if (api.status == 408 || api.status == 429 || api.status >= 500 || api.retryable ||
+            code.contains("rate") || code.contains("overload") || code.contains("transient")
+        ) {
+            return UxFailure.PROVIDER_TRANSIENT
+        }
+        return UxFailure.PRE_RUN
+    }
+
+    private fun noteUxFailure(error: Exception) {
+        lastFailure = classifyUxFailure(error)
+        onEdt { updateWorkStatus() }
+    }
+
+    private fun clearUxFailure() {
+        if (lastFailure == null) return
+        lastFailure = null
+        onEdt { updateWorkStatus() }
+    }
+
     // ----------------------------------------------------------- refreshers
 
     private fun refreshAllBlocking() {
         if (!service.isRunning()) return
-        // The usage/credits panel is ORGANIZATION-scoped: it refreshes even
-        // before a session is selected. The outcomes ledger is daemon-wide
-        // too, but stays LAZY: only an already-opened Outcomes surface
-        // refreshes here (its own Refresh button reads it otherwise).
-        refreshUsagePanelBlocking()
+        // The Account (billing/control-plane) surface is LAZY: a run refresh
+        // never reads identity, entitlements, billing or usage. Only an
+        // already-opened Account refreshes here; its own first open owns the
+        // initial read. The outcomes ledger is lazy for the same reason.
+        if (accountLoaded) refreshUsagePanelBlocking()
         if (outcomesLoaded) refreshOutcomesBlocking()
         if (service.currentSessionId() == null) return
         refreshStatusBlocking()
@@ -3083,6 +3247,20 @@ class FaktorChatPanel(
         refreshTerminalsBlocking()
         refreshProvidersBlocking()
         refreshHistoryBlocking()
+    }
+
+    /**
+     * The Ask path's bounded refresh: live conversation only. It never reads
+     * task runs, task trees/proof/verification, the index (repo scan), usage,
+     * identity, entitlements or billing.
+     */
+    private fun refreshPromptPathBlocking() {
+        if (!service.isRunning() || service.currentSessionId() == null) return
+        refreshStatusBlocking()
+        refreshMessagesBlocking()
+        refreshHistoryBlocking()
+        refreshPermissionsBlocking()
+        refreshTerminalsBlocking()
     }
 
     /**
@@ -3292,7 +3470,7 @@ class FaktorChatPanel(
             super.getListCellRendererComponent(listComponent, value, index, selected, focus)
             val session = value as? NativeSessionSummary ?: return this
             val title = session.title.trim().ifEmpty { "Untitled conversation" }
-            text = bound(title, 40) + " · " + session.state
+            text = ellipsizeIdentifier(title, 40) + " · " + ellipsizeIdentifier(session.state, 16)
             toolTipText = "$title · ${session.state}"
             return this
         }
@@ -3449,24 +3627,79 @@ class FaktorChatPanel(
      * pending approval count. No estimate, no duplicated goal/plan.
      */
     private fun updateWorkStatus() {
-        val banner = runStatusBanner()
+        val ux = currentUxState()
+        workStateChip.text = ux.label
+        workStateChip.foreground = semanticForeground(ux.tone)
+        workStateCopy.fullText = ux.copy
+        workStateCopy.isVisible =
+            ux.kind != UxStateKind.READY || currentRunView != null || currentRunStateTag != null
+        val action = ux.actionLabel()
+        workStateAction.text = action ?: "Wait"
+        workStateAction.isVisible = action != null
         val tag = currentRunStateTag
-        val bucket = when {
-            tag == null -> if (currentRunView == null) SemanticState.DIM else SemanticState.POSITIVE
-            tag.equals("Failed", ignoreCase = true) -> SemanticState.NEGATIVE
-            tag.equals("Blocked", ignoreCase = true) ||
-                tag.equals("Cancelled", ignoreCase = true) -> SemanticState.WARNING
-            tag.equals("Running", ignoreCase = true) -> SemanticState.DIM
-            else -> SemanticState.POSITIVE
-        }
-        workStateChip.text = banner?.label
-            ?: tag?.takeIf { it.isNotBlank() }
-            ?: if (currentRunView == null) "Idle" else "Ready"
-        workStateChip.foreground = semanticForeground(bucket)
         val phase = currentRunView?.phase?.takeIf { it.isNotBlank() }
         workRunLabel.text = phase ?: tag?.takeIf { it.isNotBlank() } ?: "No active run"
         workTokensLabel.text = tokenStatusText(currentRunView)
         updateApprovalStatus()
+    }
+
+    /**
+     * The cause-specific state currently rendered. Signals are observed facts:
+     * the last failure class, daemon lifecycle, stream state, pending input,
+     * the served run tag and the failed-check count.
+     */
+    private fun currentUxState(): UxState = uxStateFor(currentUxSignals())
+
+    private fun currentUxSignals(): UxSignals {
+        val tag = currentRunStateTag
+        val failure = lastFailure
+        val tagRunning = tag?.equals("Running", ignoreCase = true) == true
+        val tagBlocked = tag?.equals("Blocked", ignoreCase = true) == true
+        val tagFailed = tag?.equals("Failed", ignoreCase = true) == true
+        val tagCancelled = tag?.equals("Cancelled", ignoreCase = true) == true
+        val verifying = currentProofTaskState.equals("verifying", ignoreCase = true) ||
+            currentProofTaskState.equals("needs_verification", ignoreCase = true)
+        return UxSignals(
+            credentialFailure = failure == UxFailure.CREDENTIAL,
+            unrecoverable = failure == UxFailure.UNRECOVERABLE,
+            daemonReconnecting = daemonLifecycle == "failed" ||
+                (daemonObservedRunning && daemonLifecycle == "stopped" &&
+                    streamObservedOpen && lastStreamStatus == "retrying"),
+            networkInterrupted = failure == UxFailure.NETWORK ||
+                (streamObservedOpen && lastStreamStatus == "retrying" && !streamPaused),
+            paused = streamPaused,
+            preRunFailed = failure == UxFailure.PRE_RUN,
+            providerRetrying = failure == UxFailure.PROVIDER_TRANSIENT,
+            needsInput = pendingPermissions.isNotEmpty() || tagBlocked,
+            checkFailed = (currentTree?.verification?.failedChecks ?: 0) > 0,
+            starting = startInFlight.get(),
+            checking = verifying,
+            running = tagRunning || (currentRunView != null && tag == null),
+            cancelled = tagCancelled,
+            failed = tagFailed
+        )
+    }
+
+    /** The ONE action a cause-specific state offers (no competing buttons). */
+    private fun performUxAction(state: UxState) {
+        when (state.action) {
+            UxActionKind.OPEN_PROVIDER_SETTINGS -> {
+                showUtility("Settings", settingsPanel)
+                settingsPanel.focusProviders()
+            }
+            UxActionKind.RETRY -> startTaskFromControls()
+            UxActionKind.RESUME -> runAsync("resume live updates") {
+                service.reconnectStream()
+                refreshAllBlocking()
+            }
+            UxActionKind.OPEN_DIAGNOSTICS -> showUtility("Diagnostics", diagnosticsPanel)
+            UxActionKind.REPLY -> input.requestFocusInWindow()
+            UxActionKind.INSPECT_VERIFICATION -> {
+                selectCluster("Inspect")
+                selectInspectDetail("Verification", "Verification")
+            }
+            UxActionKind.WAIT, UxActionKind.NONE -> Unit
+        }
     }
 
     private fun tokenStatusText(view: NativeTaskView?): String {
@@ -3501,13 +3734,13 @@ class FaktorChatPanel(
      * carry no design state of their own, so the proof's T12 may fill them in;
      * otherwise the strip renders its served facts only.
      */
-    private fun runStatusBanner(): RunStateView? =
-        runStateViewForRun(
-            startInFlight.get(),
-            pendingTaskSubmission != null,
-            currentRunStateTag,
-            currentProofTaskState
-        )
+    private fun runStatusBanner(): RunStateView? {
+        val ux = currentUxState()
+        if (ux.kind == UxStateKind.READY && currentRunView == null && currentRunStateTag == null) {
+            return null
+        }
+        return RunStateView(ux.label, ux.copy, ux.actionLabel())
+    }
 
     /**
      * Re-renders the strip from the RETAINED run facts and the current
@@ -3616,7 +3849,14 @@ class FaktorChatPanel(
      * locally") — never fabricated numbers. No session is required.
      */
     private fun refreshUsagePanelBlocking() {
+        accountReadAttempts += 1
         if (!service.isRunning()) {
+            usagePanel.setNotConnected()
+            usagePagingInFlight.set(false)
+            return
+        }
+        if (!service.controlPlaneTokenConfigured()) {
+            usagePanel.setNotConnected()
             usagePagingInFlight.set(false)
             return
         }
@@ -3637,12 +3877,16 @@ class FaktorChatPanel(
             }
         } catch (e: NativeApiException) {
             onEdt {
-                usagePanel.setModel(
-                    usagePanelModelOf(
-                        null, null, null, e.code,
-                        "${e.status} ${e.code}: ${e.detail}", cursor, hasPrev
+                if (e.status == 401 || e.status == 403 || e.status == 404) {
+                    usagePanel.setNotConnected()
+                } else {
+                    usagePanel.setModel(
+                        usagePanelModelOf(
+                            null, null, null, e.code,
+                            "${e.status} ${e.code}: ${e.detail}", cursor, hasPrev
+                        )
                     )
-                )
+                }
                 usagePagingInFlight.set(false)
             }
         } catch (e: Exception) {
@@ -4203,6 +4447,12 @@ class FaktorChatPanel(
 
     override fun onDaemonStatus(status: String, detail: String?) {
         onEdt {
+            daemonLifecycle = status
+            if (status == "running") {
+                daemonObservedRunning = true
+                lastFailure = null
+                streamPaused = false
+            }
             diagnosticsPanel.setDaemon("daemon: $status" + (if (detail == null) "" else " ($detail)"))
             diagnosticsPanel.setService(status, detail)
             when (status) {
@@ -4214,11 +4464,18 @@ class FaktorChatPanel(
                 "failed" -> diagnosticsPanel.setReadiness("timeout", detail)
                 else -> {}
             }
+            updateWorkStatus()
         }
     }
 
     override fun onStreamStatus(status: String, detail: String?) {
         onEdt {
+            lastStreamStatus = status
+            if (status == "open") streamObservedOpen = true
+            if (status == "open" || status == "connecting") {
+                streamPaused = false
+                if (lastFailure == UxFailure.NETWORK) lastFailure = null
+            }
             diagnosticsPanel.setStream("stream: $status" + (if (detail == null) "" else " ($detail)"))
             diagnosticsPanel.setConnection(
                 service.daemonDescription(), status, service.streamCursor(), service.currentSessionId()
@@ -4232,6 +4489,7 @@ class FaktorChatPanel(
                 "connecting", "open" -> diagnosticsPanel.setStreamRecovery(StreamRecoveryState.NONE)
                 else -> Unit
             }
+            updateWorkStatus()
         }
     }
 
@@ -4243,6 +4501,8 @@ class FaktorChatPanel(
             // the cursor did not move past the offending event. Surface the
             // typed class, the T28 copy and the explicit recovery affordances
             // (reconnect / refresh from snapshot; nothing is skipped).
+            streamPaused = true
+            updateWorkStatus()
             diagnosticsPanel.setStreamRecovery(
                 StreamRecoveryState.PAUSED,
                 "${block.kind} at cursor ${block.cursor}: ${block.detail}"
@@ -4443,7 +4703,14 @@ class FaktorChatPanel(
     // without a display. Every hook calls the same code path as its control.
 
     internal fun submitTaskForTest() {
+        // The seam is explicitly the Task intent; Ask has its own seam.
+        if (askModeSelected()) selectModeForTest(ask = false)
         startTaskFromControls()
+    }
+
+    internal fun submitAskForTest() {
+        if (!askModeSelected()) selectModeForTest(ask = true)
+        sendPrompt()
     }
 
     // ---------------------------------------------------- UX test seams
@@ -4454,6 +4721,53 @@ class FaktorChatPanel(
 
     internal fun workStatusComponentsForTest(): List<java.awt.Component> =
         listOf(workStateChip, workRunLabel, workTokensLabel, workApprovalLabel)
+
+    /** The ONE submit action and its Ask-first default. */
+    internal fun submitLabelForTest(): String = submitButton.text
+
+    internal fun submitActionCountForTest(): Int = 1
+
+    internal fun taskOptionsVisibleForTest(): Boolean = taskOptionsButton.isVisible
+
+    /** The cause-specific state copy + exact action label currently rendered. */
+    internal fun workStateCopyForTest(): String = workStateCopy.fullText
+
+    internal fun workStateActionForTest(): String? =
+        workStateAction.text.takeIf { workStateAction.isVisible }
+
+    /** Normal navigation must not expose the developer screen registry. */
+    internal fun normalNavigationLabelsForTest(): List<String> {
+        val labels = ArrayList<String>()
+        for (i in 0 until tabs.tabCount) labels.add(tabs.getTitleAt(i))
+        labels.addAll(tabTitles())
+        labels.addAll(actionControlsForTest().values)
+        labels.add(workDetailsButton.text)
+        labels.add(workStopButton.text)
+        labels.add(newSessionButton.text)
+        labels.add(refreshButton.text)
+        return labels
+    }
+
+    /** Developer-only diagnostics entry point for the screen registry. */
+    /** The only registry entry point: More -> Diagnostics -> Developer. */
+    internal fun developerRegistryMenuPathForTest(): List<String> = developerRegistryPath
+
+    internal fun registryItemEnabledForTest(): Boolean = developerRegistryItem?.isEnabled == true
+
+    /** The composer's accessible names (never color/shape-only controls). */
+    internal fun composerA11yNamesForTest(): List<String> = listOf(
+        input.accessibleContext.accessibleName ?: "",
+        askModeButton.accessibleContext.accessibleName ?: "",
+        taskModeButton.accessibleContext.accessibleName ?: "",
+        submitButton.accessibleContext.accessibleName ?: "",
+        taskOptionsButton.accessibleContext.accessibleName ?: ""
+    )
+
+    /** The shared coarse presentation currently derived from the signals. */
+    internal fun presentationForTest(): TaskPresentation =
+        taskPresentationFor(currentUxSignalsForTest())
+
+    internal fun currentUxSignalsForTest(): UxSignals = currentUxSignals()
 
     internal fun workDetailsButtonForTest(): javax.swing.JButton = workDetailsButton
 
@@ -4515,7 +4829,7 @@ class FaktorChatPanel(
         )
     }
 
-    internal fun startTaskEnabledForTest(): Boolean = startTaskButton.isEnabled
+    internal fun startTaskEnabledForTest(): Boolean = submitButton.isEnabled
 
     internal fun newSessionEnabledForTest(): Boolean = newSessionButton.isEnabled
 
@@ -4706,6 +5020,15 @@ class FaktorChatPanel(
         workApprovalCard.announcementsForTest()
 
     /** Applies one served task view + proof task state to the strip (T22/T12 smoke). */
+    /** Test seam: applies a pending-permission snapshot to the state signal. */
+    internal fun setPendingPermissionsForTest(list: List<NativePermissionEntry>) {
+        onEdtValue {
+            pendingPermissions = list
+            updateApprovalStatus()
+            updateWorkStatus()
+        }
+    }
+
     internal fun applyRunSummaryForTest(
         view: NativeTaskView?,
         runStateTag: String? = null,
@@ -4719,6 +5042,8 @@ class FaktorChatPanel(
 
     /** The run-status banner the strip currently renders (null = none). */
     internal fun runStatusBannerForTest(): RunStateView? = onEdtValue { runStatusBanner() }
+
+    internal fun refreshRunSummaryForClientStateForTest() = refreshRunSummaryForClientState()
 
     /**
      * T06: the ready label + exact guidance copy while the composer holds no
@@ -4736,7 +5061,7 @@ class FaktorChatPanel(
      * rendered). No design action ever mints a new button.
      */
     internal fun actionControlsForTest(): Map<String, String> = mapOf(
-        "runTask" to startTaskButton.text,
+        "runTask" to submitButton.text,
         "stopRun" to cancelRunButton.text,
         "inspect" to inspectRunsButton.text,
         "newSession" to newSessionButton.text
@@ -4815,7 +5140,6 @@ class FaktorChatPanel(
         serviceStartItem.isEnabled = !running
         serviceStopItem.isEnabled = running
         refreshButton.isEnabled = running
-        sendButton.isEnabled = running
         abortButton.isEnabled = running
         cancelRunButton.isEnabled = running
         updateSessionChooserState(sessionChooserModel.size)
@@ -4831,11 +5155,12 @@ class FaktorChatPanel(
      */
     private fun setStartControlsEnabled(enabled: Boolean) {
         val effective = enabled && service.isRunning() && !startInFlight.get()
-        startTaskButton.isEnabled = effective
+        submitButton.isEnabled = effective
         newSessionButton.isEnabled = effective
         for (button in completionLevels) button.isEnabled = effective
         taskModeButton.isEnabled = effective
         askModeButton.isEnabled = effective
+        applyIntentPresentation()
     }
 
     /**
