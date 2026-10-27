@@ -438,8 +438,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 <meta charset="UTF-8">
 <meta http-equiv="Content-Security-Policy" content="${csp}">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<link href="${settingsStyleUri}" rel="stylesheet">
-<link href="${styleUri}" rel="stylesheet">
+<link href="${settingsStyleUri}?v=0.2.3" rel="stylesheet">
+<link href="${styleUri}?v=0.2.3" rel="stylesheet">
 <title>Faktor</title>
 </head>
 <body data-surface="sidebar">
@@ -447,7 +447,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   <header>
     <button id="btn-back-chat" class="toggle back-to-chat" type="button" title="Back to chat" aria-label="Back to chat" hidden>← Chat</button>
     <span id="brand">Faktor</span>
-    <span id="ui-version" class="header-status" title="Installed Faktor build">v0.2.2</span>
+    <span id="ui-version" class="header-status" title="Installed Faktor build">v0.2.3</span>
     <span id="daemon-dot" class="dot dot-stopped" aria-hidden="true"></span>
     <span id="daemon-text" class="header-status">Ready</span>
     <span class="spacer"></span>
@@ -766,11 +766,11 @@ ${settingsMarkup}
   </section>
 </div>
 <script nonce="${nonce}">document.body.setAttribute('data-mode', 'chat');</script>
-<script nonce="${nonce}" src="${settingsScriptUri}"></script>
-<script nonce="${nonce}" src="${boardUri}"></script>
-<script nonce="${nonce}" src="${historyUri}"></script>
-<script nonce="${nonce}" src="${composerUri}"></script>
-<script nonce="${nonce}" src="${scriptUri}"></script>
+<script nonce="${nonce}" src="${settingsScriptUri}?v=0.2.3"></script>
+<script nonce="${nonce}" src="${boardUri}?v=0.2.3"></script>
+<script nonce="${nonce}" src="${historyUri}?v=0.2.3"></script>
+<script nonce="${nonce}" src="${composerUri}?v=0.2.3"></script>
+<script nonce="${nonce}" src="${scriptUri}?v=0.2.3"></script>
 </body>
 </html>`;
   }
