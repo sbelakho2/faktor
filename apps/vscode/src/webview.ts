@@ -41,6 +41,18 @@ const MAX_WEBVIEW_MESSAGE_BYTES = 64 * 1024 * 1024;
  * Untrusted webview content cannot hand the host a multi-gigabyte nested
  * value, a prototype-shaped non-object, or an unbounded command name.
  */
+/**
+ * The installed extension's own version, used for webview asset cache-busting
+ * and the header badge. Reading it at runtime (instead of a hardcoded
+ * literal) makes every release bust the webview cache automatically — a
+ * stale `?v=` pin silently served an OLD chat.js across upgrades.
+ */
+function assetVersion(): string {
+  const version = vscode.extensions.getExtension('faktor.faktor')?.packageJSON
+    ?.version as string | undefined;
+  return typeof version === 'string' && version.length > 0 ? version : '0.0.0-dev';
+}
+
 function validChatMessage(value: unknown): value is ChatMessage {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
   const type = (value as { type?: unknown }).type;
@@ -438,8 +450,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 <meta charset="UTF-8">
 <meta http-equiv="Content-Security-Policy" content="${csp}">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<link href="${settingsStyleUri}?v=0.2.7" rel="stylesheet">
-<link href="${styleUri}?v=0.2.7" rel="stylesheet">
+<link href="${settingsStyleUri}?v=${assetVersion()}" rel="stylesheet">
+<link href="${styleUri}?v=${assetVersion()}" rel="stylesheet">
 <title>Faktor</title>
 </head>
 <body data-surface="sidebar">
@@ -447,7 +459,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   <header>
     <button id="btn-back-chat" class="toggle back-to-chat" type="button" title="Back to chat" aria-label="Back to chat" hidden>← Chat</button>
     <span id="brand">Faktor</span>
-    <span id="ui-version" class="header-status" title="Installed Faktor build">v0.2.7</span>
+    <span id="ui-version" class="header-status" title="Installed Faktor build">v${assetVersion()}</span>
     <span id="daemon-dot" class="dot dot-stopped" aria-hidden="true"></span>
     <span id="daemon-text" class="header-status">Ready</span>
     <span class="spacer"></span>
@@ -770,11 +782,11 @@ ${settingsMarkup}
   </section>
 </div>
 <script nonce="${nonce}">document.body.setAttribute('data-mode', 'chat');</script>
-<script nonce="${nonce}" src="${settingsScriptUri}?v=0.2.7"></script>
-<script nonce="${nonce}" src="${boardUri}?v=0.2.7"></script>
-<script nonce="${nonce}" src="${historyUri}?v=0.2.7"></script>
-<script nonce="${nonce}" src="${composerUri}?v=0.2.7"></script>
-<script nonce="${nonce}" src="${scriptUri}?v=0.2.7"></script>
+<script nonce="${nonce}" src="${settingsScriptUri}?v=${assetVersion()}"></script>
+<script nonce="${nonce}" src="${boardUri}?v=${assetVersion()}"></script>
+<script nonce="${nonce}" src="${historyUri}?v=${assetVersion()}"></script>
+<script nonce="${nonce}" src="${composerUri}?v=${assetVersion()}"></script>
+<script nonce="${nonce}" src="${scriptUri}?v=${assetVersion()}"></script>
 </body>
 </html>`;
   }
