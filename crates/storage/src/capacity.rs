@@ -230,6 +230,9 @@ fn system_space(path: &Path) -> Option<(u64, u64)> {
     let mut available = 0u64;
     let mut total = 0u64;
     let mut total_free = 0u64;
+    // SAFETY: `wide` is a NUL-terminated buffer built here from an OsStr and
+    // only read by the call; the three out-pointers reference stack slots we
+    // just initialized, nothing is aliased or retained after the call.
     let ok =
         unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut available, &mut total, &mut total_free) };
     (ok != 0).then_some((total, available))

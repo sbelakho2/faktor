@@ -1,7 +1,7 @@
 {
   "schema": "faktor-live-ask-extension/v1",
   "capturedAt": "2026-10-27T18:47:39.264Z",
-  "repoRoot": "/Users/sabelakhoua/IdeaProjects/Kilo+",
+  "repoRoot": "/Users/sabelakhoua/IdeaProjects/<retired-repo>",
   "installedExtension": {
     "path": "/Users/sabelakhoua/.vscode/extensions/faktor.faktor-0.1.0",
     "name": "faktor",
@@ -93,8 +93,8 @@
     ]
   },
   "webviewScreenshotError": "Page.captureScreenshot: Command can only be executed on top-level targets",
-  "screenshot": "/Users/sabelakhoua/IdeaProjects/Kilo+/docs/specs/live-evidence/ask-fetch-fix/extension-live.png",
-  "workbenchScreenshot": "/Users/sabelakhoua/IdeaProjects/Kilo+/docs/specs/live-evidence/ask-fetch-fix/extension-live-workbench.png",
+  "screenshot": "/Users/sabelakhoua/IdeaProjects/<retired-repo>/docs/specs/live-evidence/ask-fetch-fix/extension-live.png",
+  "workbenchScreenshot": "/Users/sabelakhoua/IdeaProjects/<retired-repo>/docs/specs/live-evidence/ask-fetch-fix/extension-live-workbench.png",
   "sidebarRect": {
     "x": 48,
     "y": 70,
@@ -120,7 +120,7 @@
     },
     {
       "file": "<profile>/logs/20261027T194740/window1/exthost/exthost.log",
-      "tail": "2026-10-27 19:47:42.435 [info] ExtensionService#_doActivateExtension vscode.git-base, startup: true, activationEvent: '*', root cause: vscode.git\n2026-10-27 19:47:42.442 [info] ExtensionService#_doActivateExtension vscode.git, startup: true, activationEvent: '*'\n2026-10-27 19:47:42.490 [info] ExtensionService#_doActivateExtension vscode.github, startup: true, activationEvent: '*'\n2026-10-27 19:47:42.622 [info] Eager extensions activated\n2026-10-27 19:47:42.625 [info] ExtensionService#_doActivateExtension vscode.debug-auto-launch, startup: false, activationEvent: 'onStartupFinished'\n2026-10-27 19:47:42.626 [info] ExtensionService#_doActivateExtension vscode.merge-conflict, startup: false, activationEvent: 'onStartupFinished'\n2026-10-27 19:47:42.636 [info] ExtensionService#_doActivateExtension cweijan.vscode-office, startup: false, activationEvent: 'onStartupFinished'\n2026-10-27 19:47:42.766 [info] ExtensionService#_doActivateExtension kilocode.kilo-code, startup: false, activationEvent: 'onStartupFinished'\n2026-10-27 19:47:43.225 [info] ExtensionService#_doActivateExtension vscode.configuration-editing, startup: false, activationEvent: 'onLanguage:jsonc'\n2026-10-27 19:47:43.230 [info] ExtensionService#_doActivateExtension vscode.json-language-features, startup: false, activationEvent: 'onLanguage:jsonc'\n2026-10-27 19:47:43.273 [info] ExtensionService#_doActivateExtension vscode.typescript-language-features, startup: false, activationEvent: 'onLanguage:jsonc'\n"
+      "tail": "2026-10-27 19:47:42.435 [info] ExtensionService#_doActivateExtension vscode.git-base, startup: true, activationEvent: '*', root cause: vscode.git\n2026-10-27 19:47:42.442 [info] ExtensionService#_doActivateExtension vscode.git, startup: true, activationEvent: '*'\n2026-10-27 19:47:42.490 [info] ExtensionService#_doActivateExtension vscode.github, startup: true, activationEvent: '*'\n2026-10-27 19:47:42.622 [info] Eager extensions activated\n2026-10-27 19:47:42.625 [info] ExtensionService#_doActivateExtension vscode.debug-auto-launch, startup: false, activationEvent: 'onStartupFinished'\n2026-10-27 19:47:42.626 [info] ExtensionService#_doActivateExtension vscode.merge-conflict, startup: false, activationEvent: 'onStartupFinished'\n2026-10-27 19:47:42.636 [info] ExtensionService#_doActivateExtension cweijan.vscode-office, startup: false, activationEvent: 'onStartupFinished'\n2026-10-27 19:47:42.766 [info] ExtensionService#_doActivateExtension <retired-extension>, startup: false, activationEvent: 'onStartupFinished'\n2026-10-27 19:47:43.225 [info] ExtensionService#_doActivateExtension vscode.configuration-editing, startup: false, activationEvent: 'onLanguage:jsonc'\n2026-10-27 19:47:43.230 [info] ExtensionService#_doActivateExtension vscode.json-language-features, startup: false, activationEvent: 'onLanguage:jsonc'\n2026-10-27 19:47:43.273 [info] ExtensionService#_doActivateExtension vscode.typescript-language-features, startup: false, activationEvent: 'onLanguage:jsonc'\n"
     },
     {
       "file": "<profile>/logs/20261027T194740/window1/exthost/output_logging_20261027T194742/1-Faktor Revision 8.log",
@@ -131,15 +131,15 @@
       "tail": ""
     },
     {
-      "file": "<profile>/logs/20261027T194740/window1/exthost/output_logging_20261027T194742/3-Kilo Agent Manager.log",
-      "tail": "\tat Pn.handleTaskData (/Users/sabelakhoua/.vscode/extensions/kilocode.kilo-code-7.8.18-darwin-arm64/dist/extension.js:215:5826)\n\tat Pn.attemptRemoteTask (/Users/sabelakhoua/.vscode/extensions/kilocode.kilo-code-7.8.18-darwin-arm64/dist/extension.js:215:5466)\n\tat async Pn.attemptTask (/Users/sabelakhoua/.vscode/extensions/kilocode.kilo-code-7.8.18-darwin-arm64/dist/extension.js:215:4898)\n[WorktreeManager] registeredPaths: worktree list failed: Error: fatal: not a git repository (or any of the parent directories): .git\n\n2026-10-27T18:47:45.186Z worktree health: could not list git worktrees, skipping reconcile\n2026-10-27T18:47:45.186Z worktree health: orphans=0 degraded\n[WorktreeManager] defaultBranch: currentBranch failed: Error: Failed to determine current branch\n[WorktreeManager] defaultBranch: branchLocal failed: Error: fatal: not a git repository (or any of the parent directories): .git\n\n[WorktreeManager] worktree pool: warm failed: Error: This repository has no commits yet. Create an initial commit before using worktrees.\n"
+      "file": "<profile>/logs/20261027T194740/window1/exthost/output_logging_20261027T194742/3-<retired> Agent Manager.log",
+      "tail": "\tat Pn.handleTaskData (/Users/sabelakhoua/.vscode/extensions/<retired-extension>/dist/extension.js:215:5826)\n\tat Pn.attemptRemoteTask (/Users/sabelakhoua/.vscode/extensions/<retired-extension>/dist/extension.js:215:5466)\n\tat async Pn.attemptTask (/Users/sabelakhoua/.vscode/extensions/<retired-extension>/dist/extension.js:215:4898)\n[WorktreeManager] registeredPaths: worktree list failed: Error: fatal: not a git repository (or any of the parent directories): .git\n\n2026-10-27T18:47:45.186Z worktree health: could not list git worktrees, skipping reconcile\n2026-10-27T18:47:45.186Z worktree health: orphans=0 degraded\n[WorktreeManager] defaultBranch: currentBranch failed: Error: Failed to determine current branch\n[WorktreeManager] defaultBranch: branchLocal failed: Error: fatal: not a git repository (or any of the parent directories): .git\n\n[WorktreeManager] worktree pool: warm failed: Error: This repository has no commits yet. Create an initial commit before using worktrees.\n"
     },
     {
-      "file": "<profile>/logs/20261027T194740/window1/exthost/output_logging_20261027T194742/4-Kilo Diff Panel.log",
+      "file": "<profile>/logs/20261027T194740/window1/exthost/output_logging_20261027T194742/4-<retired> Diff Panel.log",
       "tail": ""
     },
     {
-      "file": "<profile>/logs/20261027T194740/window1/exthost/output_logging_20261027T194742/5-Kilo Diff Virtual.log",
+      "file": "<profile>/logs/20261027T194740/window1/exthost/output_logging_20261027T194742/5-<retired> Diff Virtual.log",
       "tail": ""
     },
     {

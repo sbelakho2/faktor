@@ -1059,7 +1059,7 @@
       try {
         vscode.postMessage({
           type: 'uiDomDump',
-          html: document.documentElement.outerHTML.slice(0, 300000),
+          html: new XMLSerializer().serializeToString(document.documentElement).slice(0, 300000),
           mode: document.body.getAttribute('data-mode') + ':' + key,
           version: (byId('ui-version') || {}).textContent || '',
         });
@@ -6487,7 +6487,7 @@
     try {
       vscode.postMessage({
         type: 'uiDomDump',
-        html: document.documentElement.outerHTML.slice(0, 300000),
+        html: new XMLSerializer().serializeToString(document.documentElement).slice(0, 300000),
         mode: document.body.getAttribute('data-mode'),
         version: (byId('ui-version') || {}).textContent || '',
       });

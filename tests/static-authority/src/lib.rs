@@ -7087,6 +7087,11 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         // plus job/process handle use, all inside this platform module.
         ("crates/terminal/src/win_spawn.rs", 1),
         ("crates/winjob/src/lib.rs", 1),
+        // Storage Governor per-filesystem capacity: the one Windows
+        // `GetDiskFreeSpaceExW` call (free/total bytes for a path) sits behind
+        // `#[allow(unsafe_code)]` with a per-site SAFETY comment; POSIX uses
+        // `statvfs` and needs no unsafe.
+        ("crates/storage/src/capacity.rs", 1),
         // fd-identity exec of the verified updater artifact (`fexecve`); the
         // single unsafe block exists solely to bind exec to the hashed inode.
         ("crates/updater/src/fd_exec.rs", 1),

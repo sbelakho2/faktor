@@ -232,7 +232,7 @@ async fn ngspice_is_supervised_and_typed_when_absent() {
     let fixture = Fixture::new();
     let netlist = fixture.write(
         "rc.cir",
-        b"* rc\nV1 in 0 5\nR1 in out 1k\nC1 out 0 1u\n.tran 1u 10u\n.end\n",
+        b"* rc\nV1 in 0 5\nR1 in out 1k\nC1 out 0 1u\n.tran 1u 10u\n.print tran v(out)\n.end\n",
     );
     let case = fixture.case(
         "ngspice",
