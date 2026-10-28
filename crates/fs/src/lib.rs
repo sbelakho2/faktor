@@ -3658,6 +3658,267 @@ mod tests {
             "the swapped path must not compare equal to the anchored root"
         );
     }
+
+    // ------------------------------------- PERF-10 shadow-turn census probes
+
+    /// Live OS threads of this process when the platform exposes them
+    /// (Linux `/proc/self/task`, macOS `ps -M`); `None` elsewhere.
+    fn live_thread_count() -> Option<usize> {
+        #[cfg(target_os = "linux")]
+        let count = std::fs::read_dir("/proc/self/task").ok().map(|d| d.count());
+        #[cfg(target_os = "macos")]
+        let count = std::process::Command::new("ps")
+            .arg("-M")
+            .arg(std::process::id().to_string())
+            .output()
+            .ok()
+            .and_then(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .count()
+                    .checked_sub(1)
+            });
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let count = None;
+        count
+    }
+
+    /// Live file descriptors of this process (Linux `/proc/self/fd`,
+    /// macOS `/dev/fd`); `None` elsewhere. Both listings include the
+    /// directory handle of the listing itself, so census bounds keep an
+    /// explicit small slack.
+    fn live_fd_count() -> Option<usize> {
+        #[cfg(target_os = "linux")]
+        let count = std::fs::read_dir("/proc/self/fd").ok().map(|d| d.count());
+        #[cfg(target_os = "macos")]
+        let count = std::fs::read_dir("/dev/fd").ok().map(|d| d.count());
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let count = None;
+        count
+    }
+
+    /// Bounded settle for OS-resource growth assertions: parallel tests in
+    /// this binary can transiently overlap a census; a real per-turn leak
+    /// is hundreds of threads/fds and can never settle into the slack.
+    fn settled_count(read: fn() -> Option<usize>, before: usize, slack: usize) -> Option<usize> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut after = read().unwrap_or(before);
+        while after > before + slack && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            after = read().unwrap_or(after);
+        }
+        Some(after)
+    }
+
+    /// PERF-10 fast tier: shadowed-turn-style open/close churn with the
+    /// REAL watcher backend (the degraded preflight-0 path used by the
+    /// registry-bound tests never exercises watcher attach/drop). No
+    /// wall-clock deadlines and no ms-scale reliance: the assertions are
+    /// the deterministic registry counters, the instrumented eviction
+    /// probe, and handle usability.
+    #[test]
+    fn real_watcher_shadow_churn_keeps_registry_and_eviction_bounded() {
+        let _guard = lock_watch_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let service = WorkspaceFileService::with_watch_registration_deadline(
+            TEST_WATCH_REGISTRATION_DEADLINE,
+        );
+        let id = WorkspaceId::new(21);
+        // Warm the singleton registration worker BEFORE counting spawns:
+        // like `watcher_registration_uses_exactly_one_worker_thread`, the
+        // counted window proves REUSE — no churn turn may spawn another.
+        {
+            let warm = dir.path().join("warm");
+            std::fs::create_dir_all(&warm).unwrap();
+            drop(service.open(id, warm).unwrap());
+            service.close(id);
+        }
+        let spawns_before = crate::workspace_service::watch_registration_worker_spawns();
+
+        let durable_root = dir.path().join("durable");
+        std::fs::create_dir_all(&durable_root).unwrap();
+        let durable = service.open(id, durable_root.clone()).unwrap();
+        assert!(
+            durable.watcher_attached(),
+            "the durable root must register a REAL watcher"
+        );
+        for i in 0..(crate::workspace_service::MAX_CACHED_ROOTS * 2) {
+            let root = dir.path().join(format!("shadow-{i:03}"));
+            std::fs::create_dir_all(&root).unwrap();
+            let handle = service.open(id, root).unwrap();
+            assert_eq!(handle.workspace_id(), id);
+        }
+        assert!(
+            service.open_count() <= crate::workspace_service::MAX_CACHED_ROOTS,
+            "real-watcher shadow churn must not grow the registry: {}",
+            service.open_count()
+        );
+        assert_eq!(
+            crate::workspace_service::watch_registration_worker_spawns(),
+            spawns_before,
+            "shadow churn must reuse the singleton registration worker"
+        );
+        // The held durable root survived every eviction and keeps its
+        // watcher across 2x the cache bound of REAL-watcher shadow churn.
+        let canonical = durable_root.canonicalize().unwrap();
+        assert!(
+            service
+                .cached_roots()
+                .iter()
+                .any(|(cached_id, root)| *cached_id == id && *root == canonical),
+            "the held durable root must stay cached: {:?}",
+            service.cached_roots()
+        );
+        assert!(durable.watcher_attached());
+        std::fs::write(canonical.join("still-hot.txt"), b"ok").unwrap();
+        assert!(durable
+            .read_default(std::path::Path::new("still-hot.txt"))
+            .is_ok());
+
+        // Deterministic eviction-cost counter (the CI-stable stand-in for
+        // wall time): at capacity, each insert examines the OLDEST index
+        // entry, not the whole map — with real watchers attached too.
+        crate::workspace_service::EVICTION_CANDIDATES.with(|count| count.set(0));
+        const ROUNDS: usize = 32;
+        for i in 0..ROUNDS {
+            let root = dir.path().join(format!("probe-{i:03}"));
+            std::fs::create_dir_all(&root).unwrap();
+            drop(service.open(id, root).unwrap());
+        }
+        let probes = crate::workspace_service::EVICTION_CANDIDATES.with(|count| count.get());
+        assert!(
+            probes <= ROUNDS * 2,
+            "real-watcher eviction scanned {probes} candidates over {ROUNDS} inserts (ordered index should probe ~1)"
+        );
+        drop(durable);
+        service.close(id);
+    }
+
+    /// PERF-10 fault tier: 1,000 shadowed-turn-style root open/close
+    /// cycles on the REAL watcher backend, with an OS thread/descriptor
+    /// census. The historical defect accumulated >500 FSEvents threads at
+    /// 1,000 turns; the census must show a PLATEAU after the cache fills
+    /// (never monotonic growth) and a return to baseline after close.
+    /// Manual: `cargo test -p faktor-fs -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "[fault] 1000 real-watcher shadow turns with OS thread/fd census; run with --ignored --nocapture"]
+    fn fault_probe_1000_shadow_turns_with_real_watchers_census_os_resources() {
+        let _guard = lock_watch_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let service = WorkspaceFileService::with_watch_registration_deadline(
+            TEST_WATCH_REGISTRATION_DEADLINE,
+        );
+        let id = WorkspaceId::new(22);
+        // Warm-up: the singleton registration worker and any pool threads
+        // exist BEFORE the baseline, so the census measures churn only.
+        {
+            let warm = dir.path().join("warm");
+            std::fs::create_dir_all(&warm).unwrap();
+            drop(service.open(id, warm).unwrap());
+            service.close(id);
+        }
+        let spawns_before = crate::workspace_service::watch_registration_worker_spawns();
+        let threads_baseline = live_thread_count();
+        let fds_baseline = live_fd_count();
+
+        let durable_root = dir.path().join("durable");
+        std::fs::create_dir_all(&durable_root).unwrap();
+        let durable = service.open(id, durable_root.clone()).unwrap();
+        assert!(
+            durable.watcher_attached(),
+            "the durable root must register a REAL watcher"
+        );
+        crate::workspace_service::EVICTION_CANDIDATES.with(|count| count.set(0));
+
+        const CYCLES: usize = 1_000;
+        let mut threads_early = None;
+        for i in 0..CYCLES {
+            let root = dir.path().join(format!("shadow-{i:04}"));
+            std::fs::create_dir_all(&root).unwrap();
+            let handle = service.open(id, root).unwrap();
+            assert_eq!(handle.workspace_id(), id);
+            // The cache is full long before cycle 300; a census there is
+            // the plateau the 1,000-turn census must never exceed.
+            if i == 299 {
+                threads_early = live_thread_count();
+            }
+        }
+        let threads_peak = live_thread_count();
+        let fds_peak = live_fd_count();
+        eprintln!(
+            "[fault] census baseline threads={threads_baseline:?} fds={fds_baseline:?}; \
+             plateau@300 threads={threads_early:?}; peak@{CYCLES} threads={threads_peak:?} fds={fds_peak:?}"
+        );
+        if let (Some(early), Some(peak)) = (threads_early, threads_peak) {
+            assert!(
+                peak <= early + 16,
+                "OS threads grew monotonically with turn count: {early} at cycle 300 vs {peak} at cycle {CYCLES} \
+                 (the historical defect accumulated >500 FSEvents threads)"
+            );
+        }
+        if let (Some(base), Some(peak)) = (fds_baseline, fds_peak) {
+            assert!(
+                peak <= base + 6 * crate::workspace_service::MAX_CACHED_ROOTS + 64,
+                "file descriptors grew with turn count: baseline {base} vs peak {peak} at cycle {CYCLES}"
+            );
+        }
+        assert!(
+            service.open_count() <= crate::workspace_service::MAX_CACHED_ROOTS,
+            "the registry must stay bounded across 1000 real-watcher turns: {}",
+            service.open_count()
+        );
+        assert_eq!(
+            crate::workspace_service::watch_registration_worker_spawns(),
+            spawns_before,
+            "1000 shadow turns must reuse the singleton registration worker"
+        );
+        let probes = crate::workspace_service::EVICTION_CANDIDATES.with(|count| count.get());
+        assert!(
+            probes <= CYCLES * 2,
+            "eviction examined {probes} candidates over {CYCLES} churn inserts (ordered index should probe ~1 each)"
+        );
+
+        // Eviction only removed idle roots: the HELD durable root is still
+        // cached, still watched, and still usable after 1000 shadow turns.
+        let canonical = durable_root.canonicalize().unwrap();
+        assert!(
+            service
+                .cached_roots()
+                .iter()
+                .any(|(cached_id, root)| *cached_id == id && *root == canonical),
+            "the held durable root must survive 1000 shadow turns: {:?}",
+            service.cached_roots()
+        );
+        assert!(durable.watcher_attached());
+        std::fs::write(canonical.join("still-hot.txt"), b"ok").unwrap();
+        assert!(durable
+            .read_default(std::path::Path::new("still-hot.txt"))
+            .is_ok());
+
+        // Release everything: the process must RETURN to (near) baseline —
+        // watcher teardown is bounded, so a leaked per-turn thread/fd can
+        // never hide inside the settle window.
+        drop(durable);
+        service.close(id);
+        let threads_after = settled_count(live_thread_count, threads_baseline.unwrap_or(0), 8);
+        let fds_after = settled_count(live_fd_count, fds_baseline.unwrap_or(0), 32);
+        eprintln!(
+            "[fault] after close: threads={threads_after:?} (baseline {threads_baseline:?}), \
+             fds={fds_after:?} (baseline {fds_baseline:?})"
+        );
+        if let (Some(base), Some(after)) = (threads_baseline, threads_after) {
+            assert!(
+                after <= base + 8,
+                "OS threads did not return to baseline after close: baseline {base} vs {after}"
+            );
+        }
+        if let (Some(base), Some(after)) = (fds_baseline, fds_after) {
+            assert!(
+                after <= base + 32,
+                "file descriptors did not return to baseline after close: baseline {base} vs {after}"
+            );
+        }
+    }
 }
 
 /// Report row 6: cache eviction is use-aware. A held (in-use) durable root

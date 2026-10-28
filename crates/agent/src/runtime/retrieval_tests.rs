@@ -2170,6 +2170,309 @@ fn corrupt_durable_activation_fact_is_a_typed_read_failure() {
     assert!(!load.found());
 }
 
+// ------------------------------------------- PERF-09 churn-scale probes
+
+/// EXPLAIN QUERY PLAN of the activation point lookup, run on the store's
+/// own writer connection through the documented debug seam. Bind values
+/// are INLINED as literals (no ANALYZE stats exist to specialize per
+/// value, so the planner treats them like the bound parameters the
+/// production statement uses), keeping rusqlite types out of this crate.
+fn explain_plan(runtime: &AgentRuntime, sql: String) -> Vec<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    runtime
+        .deps()
+        .session
+        .store()
+        .writer_debug_job("tool_activation_explain", move |conn| {
+            let outcome = (|| -> Result<Vec<String>, String> {
+                let mut stmt = conn
+                    .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                    .map_err(|e| e.to_string())?;
+                let mut rows = stmt.query(()).map_err(|e| e.to_string())?;
+                let mut lines = Vec::new();
+                while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+                    lines.push(row.get::<_, String>(3).map_err(|e| e.to_string())?);
+                }
+                Ok(lines)
+            })();
+            let _ = tx.send(outcome);
+        })
+        .expect("writer debug job admitted");
+    rx.recv()
+        .expect("writer debug job answered")
+        .expect("EXPLAIN QUERY PLAN must run on the live schema")
+}
+
+/// Query-plan truth: the activation lookup must be index-SEARCHed. A plan
+/// that degrades to a full `SCAN memory_fact` fails here — that is the
+/// O(all-facts) page-walk regression this probe exists to catch.
+fn assert_index_backed_activation_plan(plan: &[String]) {
+    let joined = plan.join(" | ");
+    assert!(
+        joined.contains("SEARCH memory_fact"),
+        "activation point plan is not index-backed: {joined}"
+    );
+    assert!(
+        !joined.contains("SCAN memory_fact"),
+        "activation point plan degrades to a full fact-table scan: {joined}"
+    );
+}
+
+/// Batched public-API churn seeding (the crates/memory 100k pattern).
+fn seed_churn_via_public_api(runtime: &AgentRuntime, session: SessionId, rows: usize) {
+    const CHUNK: usize = 2_000;
+    let store = runtime.deps().session.store();
+    for start in (0..rows).step_by(CHUNK) {
+        let end = (start + CHUNK).min(rows);
+        let batch: Vec<(String, String, String)> = (start..end)
+            .map(|i| {
+                (
+                    "taskexec_run".to_string(),
+                    format!("k{i:07}"),
+                    "{}".to_string(),
+                )
+            })
+            .collect();
+        let refs: Vec<(&str, &str, &str)> = batch
+            .iter()
+            .map(|(kind, key, value)| (kind.as_str(), key.as_str(), value.as_str()))
+            .collect();
+        store.upsert_memory_facts(session, &refs).unwrap();
+    }
+}
+
+/// 1M-row churn seeding through ONE recursive-CTE INSERT on the writer
+/// connection (the billing 1M-event pattern).
+fn seed_churn_recursive_cte(runtime: &AgentRuntime, session: SessionId, rows: i64) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let sid = session.raw();
+    let sql = format!(
+        "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < {rows})
+         INSERT INTO memory_fact(session_id, kind, key, value, updated_ms)
+         SELECT {sid}, 'taskexec_run', printf('k%07d', n), '{{}}', 1 FROM seq"
+    );
+    runtime
+        .deps()
+        .session
+        .store()
+        .writer_debug_job("tool_activation_churn_seed", move |conn| {
+            let outcome = conn.execute_batch(&sql).map_err(|e| e.to_string());
+            let _ = tx.send(outcome);
+        })
+        .expect("writer debug job admitted");
+    rx.recv()
+        .expect("writer debug job answered")
+        .expect("churn seed transaction must land atomically");
+}
+
+/// Median and p95 of one durable activation load over `rounds` samples.
+fn sample_activation_loads(
+    runtime: &AgentRuntime,
+    handle: &faktor_session::SessionHandle,
+    rounds: usize,
+) -> (std::time::Duration, std::time::Duration) {
+    let mut samples = Vec::with_capacity(rounds);
+    for _ in 0..rounds {
+        let started = std::time::Instant::now();
+        let load = runtime.load_tool_activation(handle);
+        assert!(load.found(), "{load:?}");
+        assert!(load.set.is_active("source_market"), "{load:?}");
+        samples.push(started.elapsed());
+    }
+    samples.sort_unstable();
+    let pick = |p: f64| {
+        let idx = (((samples.len() - 1) as f64) * p).round() as usize;
+        samples[idx]
+    };
+    (pick(0.5), pick(0.95))
+}
+
+/// Flat-latency bound: `3x baseline + 20 ms` — a genuine O(churn)
+/// degradation (full-fact scan per load) blows far past it, while runner
+/// noise on microsecond baselines cannot.
+fn assert_flat(
+    label: &str,
+    base: (std::time::Duration, std::time::Duration),
+    churn: (std::time::Duration, std::time::Duration),
+) {
+    let slack = std::time::Duration::from_millis(20);
+    assert!(
+        churn.0 <= base.0 * 3 + slack,
+        "{label}: median grew from {:?} to {:?} under churn",
+        base.0,
+        churn.0
+    );
+    assert!(
+        churn.1 <= base.1 * 3 + slack,
+        "{label}: p95 grew from {:?} to {:?} under churn",
+        base.1,
+        churn.1
+    );
+}
+
+/// PERF-09 non-ignored tier (100k rows): the tool-activation point lookup
+/// returns the SAME durable value at 0 and at 100k unrelated churn rows
+/// with flat latency, its plan stays index-SEARCHed, and at that scale the
+/// typed verdicts hold: a MISSING activation row is `Absent` (decisive,
+/// never a scan that fell off the end of the fact table) and a CORRUPT one
+/// is `ReadFailed` (never a silent inactive set).
+#[test]
+fn tool_activation_lookup_stays_index_flat_at_100k_churn_rows() {
+    let (deps, _dir) = deps(scripted_provider(one_text_turn()), vec![]);
+    let runtime = AgentRuntime::new(deps).unwrap();
+    let session = new_session(runtime.deps());
+    let handle = runtime
+        .deps()
+        .session
+        .get_session(session)
+        .unwrap()
+        .unwrap();
+    handle
+        .upsert_memory_fact(
+            TOOL_ACTIVATION_FACT_KIND,
+            TOOL_ACTIVATION_FACT_KEY,
+            r#"["source_market"]"#,
+        )
+        .unwrap();
+
+    let base = sample_activation_loads(&runtime, &handle, 40);
+    let seed_started = std::time::Instant::now();
+    seed_churn_via_public_api(&runtime, session, 100_000);
+    let seed_elapsed = seed_started.elapsed();
+
+    let load = runtime.load_tool_activation(&handle);
+    assert_eq!(load.scan, ToolActivationScan::Found, "{load:?}");
+    assert!(load.set.is_active("source_market"), "{load:?}");
+    let after = sample_activation_loads(&runtime, &handle, 40);
+    println!(
+        "[perf] 100k churn: seed {seed_elapsed:?}, activation median {:?} -> {:?}, p95 {:?} -> {:?}",
+        base.0, after.0, base.1, after.1
+    );
+    assert_flat("100k churn activation", base, after);
+
+    let plan = explain_plan(
+        &runtime,
+        format!(
+            "SELECT value FROM memory_fact WHERE session_id = {} \
+             AND kind = '{TOOL_ACTIVATION_FACT_KIND}' AND key = '{TOOL_ACTIVATION_FACT_KEY}'",
+            session.raw()
+        ),
+    );
+    assert_index_backed_activation_plan(&plan);
+
+    // Missing activation at scale: the Absent verdict is a decisive point
+    // lookup, not the tail of a bounded scan over 100k churn rows.
+    let fresh = new_session(runtime.deps());
+    let fresh_handle = runtime.deps().session.get_session(fresh).unwrap().unwrap();
+    seed_churn_via_public_api(&runtime, fresh, 100_000);
+    let load = runtime.load_tool_activation(&fresh_handle);
+    assert_eq!(
+        load.scan,
+        ToolActivationScan::Absent,
+        "a fresh session at churn scale must read Absent, not scan: {load:?}"
+    );
+
+    // Corrupt activation at scale: typed ReadFailed, never Found-empty.
+    handle
+        .upsert_memory_fact(
+            TOOL_ACTIVATION_FACT_KIND,
+            TOOL_ACTIVATION_FACT_KEY,
+            "{not json",
+        )
+        .unwrap();
+    let load = runtime.load_tool_activation(&handle);
+    assert_eq!(
+        load.scan,
+        ToolActivationScan::ReadFailed,
+        "corruption at churn scale must stay a typed refusal: {load:?}"
+    );
+    assert!(load.set.is_empty());
+}
+
+/// PERF-09 fault tier (1M rows): the same invariants at full scale.
+/// Manual: `cargo test -p faktor-agent retrieval -- --ignored --nocapture`.
+#[test]
+#[ignore = "[fault] 1M-churn tool-activation lookup flatness + EXPLAIN plan; run with --ignored --nocapture"]
+fn fault_probe_tool_activation_lookup_at_one_million_churn_rows() {
+    let (deps, _dir) = deps(scripted_provider(one_text_turn()), vec![]);
+    let runtime = AgentRuntime::new(deps).unwrap();
+    let session = new_session(runtime.deps());
+    let handle = runtime
+        .deps()
+        .session
+        .get_session(session)
+        .unwrap()
+        .unwrap();
+    handle
+        .upsert_memory_fact(
+            TOOL_ACTIVATION_FACT_KIND,
+            TOOL_ACTIVATION_FACT_KEY,
+            r#"["source_market"]"#,
+        )
+        .unwrap();
+
+    let base = sample_activation_loads(&runtime, &handle, 40);
+    let seed_started = std::time::Instant::now();
+    seed_churn_recursive_cte(&runtime, session, 1_000_000);
+    let seed_elapsed = seed_started.elapsed();
+    assert_eq!(
+        runtime
+            .deps()
+            .session
+            .store()
+            .memory_fact_count(session)
+            .unwrap(),
+        1_000_001,
+        "the churn seed must land every row in ONE transaction (1M churn + activation)"
+    );
+
+    let load = runtime.load_tool_activation(&handle);
+    assert_eq!(load.scan, ToolActivationScan::Found, "{load:?}");
+    assert!(load.set.is_active("source_market"), "{load:?}");
+    let after = sample_activation_loads(&runtime, &handle, 40);
+    eprintln!(
+        "[fault] 1M churn: seed {seed_elapsed:?}, activation median {:?} -> {:?}, p95 {:?} -> {:?}",
+        base.0, after.0, base.1, after.1
+    );
+    assert_flat("1M churn activation", base, after);
+
+    let plan = explain_plan(
+        &runtime,
+        format!(
+            "SELECT value FROM memory_fact WHERE session_id = {} \
+             AND kind = '{TOOL_ACTIVATION_FACT_KIND}' AND key = '{TOOL_ACTIVATION_FACT_KEY}'",
+            session.raw()
+        ),
+    );
+    assert_index_backed_activation_plan(&plan);
+    eprintln!("[fault] plan activation point: {plan:?}");
+
+    let fresh = new_session(runtime.deps());
+    let fresh_handle = runtime.deps().session.get_session(fresh).unwrap().unwrap();
+    seed_churn_recursive_cte(&runtime, fresh, 1_000_000);
+    let load = runtime.load_tool_activation(&fresh_handle);
+    assert_eq!(
+        load.scan,
+        ToolActivationScan::Absent,
+        "a fresh session at 1M churn must read Absent, not scan: {load:?}"
+    );
+
+    handle
+        .upsert_memory_fact(
+            TOOL_ACTIVATION_FACT_KIND,
+            TOOL_ACTIVATION_FACT_KEY,
+            "{not json",
+        )
+        .unwrap();
+    let load = runtime.load_tool_activation(&handle);
+    assert_eq!(
+        load.scan,
+        ToolActivationScan::ReadFailed,
+        "corruption at 1M churn must stay a typed refusal: {load:?}"
+    );
+    assert!(load.set.is_empty());
+}
+
 pub(crate) fn design_focus_contract() -> faktor_core::EngineeringContract {
     faktor_core::EngineeringContract {
         risks: vec![faktor_core::RiskHypothesis {

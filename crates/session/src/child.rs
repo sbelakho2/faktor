@@ -885,6 +885,342 @@ mod tests {
         );
     }
 
+    // ------------------------------------------- PERF-09 churn-scale probes
+
+    /// EXPLAIN QUERY PLAN of one production hot statement, run on the
+    /// store's own writer connection through the documented debug seam.
+    /// Bind values are INLINED as literals (the planner treats them exactly
+    /// like bound parameters here — no ANALYZE stats exist to specialize
+    /// per value), so no rusqlite parameter types cross the crate boundary.
+    fn explain_plan(m: &SessionManager, sql: String) -> Vec<String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        m.store()
+            .writer_debug_job("child_ctl_explain", move |conn| {
+                let outcome = (|| -> Result<Vec<String>, String> {
+                    let mut stmt = conn
+                        .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                        .map_err(|e| e.to_string())?;
+                    let mut rows = stmt.query(()).map_err(|e| e.to_string())?;
+                    let mut lines = Vec::new();
+                    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+                        lines.push(row.get::<_, String>(3).map_err(|e| e.to_string())?);
+                    }
+                    Ok(lines)
+                })();
+                let _ = tx.send(outcome);
+            })
+            .expect("writer debug job admitted");
+        rx.recv()
+            .expect("writer debug job answered")
+            .expect("EXPLAIN QUERY PLAN must run on the live schema")
+    }
+
+    /// Query-plan truth: a hot child control/identity lookup must be
+    /// index-SEARCHed. A plan that degrades to a full `SCAN memory_fact`
+    /// fails here — that is exactly the O(all-facts) regression this probe
+    /// exists to catch.
+    fn assert_index_backed_memory_fact_plan(name: &str, plan: &[String]) {
+        let joined = plan.join(" | ");
+        assert!(
+            joined.contains("SEARCH memory_fact"),
+            "{name}: plan is not index-backed: {joined}"
+        );
+        assert!(
+            !joined.contains("SCAN memory_fact"),
+            "{name}: plan degrades to a full fact-table scan: {joined}"
+        );
+    }
+
+    /// Median and p95 of the turn-shape read (control queue + identity
+    /// point lookup) over `rounds` samples.
+    fn sample_ctl_and_identity_reads(
+        s: &SessionHandle,
+        rounds: usize,
+    ) -> (std::time::Duration, std::time::Duration) {
+        let mut samples = Vec::with_capacity(rounds);
+        for _ in 0..rounds {
+            let started = std::time::Instant::now();
+            let rows = s.orchestrator_ctl_all().unwrap();
+            assert_eq!(rows.len(), 1, "the queue must hold exactly the control");
+            assert!(
+                s.orchestrator_child_identity_get().unwrap().is_some(),
+                "the identity point lookup must survive fact churn"
+            );
+            samples.push(started.elapsed());
+        }
+        samples.sort_unstable();
+        let pick = |p: f64| {
+            let idx = (((samples.len() - 1) as f64) * p).round() as usize;
+            samples[idx]
+        };
+        (pick(0.5), pick(0.95))
+    }
+
+    /// Batched public-API churn seeding (the crates/memory 100k pattern:
+    /// one multi-row transaction per chunk through `upsert_memory_facts`).
+    fn seed_churn_via_public_api(m: &SessionManager, sid: SessionId, rows: usize) {
+        const CHUNK: usize = 2_000;
+        for start in (0..rows).step_by(CHUNK) {
+            let end = (start + CHUNK).min(rows);
+            let batch: Vec<(String, String, String)> = (start..end)
+                .map(|i| {
+                    (
+                        "taskexec_run".to_string(),
+                        format!("k{i:07}"),
+                        "{}".to_string(),
+                    )
+                })
+                .collect();
+            let refs: Vec<(&str, &str, &str)> = batch
+                .iter()
+                .map(|(kind, key, value)| (kind.as_str(), key.as_str(), value.as_str()))
+                .collect();
+            m.store().upsert_memory_facts(sid, &refs).unwrap();
+        }
+    }
+
+    /// 1M-row churn seeding through ONE recursive-CTE INSERT on the writer
+    /// connection (the billing 1M-event pattern): a single statement inside
+    /// the debug seam keeps the seed to seconds instead of per-row dispatch.
+    fn seed_churn_recursive_cte(m: &SessionManager, sid: SessionId, rows: i64) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sql = format!(
+            "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < {rows})
+             INSERT INTO memory_fact(session_id, kind, key, value, updated_ms)
+             SELECT {sid}, 'taskexec_run', printf('k%07d', n), '{{}}', 1 FROM seq"
+        );
+        m.store()
+            .writer_debug_job("child_ctl_churn_seed", move |conn| {
+                let outcome = conn.execute_batch(&sql).map_err(|e| e.to_string());
+                let _ = tx.send(outcome);
+            })
+            .expect("writer debug job admitted");
+        rx.recv()
+            .expect("writer debug job answered")
+            .expect("1M churn seed transaction must land atomically");
+    }
+
+    fn seed_hostile_control_rows(m: &SessionManager, sid: SessionId) {
+        let total = (CONTROL_PAGE as usize) * MAX_CONTROL_PAGES + 1;
+        // Seqs start far above any enqueued control so the hostile rows
+        // never collide with the live queue's keys.
+        let base = 1_000_000u64;
+        for chunk_start in (1..=total as u64).collect::<Vec<_>>().chunks(2_000) {
+            let batch: Vec<(String, String, String)> = chunk_start
+                .iter()
+                .map(|i| {
+                    let seq = base + i;
+                    (
+                        ROW_KIND_CONTROL.to_string(),
+                        ctl_key(seq),
+                        serde_json::to_string(&ControlRow {
+                            seq,
+                            control: ChildControl::Pause,
+                            created_ms: 0,
+                            applied_ms: None,
+                        })
+                        .unwrap(),
+                    )
+                })
+                .collect();
+            let refs: Vec<(&str, &str, &str)> = batch
+                .iter()
+                .map(|(kind, key, value)| (kind.as_str(), key.as_str(), value.as_str()))
+                .collect();
+            m.store().upsert_memory_facts(sid, &refs).unwrap();
+        }
+    }
+
+    fn child_identity_fixture() -> ChildIdentity {
+        ChildIdentity {
+            parent_session_id: SessionId::new(1),
+            workspace_id: 1,
+            worktree_id: 1,
+            item_id: "main".into(),
+            task_goal: "goal".into(),
+            operation_id: 0,
+            ownership: ChildOwnership::ReadOnlyShared,
+            model: "m".into(),
+            require_semantic_delta: false,
+            permissions: faktor_core::CapabilitySet::ALL,
+            created_ms: 0,
+        }
+    }
+
+    /// Flat-latency bound: median/p95 at churn scale vs the 0-churn
+    /// baseline. A ratio alone is CI-hostile when the baseline is tens of
+    /// microseconds, so the bound is `3x baseline + 20 ms` — a genuine
+    /// O(churn) degradation (a full scan of 100k+ rows per read) blows far
+    /// past it, while scheduler noise on a loaded runner cannot.
+    fn assert_flat(
+        label: &str,
+        base: (std::time::Duration, std::time::Duration),
+        churn: (std::time::Duration, std::time::Duration),
+    ) {
+        let slack = std::time::Duration::from_millis(20);
+        assert!(
+            churn.0 <= base.0 * 3 + slack,
+            "{label}: median grew from {:?} to {:?} under churn",
+            base.0,
+            churn.0
+        );
+        assert!(
+            churn.1 <= base.1 * 3 + slack,
+            "{label}: p95 grew from {:?} to {:?} under churn",
+            base.1,
+            churn.1
+        );
+    }
+
+    /// PERF-09 non-ignored tier (100k rows): the invariant that PR CI must
+    /// exercise. Unrelated fact churn can never change the control-queue
+    /// contents, hide the child identity, slow the turn-shape read past the
+    /// flat bound, or degrade the hot lookups off their indexes — and the
+    /// hostile-page refusal still holds once the churn is in place.
+    #[test]
+    fn control_queue_and_identity_stay_index_flat_at_100k_churn_rows() {
+        let (_d, m, s) = fixture();
+        s.orchestrator_ctl_enqueue(ChildControl::Pause).unwrap();
+        s.orchestrator_child_identity_put(&child_identity_fixture())
+            .unwrap();
+
+        let base = sample_ctl_and_identity_reads(&s, 40);
+        let seed_started = std::time::Instant::now();
+        seed_churn_via_public_api(&m, s.id(), 100_000);
+        let seed_elapsed = seed_started.elapsed();
+
+        let after = sample_ctl_and_identity_reads(&s, 40);
+        println!(
+            "[perf] 100k churn: seed {seed_elapsed:?}, ctl+identity median {:?} -> {:?}, p95 {:?} -> {:?}",
+            base.0, after.0, base.1, after.1
+        );
+        assert_flat("100k churn ctl+identity", base, after);
+
+        // Query-plan truth at scale: identity point lookup, control point
+        // lookup, and the queue page (with and without a cursor) must all
+        // stay index-SEARCHed — never a full fact-table scan.
+        let sid = s.id().raw();
+        let identity_plan = explain_plan(
+            &m,
+            format!(
+                "SELECT value FROM memory_fact WHERE session_id = {sid} \
+                 AND kind = 'orchestrator' AND key = 'identity'"
+            ),
+        );
+        assert_index_backed_memory_fact_plan("identity point", &identity_plan);
+        let control_plan = explain_plan(
+            &m,
+            format!(
+                "SELECT value FROM memory_fact WHERE session_id = {sid} \
+                 AND kind = 'orchestrator_ctl' AND key = 'seq-0000000000000001'"
+            ),
+        );
+        assert_index_backed_memory_fact_plan("control point", &control_plan);
+        let page_plan = explain_plan(
+            &m,
+            format!(
+                "SELECT kind, key, value, updated_ms FROM memory_fact \
+                 WHERE session_id = {sid} AND kind = 'orchestrator_ctl' \
+                 ORDER BY updated_ms DESC, kind DESC, key DESC LIMIT 201"
+            ),
+        );
+        assert_index_backed_memory_fact_plan("control page", &page_plan);
+        let (_, stamp) = s
+            .memory_fact_get_stamped(ROW_KIND_CONTROL, &ctl_key(1))
+            .unwrap()
+            .expect("the enqueued control row exists");
+        let cursor_key = ctl_key(1);
+        let cursor_plan = explain_plan(
+            &m,
+            format!(
+                "SELECT kind, key, value, updated_ms FROM memory_fact \
+                 WHERE session_id = {sid} AND kind = 'orchestrator_ctl' \
+                 AND (updated_ms < {stamp} OR (updated_ms = {stamp} AND \
+                 (kind < 'orchestrator_ctl' OR (kind = 'orchestrator_ctl' AND key < '{cursor_key}')))) \
+                 ORDER BY updated_ms DESC, kind DESC, key DESC LIMIT 201"
+            ),
+        );
+        assert_index_backed_memory_fact_plan("control page cursor", &cursor_plan);
+
+        // Hostile typed refusal still holds once 100k churn rows exist on
+        // the same row space: a queue past the page bound is refused, never
+        // silently truncated, and the identity lookup stays readable.
+        seed_hostile_control_rows(&m, s.id());
+        let err = s.orchestrator_ctl_all().unwrap_err();
+        assert!(
+            err.to_string().contains("refusing a partial control read"),
+            "the read must refuse typed at churn scale: {err}"
+        );
+        assert!(s.orchestrator_child_identity_get().unwrap().is_some());
+    }
+
+    /// PERF-09 fault tier (1M rows): the same invariants at the plan's full
+    /// scale. Manual: `cargo test -p faktor-session child -- --ignored
+    /// --nocapture`.
+    #[test]
+    #[ignore = "[fault] 1M-churn control read/identity flatness + EXPLAIN plans; run with --ignored --nocapture"]
+    fn fault_probe_control_queue_flat_at_one_million_churn_rows() {
+        let (_d, m, s) = fixture();
+        s.orchestrator_ctl_enqueue(ChildControl::Pause).unwrap();
+        s.orchestrator_child_identity_put(&child_identity_fixture())
+            .unwrap();
+
+        let base = sample_ctl_and_identity_reads(&s, 40);
+        let seed_started = std::time::Instant::now();
+        seed_churn_recursive_cte(&m, s.id(), 1_000_000);
+        let seed_elapsed = seed_started.elapsed();
+        assert_eq!(
+            m.store().memory_fact_count(s.id()).unwrap(),
+            1_000_002,
+            "the churn seed must land every row in ONE transaction (1M churn + control + identity)"
+        );
+
+        let after = sample_ctl_and_identity_reads(&s, 40);
+        eprintln!(
+            "[fault] 1M churn: seed {seed_elapsed:?}, ctl+identity median {:?} -> {:?}, p95 {:?} -> {:?}",
+            base.0, after.0, base.1, after.1
+        );
+        assert_flat("1M churn ctl+identity", base, after);
+
+        let sid = s.id().raw();
+        for (name, sql) in [
+            (
+                "identity point",
+                format!(
+                    "SELECT value FROM memory_fact WHERE session_id = {sid} \
+                     AND kind = 'orchestrator' AND key = 'identity'"
+                ),
+            ),
+            (
+                "control point",
+                format!(
+                    "SELECT value FROM memory_fact WHERE session_id = {sid} \
+                     AND kind = 'orchestrator_ctl' AND key = 'seq-0000000000000001'"
+                ),
+            ),
+            (
+                "control page",
+                format!(
+                    "SELECT kind, key, value, updated_ms FROM memory_fact \
+                     WHERE session_id = {sid} AND kind = 'orchestrator_ctl' \
+                     ORDER BY updated_ms DESC, kind DESC, key DESC LIMIT 201"
+                ),
+            ),
+        ] {
+            let plan = explain_plan(&m, sql);
+            assert_index_backed_memory_fact_plan(name, &plan);
+            eprintln!("[fault] plan {name}: {plan:?}");
+        }
+
+        seed_hostile_control_rows(&m, s.id());
+        let err = s.orchestrator_ctl_all().unwrap_err();
+        assert!(
+            err.to_string().contains("refusing a partial control read"),
+            "the read must refuse typed at 1M-churn scale: {err}"
+        );
+        assert!(s.orchestrator_child_identity_get().unwrap().is_some());
+    }
+
     #[test]
     fn hostile_and_oversized_inputs_rejected_before_write() {
         let (_d, _m, s) = fixture();

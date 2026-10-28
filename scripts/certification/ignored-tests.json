@@ -203,6 +203,24 @@
       "reason": "manual fault/scale probe outside the nightly fault lane's package set: run explicitly with `cargo test -- --ignored`"
     },
     {
+      "file": "crates/session/src/child.rs",
+      "fn": "fault_probe_control_queue_flat_at_one_million_churn_rows",
+      "tag": "fault",
+      "reason": "manual fault/scale probe outside the nightly fault lane's package set: run explicitly with `cargo test -- --ignored`"
+    },
+    {
+      "file": "crates/agent/src/runtime/retrieval_tests.rs",
+      "fn": "fault_probe_tool_activation_lookup_at_one_million_churn_rows",
+      "tag": "fault",
+      "reason": "manual fault/scale probe outside the nightly fault lane's package set: run explicitly with `cargo test -- --ignored`"
+    },
+    {
+      "file": "crates/fs/src/lib.rs",
+      "fn": "fault_probe_1000_shadow_turns_with_real_watchers_census_os_resources",
+      "tag": "fault",
+      "reason": "manual fault/scale probe outside the nightly fault lane's package set: run explicitly with `cargo test -- --ignored`"
+    },
+    {
       "file": "crates/session/src/extreme_scale_probes.rs",
       "fn": "scale_10k_compaction_operations_under_a_backward_clock",
       "tag": "perf",
