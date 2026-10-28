@@ -2597,3 +2597,1137 @@ async fn compaction_evidence_refs_resolve_after_the_compactor_is_dropped() {
         .iter()
         .any(|turn| turn.text.contains(&format!("evidence://{}", evidence.id))));
 }
+
+// ============================================================================
+// DOM-10 / AG-11: the tiny-history SIZE MATRIX (0/1/2 tokens + floor
+// boundary). Every cell asserts the EXACT typed outcome: never accepted,
+// never panicked, never silently truncated, never a compaction-model call.
+// ============================================================================
+
+/// One single-`user`-turn history whose estimate is EXACTLY `tokens` (the
+/// dense estimator term dominates everywhere in the matrix range).
+fn user_turn_history_of_tokens(tokens: usize) -> Vec<RecentTurn> {
+    assert!(tokens >= 3, "role 'user' needs at least 3 estimated tokens");
+    let len = 3 * (tokens - 1) - 7; // rendered chars = len + 7
+    let history = vec![RecentTurn {
+        role: "user".into(),
+        text: "x".repeat(len),
+    }];
+    assert_eq!(
+        faktor_context::estimate_history_tokens(&history),
+        tokens,
+        "matrix history must hit its exact token size"
+    );
+    history
+}
+
+/// AG-11/DOM-11 size matrix (runtime layer): a history of 0 tokens (empty),
+/// the estimator-minimum 2 tokens (the closest constructible shape to the
+/// unconstructible "one-token history" that crashed the daemon), a normal
+/// 3-token first prompt, and anything below the compactable floor is
+/// REFUSED with the typed skip: no plan, no journal event, no checkpoint,
+/// no model call, no panic. AT the floor the attempt must happen and
+/// journal truthfully (CompactRejected for this shape) — the refusal below
+/// the floor and the attempt at it are DISTINCT typed outcomes.
+#[tokio::test]
+async fn tiny_history_size_matrix_is_refused_typed_at_every_boundary() {
+    let (seed_deps, _dir0) = deps(
+        scripted_provider(vec![ScriptedResponse::Text("SHOULD-NOT-RUN".into())]),
+        vec![],
+    );
+    let (manager, session) = shared_session(&seed_deps);
+    // A registered compaction model whose requests are OBSERVED: below the
+    // floor the provider must never be contacted at all.
+    let calls = Arc::new(std::sync::Mutex::new(0usize));
+    let counted = Arc::new(InspectingProvider::new(
+        Arc::new(FakeProvider::with_script(
+            "compacto",
+            ModelCapabilities {
+                streaming: true,
+                context: 64_000,
+                ..Default::default()
+            },
+            vec![
+                ScriptedResponse::Text("SUMMARY".into()),
+                ScriptedResponse::End,
+            ],
+        )),
+        {
+            let calls = calls.clone();
+            move |_n, _req| {
+                *calls.lock().unwrap() += 1;
+                Ok(())
+            }
+        },
+    ));
+    let mut registry = ProviderRegistry::new();
+    registry.try_register(counted).unwrap();
+    registry
+        .try_register(Arc::new(FakeProvider::with_script(
+            "fake",
+            ModelCapabilities {
+                tools: true,
+                context: 200_000,
+                ..Default::default()
+            },
+            vec![ScriptedResponse::End],
+        )))
+        .unwrap();
+    let (mut final_deps, _dir) = deps_sharing_session(
+        manager.clone(),
+        Arc::new(FakeProvider::with_script(
+            "fake",
+            ModelCapabilities {
+                tools: true,
+                context: 200_000,
+                ..Default::default()
+            },
+            vec![ScriptedResponse::End],
+        )),
+        vec![],
+    );
+    final_deps.providers = Arc::new(registry);
+    final_deps.compaction_model = Some("compacto/summary-model".into());
+    let runtime = AgentRuntime::new(final_deps).unwrap();
+    let handle = manager.get_session(session).unwrap().unwrap();
+
+    // The estimator floor over ANY non-empty RecentTurn: even an empty
+    // role+text turn renders 3 chars and is rated 2 tokens, so a literal
+    // one-token history is UNCONSTRUCTIBLE on the wire (the AG-11 crash
+    // shape survives only as a raw `before` integer at the durable layer,
+    // which the cells below also pin).
+    let min_turn = RecentTurn {
+        role: String::new(),
+        text: String::new(),
+    };
+    assert_eq!(
+        faktor_context::estimate_history_tokens(std::slice::from_ref(&min_turn)),
+        2,
+        "the smallest constructible non-empty history is 2 tokens"
+    );
+
+    // ---- runtime-layer cells: below the 128-token floor --------------
+    let mut below_floor: Vec<(usize, Vec<RecentTurn>)> = vec![
+        (0, Vec::new()),             // size 0: the empty history
+        (2, vec![min_turn.clone()]), // size 2: estimator floor
+        (
+            3,
+            vec![RecentTurn {
+                role: "user".into(),
+                text: String::new(),
+            }],
+        ), // first-prompt-shaped
+    ];
+    below_floor.push((127, user_turn_history_of_tokens(127))); // just below
+    for (tokens, history) in below_floor {
+        let events_before = handle.events_range(1, None).unwrap().len();
+        let plan = runtime
+            .try_compact_with_head(
+                &handle,
+                &history,
+                &TaskLedger::default(),
+                &ContextBudget::default(),
+                &CancellationToken::new(),
+                Some(1),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{tokens}-token history must not error: {e}"));
+        assert!(
+            plan.is_none(),
+            "a {tokens}-token history must be refused, never compacted"
+        );
+        assert_eq!(
+            handle.events_range(1, None).unwrap().len(),
+            events_before,
+            "a {tokens}-token refusal must journal NOTHING (no attempt, no rejection)"
+        );
+        assert!(
+            handle.context_checkpoint().unwrap().is_none(),
+            "a {tokens}-token refusal must install no context"
+        );
+    }
+    assert_eq!(
+        *calls.lock().unwrap(),
+        0,
+        "no below-floor refusal may ever contact the compaction model"
+    );
+
+    // ---- runtime-layer cell: AT the floor (128 tokens) ---------------
+    // The attempt MUST happen (typed journal event), and for this
+    // single-oversized-turn shape the compactor truthfully refuses
+    // (the turn alone exceeds the 75% hard cap): CompactRejected, not a
+    // silent skip and never an accepted plan that dropped the prompt.
+    let at_floor = user_turn_history_of_tokens(128);
+    let events_before = handle.events_range(1, None).unwrap().len();
+    let plan = runtime
+        .try_compact_with_head(
+            &handle,
+            &at_floor,
+            &TaskLedger::default(),
+            &ContextBudget::default(),
+            &CancellationToken::new(),
+            Some(1),
+        )
+        .await
+        .unwrap();
+    assert!(plan.is_none(), "the oversized lone turn cannot be kept");
+    let attempt: Vec<_> = handle
+        .events_range(1, None)
+        .unwrap()
+        .into_iter()
+        .skip(events_before)
+        .collect();
+    assert!(
+        attempt.iter().any(|e| matches!(
+            e.kind,
+            faktor_core::event::EventKind::CompactRejected
+                | faktor_core::event::EventKind::ContextCompacted
+        )),
+        "AT the floor the attempt must journal; got {attempt:?}"
+    );
+    assert!(
+        !attempt
+            .iter()
+            .any(|e| e.kind == faktor_core::event::EventKind::ContextCompacted),
+        "a plan that cannot keep the newest user turn is never ContextCompacted"
+    );
+
+    // ---- durable-layer cells: raw 0/1/2 `before` sizes ---------------
+    // 0 (and negative) `before` is a TYPED Malformed error and journals
+    // nothing; 1/2 with zero reduction are journaled CompactRejected with
+    // the exact reason; growth is Malformed; a rejected plan whose `after`
+    // is tiny is NEVER reinterpreted as success (the verdict guard).
+    let events_before = handle.events_range(1, None).unwrap().len();
+    let zero = handle
+        .record_compaction_defaults(0, 0, 0, "deterministic")
+        .unwrap_err();
+    assert_eq!(zero.kind, ErrorKind::Malformed, "0-token before: {zero}");
+    assert!(zero.message.contains("before"), "{zero}");
+    let negative = handle
+        .record_compaction_defaults(-1, 0, 0, "deterministic")
+        .unwrap_err();
+    assert_eq!(negative.kind, ErrorKind::Malformed, "{negative}");
+    let grow = handle
+        .record_compaction_defaults(1, 2, 2, "deterministic")
+        .unwrap_err();
+    assert_eq!(grow.kind, ErrorKind::Malformed, "{grow}");
+    assert!(grow.message.contains("grow"), "{grow}");
+    assert_eq!(
+        handle.events_range(1, None).unwrap().len(),
+        events_before,
+        "malformed sizes journal nothing"
+    );
+    for size in [1i64, 2] {
+        let record = handle
+            .record_compaction_defaults(size, size, size, "deterministic")
+            .unwrap();
+        assert!(
+            !record.accepted,
+            "a {size}-token zero-reduction compaction is refused"
+        );
+        assert!(
+            record
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("minimum"),
+            "the refusal names the minimum-reduction invariant: {:?}",
+            record.reason
+        );
+    }
+    // The verdict guard: a REJECTED plan with a tiny numeric `after` must
+    // stay rejected (it can have dropped the active instruction).
+    let flipped = handle
+        .commit_compaction_with_checkpoint(
+            1,
+            0,
+            0,
+            false,
+            "deterministic",
+            &faktor_session::compaction::CompactionPolicy::default(),
+            1,
+            &"0".repeat(64),
+            b"[]",
+        )
+        .unwrap();
+    assert!(
+        !flipped.accepted,
+        "a rejected 1-token plan is never applied"
+    );
+    assert!(flipped
+        .reason
+        .as_deref()
+        .unwrap_or_default()
+        .contains("compactor rejected"));
+    let kinds: Vec<_> = handle
+        .events_range(1, None)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.kind)
+        .collect();
+    assert!(kinds.contains(&faktor_core::event::EventKind::CompactRejected));
+    assert!(
+        !kinds.contains(&faktor_core::event::EventKind::ContextCompacted),
+        "no tiny-size cell may ever journal ContextCompacted"
+    );
+}
+
+// ============================================================================
+// DOM-67: pins survive compaction; manifest totals equal parts; cancel
+// mid-compaction leaves the original byte-identical; a corrupted summary
+// artifact is a typed error, never silently installed as context.
+// ============================================================================
+
+/// DOM-67(a): the PINNED typed-ledger set (last decision, learning corpus
+/// rows) and the durable task identity survive repeated REAL runtime
+/// compactions byte-identically, stay pinned in the watermark report, and
+/// keep riding the compacted wire through the durable projection.
+#[tokio::test]
+async fn pinned_ledger_rows_survive_runtime_compaction_byte_identical() {
+    let (mut seed_deps, _dir0) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
+    seed_deps.efficiency.typed_handoff = true;
+    let (manager, session) = shared_session(&seed_deps);
+    let runtime = AgentRuntime::new(seed_deps).unwrap();
+    let handle = manager.get_session(session).unwrap().unwrap();
+    let task_id = handle.task_id().unwrap();
+    let now = handle.now_ms();
+    handle
+        .create_task(Task {
+            task_id,
+            session_id: session,
+            goal: "PIN-GOAL Ω".into(),
+            acceptance_criteria: vec!["PIN-CRITERION Ω".into()],
+            plan: vec![],
+            attachments: Vec::new(),
+            contract: Default::default(),
+            budget: Default::default(),
+            state: TaskState::Running,
+            created_ms: now,
+            updated_ms: now,
+        })
+        .unwrap();
+    // The pinned set: the LAST decision and the learning corpus row.
+    let decision_seq = handle
+        .ledger_decision("pin-step", "PIN-DECISION-Ω", "must survive compaction")
+        .unwrap()
+        .expect("decision journaled");
+    let learning_seq = handle
+        .ledger_learning_record(
+            faktor_session::LEARNING_RECORD_EPISODE,
+            r#"{"episode":41,"marker":"PIN-LEARNING-Ω"}"#,
+        )
+        .unwrap()
+        .expect("learning journaled");
+    let learning_before = handle.ledger_learning_records().unwrap();
+    let task_before = handle.get_task(task_id).unwrap().unwrap();
+
+    let ledger = TaskLedger {
+        goal: "PIN-GOAL Ω".into(),
+        ..Default::default()
+    };
+    let budget = ContextBudget::default();
+    let cancel = CancellationToken::new();
+    // ~40 turns x ~140 chars: far above the floor, well under the cap.
+    let mut history: Vec<RecentTurn> = (0..40)
+        .map(|i| RecentTurn {
+            role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
+            text: format!("pin turn {i} {}", "p".repeat(140)),
+        })
+        .collect();
+    for round in 0..3usize {
+        let seq = u64::try_from(round + 1).unwrap();
+        let plan = runtime
+            .try_compact_with_head(&handle, &history, &ledger, &budget, &cancel, Some(seq))
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("round {round}: the long history must compact"));
+        assert!(plan.accepted);
+        let wire: String = plan
+            .kept_recent
+            .iter()
+            .map(|t| t.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for marker in ["PIN-GOAL Ω", "PIN-CRITERION Ω", "PIN-DECISION-Ω"] {
+            assert!(
+                wire.contains(marker),
+                "round {round}: the pinned durable state must ride the compacted wire: missing {marker}"
+            );
+        }
+        // The pinned rows are byte-identical in the store after the
+        // compaction's watermark pruning.
+        assert_eq!(
+            handle.ledger_learning_records().unwrap(),
+            learning_before,
+            "round {round}: learning corpus rows must survive byte-identically"
+        );
+        let head = handle.ledger_ensure_head().unwrap();
+        assert!(
+            head.decisions.iter().any(|d| d.choice == "PIN-DECISION-Ω"),
+            "round {round}: the pinned decision must survive in the head projection"
+        );
+        let report = handle.compact_typed_ledger().unwrap();
+        assert!(
+            report.pinned.contains(&decision_seq) && report.pinned.contains(&learning_seq),
+            "round {round}: the pinned seqs must be in the never-evict set: {:?}",
+            report.pinned
+        );
+        let page = handle.ledger_entries_page(None, 500).unwrap();
+        assert!(
+            page.entries.iter().any(|e| {
+                e.seq == learning_seq
+                    && matches!(&e.payload,
+                        faktor_session::LedgerPayload::LearningRecord { payload, .. }
+                            if payload.contains("PIN-LEARNING-Ω"))
+            }),
+            "round {round}: the learning entry must remain in the stream"
+        );
+        assert_eq!(
+            handle.get_task(task_id).unwrap().unwrap(),
+            task_before,
+            "round {round}: compaction must never rewrite the durable task row"
+        );
+        history = plan.kept_recent;
+    }
+}
+
+/// DOM-67(b): the compaction manifest's `total_bytes` MUST equal the sum
+/// of its parts, and each part's declared size MUST equal the stored blob
+/// exactly. Every forged manifest (lying total, lying part size, missing
+/// total, truncated JSON, wrong version, empty parts) is refused — not
+/// retrievable — and a digest turn pointing at one is replaced by the
+/// explicit `[archive evicted: …]` marker, never carried as a live
+/// `artifact://` ref.
+#[test]
+fn forged_compaction_manifest_totals_are_rejected_and_never_carried_as_retrievable() {
+    let dir = tempfile::tempdir().unwrap();
+    let cas = faktor_cas::Cas::open(dir.path().join("cas")).unwrap();
+    let chunks = vec![
+        "old turn one\n".to_string(),
+        "old turn two and more\n".to_string(),
+    ];
+    let manifest = store_compaction_archive(&cas, &chunks).expect("archive stored");
+    // Honest control: totals equal the sum of the parts exactly.
+    let bytes = cas
+        .get_bounded(manifest, 256 * 1024)
+        .unwrap()
+        .expect("manifest readable");
+    let honest: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let sum: u64 = honest["chunks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["size"].as_u64().unwrap())
+        .sum();
+    assert_eq!(honest["total_bytes"].as_u64(), Some(sum));
+    assert!(archive_manifest_is_retrievable(&cas, manifest));
+
+    let forge = |value: serde_json::Value| -> FileHash {
+        cas.put(&serde_json::to_vec(&value).unwrap()).unwrap()
+    };
+    // (1) total_bytes lies by +1.
+    let mut lying_total = honest.clone();
+    lying_total["total_bytes"] = serde_json::json!(sum + 1);
+    let forged_total = forge(lying_total);
+    // (2) a part's declared size lies (total made consistent with the lie).
+    let mut lying_part = honest.clone();
+    lying_part["chunks"][0]["size"] = serde_json::json!(chunks[0].len() + 1);
+    lying_part["total_bytes"] = serde_json::json!(sum + 1);
+    let forged_part = forge(lying_part);
+    // (3) total_bytes missing entirely: totals cannot equal the parts.
+    let mut missing_total = honest.clone();
+    missing_total.as_object_mut().unwrap().remove("total_bytes");
+    let forged_missing = forge(missing_total);
+    // (4) truncated manifest bytes.
+    let forged_truncated = cas.put(&bytes[..bytes.len() / 2]).unwrap();
+    // (5) wrong schema version.
+    let mut wrong_version = honest.clone();
+    wrong_version["version"] = serde_json::json!(2);
+    let forged_version = forge(wrong_version);
+    // (6) no parts at all.
+    let mut empty_parts = honest.clone();
+    empty_parts["chunks"] = serde_json::json!([]);
+    empty_parts["total_bytes"] = serde_json::json!(0);
+    let forged_empty = forge(empty_parts);
+    for (name, forged) in [
+        ("lying total", forged_total),
+        ("lying part size", forged_part),
+        ("missing total", forged_missing),
+        ("truncated", forged_truncated),
+        ("wrong version", forged_version),
+        ("empty parts", forged_empty),
+    ] {
+        assert!(
+            !archive_manifest_is_retrievable(&cas, forged),
+            "a forged manifest ({name}) must never be retrievable"
+        );
+        // On the wire the forged ref becomes the explicit typed loss
+        // marker — never carried as a live archive pointer.
+        let mut plan = archive_plan();
+        plan.kept_recent[0].text =
+            format!("[Earlier context archived: forged ref artifact://{forged}]");
+        assert_eq!(mark_evicted_compaction_archives(Some(&cas), &mut plan), 1);
+        let text = &plan.kept_recent[0].text;
+        assert!(
+            text.contains("[archive evicted:"),
+            "{name}: the loss must be named on the wire: {text}"
+        );
+        assert!(
+            !text.contains(&format!("artifact://{forged}")),
+            "{name}: the forged ref must be replaced: {text}"
+        );
+    }
+}
+
+/// DOM-67(c): a deterministic cancellation mid-compaction (the gated
+/// summary stream + the turn token, the same seam the stream-termination
+/// tests use) leaves the ORIGINAL context BYTE-IDENTICAL: no replacement
+/// checkpoint, no compaction journal event, no durable transcript change,
+/// and the stalled summary stream is terminated promptly.
+#[tokio::test]
+async fn cancel_mid_compaction_leaves_the_original_context_byte_identical() {
+    let (seed_deps, _dir0) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
+    let (manager, session) = shared_session(&seed_deps);
+    seed_long_history(&manager, session, 5, 1500).await;
+
+    let gated = Arc::new(GatedStreamProvider::new());
+    let main_caps = ModelCapabilities {
+        tools: true,
+        context: 200_000,
+        ..Default::default()
+    };
+    let mut registry = ProviderRegistry::new();
+    registry
+        .try_register(Arc::new(FakeProvider::with_script(
+            "fake",
+            main_caps.clone(),
+            vec![ScriptedResponse::End],
+        )))
+        .unwrap();
+    registry.try_register(gated.clone()).unwrap();
+    let (mut final_deps, _dir) = deps_sharing_session(
+        manager.clone(),
+        Arc::new(FakeProvider::with_script(
+            "fake",
+            main_caps,
+            vec![ScriptedResponse::End],
+        )),
+        vec![],
+    );
+    final_deps.providers = Arc::new(registry);
+    final_deps.compact_at_usage = 0.0;
+    final_deps.compaction_model = Some("gated/gated-model".into());
+    let runtime = AgentRuntime::new(final_deps).unwrap();
+    let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+    let receipt = handle.submit_prompt("do the thing", &[]).unwrap();
+    let turn_token = receipt.op_meta.cancellation.clone();
+    // THE ORIGINAL CONTEXT: the durable transcript as of the compaction
+    // boundary (the prompt is already durable) and no replacement
+    // checkpoint yet.
+    let original_page = handle.messages_page(None, 200).unwrap();
+    let original_debug = format!("{:?}", original_page.messages);
+    assert!(handle.context_checkpoint().unwrap().is_none());
+    let compaction_events_before = handle
+        .events_range(1, None)
+        .unwrap()
+        .into_iter()
+        .filter(|e| {
+            matches!(
+                e.kind,
+                faktor_core::event::EventKind::ContextCompacted
+                    | faktor_core::event::EventKind::CompactRejected
+            )
+        })
+        .count();
+    let drive_runtime = runtime.clone();
+    let drive_handle = handle.clone();
+    let drive = tokio::spawn(async move {
+        drive_runtime
+            .drive_turn(&drive_handle, receipt.op_id, turn_token, None)
+            .await
+    });
+    // Deterministic seam: wait until the gated summarizer has the summary
+    // request open and is parked mid-stream, THEN cancel the turn token.
+    let seen = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if gated.recorded().is_some() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(seen.is_ok(), "the summary stream must have opened");
+    receipt.op_meta.cancellation.cancel();
+    let terminated = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if !gated.push(Ok(ProviderChunk::Text {
+                text: "too late".into(),
+            })) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        terminated.is_ok(),
+        "the summary stream must terminate promptly on cancellation"
+    );
+    let outcome = tokio::time::timeout(Duration::from_secs(30), drive)
+        .await
+        .expect("the cancelled turn must finish promptly")
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome.final_state, AgentState::Cancelled);
+    // THE ORIGINAL CONTEXT IS INTACT, BYTE-IDENTICAL.
+    assert!(
+        handle.context_checkpoint().unwrap().is_none(),
+        "a cancelled compaction must install no replacement context"
+    );
+    let after_page = handle.messages_page(None, 200).unwrap();
+    assert_eq!(
+        format!("{:?}", after_page.messages),
+        original_debug,
+        "a cancelled compaction must leave the durable transcript byte-identical"
+    );
+    let compaction_events_after = handle
+        .events_range(1, None)
+        .unwrap()
+        .into_iter()
+        .filter(|e| {
+            matches!(
+                e.kind,
+                faktor_core::event::EventKind::ContextCompacted
+                    | faktor_core::event::EventKind::CompactRejected
+            )
+        })
+        .count();
+    assert_eq!(
+        compaction_events_after, compaction_events_before,
+        "a discarded plan journals neither ContextCompacted nor CompactRejected"
+    );
+}
+
+/// DOM-67 (corrupted summary artifact): a truncated/corrupt DURABLE
+/// summary checkpoint is a LOUD typed error — never mistaken for "no
+/// checkpoint" (which would silently change context to the full
+/// transcript) — while the original durable transcript stays readable as
+/// the fallback authority.
+#[tokio::test]
+async fn corrupted_summary_checkpoint_is_a_typed_error_never_silent_context_loss() {
+    let (mut seed_deps, _dir0) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
+    seed_deps.efficiency.typed_handoff = true;
+    let (manager, session) = shared_session(&seed_deps);
+    let runtime = AgentRuntime::new(seed_deps).unwrap();
+    let handle = manager.get_session(session).unwrap().unwrap();
+    // Install a real accepted checkpoint through the runtime path.
+    let history: Vec<RecentTurn> = (0..30)
+        .map(|i| RecentTurn {
+            role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
+            text: format!("artifact turn {i} {}", "a".repeat(160)),
+        })
+        .collect();
+    runtime
+        .try_compact_with_head(
+            &handle,
+            &history,
+            &TaskLedger::default(),
+            &ContextBudget::default(),
+            &CancellationToken::new(),
+            Some(7),
+        )
+        .await
+        .unwrap()
+        .expect("the history compacts");
+    let installed = handle
+        .context_checkpoint()
+        .unwrap()
+        .expect("the accepted compaction installed a checkpoint");
+    assert_eq!(installed.through_seq, 7);
+    let page_before = format!("{:?}", handle.messages_page(None, 200).unwrap().messages);
+    // Corrupt the summary artifact: one chunk row is replaced with garbage.
+    manager
+        .store()
+        .upsert_memory_fact(
+            session,
+            faktor_session::CONTEXT_CHECKPOINT_KIND,
+            "c/000000",
+            "garbage-truncated-summary",
+        )
+        .unwrap();
+    let err = match handle.context_checkpoint() {
+        Ok(Some(_)) => panic!("a corrupt checkpoint must never parse as a valid context"),
+        Ok(None) => panic!("a corrupt checkpoint must be a typed error, never 'no checkpoint'"),
+        Err(err) => err,
+    };
+    assert_eq!(err.kind, ErrorKind::Malformed, "{err}");
+    // The original durable transcript is still the readable fallback
+    // authority — corruption changes nothing about it.
+    assert_eq!(
+        format!("{:?}", handle.messages_page(None, 200).unwrap().messages),
+        page_before,
+        "the durable transcript must be untouched by checkpoint corruption"
+    );
+}
+
+// ============================================================================
+// DOM-10 hard invariant probes: a summary engineered to achieve ~no
+// reduction is REJECTED (never installed); an accepted compaction always
+// meets the configured minimum, measured on the real wire shapes.
+// ============================================================================
+
+/// Probe (a): a summarizer that ECHOES the residue (role-prefixed rows)
+/// — the archetypal ~0%-reduction "summary" — is refused as an echo; the
+/// deterministic fallback must carry the history instead, and no
+/// echo-summary row may ever reach the wire.
+#[tokio::test]
+async fn hostile_echo_summary_achieving_no_reduction_is_rejected_never_installed() {
+    // Sized so the echoed rows FIT under the request-relative summary
+    // budget (12 uniform turns: budget = hard_cap/8 > one row) — the echo
+    // guard then fires on the full role-prefixed row.
+    let history: Vec<RecentTurn> = (0..40)
+        .map(|i| RecentTurn {
+            role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
+            text: format!("echo turn {i} {}", "e".repeat(60)),
+        })
+        .collect();
+    assert!(history[0].text.len() > 64, "the echo guard needs >64 chars");
+    let before = faktor_context::estimate_history_tokens(&history);
+    assert!(before > 128, "the LLM path must be reachable: {before}");
+    // The hostile summary: the residue rendered verbatim, role-prefixed.
+    let echo = history
+        .iter()
+        .map(|t| format!("{}: {}", t.role, t.text))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let provider = Arc::new(scripted_provider(vec![
+        ScriptedResponse::Text(echo),
+        ScriptedResponse::End,
+    ]));
+    let summarizer: Arc<dyn Summarizer> =
+        Arc::new(streaming_summarizer(provider, Duration::from_secs(30)));
+    let plan = Compactor::new(Some(summarizer))
+        .compact(
+            &history,
+            &TaskLedger::default(),
+            &CompactionRequest::new(before, before * 3 / 4),
+        )
+        .await;
+    assert_eq!(
+        plan.strategy,
+        faktor_context::CompactionStrategy::Rejected,
+        "an echo of the residue is not a summary"
+    );
+    assert!(
+        plan.accepted,
+        "the deterministic fallback must carry the history instead: before={} after={} cap={} rows={:?}",
+        plan.before_tokens,
+        plan.after_tokens,
+        plan.before_tokens * 3 / 4,
+        plan.kept_recent.iter().map(|t| (t.role.clone(), t.text.len())).collect::<Vec<_>>()
+    );
+    assert!(
+        (1.0 - (plan.after_tokens as f64 / plan.before_tokens as f64)) >= 0.25 - 1e-9,
+        "the fallback must still meet the minimum reduction: before={} after={}",
+        plan.before_tokens,
+        plan.after_tokens
+    );
+    assert!(
+        !plan.kept_recent.iter().any(|t| t.role == "summary"),
+        "no echo summary row may ever be installed as context"
+    );
+}
+
+/// Probe (b): a hostile MAXIMAL-size summary through the REAL runtime path
+/// is clamped to the request-relative summary budget, so the accepted
+/// plan's MEASURED reduction always meets the configured minimum — and the
+/// durable compaction journal records exactly those numbers.
+#[tokio::test]
+async fn hostile_maximal_summary_still_meets_the_configured_minimum_reduction() {
+    let (seed_deps, _dir0) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
+    let (manager, session) = shared_session(&seed_deps);
+    let hostiles: Vec<String> = (0..80)
+        .map(|i| format!("- F:h{i} hostile state line {i} recorded verbatim"))
+        .collect();
+    let hostile_summary = hostiles.join("\n"); // under the 4096-char stream cap, ~4x the summary budget
+    let compactor = Arc::new(FakeProvider::with_script(
+        "compacto",
+        ModelCapabilities {
+            streaming: true,
+            context: 64_000,
+            ..Default::default()
+        },
+        vec![
+            ScriptedResponse::Text(hostile_summary.clone()),
+            ScriptedResponse::End,
+        ],
+    ));
+    let mut registry = ProviderRegistry::new();
+    registry
+        .try_register(Arc::new(FakeProvider::with_script(
+            "fake",
+            ModelCapabilities {
+                tools: true,
+                context: 200_000,
+                ..Default::default()
+            },
+            vec![ScriptedResponse::End],
+        )))
+        .unwrap();
+    registry.try_register(compactor).unwrap();
+    let (mut final_deps, _dir) = deps_sharing_session(
+        manager.clone(),
+        Arc::new(FakeProvider::with_script(
+            "fake",
+            ModelCapabilities {
+                tools: true,
+                context: 200_000,
+                ..Default::default()
+            },
+            vec![ScriptedResponse::End],
+        )),
+        vec![],
+    );
+    final_deps.providers = Arc::new(registry);
+    final_deps.compaction_model = Some("compacto/summary-model".into());
+    let runtime = AgentRuntime::new(final_deps).unwrap();
+    let handle = manager.get_session(session).unwrap().unwrap();
+    // 11 long assistant turns + one small ACTIVE user prompt (which must
+    // ride the compacted wire verbatim).
+    let mut history: Vec<RecentTurn> = (0..11)
+        .map(|i| RecentTurn {
+            role: "assistant".into(),
+            text: format!("hostile turn {i} {}", "h".repeat(400)),
+        })
+        .collect();
+    history.push(RecentTurn {
+        role: "user".into(),
+        text: "continue please".into(),
+    });
+    let before = faktor_context::estimate_history_tokens(&history);
+    assert!(before > 128 && before < 5_000, "probe sizing: {before}");
+    let plan = runtime
+        .try_compact(
+            &handle,
+            &history,
+            &TaskLedger::default(),
+            &ContextBudget::default(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .expect("the hostile summary still yields an accepted plan");
+    assert!(plan.accepted);
+    let measured = 1.0 - (plan.after_tokens as f64 / plan.before_tokens as f64);
+    assert!(
+        measured >= runtime.compaction_min_reduction() - 1e-9,
+        "even a maximal hostile summary must meet the configured minimum: before={} after={} reduction={measured}",
+        plan.before_tokens,
+        plan.after_tokens
+    );
+    let summary_rows: Vec<&RecentTurn> = plan
+        .kept_recent
+        .iter()
+        .filter(|t| t.role == "summary")
+        .collect();
+    if let Some(summary) = summary_rows.first() {
+        // The clamp bounds every accepted summary to the request-relative
+        // budget: the hostile ~4.5k-char body can never ride verbatim.
+        assert!(
+            summary.text.len() < hostile_summary.len() / 2,
+            "the hostile summary must be clamped, not installed verbatim: {} bytes",
+            summary.text.len()
+        );
+    }
+    assert!(
+        plan.kept_recent
+            .iter()
+            .any(|t| t.role == "user" && t.text == "continue please"),
+        "the active instruction must ride the compacted wire"
+    );
+    // The durable journal carries the SAME minimum-reduction numbers.
+    let compacted: Vec<_> = handle
+        .events_range(1, None)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == faktor_core::event::EventKind::ContextCompacted)
+        .collect();
+    let event = compacted.last().expect("a ContextCompacted event");
+    let payload = event.payload.as_ref().expect("payload");
+    let reduction = payload
+        .get("reduction")
+        .and_then(serde_json::Value::as_f64)
+        .expect("reduction recorded");
+    assert!(
+        reduction >= runtime.compaction_min_reduction() - 1e-9,
+        "the journal must record the qualifying reduction: {reduction}"
+    );
+    assert_eq!(
+        payload.get("accepted").and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        payload.get("strategy").and_then(serde_json::Value::as_str),
+        Some("llm_summary")
+    );
+}
+
+// ============================================================================
+// DOM-10 soak: thousands of turns with forced compactions; context growth
+// plateaus (explicit bound), immutable instructions/task state never drop,
+// and EVERY successful compaction meets the configured minimum reduction.
+// ============================================================================
+
+#[derive(Debug)]
+struct SoakReport {
+    compactions: usize,
+    max_before_tokens: usize,
+    max_after_tokens: usize,
+    max_rows: usize,
+    min_reduction_seen: f64,
+    elapsed: std::time::Duration,
+}
+
+/// The shared soak core: `turns` synthetic turns, a forced compaction
+/// every `SOAK_INTERVAL` turns through the REAL runtime path (durable
+/// checkpoint, watermark ledger compaction, archive digest). Every DOM-10
+/// invariant is asserted at EVERY compaction — a single violation fails
+/// the run.
+async fn compaction_soak_core(turns: usize) -> SoakReport {
+    const SOAK_INTERVAL: usize = 20;
+    const SOAK_TURN_CHARS: usize = 70;
+    // Explicit plateau bound. Per cycle the history grows by
+    // ~20 x ~32 = ~640 tokens; each compaction cuts the retained set to
+    // 75% of `before`, so the steady state is ~4 x 640 = ~2560 tokens.
+    // A retained size above the bound means growth stopped being bounded.
+    const RETAINED_TOKEN_BOUND: usize = 3_500;
+    const BEFORE_TOKEN_BOUND: usize = 4_500;
+    // Row bound derived from the token bound: every retained turn is at
+    // least 16 estimated tokens at this fixture's size, plus the
+    // synthesized projection rows and the digest marker. Unbounded row
+    // growth would be ~turns/2 rows by the end of the run.
+    const RETAINED_ROW_BOUND: usize = RETAINED_TOKEN_BOUND / 16 + 8;
+
+    let (mut seed_deps, _dir0) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
+    seed_deps.efficiency.typed_handoff = true;
+    let (manager, session) = shared_session(&seed_deps);
+    let runtime = AgentRuntime::new(seed_deps).unwrap();
+    let handle = manager.get_session(session).unwrap().unwrap();
+    // The immutable instruction + task-state set (DOM-10): durable task
+    // row (goal/criteria/state), the pinned last decision and learning
+    // corpus row, and the session memory facts. Compaction must never
+    // drop or rewrite ANY of them.
+    let task_id = handle.task_id().unwrap();
+    let now = handle.now_ms();
+    handle
+        .create_task(Task {
+            task_id,
+            session_id: session,
+            goal: "SOAK-GOAL Ω".into(),
+            acceptance_criteria: vec!["SOAK-CRITERION Ω".into()],
+            plan: vec![],
+            attachments: Vec::new(),
+            contract: Default::default(),
+            budget: Default::default(),
+            state: TaskState::Running,
+            created_ms: now,
+            updated_ms: now,
+        })
+        .unwrap();
+    let decision_seq = handle
+        .ledger_decision("soak", "SOAK-DECISION-Ω", "pinned across the soak")
+        .unwrap()
+        .expect("decision journaled");
+    let learning_seq = handle
+        .ledger_learning_record(
+            faktor_session::LEARNING_RECORD_EPISODE,
+            r#"{"episode":7,"marker":"SOAK-LEARNING-Ω"}"#,
+        )
+        .unwrap()
+        .expect("learning journaled");
+    let learning_before = handle.ledger_learning_records().unwrap();
+    let task_before = handle.get_task(task_id).unwrap().unwrap();
+    let mut facts_before: Vec<_> = handle
+        .memory_facts()
+        .unwrap()
+        .into_iter()
+        // The durable context checkpoint LIVES in the fact space (kind
+        // `context_checkpoint`) and changes with every accepted
+        // compaction by design; the immutable fact set is everything else.
+        .filter(|(kind, _, _)| kind != faktor_session::CONTEXT_CHECKPOINT_KIND)
+        .collect();
+    facts_before.sort();
+
+    let ledger = TaskLedger {
+        goal: "SOAK-GOAL Ω".into(),
+        ..Default::default()
+    };
+    let budget = ContextBudget::default();
+    let cancel = CancellationToken::new();
+    let mut history: Vec<RecentTurn> = Vec::new();
+    let mut report = SoakReport {
+        compactions: 0,
+        max_before_tokens: 0,
+        max_after_tokens: 0,
+        max_rows: 0,
+        min_reduction_seen: 1.0,
+        elapsed: Duration::ZERO,
+    };
+    let started = std::time::Instant::now();
+    for turn in 0..turns {
+        history.push(RecentTurn {
+            role: if turn % 2 == 0 { "user" } else { "assistant" }.into(),
+            text: format!("soak turn {turn} {}", "s".repeat(SOAK_TURN_CHARS)),
+        });
+        if (turn + 1) % SOAK_INTERVAL != 0 {
+            continue;
+        }
+        let seq = u64::try_from(report.compactions + 1).unwrap();
+        let plan = runtime
+            .try_compact_with_head(&handle, &history, &ledger, &budget, &cancel, Some(seq))
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("turn {turn}: the plateau history must compact"));
+        assert!(
+            plan.accepted,
+            "turn {turn}: the plateau plan must be accepted"
+        );
+        // (1) The configured minimum-reduction hard invariant, measured on
+        // the REAL wire shapes at EVERY successful compaction.
+        let reduction = 1.0 - (plan.after_tokens as f64 / plan.before_tokens as f64);
+        assert!(
+            reduction + 1e-9 >= runtime.compaction_min_reduction(),
+            "turn {turn}: reduction {reduction} below the configured minimum (before={} after={})",
+            plan.before_tokens,
+            plan.after_tokens
+        );
+        // (2) Bounded growth: retained tokens/rows never exceed the
+        // explicit plateau bound after any compaction, and the
+        // pre-compaction size never drifts above the steady state.
+        assert!(
+            plan.after_tokens <= RETAINED_TOKEN_BOUND.min(plan.target_tokens),
+            "turn {turn}: retained {} tokens exceeds the plateau bound {RETAINED_TOKEN_BOUND}",
+            plan.after_tokens
+        );
+        assert!(
+            plan.before_tokens <= BEFORE_TOKEN_BOUND,
+            "turn {turn}: pre-compaction {} tokens exceeds the steady-state bound {BEFORE_TOKEN_BOUND}",
+            plan.before_tokens
+        );
+        assert!(
+            plan.kept_recent.len() <= RETAINED_ROW_BOUND,
+            "turn {turn}: retained {} rows exceeds the row bound {RETAINED_ROW_BOUND}",
+            plan.kept_recent.len()
+        );
+        // (3) Immutable instructions + task state never drop: they ride
+        // EVERY compacted wire through the durable projection, and the
+        // pinned store rows stay byte-identical.
+        let wire: String = plan
+            .kept_recent
+            .iter()
+            .map(|t| t.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for marker in ["SOAK-GOAL Ω", "SOAK-CRITERION Ω", "SOAK-DECISION-Ω"] {
+            assert!(
+                wire.contains(marker),
+                "turn {turn}: compacted wire lost the immutable marker {marker}"
+            );
+        }
+        assert_eq!(
+            handle.ledger_learning_records().unwrap(),
+            learning_before,
+            "turn {turn}: learning corpus rows must survive byte-identically"
+        );
+        assert_eq!(
+            handle.get_task(task_id).unwrap().unwrap(),
+            task_before,
+            "turn {turn}: the durable task row must never be rewritten"
+        );
+        let mut facts_now: Vec<_> = handle
+            .memory_facts()
+            .unwrap()
+            .into_iter()
+            .filter(|(kind, _, _)| kind != faktor_session::CONTEXT_CHECKPOINT_KIND)
+            .collect();
+        facts_now.sort();
+        assert_eq!(
+            facts_now, facts_before,
+            "turn {turn}: memory facts must survive every compaction"
+        );
+        let head = handle.ledger_ensure_head().unwrap();
+        assert!(
+            head.decisions.iter().any(|d| d.choice == "SOAK-DECISION-Ω"),
+            "turn {turn}: the pinned decision must survive in the head"
+        );
+        let pinned = handle.compact_typed_ledger().unwrap();
+        assert!(
+            pinned.pinned.contains(&decision_seq) && pinned.pinned.contains(&learning_seq),
+            "turn {turn}: the pinned seqs must stay in the never-evict set"
+        );
+        // (4) The installed durable context is byte-identical to the
+        // accepted plan's wire (digest + payload).
+        let checkpoint = handle
+            .context_checkpoint()
+            .unwrap()
+            .expect("the accepted compaction installs a checkpoint");
+        let expected_payload = serde_json::to_vec(&plan.kept_recent).unwrap();
+        assert_eq!(
+            checkpoint.payload, expected_payload,
+            "turn {turn}: the installed context must be byte-identical to the plan"
+        );
+        assert_eq!(
+            checkpoint.digest,
+            faktor_context::history_digest(&plan.kept_recent),
+            "turn {turn}: the checkpoint digest must match the installed wire"
+        );
+        report.max_rows = report.max_rows.max(plan.kept_recent.len());
+        history = plan.kept_recent;
+        report.compactions += 1;
+        report.max_before_tokens = report.max_before_tokens.max(plan.before_tokens);
+        report.max_after_tokens = report.max_after_tokens.max(plan.after_tokens);
+        report.min_reduction_seen = report.min_reduction_seen.min(reduction);
+    }
+    report.elapsed = started.elapsed();
+    report
+}
+
+/// The CI tier: 1,000 turns, 50 forced compactions, same invariants as the
+/// 10k tier.
+#[tokio::test]
+async fn compaction_soak_1k_turns_plateaus_with_bounded_growth() {
+    let report = compaction_soak_core(1_000).await;
+    assert_eq!(report.compactions, 50, "one compaction per interval");
+    eprintln!(
+        "[soak 1k] compactions={} max_before={} max_after={} max_rows={} min_reduction={:.3} elapsed={:?}",
+        report.compactions,
+        report.max_before_tokens,
+        report.max_after_tokens,
+        report.max_rows,
+        report.min_reduction_seen,
+        report.elapsed
+    );
+}
+
+/// The full DOM-10 tier: 10,000 turns, 500 forced compactions. The
+/// unbounded counterfactual at this fixture is ~320k retained tokens; the
+/// plateau bound proves growth stayed bounded across the whole run.
+#[tokio::test]
+async fn compaction_soak_10k_turns_plateaus_with_bounded_growth() {
+    let report = compaction_soak_core(10_000).await;
+    assert_eq!(report.compactions, 500, "one compaction per interval");
+    assert!(
+        report.max_after_tokens * 10 > 10_000,
+        "the bound must be meaningful against the unbounded counterfactual (~320k tokens)"
+    );
+    eprintln!(
+        "[soak 10k] compactions={} max_before={} max_after={} max_rows={} min_reduction={:.3} elapsed={:?}",
+        report.compactions,
+        report.max_before_tokens,
+        report.max_after_tokens,
+        report.max_rows,
+        report.min_reduction_seen,
+        report.elapsed
+    );
+}

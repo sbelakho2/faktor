@@ -369,8 +369,9 @@ pub(crate) fn collect_tool_summary(
 /// `Cas::has(manifest)` alone is not "retrievable": the governor may evict a
 /// chunk while the small manifest survives (per-object eviction), and a
 /// truncated/corrupt manifest is not a pointer either. The manifest is
-/// bounded (one small JSON row per chunk), so this check is a single bounded
-/// read plus one stat per referenced chunk.
+/// bounded (one small JSON row per chunk), so this check is one bounded
+/// read of the manifest plus one bounded, hash-verified read per referenced
+/// chunk: each part's stored bytes must match its declared size exactly.
 pub(crate) fn archive_manifest_is_retrievable(
     cas: &faktor_cas::Cas,
     manifest: faktor_core::hash::FileHash,
@@ -399,18 +400,29 @@ pub(crate) fn archive_manifest_is_retrievable(
         let Some(hash) = faktor_core::hash::FileHash::from_hex(hex) else {
             return false;
         };
-        if !cas.has(hash) {
-            return false;
-        }
         let Some(size) = chunk.get("size").and_then(serde_json::Value::as_u64) else {
             return false;
         };
+        // The declared part size must equal the STORED part exactly: a
+        // forged manifest that lies about a chunk (or a blob truncated
+        // under a still-valid address) is not retrievable even when the
+        // digest exists. The bounded read verifies the content hash
+        // (decompress + rehash) within the declared cap, so the manifest's
+        // totals equal the sum of the REAL parts — never the declared
+        // fiction. (DOM-67: manifest totals equal parts.)
+        match cas.get_bounded(hash, usize::try_from(size).unwrap_or(usize::MAX)) {
+            Ok(Some(bytes)) if bytes.len() as u64 == size => {}
+            _ => return false,
+        }
         total = total.saturating_add(size);
     }
+    // The totals MUST equal the sum of the parts: a manifest that cannot
+    // state its total is exactly as unverifiable as one that lies about
+    // it, so a missing `total_bytes` is refused (DOM-67).
     parsed
         .get("total_bytes")
         .and_then(serde_json::Value::as_u64)
-        .is_none_or(|declared| declared == total)
+        .is_some_and(|declared| declared == total)
 }
 
 /// The compactor's digest turn is the ONE wire carrier of a compaction

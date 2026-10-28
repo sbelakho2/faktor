@@ -11060,6 +11060,170 @@ async function navigationWebviewTests() {
     assertEqual(store.snapshot().board, null, 'a real id change drops session-scoped state');
   });
 
+  await test('switch during streaming, an approval prompt and a compaction never leaks the old conversation', () => {
+    // DOM-50 (A38/S72): a REAL switch (id change) fences the old
+    // conversation's LIVE surfaces. Store layer: the mid-stream run state
+    // (active run, busy, transcript) and the pending approval card are
+    // session-owned and drop on the id change, exactly like the
+    // session-scoped panels; the org/daemon-scoped panels survive. Host
+    // layer (source pins): the switch bumps the lifecycle generation and
+    // resets the stream/timer/submission gate, and every async host path
+    // is fenced on the captured generation + session id — so a late
+    // stream frame or a compaction-completion callback for the OLD
+    // conversation can never populate or control the new one.
+    const store = new st.FaktorStore();
+    const sessionA = { id: '7', title: 'a', provider: 'f', model: 'm', state: 'streaming' };
+    const usagePanel = { period: '2026-10', rows: [] };
+    const outcomes = { entries: [], reason: null };
+    // Bind the session first: the store drops session-scoped panels on ANY
+    // id change, including the first bind — the mid-stream/approval state
+    // must be established on a SAME-id patch (as the host does while the
+    // conversation is already active).
+    store.patch({
+      daemon: 'running',
+      session: sessionA,
+      board: { available: true, source: 'native', revision: 1, unread: 0, posts: [], reason: null },
+      usagePanel,
+      outcomes,
+    });
+    store.patch({
+      session: sessionA,
+      streamStatus: 'open',
+      activeRunId: 'run-A',
+      busy: true,
+      transcript: [transcriptEntry(1, 'mid-stream chunk from A')],
+      transcriptRevision: 'rev-A',
+      permissions: [
+        {
+          id: '41',
+          sessionId: '7',
+          capability: 'shell',
+          detail: '{"tool":"bash","command":"cargo test"}',
+        },
+      ],
+      changes: { files: [], reason: null },
+      tournament: { id: 't-1', state: 'running', candidates: [], criteria: [] },
+      indexCoverage: { state: 'ready', total: 1, indexed: 1, reason: null },
+    });
+    assertEqual(store.snapshot().permissions.length, 1, 'precondition: an approval is pending');
+    assertEqual(store.snapshot().activeRunId, 'run-A', 'precondition: a run is mid-stream');
+    // The EXACT session-owned patch shape the host's switchSession posts.
+    store.patch({
+      session: { id: '8', title: 'b', provider: 'f', model: 'm', state: 'idle' },
+      activeRunId: null,
+      busy: false,
+      transcript: [],
+      transcriptRevision: '',
+      streamStatus: 'stopped',
+      lastError: null,
+      permissions: [],
+    });
+    const after = store.snapshot();
+    assertEqual(after.permissions.length, 0, "the old conversation's approval card must drop");
+    assertEqual(after.activeRunId, null, 'no run id may survive the switch');
+    assertEqual(after.busy, false, 'the old conversation must not stay busy');
+    assertEqual(after.streamStatus, 'stopped', 'the switched conversation never inherits a live stream');
+    assertEqual(after.transcript.length, 0, "the old transcript never bleeds into the new conversation");
+    assertEqual(after.board, null, 'the session-scoped board drops');
+    assertEqual(after.changes, null, 'the session-scoped changes panel drops');
+    assertEqual(after.tournament, null, 'the session-scoped tournament drops');
+    assertEqual(after.indexCoverage, null, 'the session-scoped index panel drops');
+    assert(after.usagePanel !== null, 'the ORGANIZATION-scoped usage panel survives a switch');
+    assert(after.outcomes !== null, 'the DAEMON-scoped outcome ledger survives a switch');
+    // Webview layer: a pending approval card + mid-stream transcript are
+    // visible for A; after the host's switched snapshot the card is gone
+    // and the transcript is replaced — nothing from A is actionable.
+    const permissionA = {
+      id: '41',
+      sessionId: '7',
+      capability: 'shell',
+      detail: '{"tool":"bash","command":"cargo test"}',
+    };
+    const harness = runChatWebview({
+      ...webviewSnapshot([]),
+      streamStatus: 'open',
+      activeRunId: 'run-A',
+      busy: true,
+      permissions: [permissionA],
+      transcript: [transcriptEntry(1, 'mid-stream chunk from A')],
+    });
+    assertEqual(
+      harness.dom.document.getElementById('permission-card').hidden,
+      false,
+      'precondition: the approval card is visible for A',
+    );
+    assert(
+      fakeText(harness.dom.document.getElementById('entries')).includes('mid-stream chunk from A'),
+      'precondition: A mid-stream text is rendered',
+    );
+    harness.deliver({
+      type: 'snapshot',
+      snapshot: {
+        ...webviewSnapshot([]),
+        session: { ...sessionSummaryJson, id: '8' },
+        streamStatus: 'stopped',
+        activeRunId: null,
+        permissions: [],
+        transcript: [transcriptEntry(2, 'coherent transcript of B')],
+      },
+    });
+    assertEqual(
+      harness.dom.document.getElementById('permission-card').hidden,
+      true,
+      'after the switch the old approval card can never be replied to',
+    );
+    const entriesText = fakeText(harness.dom.document.getElementById('entries'));
+    assert(
+      entriesText.includes('coherent transcript of B'),
+      "the target conversation's state is coherent after the switch",
+    );
+    assert(
+      !entriesText.includes('mid-stream chunk from A'),
+      'no leaked stream text from the old conversation',
+    );
+    // Host source pins: the switch resets the live-stream surfaces and
+    // every late callback is fenced on the captured session/generation.
+    const source = readFileSync(new URL('../src/extension.ts', import.meta.url), 'utf8');
+    const switchBody = sourceFunctionSlice(source, 'function switchSession(');
+    assert(
+      switchBody.includes('bumpLifecycle()'),
+      'a real switch bumps the lifecycle generation (late callbacks are fenced)',
+    );
+    assert(
+      switchBody.includes('streamRefresh?.reset()'),
+      'the switch resets the stream refresh so old frames cannot schedule work',
+    );
+    assert(
+      switchBody.includes('active.activeRunId = null'),
+      'the switch clears the active run id',
+    );
+    assert(
+      switchBody.includes("streamStatus: 'stopped'") && switchBody.includes('transcript: []'),
+      'the switch patch stops the stream and clears the transcript',
+    );
+    assert(
+      switchBody.includes('taskStartGate.reset()'),
+      'the pending submission identity cannot leak into the new conversation',
+    );
+    assert(
+      switchBody.includes('startStream()'),
+      'the switch restarts the stream for the NEW conversation',
+    );
+    const streamBody = sourceFunctionSlice(source, 'function startStream(');
+    assert(
+      streamBody.includes('active.stream?.stop()'),
+      'starting a stream stops the previous one (no leaked streams)',
+    );
+    assert(
+      (source.match(/active\.sessionId !== sessionId/g) || []).length >= 2,
+      'late async results for the old session are dropped by the session fence',
+    );
+    assert(
+      source.includes('lifecycle.isCurrent(generation)'),
+      'late async results for an old generation are dropped by the lifecycle fence',
+    );
+  });
+
   await test('no view-open or History message path launches the daemon', () => {
     const harness = runChatWebview(webviewSnapshot([]));
     assertDeepEqual(harness.posted, [{ type: 'ready' }], 'opening the view posts only ready');
