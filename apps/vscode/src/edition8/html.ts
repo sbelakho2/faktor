@@ -766,7 +766,6 @@ function settingsHomeMarkup(state: E8PanelState): string {
   }).join('');
   return `<div class="e8-settings-route">
   <button type="button" id="e8-settings-back" class="e8-secondary e8-settings-back" data-settings-back hidden>Back to settings</button>
-      <button type="button" class="e8-secondary" data-open-chat style="margin-left:auto;font-size:0.8em;">← Chat</button>
   <section id="e8-settings-home" class="e8-settings-home" data-settings-descriptor-count="${rows.length}" aria-labelledby="e8-settings-title">
     <header class="e8-settings-head">
       <div>

@@ -326,16 +326,28 @@ export function registerLspDiagnostics(context: vscode.ExtensionContext, host: L
           : error instanceof Error
             ? error.message
             : String(error);
-      void vscode.window.showWarningMessage(`Faktor LSP diagnostics unavailable: ${message}`);
+      // A crashed/OOM-killed language server is transient (the daemon has
+      // already restarted it once and marked the refusal retryable): offer
+      // the operator a Retry instead of a dead-end warning. A permanent
+      // verdict keeps the plain warning.
+      if (error instanceof NativeApiError && error.retryable) {
+        const pick = await vscode.window.showWarningMessage(
+          `Faktor LSP diagnostics unavailable (transient): ${message}`,
+          'Retry',
+        );
+        if (pick === 'Retry') {
+          return refresh(document);
+        }
+      } else {
+        void vscode.window.showWarningMessage(`Faktor LSP diagnostics unavailable: ${message}`);
+      }
     } finally {
       inflight.delete(key);
     }
   };
 
-  const provider = vscode.languages.registerCodeActionsProvider(
-    [{ scheme: 'file', language: 'rust' }, { scheme: 'file', language: 'typescript' }, { scheme: 'file', language: 'python' }],
-    {
-      async provideCodeActions(document, range, actionContext) {
+  const codeActionProvider: vscode.CodeActionProvider = {
+      async provideCodeActions(document, range, actionContext, token) {
         if (document.isDirty) return [];
         const problem = bindingProblem(host);
         if (problem !== null) return [];
@@ -384,11 +396,24 @@ export function registerLspDiagnostics(context: vscode.ExtensionContext, host: L
               : error instanceof Error
                 ? error.message
                 : String(error);
+          if (error instanceof NativeApiError && error.retryable) {
+            const pick = await vscode.window.showWarningMessage(
+              `Faktor LSP code actions unavailable (transient): ${message}`,
+              'Retry',
+            );
+            if (pick === 'Retry') {
+              return codeActionProvider.provideCodeActions(document, range, actionContext, token);
+            }
+            return [];
+          }
           void vscode.window.showWarningMessage(`Faktor LSP code actions unavailable: ${message}`);
           return [];
         }
       },
-    },
+  };
+  const provider = vscode.languages.registerCodeActionsProvider(
+    [{ scheme: 'file', language: 'rust' }, { scheme: 'file', language: 'typescript' }, { scheme: 'file', language: 'python' }],
+    codeActionProvider,
     { providedCodeActionKinds: [vscode.CodeActionKind.QuickFix] },
   );
 

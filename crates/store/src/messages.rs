@@ -505,12 +505,14 @@ impl Store {
         }
         let limit = usize::try_from(limit.clamp(1, 200)).unwrap_or(200);
         let needle = query.to_lowercase();
-        // ASCII needles without JSON-escaped bytes (`"`, `\`, controls)
-        // appear literally in the stored JSON for every visible match, so
-        // SQLite can reject non-matching rows before Rust materializes their
-        // payload or serde decodes a single leaf. Any other needle falls
-        // back to decoding the bounded chunk (Unicode escapes/case folding
-        // cannot be expressed by SQLite's ASCII `lower`).
+        // ASCII needles without JSON-escaped bytes (`"`, `\`, controls) can
+        // be prefiltered by SQLite before Rust materializes a payload or
+        // serde decodes a leaf. The SQL chunk still treats escape-bearing or
+        // non-ASCII payloads as candidates (see `search_message_chunk`), so
+        // the prefilter is never allowed to hide a decoded match. Any other
+        // needle falls back to decoding the bounded chunk (Unicode
+        // escapes/case folding cannot be expressed by SQLite's ASCII
+        // `lower`).
         let prefilter = ascii_prefilter_needle(&needle);
         let prefilter = prefilter.as_deref();
         const CHUNK: u64 = 128;
@@ -602,9 +604,25 @@ impl Store {
         // per-row `lower()` copy (measured ~30% faster than
         // `instr(lower(data), ...)` on a 50k-row transcript). Wildcards in
         // the needle are escaped by `ascii_prefilter_needle`.
-        let predicate = "m.data LIKE ?3 ESCAPE '\\' OR EXISTS (
-                SELECT 1 FROM part p WHERE p.message_id = m.id
-                 AND p.data LIKE ?3 ESCAPE '\\')";
+        //
+        // The literal LIKE is only a PERFORMANCE filter: it must never skip a
+        // row that could match after decoding. Two stored-encoding cases can
+        // hide a visible match from it:
+        //   * a backslash introduces any JSON escape (`\u0061`, `\/`, `\n`,
+        //     ...), so the decoded text need not occur literally;
+        //   * a non-ASCII or control character can lowercase to ASCII
+        //     (U+212A KELVIN SIGN -> `k`) or is simply not expressible by
+        //     SQLite's ASCII-only `LIKE`.
+        // Such rows (message OR any part payload) are always decoded and
+        // judged by `message_matches`; ordinary printable-ASCII rows still
+        // take the fast SQL rejection path.
+        let predicate = "m.data LIKE ?3 ESCAPE '\\'
+                OR instr(m.data, '\\') > 0 OR m.data GLOB '*[^ -~]*'
+                OR EXISTS (
+                    SELECT 1 FROM part p WHERE p.message_id = m.id
+                     AND (p.data LIKE ?3 ESCAPE '\\'
+                          OR instr(p.data, '\\') > 0
+                          OR p.data GLOB '*[^ -~]*'))";
         let data_expr = if prefilter.is_some() {
             format!("CASE WHEN ({predicate}) THEN m.data ELSE NULL END")
         } else {
@@ -665,9 +683,14 @@ struct SearchChunkRow {
     created_ms: i64,
 }
 
-/// The SQL prefilter is only sound when the already-folded needle occurs
-/// literally in JSON string bodies: ASCII printable bytes except `"` and
-/// `\` (the two bytes serde_json escapes). Everything else must be decoded.
+/// The `LIKE` prefilter is only a performance shortcut for an ASCII needle
+/// without `"`, `\` or control bytes. It is applied to stored JSON only
+/// alongside the escape/non-ASCII candidate rule in
+/// [`Store::search_message_chunk`]: a valid JSON payload may represent the
+/// same visible text with `\uXXXX`/`\/` escapes or with a non-ASCII
+/// character that lowercases to ASCII, so those payloads are always
+/// decoded. Any needle that cannot be prefiltered returns `None` and the
+/// bounded chunk is decoded in full.
 fn ascii_prefilter_needle(needle: &str) -> Option<String> {
     if !needle.is_ascii()
         || needle
@@ -771,6 +794,7 @@ fn contains_folded(haystack: &str, needle: &str, folded: &mut String) -> bool {
     folded.contains(needle)
 }
 
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -815,6 +839,179 @@ mod tests {
             cursor = Some(page.last().unwrap().seq);
         }
         assert_eq!(seen.len(), 100);
+    }
+
+    /// DOM-47: the `before` cursor is a LIVE strict cut (`seq < before`), not
+    /// a snapshot. A concurrent writer that appends above the walk's newest
+    /// row interleaves those appends *behind* the cursor and they can never
+    /// enter this walk; rows deleted from a not-yet-served middle range leave
+    /// holes the cursor skips; a row already served and then deleted is never
+    /// duplicated or resurrected. Boundary cursors (`0`, `1`, newest,
+    /// newest + 1, far past the tail, limit 0) and termination are pinned.
+    #[test]
+    fn message_before_walk_survives_concurrent_appends_and_middle_deletes() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let sid = store.create_session(ws, "t", "p", "m").unwrap().id;
+        const TOTAL: i64 = 60;
+        const PAGE: u64 = 7;
+        for seq in 1..=TOTAL {
+            store
+                .put_message(
+                    sid,
+                    seq,
+                    "user",
+                    serde_json::json!({"text": format!("m{seq}")}),
+                )
+                .unwrap();
+        }
+
+        // Strict cursor boundaries before any walk mutates the transcript.
+        assert!(
+            store.messages_before(sid, Some(0), 10).unwrap().is_empty(),
+            "before=0 must be an empty strict cut"
+        );
+        assert!(
+            store.messages_before(sid, Some(1), 10).unwrap().is_empty(),
+            "before=1 must be an empty strict cut (seq starts at 1)"
+        );
+        assert_eq!(
+            store
+                .messages_before(sid, Some(2), 10)
+                .unwrap()
+                .iter()
+                .map(|m| m.seq)
+                .collect::<Vec<_>>(),
+            vec![1],
+            "before=2 cuts exactly above seq 1"
+        );
+        let past = store.messages_before(sid, Some(TOTAL + 5_000), 6).unwrap();
+        assert_eq!(
+            past.iter().map(|m| m.seq).collect::<Vec<_>>(),
+            (55..=60).rev().collect::<Vec<_>>(),
+            "a cursor past the newest seq is the newest page"
+        );
+        assert!(
+            store
+                .messages_before_page(sid, None, Some(0))
+                .unwrap()
+                .is_empty(),
+            "limit 0 is an empty bounded page"
+        );
+        let first = store.messages_before_page(sid, None, Some(PAGE)).unwrap();
+        assert_eq!(first.len() as u64, PAGE, "the first page is page-bounded");
+        assert_eq!(
+            first.iter().map(|m| m.seq).collect::<Vec<_>>(),
+            (54..=60).rev().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            store.messages_before(sid, Some(TOTAL), PAGE).unwrap()[0].seq,
+            TOTAL - 1,
+            "before = the newest seq excludes that row"
+        );
+
+        // The writer runs on another thread and appends one row per page,
+        // acknowledged before the walk advances, so the interleaving is
+        // adversarial but deterministic.
+        let (go, wait_go) = std::sync::mpsc::channel::<()>();
+        let (appended_tx, appended_rx) = std::sync::mpsc::channel::<i64>();
+        let mut appended: Vec<i64> = Vec::new();
+        let mut seen: Vec<i64> = Vec::new();
+        let mut pages = 0usize;
+        let mut before: Option<i64> = None;
+        let store_ref = &store;
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let store = store_ref;
+                let mut next = TOTAL + 1;
+                while wait_go.recv().is_ok() {
+                    store
+                        .put_message(
+                            sid,
+                            next,
+                            "user",
+                            serde_json::json!({"text": format!("append {next}")}),
+                        )
+                        .unwrap();
+                    appended_tx.send(next).unwrap();
+                    next += 1;
+                }
+            });
+            loop {
+                let page = store.messages_before_page(sid, before, Some(PAGE)).unwrap();
+                pages += 1;
+                assert!(pages <= 20, "the live cursor walk must terminate");
+                assert!(
+                    page.len() <= PAGE as usize,
+                    "a page is bounded by its limit ({} > {PAGE})",
+                    page.len()
+                );
+                if page.is_empty() {
+                    break;
+                }
+                assert!(
+                    page.windows(2).all(|w| w[0].seq > w[1].seq),
+                    "pages stay strictly newest-first"
+                );
+                seen.extend(page.iter().map(|m| m.seq));
+                before = Some(page.last().unwrap().seq);
+                if pages == 1 {
+                    // A not-yet-served middle range disappears from the walk.
+                    for seq in 20..=29 {
+                        assert!(store.delete_message(sid, seq).unwrap());
+                    }
+                    // A row already served is deleted: it must not duplicate
+                    // or resurrect later in the same walk.
+                    assert!(store.delete_message(sid, 57).unwrap());
+                }
+                // Interleave one append behind the cursor before advancing.
+                go.send(()).unwrap();
+                appended.push(appended_rx.recv().unwrap());
+            }
+            drop(go);
+        });
+
+        assert!(
+            !appended.is_empty(),
+            "the concurrent writer must have interleaved appends"
+        );
+        let expected: Vec<i64> = (1..=TOTAL)
+            .rev()
+            .filter(|seq| !(20..=29).contains(seq))
+            .collect();
+        assert_eq!(
+            seen, expected,
+            "every surviving pre-existing row exactly once (no skip/duplicate)"
+        );
+        assert!(
+            appended.iter().all(|seq| !seen.contains(seq)),
+            "appends above the walk start never enter an older page"
+        );
+        let newest = store.messages_before(sid, None, 10).unwrap();
+        assert_eq!(
+            newest[0].seq,
+            *appended.iter().max().unwrap(),
+            "the next live walk starts at the appended tail"
+        );
+        assert_eq!(
+            store
+                .messages_before(sid, Some(TOTAL + 1), 5)
+                .unwrap()
+                .iter()
+                .map(|m| m.seq)
+                .collect::<Vec<_>>(),
+            vec![60, 59, 58, 56, 55],
+            "before = original tail + 1 still excludes every append"
+        );
+        assert!(
+            store.messages_before(sid, Some(1), 10).unwrap().is_empty(),
+            "the oldest boundary remains a strict cut after appends/deletes"
+        );
+        assert_eq!(
+            store.messages_before(sid, Some(2), 10).unwrap()[0].seq,
+            1,
+            "the oldest surviving row is still reachable at before=2"
+        );
     }
 
     /// D-03: Find must reach model answers (stored ONLY as `part` rows), tool

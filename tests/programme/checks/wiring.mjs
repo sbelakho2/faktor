@@ -54,7 +54,7 @@ const NAVIGATION_COMMANDS = new Set([
 
 /** A handler body must name one of these seams to count as wired. */
 const EFFECT_SEAM =
-  /(?:\b(?:client|backend|service|native|runtime\.deps|deps\.(?:backend|client|service))\s*\.|startDaemon\s*\(|stopDaemon\s*\(|resolveDaemon\s*\(|cancelActiveRun\s*\(|cancelTaskRun\s*\(|replyPermission|refreshFromUserGesture\s*\(|recoverEventStream\s*\(|controlPlaneSignIn\s*\(|controlPlaneSignOut\s*\(|locateDaemon\s*\(|newTaskFromCommand\s*\(|switchSessionFromCommand\s*\(|readCurrent\s*\(|applyPatch\s*\(|startTaskRun\s*\(|uploadAttachment\s*\(|captureBrowser\s*\(|trustExecutable\s*\(|deleteMemory\s*\(|testHook\s*\(|stopScoped\s*\(|switchConversationSafe\s*\(|grantCredits\s*\(|requestApproval\s*\(|resolveApproval\s*\(|addContextDraft\s*\()/;
+  /(?:\b(?:client|backend|service|native|runtime\.deps|deps\.(?:backend|client|service))\s*\.|ensureServiceLifecycle\s*\(|serviceLifecycle\s*\.|startDaemon\s*\(|stopDaemon\s*\(|resolveDaemon\s*\(|cancelActiveRun\s*\(|cancelTaskRun\s*\(|replyPermission|refreshFromUserGesture\s*\(|recoverEventStream\s*\(|controlPlaneSignIn\s*\(|controlPlaneSignOut\s*\(|locateDaemon\s*\(|newTaskFromCommand\s*\(|switchSessionFromCommand\s*\(|readCurrent\s*\(|applyPatch\s*\(|startTaskRun\s*\(|uploadAttachment\s*\(|captureBrowser\s*\(|trustExecutable\s*\(|deleteMemory\s*\(|testHook\s*\(|stopScoped\s*\(|switchConversationSafe\s*\(|grantCredits\s*\(|requestApproval\s*\(|resolveApproval\s*\(|addContextDraft\s*\()/;
 
 function read(root, rel) {
   const path = join(root, rel);

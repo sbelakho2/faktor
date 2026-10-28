@@ -85,6 +85,7 @@ fn harness(
                 reasoning_tokens: 0,
                 provider_cost_micro: 500,
                 provider_reported_micro: 500,
+                price_authority: Some(faktor_core::model::PriceAuthority::Exact),
                 state: "settled".into(),
                 occurred_at_ms: 1_500,
                 source_operation: "provider_call".into(),

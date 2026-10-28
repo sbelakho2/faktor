@@ -30,6 +30,15 @@ fn send(id: &str, result: &str) {
     let _ = out.flush();
 }
 
+fn send_error(id: &str, code: i32, message: &str) {
+    let body = format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"error\":{{\"code\":{code},\"message\":\"{message}\"}}}}"
+    );
+    let mut out = std::io::stdout().lock();
+    let _ = write!(out, "Content-Length: {}\r\n\r\n{}", body.len(), body);
+    let _ = out.flush();
+}
+
 fn log(message: &str) {
     let mut err = std::io::stderr().lock();
     let _ = writeln!(err, "{message}");
@@ -140,6 +149,10 @@ fn main() {
         log("mock closing before handshake");
         return;
     }
+    if mode == "exit-immediately" {
+        log("mock-lsp: simulated early exit before reading the request");
+        std::process::exit(7);
+    }
     if mode == "flood" {
         std::thread::spawn(|| loop {
             let mut err = std::io::stderr().lock();
@@ -159,6 +172,31 @@ fn main() {
         let id = message.get("id").map(J::raw);
         match method {
             "initialize" => {
+                // Crash-class modes for the transient-exit contract: the
+                // child ends BEFORE answering, exactly like an OOM-killed or
+                // externally-killed real server.
+                if mode == "exit-at-initialize" {
+                    log("mock-lsp: simulated crash before initialize (mode exit-at-initialize)");
+                    std::process::exit(7);
+                }
+                if mode == "crash-once" {
+                    let counter = std::env::args().nth(4).unwrap_or_default();
+                    let first = counter.is_empty() || !std::path::Path::new(&counter).exists();
+                    if first {
+                        if !counter.is_empty() {
+                            let _ = std::fs::write(&counter, b"crashed-once");
+                        }
+                        log("mock-lsp: first start crashes at initialize (mode crash-once)");
+                        std::process::exit(7);
+                    }
+                }
+                if mode == "rpc-error-initialize" {
+                    if let Some(id) = id {
+                        send_error(&id, -32603, "internal mock refusal");
+                    }
+                    log("SENT initialize error");
+                    continue;
+                }
                 let params = message.get("params");
                 let root_uri = params
                     .and_then(|params| params.get("rootUri"))

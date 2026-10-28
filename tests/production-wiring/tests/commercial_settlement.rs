@@ -291,6 +291,7 @@ fn replayed_outbox_projection_is_idempotent() {
         cache_write_tokens: row.cache_write_tokens,
         reasoning_tokens: row.reasoning_tokens,
         provider_cost_micro: row.provider_cost_micro,
+        price_authority: Some(faktor_core::model::PriceAuthority::Exact),
         provider_reported_micro: row.provider_reported_micro.unwrap_or(0),
         state: row.state.clone(),
         occurred_at_ms: row.occurred_at_ms,

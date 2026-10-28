@@ -2752,6 +2752,118 @@ object FrontendSmoke {
             assertEquals(listOf("41", "42", "43", "44"), panel.evidenceButtonIds())
         }
 
+        step(
+            "T21 finish action pending renders on Verification only when a requested step lacks a succeeded durable result"
+        ) {
+            val pendingTask = parseNativeTaskViews(TASK_JSON)[0].copy(
+                completion = NativeTaskCompletion(
+                    NativeCompletionContract(true, true, false),
+                    listOf(
+                        NativeCompletionStepStatus("commit", "pending", "awaiting the gate"),
+                        NativeCompletionStepStatus("push", "succeeded", "pushed")
+                    )
+                )
+            )
+            val pendingModel = TaskTree.build(task = pendingTask)
+            assertEquals(true, pendingModel.completion?.finishActionPending)
+            val pendingPanel = VerificationPanel()
+            var viewFinishClicks = 0
+            pendingPanel.setListener(object : VerificationPanel.Listener {
+                override fun onEvidenceSelected(ref: EvidenceRef) {}
+
+                override fun onViewFinishActions() {
+                    viewFinishClicks++
+                }
+            })
+            pendingPanel.updateModel(pendingModel)
+            assertTrue(
+                pendingPanel.completionCardVisibleForTest(),
+                "a served completion contract keeps its card"
+            )
+            assertTrue(
+                pendingPanel.completionLabelsForTest()
+                    .contains(RunStateCopy.FINISH_ACTION_PENDING_LABEL),
+                "T21 label renders on Verification"
+            )
+            assertTrue(
+                pendingPanel.completionLabelsForTest()
+                    .contains(RunStateCopy.FINISH_ACTION_PENDING_COPY),
+                "T21 copy renders on Verification"
+            )
+            val action = pendingPanel.finishActionButtonForTest()
+                ?: fail("T21 must render its action when a requested finish step is pending")
+            assertEquals(RunStateCopy.FINISH_ACTION_PENDING_ACTION, action.text)
+            action.doClick()
+            assertEquals(1, viewFinishClicks)
+
+            // An all-succeeded contract renders the step detail only: the
+            // T21 label/copy/action never claim pending work.
+            val succeededTask = pendingTask.copy(
+                completion = NativeTaskCompletion(
+                    NativeCompletionContract(true, true, false),
+                    listOf(
+                        NativeCompletionStepStatus("commit", "succeeded", "committed"),
+                        NativeCompletionStepStatus("push", "succeeded", "pushed")
+                    )
+                )
+            )
+            val succeededModel = TaskTree.build(task = succeededTask)
+            assertEquals(false, succeededModel.completion?.finishActionPending)
+            val succeededPanel = VerificationPanel()
+            succeededPanel.updateModel(succeededModel)
+            assertTrue(
+                succeededPanel.completionCardVisibleForTest(),
+                "the completion detail stays inspectable"
+            )
+            assertTrue(
+                !succeededPanel.completionLabelsForTest()
+                    .contains(RunStateCopy.FINISH_ACTION_PENDING_LABEL),
+                "no T21 label after every requested step succeeded"
+            )
+            assertTrue(
+                !succeededPanel.completionLabelsForTest()
+                    .contains(RunStateCopy.FINISH_ACTION_PENDING_COPY),
+                "no T21 copy after every requested step succeeded"
+            )
+            assertEquals(null, succeededPanel.finishActionButtonForTest())
+
+            // A requested step with no durable row at all is pending too.
+            val missingRowTask = pendingTask.copy(
+                completion = NativeTaskCompletion(
+                    NativeCompletionContract(true, false, false),
+                    emptyList()
+                )
+            )
+            val missingRowModel = TaskTree.build(task = missingRowTask)
+            assertEquals(true, missingRowModel.completion?.finishActionPending)
+            val missingRowPanel = VerificationPanel()
+            missingRowPanel.updateModel(missingRowModel)
+            assertTrue(
+                missingRowPanel.completionLabelsForTest()
+                    .contains(RunStateCopy.FINISH_ACTION_PENDING_LABEL),
+                "a missing durable row still renders T21"
+            )
+            assertEquals(
+                RunStateCopy.FINISH_ACTION_PENDING_ACTION,
+                missingRowPanel.finishActionButtonForTest()?.text
+            )
+
+            // No completion contract: the card is omitted and no T21 text
+            // leaks into an unrelated run.
+            val absentPanel = VerificationPanel()
+            absentPanel.updateModel(TaskTree.build(task = parseNativeTaskViews(TASK_JSON)[0]))
+            assertTrue(
+                !absentPanel.completionCardVisibleForTest(),
+                "no completion contract omits the card"
+            )
+            assertTrue(
+                !absentPanel.completionLabelsForTest()
+                    .contains(RunStateCopy.FINISH_ACTION_PENDING_LABEL),
+                "no T21 label without a completion contract"
+            )
+            assertEquals(null, absentPanel.finishActionButtonForTest())
+        }
+
         step("overview is concise; proof honesty stays in Verification/Advanced") {
             val task = parseNativeTaskViews(TASK_JSON)[0]
             val records = parseNativeTaskVerification(TASK_VERIFICATION_JSON)

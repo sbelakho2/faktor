@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! faktor-mcp — JSON-RPC Model Context Protocol client (spec §31).
 //!
 //! Stdio MCP processes are supervised like terminals: crashes, hangs, and
@@ -194,6 +195,53 @@ pub struct McpResult {
     pub is_error: bool,
 }
 
+/// Bounded tail of server stderr (bytes), drained so a verbose MCP server can
+/// never block itself on a full pipe. The tail is evidence, never a stream.
+const STDERR_RING_CAP: usize = 32 * 1024;
+
+struct StderrRing {
+    tail: std::collections::VecDeque<u8>,
+    total: u64,
+}
+
+impl StderrRing {
+    fn new(cap: usize) -> Self {
+        Self {
+            tail: std::collections::VecDeque::with_capacity(cap),
+            total: 0,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8], cap: usize) {
+        self.total = self.total.saturating_add(bytes.len() as u64);
+        self.tail.extend(bytes.iter().copied());
+        while self.tail.len() > cap {
+            self.tail.pop_front();
+        }
+    }
+
+    fn tail_lossy(&self) -> String {
+        let bytes: Vec<u8> = self.tail.iter().copied().collect();
+        String::from_utf8_lossy(&bytes).to_string()
+    }
+}
+
+fn stderr_drain(pipe: impl std::io::Read, ring: Arc<Mutex<StderrRing>>) {
+    let mut pipe = pipe;
+    let mut chunk = [0u8; 8192];
+    loop {
+        match pipe.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                if let Ok(mut guard) = ring.lock() {
+                    guard.push(&chunk[..n], STDERR_RING_CAP);
+                }
+            }
+            Err(_) => break,
+        }
+    }
+}
+
 struct Conn {
     child_pid: u32,
     next_id: u64,
@@ -370,14 +418,61 @@ pub struct McpServer {
     /// The stdout reader thread's JoinHandle: consumed by the bounded join on
     /// close/Drop (a handle of None means the thread was already joined).
     reader: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// The stderr drain thread: a verbose server must never block on a full
+    /// stderr pipe; the bounded ring keeps the recent tail as evidence.
+    stderr_reader: Mutex<Option<std::thread::JoinHandle<()>>>,
+    stderr: Arc<Mutex<StderrRing>>,
+}
+
+/// True for the TRANSIENT exit class only: a provider error coded `mcp`
+/// with `retryable: true` is produced exclusively for a server process that
+/// ended mid-request (crash/OOM-kill), never for a protocol verdict.
+fn is_server_exit(error: &Error) -> bool {
+    matches!(&error.kind, ErrorKind::Provider { code, retryable } if code == "mcp" && *retryable)
 }
 
 impl McpServer {
+    /// Recent stderr tail (bounded; lossy UTF-8) for diagnostics.
+    pub fn stderr_tail(&self) -> String {
+        recover_lock(&self.stderr).tail_lossy()
+    }
+
+    /// Total stderr bytes drained (never bounded): proves a flood was
+    /// actually drained and never blocked the server.
+    pub fn stderr_total_bytes(&self) -> u64 {
+        recover_lock(&self.stderr).total
+    }
+
     /// Connect: spawn the server process through the given (shared)
     /// supervisor and perform the initialize handshake with a bounded
     /// timeout. The supervisor owns the child's process group, registry
     /// row and reaping; [`McpServer::close`] / `Drop` kill the group.
     pub async fn connect(
+        cfg: McpConfig,
+        supervisor: Arc<ProcessSupervisor>,
+    ) -> Result<Arc<Self>, Error> {
+        match Self::connect_once(cfg.clone(), supervisor.clone()).await {
+            Err(first) if is_server_exit(&first) => {
+                // ONE bounded restart: a server that exited at the handshake
+                // (crash/OOM-kill) is transient — a killed server must not
+                // read as a permanent tool loss; a deterministic crash still
+                // surfaces, with BOTH children's stderr evidence merged.
+                match Self::connect_once(cfg, supervisor).await {
+                    Ok(server) => Ok(server),
+                    Err(second) => Err(Error::new(
+                        ErrorKind::Provider {
+                            code: "mcp".into(),
+                            retryable: true,
+                        },
+                        format!("{first}; after one restart: {second}"),
+                    )),
+                }
+            }
+            other => other,
+        }
+    }
+
+    async fn connect_once(
         cfg: McpConfig,
         supervisor: Arc<ProcessSupervisor>,
     ) -> Result<Arc<Self>, Error> {
@@ -417,14 +512,57 @@ impl McpServer {
                 read_loop(conn2, spawned.stdout);
             })
         };
+        // Stderr MUST be drained for the child's whole life: a server that
+        // logs more than one pipe buffer would otherwise block forever (the
+        // classic verbose-server deadlock).
+        let stderr = Arc::new(Mutex::new(StderrRing::new(STDERR_RING_CAP)));
+        let stderr_reader = {
+            let ring = stderr.clone();
+            std::thread::spawn(move || stderr_drain(spawned.stderr, ring))
+        };
         let server = Arc::new(Self {
             name: cfg.name.clone(),
             conn,
             writer,
             supervisor,
             reader: Mutex::new(Some(reader)),
+            stderr_reader: Mutex::new(Some(stderr_reader)),
+            stderr,
         });
-        server.initialize().await?;
+        if let Err(error) = server.initialize().await {
+            // Handshake failures carry the drained stderr as evidence, and
+            // the two crash sub-classes are classified transient: (a) the
+            // child exited before answering (already Provider{mcp,true}
+            // with evidence from the EOF marker), (b) the child was already
+            // gone when the request was written (EPIPE → Network). For
+            // stdio the only Network shape during the handshake IS a dead
+            // child, so it is wrapped as the same transient class.
+            let tail = server.stderr_tail();
+            let tail = tail.trim();
+            let evidence = if tail.is_empty() {
+                "no stderr was captured".to_string()
+            } else {
+                format!(
+                    "stderr tail: {}",
+                    tail.chars().take(1200).collect::<String>()
+                )
+            };
+            return Err(match error.kind.clone() {
+                ErrorKind::Provider { code, .. } if code == "mcp" => error,
+                ErrorKind::Network => Error::new(
+                    ErrorKind::Provider {
+                        code: "mcp".into(),
+                        retryable: true,
+                    },
+                    format!(
+                        "mcp initialize: the MCP server exited before the request was written \
+                         ({}); {evidence}",
+                        error.message
+                    ),
+                ),
+                _ => error,
+            });
+        }
         Ok(server)
     }
 
@@ -496,20 +634,55 @@ impl McpServer {
                     // server's own frame): the oversized marker keeps the
                     // typed bound failure instead of degrading it to a
                     // generic provider error.
-                    let kind = if err
+                    let marker = err
                         .get("data")
                         .and_then(|data| data.get("faktor_kind"))
-                        .and_then(|kind| kind.as_str())
-                        == Some(OVERSIZED_MARKER)
-                    {
-                        ErrorKind::Oversized
-                    } else {
+                        .and_then(|kind| kind.as_str());
+                    if marker == Some(OVERSIZED_MARKER) {
+                        return Err(Error::new(
+                            ErrorKind::Oversized,
+                            format!("mcp {method}: {err}"),
+                        ));
+                    }
+                    let exited = err
+                        .get("data")
+                        .and_then(|data| data.get("faktor_exit"))
+                        .is_some();
+                    if exited {
+                        // The SERVER PROCESS ended mid-request: transient,
+                        // retryable, with its drained stderr as evidence.
+                        let tail = self.stderr_tail();
+                        let tail = tail.trim();
+                        let evidence = if tail.is_empty() {
+                            "no stderr was captured".to_string()
+                        } else {
+                            format!(
+                                "stderr tail: {}",
+                                tail.chars().take(1200).collect::<String>()
+                            )
+                        };
+                        let reason = err
+                            .get("message")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("no reason reported");
+                        return Err(Error::new(
+                            ErrorKind::Provider {
+                                code: "mcp".into(),
+                                retryable: true,
+                            },
+                            format!(
+                                "mcp {method}: the MCP server exited during the request \
+                                 ({reason}); {evidence}"
+                            ),
+                        ));
+                    }
+                    return Err(Error::new(
                         ErrorKind::Provider {
                             code: "mcp".into(),
                             retryable: false,
-                        }
-                    };
-                    return Err(Error::new(kind, format!("mcp {method}: {err}")));
+                        },
+                        format!("mcp {method}: {err}"),
+                    ));
                 }
                 Ok(response
                     .get("result")
@@ -785,10 +958,20 @@ impl Drop for McpServer {
         });
         let _ = self.supervisor.kill_child_pid(pid, 300);
         let reader = self.reader.lock().ok().and_then(|mut slot| slot.take());
+        let stderr_reader = self
+            .stderr_reader
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
         let writer = self.writer.take_thread();
         if let Some(handle) = reader {
             if !join_thread_bounded(handle, Duration::from_millis(500)) {
                 tracing::warn!("mcp stdout reader thread did not stop within the Drop bound");
+            }
+        }
+        if let Some(handle) = stderr_reader {
+            if !join_thread_bounded(handle, Duration::from_millis(500)) {
+                tracing::warn!("mcp stderr drain thread did not stop within the Drop bound");
             }
         }
         if let Some(handle) = writer {
@@ -877,10 +1060,17 @@ fn read_loop(conn: Arc<Mutex<Conn>>, stdout: std::process::ChildStdout) {
             }
         }
     }
-    // EOF: fail all pending requests.
+    // EOF: fail all pending requests, marked as OUR exit observation so the
+    // mapper can classify it as transient (never a server protocol verdict).
     let mut guard = recover_lock(&conn);
     for (_, tx) in guard.pending.drain() {
-        let _ = tx.send(serde_json::json!({"error": {"code": -32000, "message": "server closed"}}));
+        let _ = tx.send(serde_json::json!({
+            "error": {
+                "code": -32000,
+                "message": "server closed",
+                "data": {"faktor_exit": true}
+            }
+        }));
     }
 }
 
@@ -1149,6 +1339,156 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         sup.reap();
         assert_eq!(sup.registered(), 0, "Drop must leave no child behind");
+    }
+
+    /// Crash-class contract (mirrors the live "server closed at initialize"
+    /// class): a server that EXITS before answering the handshake is
+    /// TRANSIENT — retryable, retried exactly once, and the message carries
+    /// the drained stderr as evidence.
+    #[tokio::test]
+    async fn initialize_child_exit_is_transient_retryable_with_stderr_and_one_restart() {
+        let dir = tempdir().unwrap();
+        let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
+        let sup = ProcessSupervisor::new(cas);
+        let cfg = McpConfig {
+            name: "crash".into(),
+            command: faktor_test_mocks::mcp_bin().to_string_lossy().into_owned(),
+            args: vec!["exit-at-initialize".into()],
+            env: vec![],
+        };
+        let error = match McpServer::connect(cfg, sup.clone()).await {
+            Ok(_) => panic!("exit-at-initialize must fail the connect"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                &error.kind,
+                ErrorKind::Provider { code, retryable } if code == "mcp" && *retryable
+            ),
+            "a server exit at initialize must be the retryable mcp class: {:?}",
+            error.kind
+        );
+        let message = format!("{error}");
+        assert!(message.contains("exited during the request"), "{message}");
+        assert!(
+            message.contains("simulated crash before initialize"),
+            "the drained stderr must be the evidence: {message}"
+        );
+        assert!(message.contains("after one restart"), "{message}");
+        std::thread::sleep(Duration::from_millis(100));
+        sup.reap();
+        assert_eq!(
+            sup.registered(),
+            0,
+            "failed connects must not orphan children"
+        );
+    }
+
+    /// Crash-once recovery: the FIRST child crashes at initialize, the second
+    /// answers normally — connect must succeed through the single restart.
+    #[tokio::test]
+    async fn initialize_crash_once_recovers_after_one_restart() {
+        let dir = tempdir().unwrap();
+        let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
+        let sup = ProcessSupervisor::new(cas);
+        let counter = dir.path().join("crash-once.marker");
+        let cfg = McpConfig {
+            name: "crash-once".into(),
+            command: faktor_test_mocks::mcp_bin().to_string_lossy().into_owned(),
+            args: vec!["crash-once".into(), counter.to_string_lossy().into_owned()],
+            env: vec![],
+        };
+        let server = McpServer::connect(cfg, sup.clone())
+            .await
+            .expect("a crash-once server must recover through the single restart");
+        assert!(
+            counter.exists(),
+            "the first child must have recorded its crash"
+        );
+        assert!(
+            !server.stderr_tail().contains("first start crashes"),
+            "the surviving server is the healthy second child: {}",
+            server.stderr_tail()
+        );
+        let tools = server
+            .call("tools/list", serde_json::json!({}), Duration::from_secs(5))
+            .await
+            .expect("the recovered server must answer");
+        assert!(tools.get("tools").is_some(), "{tools:?}");
+        drop(server);
+    }
+
+    /// A JSON-RPC error the SERVER itself answered is a permanent provider
+    /// verdict: non-retryable and never described as a crash/retry.
+    #[tokio::test]
+    async fn initialize_server_rpc_error_stays_permanent() {
+        let dir = tempdir().unwrap();
+        let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
+        let sup = ProcessSupervisor::new(cas);
+        let cfg = McpConfig {
+            name: "refusal".into(),
+            command: faktor_test_mocks::mcp_bin().to_string_lossy().into_owned(),
+            args: vec!["rpc-error-initialize".into()],
+            env: vec![],
+        };
+        let error = match McpServer::connect(cfg, sup).await {
+            Ok(_) => panic!("rpc-error-initialize must fail"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                &error.kind,
+                ErrorKind::Provider { code, retryable } if code == "mcp" && !*retryable
+            ),
+            "a server-answered error is permanent: {:?}",
+            error.kind
+        );
+        let message = format!("{error}");
+        assert!(message.contains("internal mock refusal"), "{message}");
+        assert!(
+            !message.contains("exited during the request")
+                && !message.contains("after one restart"),
+            "a server verdict must never be described as a crash/retry: {message}"
+        );
+    }
+
+    /// A verbose server must never block on a full stderr pipe: the drain
+    /// keeps the child flowing under continuous stderr pressure, and the
+    /// unbounded byte count proves real draining (not just a quiet tail).
+    #[tokio::test]
+    async fn verbose_stderr_is_drained_and_never_blocks_the_server() {
+        let dir = tempdir().unwrap();
+        let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
+        let sup = ProcessSupervisor::new(cas);
+        let cfg = McpConfig {
+            name: "verbose".into(),
+            command: faktor_test_mocks::mcp_bin().to_string_lossy().into_owned(),
+            args: vec!["flood-stderr-echo".into()],
+            env: vec![],
+        };
+        let server = McpServer::connect(cfg, sup)
+            .await
+            .expect("a verbose server must still connect");
+        for _ in 0..8 {
+            let tools = server
+                .call("tools/list", serde_json::json!({}), Duration::from_secs(5))
+                .await
+                .expect("a drained server must keep answering under stderr pressure");
+            assert!(tools.get("tools").is_some());
+        }
+        // Wait (bounded) for the flood to exceed several pipe buffers: the
+        // proof is sustained draining, not a lucky instant.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while server.stderr_total_bytes() <= 8 * 64 * 1024 && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            server.stderr_total_bytes() > 8 * 64 * 1024,
+            "the drain must consume far beyond the pipe buffers, got {}",
+            server.stderr_total_bytes()
+        );
+        drop(server);
     }
 
     #[tokio::test]

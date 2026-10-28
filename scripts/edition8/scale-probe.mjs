@@ -695,6 +695,37 @@ async function getJson(base, token, path) {
   return { status: response.status, json, text };
 }
 
+// Reaped on EVERY exit path: `process.exit()` skips finally blocks, and a
+// leaked serve/fake child outlives the run (observed: three daemons and
+// three fake providers burning cycles for hours after failing runs).
+const LIVE_CHILDREN = [];
+let LIVE_TMP = null;
+const reapLive = () => {
+  for (const child of LIVE_CHILDREN) {
+    try {
+      child.kill('SIGKILL');
+    } catch {
+      /* already gone */
+    }
+  }
+  LIVE_CHILDREN.length = 0;
+  if (LIVE_TMP !== null) {
+    try {
+      rmSync(LIVE_TMP, { recursive: true, force: true });
+    } catch {
+      /* best effort */
+    }
+    LIVE_TMP = null;
+  }
+};
+process.on('exit', reapLive);
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.on(signal, () => {
+    reapLive();
+    process.exit(128 + (signal === 'SIGINT' ? 2 : 15));
+  });
+}
+
 async function startDaemon(store, dataDir, config, token, logPath) {
   const child = spawn(store, ['serve', '--port', '0', '--data-dir', dataDir, '--config', config], {
     cwd: ROOT,
@@ -719,6 +750,7 @@ async function startDaemon(store, dataDir, config, token, logPath) {
     if (child.exitCode !== null) break;
     await new Promise((done) => setTimeout(done, 40));
   }
+  LIVE_CHILDREN.push(child);
   if (base === null) throw new Error(`daemon did not start: ${output.slice(-1200)}`);
   while (Date.now() < deadline) {
     try {
@@ -735,6 +767,8 @@ async function startDaemon(store, dataDir, config, token, logPath) {
 }
 
 async function stop(child) {
+  const tracked = LIVE_CHILDREN.indexOf(child);
+  if (tracked >= 0) LIVE_CHILDREN.splice(tracked, 1);
   if (!child || child.exitCode !== null) return;
   child.kill('SIGKILL');
   await new Promise((done) => {
@@ -800,6 +834,7 @@ async function main() {
   const seed = seedBinary();
   const appendTurn = appendBinary();
   const tmp = mkdtempSync(join(tmpdir(), 'faktor-e8-scale-'));
+  LIVE_TMP = tmp;
   const data = join(tmp, 'data');
   const config = join(tmp, 'faktor.json');
   const log = join(tmp, 'daemon.log');
@@ -809,6 +844,7 @@ async function main() {
     cwd: ROOT,
     stdio: ['ignore', 'ignore', 'ignore'],
   });
+  LIVE_CHILDREN.push(fake);
   let daemon = null;
   const samples = [];
   let sampler = null;
@@ -1924,7 +1960,9 @@ async function main() {
     console.log(
       `[scale] wrote ${path} (${sha(Buffer.from(payload))})${FULL_COVERAGE ? '' : ' [reduced run: not gate evidence]'}`,
     );
-    if (failures.length > 0) process.exit(1);
+    // Never process.exit() inside the try: it skips this function's
+    // finally (daemon/fake/tmp teardown). Let main() return instead.
+    if (failures.length > 0) process.exitCode = 1;
   } finally {
     if (sampler !== null) clearInterval(sampler);
     await stop(daemon?.child ?? null);

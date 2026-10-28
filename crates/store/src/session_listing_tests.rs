@@ -8,6 +8,7 @@
 //! at 5k sessions, and a page walk that cannot skip/duplicate under
 //! same-millisecond updates, inserts, concurrent renames or hard deletes.
 
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 use super::*;
 
 #[test]
@@ -252,6 +253,292 @@ fn concurrent_title_updates_allocate_unique_monotonic_revisions() {
     assert_eq!(page.len(), 2);
     assert_eq!(page[0].id, target.id);
     assert_eq!(page[1].id, other.id);
+}
+
+/// DOM-46 (20,000 conversations): a snapshot-bound keyset walk serves every
+/// conversation exactly once in `listing_revision DESC, id DESC` order, never
+/// more than `limit + 1` rows per statement (the `hasMore` probe row), never
+/// above the snapshot revision, and a conversation created mid-walk (its
+/// revision is above the bound) is absent from THIS walk and first in the
+/// next one. It also walks a separate 2,000-conversation workspace so both
+/// report sizes are exercised as page walks, not just as a whole-table read.
+#[test]
+fn twenty_thousand_conversation_history_walk_is_ordered_once_and_page_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), true).unwrap();
+    let ws = store.create_workspace("/w").unwrap();
+    const N: u64 = 20_000;
+    const PAGE: u64 = 257;
+    let mut created: Vec<u64> = Vec::with_capacity(N as usize);
+    for i in 0..N {
+        created.push(
+            store
+                .create_session(ws, &format!("history {i}"), "fake", "m")
+                .unwrap()
+                .id
+                .raw(),
+        );
+    }
+    let snapshot = store.session_listing_snapshot().unwrap();
+
+    let mut seen: Vec<u64> = Vec::with_capacity(N as usize);
+    let mut before: Option<(i64, i64)> = None;
+    let mut last: Option<(i64, i64)> = None;
+    let mut pages = 0usize;
+    let mut inserted: Option<u64> = None;
+    loop {
+        let page = store
+            .list_sessions_page_at(None, before, PAGE, Some(snapshot.revision))
+            .unwrap();
+        pages += 1;
+        assert!(
+            pages <= 100,
+            "the 20k walk must terminate with bounded pages"
+        );
+        assert!(
+            page.len() <= PAGE as usize + 1,
+            "a page statement may read at most limit + 1 rows, got {}",
+            page.len()
+        );
+        if page.is_empty() {
+            break;
+        }
+        // The last row may be the `+1` hasMore probe; it is NOT served by
+        // this page and will be the first row of the next one.
+        let take = page.len().min(PAGE as usize);
+        for row in &page[..take] {
+            let key = (row.listing_revision, row.id.raw() as i64);
+            assert!(
+                row.listing_revision <= snapshot.revision,
+                "the walk must stay at or below the snapshot bound"
+            );
+            if let Some(previous) = last {
+                assert!(
+                    key < previous,
+                    "keyset order must strictly descend: {key:?}"
+                );
+            }
+            last = Some(key);
+        }
+        seen.extend(page[..take].iter().map(|row| row.id.raw()));
+        if pages == 1 {
+            // A live insert after the snapshot gets a higher revision, so it
+            // can never join this walk even at 20k scale.
+            inserted = Some(
+                store
+                    .create_session(ws, "inserted mid walk", "fake", "m")
+                    .unwrap()
+                    .id
+                    .raw(),
+            );
+        }
+        if page.len() <= PAGE as usize {
+            break;
+        }
+        let tail = page[take - 1].clone();
+        before = Some((tail.listing_revision, tail.id.raw() as i64));
+    }
+
+    assert_eq!(seen.len(), N as usize, "every conversation is served once");
+    let mut unique = seen.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), N as usize, "no duplicate conversation");
+    created.reverse();
+    assert_eq!(seen, created, "page order is listing-revision DESC");
+    let inserted = inserted.expect("the mid-walk insert must have run");
+    assert!(
+        !seen.contains(&inserted),
+        "a post-snapshot conversation must not appear in the walk"
+    );
+    let fresh = store.list_sessions_page(None, None, 5).unwrap();
+    assert_eq!(
+        fresh[0].id.raw(),
+        inserted,
+        "the next (fresh snapshot) walk lists the inserted conversation first"
+    );
+
+    // The report's smaller size: a workspace-scoped 2,000-conversation walk
+    // is still page-bounded and serves every row exactly once in order.
+    const SMALL: u64 = 2_000;
+    const SMALL_PAGE: u64 = 73;
+    let small = store.create_workspace("/small").unwrap();
+    let mut small_created: Vec<u64> = Vec::with_capacity(SMALL as usize);
+    for i in 0..SMALL {
+        small_created.push(
+            store
+                .create_session(small, &format!("small {i}"), "fake", "m")
+                .unwrap()
+                .id
+                .raw(),
+        );
+    }
+    let small_snapshot = store.session_listing_snapshot().unwrap();
+    let mut small_seen: Vec<u64> = Vec::with_capacity(SMALL as usize);
+    let mut small_before: Option<(i64, i64)> = None;
+    loop {
+        let page = store
+            .list_sessions_page_at(
+                Some(small),
+                small_before,
+                SMALL_PAGE,
+                Some(small_snapshot.revision),
+            )
+            .unwrap();
+        assert!(
+            page.len() <= SMALL_PAGE as usize + 1,
+            "a 2k workspace page is still bounded"
+        );
+        if page.is_empty() {
+            break;
+        }
+        let take = page.len().min(SMALL_PAGE as usize);
+        small_seen.extend(page[..take].iter().map(|row| row.id.raw()));
+        if page.len() <= SMALL_PAGE as usize {
+            break;
+        }
+        let tail = &page[take - 1];
+        small_before = Some((tail.listing_revision, tail.id.raw() as i64));
+    }
+    small_created.reverse();
+    assert_eq!(
+        small_seen, small_created,
+        "the 2,000-conversation workspace walk is ordered and complete"
+    );
+}
+
+/// DOM-46 (plan bounded): the exact listing / snapshot statements ride the
+/// v44 indexes. Same discipline as `query_plan_tests`: the seeded size is the
+/// audit scale, and the EXPLAIN details are pinned so dropping or reordering
+/// an index fails here instead of silently turning a History page into a
+/// whole-table SCAN or a TEMP B-TREE sort.
+#[test]
+fn history_listing_statements_are_index_backed_without_temp_sorts_or_scans() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), true).unwrap();
+    let ws = store.create_workspace("/w").unwrap();
+    let other = store.create_workspace("/other").unwrap();
+    let conn = store.raw_conn();
+    conn.execute_batch("BEGIN").unwrap();
+    {
+        let mut stmt = conn
+            .prepare(
+                "INSERT INTO session(id, workspace_id, title, provider, model, state, lifecycle,
+                    created_ms, updated_ms, worktree_id, task_id, listing_revision)
+                 VALUES (?1, ?2, 't', 'p', 'm', '\"idle\"', 'open', ?1, ?1, 1, 1, ?1)",
+            )
+            .unwrap();
+        for id in 1..=20_000i64 {
+            stmt.execute(params![id, ws.raw() as i64]).unwrap();
+        }
+        for id in 20_001..=20_200i64 {
+            stmt.execute(params![id, other.raw() as i64]).unwrap();
+        }
+    }
+    conn.execute_batch("COMMIT").unwrap();
+
+    let global_first = "SELECT id, workspace_id, worktree_id, task_id, title, provider, model,
+            state, lifecycle, created_ms, updated_ms, listing_revision
+         FROM session WHERE listing_revision <= ?1
+         ORDER BY listing_revision DESC, id DESC LIMIT ?2";
+    let global_cursor = "SELECT id, workspace_id, worktree_id, task_id, title, provider, model,
+            state, lifecycle, created_ms, updated_ms, listing_revision
+         FROM session WHERE listing_revision <= ?1
+           AND (listing_revision < ?2 OR (listing_revision = ?2 AND id < ?3))
+         ORDER BY listing_revision DESC, id DESC LIMIT ?4";
+    let workspace_first = "SELECT id, workspace_id, worktree_id, task_id, title, provider, model,
+            state, lifecycle, created_ms, updated_ms, listing_revision
+         FROM session WHERE workspace_id = ?1 AND listing_revision <= ?2
+         ORDER BY listing_revision DESC, id DESC LIMIT ?3";
+    let workspace_cursor = "SELECT id, workspace_id, worktree_id, task_id, title, provider, model,
+            state, lifecycle, created_ms, updated_ms, listing_revision
+         FROM session WHERE workspace_id = ?1 AND listing_revision <= ?2
+           AND (listing_revision < ?3 OR (listing_revision = ?3 AND id < ?4))
+         ORDER BY listing_revision DESC, id DESC LIMIT ?5";
+    let snapshot_revision = "SELECT COALESCE(MAX(listing_revision), 0) FROM session";
+
+    assert_plan(
+        "global history first page",
+        explain_plan(&conn, global_first, &[20_000, 258]),
+        &["SEARCH session USING INDEX idx_session_listing_revision_id (listing_revision<?)"],
+    );
+    assert_plan(
+        "global history cursor page",
+        explain_plan(&conn, global_cursor, &[20_000, 10_000, 5, 258]),
+        &["SEARCH session USING INDEX idx_session_listing_revision_id (listing_revision<?)"],
+    );
+    assert_plan(
+        "workspace history first page",
+        explain_plan(&conn, workspace_first, &[ws.raw() as i64, 20_000, 258]),
+        &["SEARCH session USING INDEX idx_session_workspace_listing_revision_id (workspace_id=? AND listing_revision<?)"],
+    );
+    assert_plan(
+        "workspace history cursor page",
+        explain_plan(
+            &conn,
+            workspace_cursor,
+            &[ws.raw() as i64, 20_000, 10_000, 5, 258],
+        ),
+        &["SEARCH session USING INDEX idx_session_workspace_listing_revision_id (workspace_id=? AND listing_revision<?)"],
+    );
+    assert_plan(
+        "session listing snapshot revision",
+        explain_plan(&conn, snapshot_revision, &[]),
+        &["SEARCH session USING COVERING INDEX idx_session_listing_revision_id"],
+    );
+    for (name, sql, values) in [
+        ("global history first page", global_first, vec![20_000, 258]),
+        (
+            "global history cursor page",
+            global_cursor,
+            vec![20_000, 10_000, 5, 258],
+        ),
+        (
+            "workspace history first page",
+            workspace_first,
+            vec![ws.raw() as i64, 20_000, 258],
+        ),
+        (
+            "workspace history cursor page",
+            workspace_cursor,
+            vec![ws.raw() as i64, 20_000, 10_000, 5, 258],
+        ),
+    ] {
+        let plan = explain_plan(&conn, sql, &values);
+        assert!(
+            !plan.iter().any(|step| step.contains("SCAN session")),
+            "{name}: a History page must never SCAN the session table: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|step| step.contains("TEMP B-TREE")),
+            "{name}: a History page must never sort in a TEMP B-TREE: {plan:?}"
+        );
+    }
+}
+
+fn explain_plan(conn: &rusqlite::Connection, sql: &str, values: &[i64]) -> Vec<String> {
+    let params: Vec<&dyn rusqlite::types::ToSql> = values
+        .iter()
+        .map(|value| value as &dyn rusqlite::types::ToSql)
+        .collect();
+    let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+    let mut rows = stmt.query(params.as_slice()).unwrap();
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().unwrap() {
+        out.push(row.get::<_, String>(3).unwrap());
+    }
+    out
+}
+
+fn assert_plan(name: &str, actual: Vec<String>, expected: &[&str]) {
+    assert_eq!(
+        actual,
+        expected
+            .iter()
+            .map(|step| step.to_string())
+            .collect::<Vec<_>>(),
+        "query plan regression on {name}: {actual:?}"
+    );
 }
 
 /// Keyset stability under inserts and hard deletes: a row created after the

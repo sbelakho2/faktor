@@ -230,6 +230,10 @@ pub struct BillingOutboxRow {
     pub reasoning_tokens: u64,
     pub provider_cost_micro: u64,
     pub provider_reported_micro: Option<u64>,
+    /// The reservation's settlement pricing authority (read through the
+    /// reservation join). `None`/`Unknown` with a zero cost means UNPRICED:
+    /// downstream metering must never ingest it as a settled $0.
+    pub price_authority: Option<faktor_core::model::PriceAuthority>,
     pub state: String,
     pub occurred_at_ms: i64,
     pub source_operation: String,
@@ -1082,14 +1086,16 @@ impl Store {
             .clamp(0, MAX_BILLING_OUTBOX_PAGE);
         let conn = self.read()?;
         let mut stmt = conn.prepare(
-            "SELECT outbox_id, reservation_id, session_id, task_id, attempt_id,
-                    provider, model, uncached_input_tokens, cache_read_tokens,
-                    cache_write_tokens, output_tokens, reasoning_tokens,
-                    provider_cost_micro, provider_reported_micro, state,
-                    occurred_at_ms, source_operation, period_id, period_start_ms,
-                    period_end_ms
-             FROM billing_outbox WHERE outbox_id > ?1
-             ORDER BY outbox_id ASC LIMIT ?2",
+            "SELECT o.outbox_id, o.reservation_id, o.session_id, o.task_id, o.attempt_id,
+                    o.provider, o.model, o.uncached_input_tokens, o.cache_read_tokens,
+                    o.cache_write_tokens, o.output_tokens, o.reasoning_tokens,
+                    o.provider_cost_micro, o.provider_reported_micro, o.state,
+                    o.occurred_at_ms, o.source_operation, o.period_id, o.period_start_ms,
+                    o.period_end_ms, cr.pricing_snapshot_json
+             FROM billing_outbox o
+             LEFT JOIN cost_reservation cr ON cr.reservation_id = o.reservation_id
+             WHERE o.outbox_id > ?1
+             ORDER BY o.outbox_id ASC LIMIT ?2",
         )?;
         let mut rows = stmt.query(params![after_id, limit])?;
         let mut out = Vec::new();
@@ -1134,6 +1140,13 @@ impl Store {
                     r.get(13)?,
                     "billing_outbox provider_reported_micro",
                 )?,
+                // Authority is a HINT derived from the reservation snapshot;
+                // a corrupt/absent snapshot reads Unknown (never a fake
+                // Exact), so unpriced stays unpriced downstream.
+                price_authority: r
+                    .get::<_, Option<String>>(20)?
+                    .and_then(|json| serde_json::from_str::<PricingSnapshot>(&json).ok())
+                    .map(|snapshot| snapshot.authority),
                 state: r.get(14)?,
                 occurred_at_ms: r.get(15)?,
                 source_operation: r.get(16)?,

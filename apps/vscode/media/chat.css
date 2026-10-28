@@ -145,7 +145,9 @@ header {
    chat body. It overlays the header edge and closes on selection. */
 .overflow-menu {
   position: absolute;
-  top: 38px;
+  /* Anchored to the header's own edge: stays correct when the header row
+     grows (the 40px Settings target). */
+  top: 100%;
   right: var(--space-3);
   z-index: 4;
   display: flex;
@@ -229,9 +231,11 @@ header button {
   display: inline-flex;
   align-items: center;
   gap: var(--space-1);
-  min-width: 46px;
-  min-height: 32px;
-  padding: 4px 12px;
+  /* The primary entry to Settings stays a real touch target on every
+     width — 52x40 with a 1.35em glyph in the compact (label-off) form. */
+  min-width: 52px;
+  min-height: 40px;
+  padding: 6px 14px;
   border: 1px solid var(--faktor-border);
   border-radius: var(--faktor-radius-control);
 }
@@ -253,9 +257,9 @@ header button {
 
 @media (max-width: 559px) {
   .control-center-toggle {
-    min-width: 46px;
-    min-height: 32px;
-    padding: 4px 10px;
+    min-width: 52px;
+    min-height: 40px;
+    padding: 6px 10px;
     justify-content: center;
   }
   .control-center-label {
@@ -263,6 +267,7 @@ header button {
   }
   .control-center-glyph {
     display: inline;
+    font-size: 1.35em;
   }
 }
 

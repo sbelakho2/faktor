@@ -93,6 +93,50 @@ fn close_stdin_and_sleep() -> ! {
 fn main() {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "bridge".into());
     let mut stdin = std::io::stdin().lock();
+    // Crash-class modes for the transient-exit contract (all exit BEFORE any
+    // handshake answer, exactly like an OOM-killed or externally-killed
+    // server). `flood-stderr-echo` keeps the normal bridge behavior but
+    // streams stderr first: a client that does not drain stderr deadlocks.
+    if mode == "exit-at-initialize" {
+        let _ = read_frame(&mut stdin);
+        let mut err = std::io::stderr().lock();
+        let _ = writeln!(err, "mock-mcp: simulated crash before initialize (exit-at-initialize)");
+        let _ = err.flush();
+        std::process::exit(7);
+    }
+    if mode == "crash-once" {
+        let counter = std::env::args().nth(2).unwrap_or_default();
+        let first = counter.is_empty() || !std::path::Path::new(&counter).exists();
+        if first {
+            if !counter.is_empty() {
+                let _ = std::fs::write(&counter, b"crashed-once");
+            }
+            let mut err = std::io::stderr().lock();
+            let _ = writeln!(err, "mock-mcp: first start crashes at initialize (crash-once)");
+            let _ = err.flush();
+            std::process::exit(7);
+        }
+    }
+    if mode == "rpc-error-initialize" {
+        if let Some(body) = read_frame(&mut stdin) {
+            if let Some(message) = parse(&body) {
+                if let Some(id) = id_of(&message) {
+                    write_frame(&format!(
+                        "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"error\":{{\"code\":-32603,\"message\":\"internal mock refusal\"}}}}"
+                    ));
+                }
+            }
+        }
+        sleep_forever()
+    }
+    if mode == "flood-stderr-echo" {
+        std::thread::spawn(|| loop {
+            let mut err = std::io::stderr().lock();
+            let _ = err.write_all(&vec![b'z'; 8192]);
+            let _ = err.flush();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        });
+    }
     match mode.as_str() {
         "close" => {
             let _ = read_frame(&mut stdin);

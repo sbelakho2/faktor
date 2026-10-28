@@ -1047,7 +1047,10 @@
     }
     var back = byId('btn-back-chat');
     if (back) {
-      back.hidden = key === 'work';
+      // Settings renders its OWN chrome (settings-nav carries the back +
+      // title): the header back stays hidden there so exactly one back
+      // control exists per view (the E8 home button is gone entirely).
+      back.hidden = key === 'work' || key === 'settings';
     }
     var settingsNav = byId('settings-nav');
     if (settingsNav) {

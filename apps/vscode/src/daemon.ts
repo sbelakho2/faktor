@@ -62,7 +62,7 @@
 import * as http from 'node:http';
 import * as crypto from 'node:crypto';
 import { ChildProcess, execFile, execFileSync, spawn } from 'node:child_process';
-import { closeSync, existsSync, openSync, readFileSync, readSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readFileSync, readSync, unlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -183,6 +183,10 @@ export interface DaemonHandle {
   /** The typed reason stop() refused to signal, or null when it signaled (or
    * there was nothing to signal). Valid after stop() resolves. */
   readonly stopRefusal: DaemonTrustFailure | null;
+  /** True when this handle ADOPTED a live daemon from a previous host via
+   * the data-dir `serve.lock` + `serve.password` records instead of spawning
+   * it (a reload/multi-window reuse; never a child of this host). */
+  readonly reattached?: boolean;
 }
 
 let activeChild: ChildProcess | null = null;
@@ -542,6 +546,209 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
   }
 }
 
+// ---------------------------------------------------------- serve.lock reuse
+//
+// The per-spawn password dies with its host process, so a daemon left by an
+// IDE reload is an unreachable zombie that still owns the store (observed:
+// five stacked live daemons, minutes-long SQLITE_BUSY storms, and a
+// permanent "service could not be reached" card). Rust `serve` records
+// ownership in `<dataDir>/serve.lock` + a 0600 `serve.password`; a later
+// host either REUSES that healthy daemon or deliberately takes the
+// data-dir over — never silently stacks another one.
+
+const SERVE_LOCK_FILE = 'serve.lock';
+const SERVE_PASSWORD_FILE = 'serve.password';
+/** Bounded wait for a winner's bind (lock starts at port 0). */
+const REATTACH_PORT_WAIT_MS = 4_000;
+/** Grace period before a stale owner is SIGKILLed. */
+const STALE_KILL_TERM_MS = 2_000;
+
+/**
+ * The daemon's OWN default data dir when `faktor.dataDir` is unset — the
+ * CLI's `--data-dir` default (`~/.faktor`). Resolving it here is what makes
+ * cross-host adoption work for unconfigured machines: the serve.lock lives
+ * where the daemon actually keeps its store. The selftest seam
+ * (`FAKTOR_SELFTEST=1` + `FAKTOR_SELFTEST_DATA_DIR`) redirects it so tests
+ * can never read, adopt or kill a developer's real default service state.
+ */
+function effectiveDataDir(options: DaemonOptions): string {
+  if (options.dataDir !== undefined && options.dataDir.length > 0) {
+    return options.dataDir;
+  }
+  const seam =
+    process.env.FAKTOR_SELFTEST === '1' ? process.env.FAKTOR_SELFTEST_DATA_DIR : undefined;
+  if (seam !== undefined && seam.length > 0) {
+    return seam;
+  }
+  return join(homedir(), '.faktor');
+}
+
+interface ServeLockRecord {
+  readonly pid: number;
+  readonly port: number;
+}
+
+function readServeLock(dataDir: string): ServeLockRecord | null {
+  try {
+    const raw = readFileSync(join(dataDir, SERVE_LOCK_FILE), 'utf8');
+    const value = JSON.parse(raw) as { pid?: unknown; port?: unknown };
+    const pid = typeof value.pid === 'number' ? value.pid : 0;
+    const port = typeof value.port === 'number' ? value.port : 0;
+    if (!Number.isInteger(pid) || pid <= 0 || !Number.isInteger(port) || port < 0) {
+      return null;
+    }
+    return { pid, port };
+  } catch {
+    return null;
+  }
+}
+
+function readServePassword(dataDir: string): string | null {
+  try {
+    const password = readFileSync(join(dataDir, SERVE_PASSWORD_FILE), 'utf8').trim();
+    return password.length > 0 ? password : null;
+  } catch {
+    return null;
+  }
+}
+
+function clearServeLockFiles(dataDir: string): void {
+  for (const name of [SERVE_LOCK_FILE, SERVE_PASSWORD_FILE]) {
+    try {
+      unlinkSync(join(dataDir, name));
+    } catch {
+      /* absent is the normal case */
+    }
+  }
+}
+
+/** SIGTERM a stale owner, escalating to SIGKILL after a bounded grace. */
+async function killStaleOwnerBounded(pid: number): Promise<void> {
+  if (!processAlive(pid)) {
+    return;
+  }
+  try {
+    process.kill(pid, 'SIGTERM');
+  } catch {
+    return;
+  }
+  const until = Date.now() + STALE_KILL_TERM_MS;
+  while (processAlive(pid) && Date.now() < until) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+  }
+  if (processAlive(pid)) {
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch {
+      /* raced with exit */
+    }
+  }
+}
+
+/**
+ * Adopt the data-dir's live owner, or clear a stale/dead one. Returns a
+ * published-ready handle only when EVERYTHING checks out: live pid, bound
+ * port, stored password, a healthy /native/health answer, a trusted
+ * executable (binaryTrust verified), and (when reported) a release digest
+ * matching the resolved file. Anything else either clears dead records or —
+ * for a live-but-unverifiable owner — backs off WITHOUT killing (the spawn
+ * path then owns the operator-facing refusal), so this can never destroy a
+ * process it cannot positively identify.
+ */
+async function reattachExisting(options: DaemonOptions): Promise<DaemonHandle | null> {
+  const dataDir = effectiveDataDir(options);
+  const record = readServeLock(dataDir);
+  if (record === null || record.pid === process.pid) {
+    return null;
+  }
+  if (!processAlive(record.pid)) {
+    clearServeLockFiles(dataDir);
+    return null;
+  }
+  let port = record.port;
+  const waitUntil = Date.now() + REATTACH_PORT_WAIT_MS;
+  while (port === 0 && processAlive(record.pid) && Date.now() < waitUntil) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    port = readServeLock(dataDir)?.port ?? 0;
+  }
+  if (port === 0) {
+    if (!processAlive(record.pid)) {
+      clearServeLockFiles(dataDir);
+    }
+    return null;
+  }
+  const password = readServePassword(dataDir);
+  if (password === null) {
+    // A live owner with no reattach credential (a manual/legacy serve): the
+    // data-dir is single-owner, so take it over deliberately — its caller
+    // cannot ever authenticate to it.
+    await killStaleOwnerBounded(record.pid);
+    clearServeLockFiles(dataDir);
+    return null;
+  }
+  let resolved: ResolvedDaemon;
+  try {
+    resolved = resolveDaemon(options);
+  } catch {
+    // No executable to verify against: let the spawn path produce the same
+    // actionable machine-scoped refusal instead of a half-handled reuse.
+    return null;
+  }
+  const trust = binaryTrust(resolved);
+  if (trust.state !== 'verified') {
+    // Unverifiable executable: NEVER kill an owner we cannot vouch for and
+    // never adopt it either; the spawn path presents the trust prompt/refusal.
+    return null;
+  }
+  let report: DaemonHealth | null = null;
+  try {
+    report = await health(port, password);
+  } catch {
+    report = null;
+  }
+  if (report === null || !report.ok) {
+    await killStaleOwnerBounded(record.pid);
+    clearServeLockFiles(dataDir);
+    return null;
+  }
+  if (report.releaseDigest !== null && report.releaseDigest !== sha256OfFile(resolved.executable)) {
+    // A different binary owns the data-dir (stale upgrade): replace it so
+    // the trusted file the host resolved is the one that serves.
+    await killStaleOwnerBounded(record.pid);
+    clearServeLockFiles(dataDir);
+    return null;
+  }
+  const pid = record.pid;
+  const handle: DaemonHandle = {
+    port,
+    password,
+    baseUrl: `http://127.0.0.1:${port}`,
+    bearerToken: password,
+    pid,
+    launcherPid: undefined,
+    releaseTrustError: null,
+    stopRefusal: null,
+    reattached: true,
+    health: () => health(port, password),
+    stderrTail: () => '',
+    alive: async (): Promise<boolean> => {
+      if (!processAlive(pid)) {
+        return false;
+      }
+      try {
+        return (await health(port, password)).ok;
+      } catch {
+        return false;
+      }
+    },
+    stop: async (): Promise<void> => {
+      await killStaleOwnerBounded(pid);
+      clearServeLockFiles(dataDir);
+    },
+  };
+  return handle;
+}
+
 async function startDaemonOnce(options: DaemonOptions): Promise<DaemonHandle> {
   const signal = options.signal;
   if (signal?.aborted === true) {
@@ -555,12 +762,21 @@ async function startDaemonOnce(options: DaemonOptions): Promise<DaemonHandle> {
     // behind when a new one is started over it.
     await stopDaemon(activeHandle);
   }
+  // Cross-host reuse first: a daemon left by a reload (or owned by another
+  // window) is adopted after a full trust+health check, or its DEAD records
+  // are cleared — stacking a second owner is never an option.
+  const existing = await reattachExisting(options);
+  if (existing !== null) {
+    activeChild = null;
+    activeHandle = existing;
+    return existing;
+  }
   const bin = resolveExecutable(options);
   const password = crypto.randomBytes(32).toString('hex');
   const args = ['serve', '--port', '0'];
-  if (options.dataDir && options.dataDir.length > 0) {
-    args.push('--data-dir', options.dataDir);
-  }
+  // Always explicit: the resolved data dir is where serve.lock lives, so
+  // every host (configured or default) coordinates on the SAME store.
+  args.push('--data-dir', effectiveDataDir(options));
   if (options.extraArgs) {
     args.push(...options.extraArgs);
   }
@@ -591,6 +807,16 @@ async function startDaemonOnce(options: DaemonOptions): Promise<DaemonHandle> {
   } catch (error) {
     // The handshake path already stopped the child on timeout/exit/abort.
     signal?.removeEventListener('abort', onAbort);
+    // Race recovery: a sibling host won `serve.lock` between our pre-check
+    // and our spawn; our serve printed its frozen already-serving refusal
+    // (exit 3) and stopped. The WINNER's lock+password now exist — adopt it
+    // instead of surfacing a spurious start failure.
+    const winner = await reattachExisting(options);
+    if (winner !== null) {
+      activeChild = null;
+      activeHandle = winner;
+      return winner;
+    }
     throw error;
   }
   if (signal?.aborted || cancelled) {

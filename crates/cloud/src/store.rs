@@ -1278,6 +1278,13 @@ const CP_MIGRATIONS: &[&str] = &[
     // The billing domain owns this ladder slot; the all-time v8 rollups stay
     // for analytics while quota limits read the current period only.
     crate::billing_store::BILLING_PERIOD_SCHEMA_V9,
+    // v10 — the unpriced-call counter on every usage rollup (unknown pricing
+    // must never read as a settled $0). Additive columns only; legacy rows
+    // default to '0' and the event ledger remains the source of truth.
+    "ALTER TABLE billing_usage_total ADD COLUMN unpriced_calls TEXT NOT NULL DEFAULT '0';
+     ALTER TABLE billing_usage_task ADD COLUMN unpriced_calls TEXT NOT NULL DEFAULT '0';
+     ALTER TABLE billing_usage_period ADD COLUMN unpriced_calls TEXT NOT NULL DEFAULT '0';
+     ALTER TABLE billing_usage_period_task ADD COLUMN unpriced_calls TEXT NOT NULL DEFAULT '0';",
 ];
 
 impl SqliteControlPlaneStore {
@@ -3722,7 +3729,14 @@ mod tests {
         // crash point under test).
         {
             let conn = Connection::open(&path).unwrap();
-            conn.execute_batch("PRAGMA user_version = 4").unwrap();
+            conn.execute_batch(
+                "DROP TABLE IF EXISTS billing_usage_total;
+                 DROP TABLE IF EXISTS billing_usage_task;
+                 DROP TABLE IF EXISTS billing_usage_period;
+                 DROP TABLE IF EXISTS billing_usage_period_task;
+                 PRAGMA user_version = 4;",
+            )
+            .unwrap();
         }
         inject_crash_before_migration(&path);
         let err = SqliteControlPlaneStore::open(&path)

@@ -30,6 +30,9 @@ pub(crate) mod board;
 /// Revision 8 daemon contract routes (instructions/presets/trust/browser/
 /// context pins/export/efficiency/budget/provenance).
 pub(crate) mod browser_surface;
+#[cfg(test)]
+#[path = "budget_cap_tests.rs"]
+mod budget_cap_tests;
 pub(crate) mod changes_api;
 #[cfg(test)]
 #[path = "concurrency_probe_tests.rs"]
@@ -80,6 +83,9 @@ pub mod prompt;
 /// (the full VERIFIED story) and `GET /native/tasks/{id}/completion-steps`
 /// (per-step status/report), both session-scoped and fail-closed.
 pub(crate) mod proof;
+#[cfg(test)]
+#[path = "route_coverage_tests.rs"]
+mod route_coverage_tests;
 /// The SCM webhook surface (`POST /native/scm/webhook`; absent unless a
 /// webhook sink is wired through `ServerDeps::with_scm_webhook`). Public:
 /// the CLI implements [`scm_webhook::WebhookSink`] for the daemon's
@@ -102,6 +108,9 @@ pub(crate) mod usage;
 /// Value-centric paid entitlement report (`/native/value-entitlements`;
 /// plan-mapped, inference-independent; absent unless `[billing]` is on).
 pub(crate) mod value;
+#[cfg(test)]
+#[path = "vault_tests.rs"]
+mod vault_tests;
 pub(crate) mod verification;
 /// The remote/VPC worker plane (registration/leases/jobs; absent unless the
 /// `[workers]` section is enabled).

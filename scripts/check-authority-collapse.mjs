@@ -192,6 +192,14 @@ const ALLOWLIST = [
     owner: 'agent semantic consult authority',
   },
   {
+    file: 'crates/agent/src/runtime/compaction.rs',
+    line_contains: 'let Ok(Some(bytes)) = cas.get_bounded(manifest, MANIFEST_MAX_BYTES) else {',
+    count: 1,
+    reason:
+      'archive_manifest_is_retrievable (compaction archive manifest-hardening, DOM-67): the else branch is the documented REFUSAL of the predicate — a failed or absent bounded manifest read (256 KiB cap) answers "not retrievable", which only TIGHTENS: the caller replaces the wire archive pointer with the explicit "archive evicted" marker and the durable transcript rows remain the fallback authority. The predicate never claims retrievability from an unreadable manifest; forged/truncated chunk parts (declared size must equal the STORED part exactly), a missing or lying total_bytes, and a version mismatch all refuse through the same predicate.',
+    owner: 'agent compaction archive retrievability',
+  },
+  {
     file: 'crates/agent/src/runtime/media.rs',
     line_contains: 'let model = handle.model().unwrap_or_default();',
     count: 1,
@@ -401,10 +409,10 @@ const ALLOWLIST = [
   },
   {
     file: 'crates/evidence/src/store.rs',
-    line_contains: 'let cas = Cas::open(root.clone()).unwrap_or_else(|_| Cas::new(root));',
+    line_contains: '.unwrap_or_else(|_| Cas::new(root));',
     count: 1,
     reason:
-      'evidence CAS handle construction: falling back to a fresh handle over the SAME root; every blob operation below still verifies by digest and refuses on mismatch, so no evidence is fabricated or lost by the fallback.',
+      'evidence CAS handle construction (DurableEvidenceAuthority::for_store): falling back to a fresh handle over the SAME root (Cas::open_in_class only fails on tmp-dir creation I/O; the fallback rebuilds the lazy handle without the governor/class attach); every blob operation below still verifies by digest and refuses on mismatch, so no evidence is fabricated or lost by the fallback.',
     owner: 'evidence store',
   },
   {

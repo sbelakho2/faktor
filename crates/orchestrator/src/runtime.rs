@@ -3741,6 +3741,7 @@ fn truncate(s: &str, max: usize) -> String {
 /// child spec): a fresh submit carries EXACTLY it, and a crash-resumed turn
 /// re-continues the SAME recorded prompt (whose durable message already
 /// carries the same set), so attachments survive acceptance and re-attach.
+#[allow(clippy::too_many_arguments)]
 async fn drive_child_turn(
     manager: Arc<SessionManager>,
     agent: Arc<AgentRuntime>,
@@ -3749,12 +3750,20 @@ async fn drive_child_turn(
     files: &[String],
     model_override: Option<String>,
     max_tokens: Option<u64>,
+    child_id: &str,
 ) -> (Result<TurnOutcome, String>, Option<OpId>) {
     let handle = match manager.get_session(session) {
         Ok(Some(h)) => h,
         Ok(None) => return (Err(format!("child session {session} missing")), None),
         Err(e) => return (Err(e.message), None),
     };
+    // Cost-scope wiring (audit 9/H): a child must consume the RUN cap, not
+    // reserve against a NULL child cap. Inheritance is idempotent and runs
+    // before the re-attach path, so a resumed child is enrolled too.
+    let ledger = faktor_session::DurableBudgetLedger::new(manager.clone());
+    if let Err(e) = ledger.enroll_child_in_root_scope(session, child_id, None) {
+        return (Err(format!("child cost scope refused: {e}")), None);
+    }
     if let Ok(Some(record)) = handle.active_turn_record() {
         // Crash resume / re-attach: drive the SAME logical turn (recorded
         // op id + envelope). The agent's recovery paths resolve unfinished
@@ -3833,6 +3842,7 @@ fn drive_op_entry(
             &files,
             model_override,
             max_tokens,
+            &child_id,
         )
         .await;
         // Record the child session's REAL op id durably (registry row +

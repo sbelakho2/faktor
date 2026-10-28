@@ -16,12 +16,16 @@ package dev.faktor.frontend
 import java.awt.BorderLayout
 import java.awt.Component
 import javax.swing.BoxLayout
+import javax.swing.JButton
 import javax.swing.JPanel
 
 class VerificationPanel : JPanel(BorderLayout()) {
 
     interface Listener {
         fun onEvidenceSelected(ref: EvidenceRef)
+
+        /** T21 "View finish actions": open the surface that inspects them. */
+        fun onViewFinishActions()
     }
 
     private val header = WrappedLabel("verification: -")
@@ -31,6 +35,25 @@ class VerificationPanel : JPanel(BorderLayout()) {
     private val criteriaColumn = ScrollableColumn()
 
     private val contractColumn = ScrollableColumn()
+
+    private val completionColumn = ScrollableColumn().apply {
+        layout = BoxLayout(this, BoxLayout.Y_AXIS)
+        isOpaque = false
+        alignmentX = Component.LEFT_ALIGNMENT
+    }
+
+    /**
+     * The completion contract (finish actions) lives on the Verification
+     * surface: the Ask-first redesign removed the Overview summary row, and
+     * this is the existing finish-actions inspection home. The card is
+     * omitted when the daemon serves no completion contract.
+     */
+    private val completionCard = card("Completion contract", completionColumn)
+
+    private val completionGap = vSpace(Spacing.M)
+
+    /** The T21 action, present only while [CompletionView.finishActionPending]. */
+    private var finishActionButton: JButton? = null
 
     /** The served criterion cards, keyed for claim selection (I03). */
     private val criterionCards = LinkedHashMap<String, JPanel>()
@@ -55,6 +78,8 @@ class VerificationPanel : JPanel(BorderLayout()) {
         val body = pageColumn()
         body.add(card("Verification summary", summaryBody))
         body.add(vSpace(Spacing.M))
+        body.add(completionCard)
+        body.add(completionGap)
         body.add(card("Contract", contractBody))
         body.add(vSpace(Spacing.M))
         body.add(card("Criteria and checks", criteriaColumn))
@@ -78,6 +103,7 @@ class VerificationPanel : JPanel(BorderLayout()) {
         contractColumn.removeAll()
         criterionCards.clear()
         renderContract(model?.contract)
+        renderCompletion(model?.completion)
         if (model == null) {
             criterionCount = 0
             header.text = "verification: no run yet"
@@ -157,6 +183,74 @@ class VerificationPanel : JPanel(BorderLayout()) {
             fill = FaktorTheme.cardSurface(),
             padding = java.awt.Insets(Spacing.M, Spacing.M, Spacing.M, Spacing.M)
         )
+
+    /**
+     * T21: the completion contract's finish actions. A requested step that
+     * lacks a succeeded durable result renders the exact mandated label,
+     * copy and action on this Verification surface; an all-succeeded
+     * contract renders the step rows only. A missing completion contract
+     * omits the card entirely (never a fabricated success).
+     */
+    private fun renderCompletion(completion: CompletionView?) {
+        completionColumn.removeAll()
+        finishActionButton = null
+        val present = completion != null
+        completionCard.isVisible = present
+        completionGap.isVisible = present
+        if (completion == null) {
+            completionColumn.revalidate()
+            return
+        }
+        if (finishActionPending(completion)) {
+            completionColumn.add(
+                labelWithTone(
+                    RunStateCopy.FINISH_ACTION_PENDING_LABEL,
+                    SemanticState.WARNING,
+                    title = true
+                )
+            )
+            completionColumn.add(
+                wrappedLabelWithTone(
+                    RunStateCopy.FINISH_ACTION_PENDING_COPY,
+                    SemanticState.WARNING
+                )
+            )
+            val action = secondaryButton(RunStateCopy.FINISH_ACTION_PENDING_ACTION)
+            action.addActionListener { listener?.onViewFinishActions() }
+            finishActionButton = action
+            val actions = actionRow(action)
+            actions.alignmentX = Component.LEFT_ALIGNMENT
+            completionColumn.add(actions)
+            completionColumn.add(vSpace(Spacing.S))
+        }
+        val requested = completion.requestedSteps()
+        completionColumn.add(
+            wrappedMutedLabel(
+                if (requested.isEmpty()) {
+                    "No conditional finish actions were requested for this run."
+                } else {
+                    "requested: " + requested.joinToString(", ")
+                }
+            )
+        )
+        for (step in requested) {
+            val row = completion.steps.firstOrNull {
+                it.step.equals(step, ignoreCase = true)
+            }
+            val status = row?.status ?: "missing"
+            val detail = row?.detail?.takeIf { it.isNotEmpty() }?.let { " — " + it } ?: ""
+            completionColumn.add(wrappedMutedLabel("[$status] $step$detail"))
+        }
+        if (completion.source.isNotEmpty()) {
+            completionColumn.add(
+                wrappedMutedLabel(
+                    "status source: " + completion.source +
+                        (completion.reason?.let { " (" + it + ")" } ?: "")
+                )
+            )
+        }
+        completionColumn.revalidate()
+    }
 
     /**
      * The Contract card rows. The "Needs disclosure" line is text-first (the
@@ -322,6 +416,19 @@ class VerificationPanel : JPanel(BorderLayout()) {
     }
 
     fun summaryText(): String = summary.fullText
+
+    /** The completion contract card is present only when served (smoke). */
+    fun completionCardVisibleForTest(): Boolean = completionCard.isVisible
+
+    /** Every text line the Completion contract card rendered (smoke). */
+    fun completionLabelsForTest(): List<String> {
+        val out = ArrayList<String>()
+        collectLabels(completionColumn, out)
+        return out
+    }
+
+    /** The T21 action button, or null when finish actions are not pending. */
+    fun finishActionButtonForTest(): JButton? = finishActionButton
 
     /** Every text line the Contract card rendered (smoke assertions). */
     fun contractLabels(): List<String> {

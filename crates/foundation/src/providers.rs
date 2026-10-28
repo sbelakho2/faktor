@@ -12,7 +12,7 @@ use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::db::{now_ms, FoundationDb};
-use crate::vault::SecretVault;
+use crate::vault::{SecretVault, VerificationState};
 use crate::FoundationError;
 
 pub const MAX_CONNECTIONS: usize = 64;
@@ -336,11 +336,19 @@ impl ProviderService {
             }
             if let Some(rest) = reference.strip_prefix("vault://") {
                 let handle = format!("vault://{rest}");
-                self.vault.get(&handle).map_err(|_| {
+                let stored = self.vault.get(&handle).map_err(|_| {
                     FoundationError::Malformed(
                         "credential_ref does not resolve in this machine's vault".into(),
                     )
                 })?;
+                // A locally deleted/revoked reference is a typed refusal at
+                // BINDING time too: saving a connection that is guaranteed to
+                // fail on first use would only defer the error.
+                if stored.verification == VerificationState::Revoked {
+                    return Err(FoundationError::Malformed(
+                        "credential_ref was deleted/revoked locally; bind a new credential".into(),
+                    ));
+                }
             }
         }
         let transport = self.validate_transport(draft, family)?;
@@ -693,14 +701,22 @@ impl ProviderService {
         let connection = self
             .get(id)?
             .ok_or_else(|| FoundationError::NotFound(format!("provider connection {id}")))?;
-        let credential = match &connection.credential_ref {
+        // Resolve the credential bytes AND the vault generation exactly once,
+        // at call start. A rotate that lands while this probe is in flight
+        // affects only the next call; the late completion below is fenced to
+        // the generation it actually sent (see mark_verified_generation).
+        let (credential, credential_generation) = match &connection.credential_ref {
             Some(reference) if reference.starts_with("vault://") => {
-                Some(self.vault.reveal(reference)?)
+                let generation = self.vault.get(reference)?.generation;
+                (Some(self.vault.reveal(reference)?), Some(generation))
             }
-            Some(reference) => std::env::var(reference.trim_start_matches("env:"))
-                .ok()
-                .map(|v| v.into_bytes()),
-            None => None,
+            Some(reference) => (
+                std::env::var(reference.trim_start_matches("env:"))
+                    .ok()
+                    .map(|v| v.into_bytes()),
+                None,
+            ),
+            None => (None, None),
         };
         let mut stages = Vec::new();
         let state: HealthState;
@@ -949,9 +965,13 @@ impl ProviderService {
                     });
                     state = HealthState::AuthenticationRequired;
                     detail = Some("authentication failed".into());
-                    if let Some(reference) = &connection.credential_ref {
+                    if let (Some(reference), Some(generation)) =
+                        (&connection.credential_ref, credential_generation)
+                    {
                         if reference.starts_with("vault://") {
-                            let _ = self.vault.mark_verified(reference, false);
+                            let _ = self
+                                .vault
+                                .mark_verified_generation(reference, generation, false);
                         }
                     }
                 } else if !(200..300).contains(&status) {
@@ -1010,9 +1030,13 @@ impl ProviderService {
                                 detail: format!("{} models listed", model_ids.len()),
                                 duration_ms: started.elapsed().as_millis() as u64,
                             });
-                            if let Some(reference) = &connection.credential_ref {
+                            if let (Some(reference), Some(generation)) =
+                                (&connection.credential_ref, credential_generation)
+                            {
                                 if reference.starts_with("vault://") {
-                                    let _ = self.vault.mark_verified(reference, true);
+                                    let _ = self
+                                        .vault
+                                        .mark_verified_generation(reference, generation, true);
                                 }
                             }
                             state = HealthState::Ready;

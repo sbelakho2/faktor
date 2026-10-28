@@ -724,8 +724,35 @@ pub(crate) fn spawn_force_exit_watchdog() {
 }
 
 pub(crate) async fn serve(port: u16, data_dir: PathBuf, config_path: Option<PathBuf>) {
+    // ONE owner per data-dir: a live holder (e.g. a daemon from before an
+    // IDE reload, whose per-spawn password died with its host) is reused by
+    // the caller through the frozen already-serving line + serve.password;
+    // a dead holder is stale and taken over. Refusing BEFORE the store opens
+    // is what keeps reloads from stacking SQLITE-contending zombies.
+    let lock = match crate::daemon::serve_lock::acquire(&data_dir) {
+        Ok(crate::daemon::serve_lock::LockOutcome::Acquired(lock)) => Some(lock),
+        Ok(crate::daemon::serve_lock::LockOutcome::AlreadyServing(record)) => {
+            println!(
+                "{}",
+                crate::daemon::serve_lock::already_serving_line(record.pid, record.port)
+            );
+            std::process::exit(crate::daemon::serve_lock::ALREADY_SERVING_EXIT);
+        }
+        Err(e) => {
+            tracing::error!("serve.lock ownership refused: {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Some(lock) = lock.as_ref() {
+        if let Ok(password) = std::env::var("FAKTOR_SERVER_PASSWORD") {
+            if !password.is_empty() {
+                let _ = lock.write_password(&password);
+            }
+        }
+    }
     if let Err(e) = serve_impl(port, data_dir, config_path, None, None).await {
         tracing::error!("{e}");
+        drop(lock);
         std::process::exit(1);
     }
 }
@@ -1391,6 +1418,10 @@ pub(crate) async fn serve_impl(
     // release-digest attestation above precedes it). Readiness is now
     // announced — no backup has run yet and, by construction, cannot have.
     println!("{}", handle.startup_line);
+    // Ownership record gains the real port the moment the frozen line is
+    // out: a later host can health-check and REUSE this daemon instead of
+    // spawning a competitor over the same store.
+    crate::daemon::serve_lock::record_bound_port(&data_dir, handle.addr.port());
     tracing::info!("faktor serving on {}", handle.addr);
     if let Some(tx) = ready_tx {
         let _ = tx.send(());

@@ -3240,6 +3240,19 @@ function fakeLauncherTree() {
 }
 
 async function daemonTests() {
+  // Hermetic default-data-dir seam: cross-host adoption resolves ~/.faktor
+  // when faktor.dataDir is unset, and tests must never read, adopt or kill a
+  // developer's real default service state.
+  process.env.FAKTOR_SELFTEST = '1';
+  const seamDataDir = mkdtempSync(join(tmpdir(), 'faktor-selftest-data-'));
+  process.env.FAKTOR_SELFTEST_DATA_DIR = seamDataDir;
+  process.on('exit', () => {
+    try {
+      rmSync(seamDataDir, { recursive: true, force: true });
+    } catch {
+      /* best effort */
+    }
+  });
   await test('daemon resolves an explicit binary path', () => {
     assertEqual(
       dm.findBinary({ workspaceRoot: '/nonexistent', binaryPath: '/tmp/fake-faktor-cli' }),
@@ -3478,6 +3491,177 @@ async function daemonTests() {
     assertEqual(dm.releaseDigestOf('0.9.1'), null);
     assertEqual(dm.releaseDigestOf('0.9.1+release.0.9.1-abcdef123456'), null);
     assertEqual(dm.releaseDigestOf(`0.9.1+release.x.${'A'.repeat(64)}`), null);
+  });
+
+  // ------------------------------------------------ cross-host serve.lock reuse
+  //
+  // The per-spawn password dies with its host, so a daemon left by a reload
+  // is an unreachable zombie holding the store (observed live: five stacked
+  // daemons + a permanent "service could not be reached"). These tests drive
+  // the Rust `serve.lock`/`serve.password` contract from the extension side.
+
+  async function spawnFakeServe(targetDataDir = null) {
+    const dir = mkdtempSync(join(tmpdir(), 'faktor-serve-lock-'));
+    const release = join(dir, 'fake-release.cjs');
+    writeExecutable(release, FAKE_RELEASE_SOURCE);
+    const password = 'f'.repeat(64);
+    const child = spawn(process.execPath, [release], {
+      env: {
+        ...process.env,
+        FAKE_RELEASE_PIDFILE: join(dir, 'release.pid'),
+        FAKE_RELEASE_NO_DIGEST: '1',
+        FAKTOR_SERVER_PASSWORD: password,
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const port = await new Promise((resolve, reject) => {
+      let buffered = '';
+      const timer = setTimeout(() => reject(new Error('fake serve did not announce a port')), 10_000);
+      child.stdout.on('data', (chunk) => {
+        buffered += String(chunk);
+        const match = buffered.match(/listening on http:\/\/127\.0\.0\.1:(\d+)/);
+        if (match) {
+          clearTimeout(timer);
+          resolve(Number(match[1]));
+        }
+      });
+      child.on('exit', () => reject(new Error('fake serve exited before announcing')));
+    });
+    const dataDir = targetDataDir ?? join(dir, 'data');
+    mkdirSync(dataDir, { recursive: true });
+    writeFileSync(join(dataDir, 'serve.lock'), JSON.stringify({ pid: child.pid, port }));
+    writeFileSync(join(dataDir, 'serve.password'), password, { mode: 0o600 });
+    return { dir, child, port, password, dataDir };
+  }
+
+  function trustedDaemonBinary(dir, counter) {
+    const release = join(dir, 'spawned-release.cjs');
+    writeExecutable(release, FAKE_RELEASE_SOURCE);
+    const pidfile = join(dir, 'spawned.pid');
+    const bin = join(dir, 'counting-bin.sh');
+    writeExecutable(
+      bin,
+      `#!/bin/sh\necho spawn >> '${counter}'\nFAKE_RELEASE_PIDFILE='${pidfile}' FAKE_RELEASE_NO_DIGEST=1 exec node '${release}' "$@"\n`,
+    );
+    const digest = createHash('sha256').update(readFileSync(bin)).digest('hex');
+    writeFileSync(`${bin}.sha256`, `${digest}  ${bin}\n`);
+    return bin;
+  }
+
+  await test('a reload adopts the DEFAULT data-dir owner when faktor.dataDir is unset', async () => {
+    const seam = process.env.FAKTOR_SELFTEST_DATA_DIR;
+    assert(typeof seam === 'string' && seam.length > 0, 'the selftest seam must be armed');
+    const serving = await spawnFakeServe(seam);
+    try {
+      const counter = join(serving.dir, 'spawns.txt');
+      const bin = trustedDaemonBinary(serving.dir, counter);
+      const handle = await dm.startDaemon({
+        workspaceRoot: '/nonexistent',
+        binaryPath: bin,
+      });
+      assertEqual(handle.reattached, true, 'the default data dir owner must be adopted');
+      assertEqual(handle.pid, serving.child.pid);
+      assertEqual(existsSync(counter), false, 'adoption must never spawn a competitor');
+      await dm.stopDaemon(handle);
+      await waitFor(() => !dm.processAlive(serving.child.pid), 5_000, 'the adopted owner to stop');
+    } finally {
+      try {
+        serving.child.kill('SIGKILL');
+      } catch {
+        /* already gone */
+      }
+      rmSync(serving.dir, { recursive: true, force: true });
+      rmSync(seam, { recursive: true, force: true });
+      mkdirSync(seam, { recursive: true });
+    }
+  });
+
+  await test('a live serve.lock owner is REUSED (no second daemon) with its recorded password', async () => {
+    const serving = await spawnFakeServe();
+    try {
+      const counter = join(serving.dir, 'spawns.txt');
+      const bin = trustedDaemonBinary(serving.dir, counter);
+      const handle = await dm.startDaemon({
+        workspaceRoot: '/nonexistent',
+        binaryPath: bin,
+        dataDir: serving.dataDir,
+      });
+      assertEqual(handle.reattached, true, 'the healthy recorded owner must be adopted');
+      assertEqual(handle.pid, serving.child.pid, 'the adopted pid is the recorded owner');
+      assertEqual(handle.port, serving.port);
+      assertEqual(await handle.health().then((h) => h.ok), true);
+      assertEqual(existsSync(counter), false, 'reuse must NEVER spawn a competitor daemon');
+      await dm.stopDaemon(handle);
+      await waitFor(() => !dm.processAlive(serving.child.pid), 5_000, 'the adopted owner to stop');
+      assertEqual(existsSync(join(serving.dataDir, 'serve.lock')), false, 'stop clears the lock');
+      assertEqual(existsSync(join(serving.dataDir, 'serve.password')), false, 'stop clears the credential');
+    } finally {
+      try {
+        serving.child.kill('SIGKILL');
+      } catch {
+        /* already gone */
+      }
+      rmSync(serving.dir, { recursive: true, force: true });
+    }
+  });
+
+  await test('a DEAD serve.lock pid is stale: records are cleared and a fresh daemon starts', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'faktor-serve-stale-'));
+    try {
+      const dataDir = join(dir, 'data');
+      mkdirSync(dataDir, { recursive: true });
+      const victim = spawn(process.execPath, ['-e', '']);
+      await new Promise((resolve) => victim.on('exit', resolve));
+      writeFileSync(join(dataDir, 'serve.lock'), JSON.stringify({ pid: victim.pid, port: 1 }));
+      writeFileSync(join(dataDir, 'serve.password'), 'dead-password');
+      const counter = join(dir, 'spawns.txt');
+      const bin = trustedDaemonBinary(dir, counter);
+      const handle = await dm.startDaemon({
+        workspaceRoot: '/nonexistent',
+        binaryPath: bin,
+        dataDir,
+      });
+      assertEqual(handle.reattached ?? false, false, 'a dead owner is never adopted');
+      assertEqual(existsSync(counter), true, 'a fresh daemon must start');
+      assert(
+        dm.processAlive(handle.pid) || handle.launcherPid !== undefined,
+        'the fresh handle names a live process',
+      );
+      await dm.stopDaemon(handle);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  await test('a live owner with an UNVERIFIABLE password is taken over (killed), never adopted', async () => {
+    const serving = await spawnFakeServe();
+    try {
+      // Corrupt the credential: the recorded owner can never be
+      // authenticated again, so the single-owner contract demands takeover.
+      writeFileSync(join(serving.dataDir, 'serve.password'), 'not-the-password');
+      const counter = join(serving.dir, 'spawns.txt');
+      const bin = trustedDaemonBinary(serving.dir, counter);
+      const handle = await dm.startDaemon({
+        workspaceRoot: '/nonexistent',
+        binaryPath: bin,
+        dataDir: serving.dataDir,
+      });
+      assertEqual(handle.reattached ?? false, false, 'an unverifiable owner is never adopted');
+      await waitFor(
+        () => !dm.processAlive(serving.child.pid),
+        5_000,
+        'the unverifiable owner to be taken over',
+      );
+      assertEqual(existsSync(counter), true, 'a fresh daemon replaces the taken-over owner');
+      await dm.stopDaemon(handle);
+    } finally {
+      try {
+        serving.child.kill('SIGKILL');
+      } catch {
+        /* already gone */
+      }
+      rmSync(serving.dir, { recursive: true, force: true });
+    }
   });
 
   await test('launcher-exits-early-still-alive: the release pid is tracked, launcher exit is not daemon death', async () => {
@@ -14939,6 +15123,138 @@ async function preflightTests() {
     assert(
       !/signed checksum record/i.test(daemonSource),
       'the bare-record detail text must never claim a signature',
+    );
+  });
+
+  await test('attention is aggregated to at most three grouped rows and absent groups are omitted', () => {
+    // Kitchen sink: ALL five served conditions at once. The aggregate must
+    // still render at most three grouped rows (raising the cap ships a wall
+    // of rows instead of the summary), fold duplicates, and omit absent
+    // groups entirely.
+    const sink = {
+      lastError: 'invalid api key for provider (401)',
+      verification: { status: 'failed', checksFailed: 2 },
+      task: { blockers: ['which approach should I pick?', 'repository is read-only'] },
+      permissions: [{}, {}],
+    };
+    const items = ux.aggregateAttention(sink);
+    assert(
+      items.length <= 3,
+      `attention rows must be capped at three, got ${items.length}: ${items.map((item) => item.kind).join(',')}`,
+    );
+    assert(items.length === 3, 'the kitchen-sink input exercises the cap with three visible groups');
+    assert(ux.aggregateAttention({}).length === 0, 'an absent condition must produce no group at all');
+    const onlyApproval = ux.aggregateAttention({ permissions: [{}] });
+    assert(onlyApproval.length === 1 && onlyApproval[0].kind === 'Approval');
+    const unknownChecks = ux.aggregateAttention({ verification: { status: 'unknown', checksTotal: 2 } });
+    assert(
+      !unknownChecks.some((item) => item.kind === 'FailedCheck'),
+      'unknown checks never become a disclosure item',
+    );
+  });
+
+  await test('run state uses the shared cause-specific labels and never says resend', () => {
+    const uxSource = readFileSync(new URL('../src/uxState.ts', import.meta.url), 'utf8');
+    const chatSource = readFileSync(new URL('../media/chat.js', import.meta.url), 'utf8');
+    for (const label of [
+      'Provider setup needed',
+      'Reconnecting',
+      'Connection interrupted',
+      'Paused',
+      'Retrying automatically',
+      'Checks found a problem',
+      'Needs your input',
+    ]) {
+      assert(uxSource.includes(label), `the shared cause label '${label}' must exist`);
+    }
+    // Durable pause promises Resume and explicitly negates resending.
+    assert(uxSource.includes("label: 'Resume'"), 'durable pause must offer Resume');
+    assert(
+      /nothing needs to be sent again/.test(chatSource),
+      'the durable-pause copy must state that nothing needs to be sent again',
+    );
+    const resendCopy = /(?:label|copy|detail|summary|title)\s*:\s*['"][^'"]*\bresend\b/i;
+    assert(!resendCopy.test(uxSource), 'no user-facing uxState copy may say resend');
+    assert(!resendCopy.test(chatSource), 'no user-facing chat copy may say resend');
+  });
+
+  await test('edition8: settings is one searchable domain surface with one apply and human values', () => {
+    const htmlSource = readFileSync(new URL('../src/edition8/html.ts', import.meta.url), 'utf8');
+    const e8Source = readFileSync(new URL('../media/edition8.js', import.meta.url), 'utf8');
+    assert(
+      /mode === 'settings'[^\n]*settingsHomeMarkup\(/.test(htmlSource),
+      'boot must render the one searchable settings home surface',
+    );
+    // The BOOT sequence specifically: the wiring installs right after the
+    // ready post (a second late call site elsewhere cannot mask a boot
+    // regression).
+    assert(
+      /vscode\.postMessage\(\{ type: 'e8Ready' \}\);\s*\n\s*installSettingsSearch\(\);\s*\n\s*installSettingsHome\(\);/.test(
+        e8Source,
+      ),
+      'boot must install the settings search AND home wiring together (one surface)',
+    );
+    const homeStart = htmlSource.indexOf('function settingsHomeMarkup');
+    assert(homeStart !== -1, 'settingsHomeMarkup must exist');
+    const homeEnd = htmlSource.indexOf('\nfunction screenBrowser', homeStart);
+    const homeBody = htmlSource.slice(homeStart, homeEnd === -1 ? undefined : homeEnd);
+    assert(
+      (homeBody.match(/id="e8-settings-search"/g) ?? []).length === 1,
+      'exactly one global settings search input',
+    );
+    assert(
+      (homeBody.match(/data-settings-review/g) ?? []).length === 1,
+      'exactly one review/apply commit action for the whole surface',
+    );
+    assert(htmlSource.includes('data-settings-row'), 'rows come from the served descriptor list');
+    assert(htmlSource.includes('e8-settings-label'), 'rows render descriptor labels');
+    const valueStart = htmlSource.indexOf('function settingsValueMarkup');
+    assert(valueStart !== -1, 'settingsValueMarkup must exist');
+    const valueEnd = htmlSource.indexOf('\nfunction ', valueStart + 10);
+    const valueBody = htmlSource.slice(valueStart, valueEnd === -1 ? undefined : valueEnd);
+    assert(
+      !/JSON\.stringify/.test(valueBody),
+      'settings values are human text, never raw serialized JSON',
+    );
+  });
+
+  await test('the Work status row carries state, run, exact tokens and approval count only', () => {
+    const markup = readFileSync(new URL('../src/webview.ts', import.meta.url), 'utf8');
+    const detailsStart = markup.indexOf('<section id="run-details"');
+    assert(detailsStart !== -1, 'the Work status row must exist');
+    const detailsEnd = markup.indexOf('</section>', detailsStart);
+    const details = markup.slice(detailsStart, detailsEnd);
+    assert(details.includes('id="run-state"'), 'the status row carries the run state strip');
+    assert(details.includes('id="task-agents"'), 'the run strip carries the agent/approval counts');
+    const allowed = new Set([
+      'run-details',
+      'run-strip',
+      'task-progress',
+      'task-tests',
+      'task-agents',
+      'run-state',
+      'run-state-glyph',
+      'run-state-label',
+      'run-state-copy',
+      'run-state-action',
+      'task-goal',
+    ]);
+    const stripIds = [...details.matchAll(/id="([a-z-]+)"/g)].map((match) => match[1]);
+    const unexpected = stripIds.filter((id) => !allowed.has(id));
+    assert(unexpected.length === 0, `unexpected Work status-row fields: ${unexpected.join(',')}`);
+    assert(
+      !/board|transcript/i.test(details),
+      'the Work status row never carries board or transcript chrome',
+    );
+    // The board is an explicit collapsed drawer inside the Inspect Agents
+    // subpanel — never persistent chat chrome (a persistent card fails).
+    const agentsStart = markup.indexOf('id="inspect-subpanel-agents"');
+    const nextSubpanel = markup.indexOf('<div id="inspect-subpanel-', agentsStart + 10);
+    const boardAt = markup.indexOf('<details id="board-card" class="coordination-drawer" hidden>');
+    assert(boardAt !== -1, 'the board must be a collapsed drawer element');
+    assert(
+      boardAt > agentsStart && (nextSubpanel === -1 || boardAt < nextSubpanel),
+      'the board drawer must live inside the Inspect Agents subpanel',
     );
   });
 

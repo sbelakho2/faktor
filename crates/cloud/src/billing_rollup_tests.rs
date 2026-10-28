@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! Durable billing rollup equivalence and query-plan tests.
 //!
 //! The v8 rollups are PROJECTIONS of the append-only ledgers. These tests
@@ -7,13 +8,16 @@
 //! a live database, settles below/above their hold, refunds, and the
 //! historical 100k-event fold bound.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Barrier};
 
 use crate::billing::{
     fold_credits, fold_usage, CreditEntry, CreditKind, CreditLedgerError, ReconciliationState,
     SpendCategory, UsageEvent, UsageUnit,
 };
-use crate::billing_store::{BillingStore, CreditAppend, MemoryBillingStore};
+use crate::billing_store::{
+    BillingStore, BillingStoreError, CreditAppend, MemoryBillingStore, UsageAppend,
+};
 use crate::ids::{BillingAccountId, CreditEntryId, OrganizationId, UsageEventId};
 use crate::store::SqliteControlPlaneStore;
 
@@ -700,5 +704,219 @@ fn billing_admission_is_constant_at_one_million_events() {
     assert!(
         cold > p95.saturating_mul(10),
         "the cold repair must dominate the caught-up read: cold={cold:?} p95={p95:?}"
+    );
+}
+
+/// Concurrent credit grants are exact and idempotent: many writers grant to
+/// the same account at once, each key is retried, and the folded balance is
+/// exactly the sum of the DISTINCT entries. No lost update, no double debit.
+#[test]
+fn concurrent_credit_grants_are_exact_and_idempotency_is_race_safe() {
+    const THREADS: usize = 8;
+    const PER_THREAD: u64 = 40;
+    const GRANT: u64 = 1_000;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(SqliteControlPlaneStore::open(&dir.path().join("billing.db")).unwrap());
+    let barrier = Arc::new(Barrier::new(THREADS));
+    let mut handles = Vec::new();
+    for thread in 0..THREADS {
+        let store = store.clone();
+        let barrier = barrier.clone();
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            for i in 0..PER_THREAD {
+                let key = format!("grant-key-{thread}-{i}");
+                let entry = CreditEntry {
+                    id: CreditEntryId::try_new(format!("crd_{thread}_{i:04}")).unwrap(),
+                    organization: org(),
+                    billing_account_id: account(),
+                    kind: CreditKind::Grant,
+                    amount_micro: GRANT,
+                    reference: None,
+                    usage_event_id: None,
+                    reason: "concurrent grant".into(),
+                    occurred_at_ms: (thread as u64 * 1_000 + i) as i64,
+                    idempotency_key: Some(key),
+                };
+                assert_eq!(
+                    store.append_credit_entry(&entry).unwrap(),
+                    CreditAppend::Appended
+                );
+                // The same request replayed after another writer committed
+                // must never debit twice.
+                assert_eq!(
+                    store.append_credit_entry(&entry).unwrap(),
+                    CreditAppend::Duplicate
+                );
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    let want = THREADS as u64 * PER_THREAD * GRANT;
+    assert_eq!(
+        store.credit_balance(&org()).unwrap().granted_micro,
+        want,
+        "the concurrent grants must be exact"
+    );
+    assert_eq!(store.credit_balance(&org()).unwrap().consumed_micro, 0);
+    // And it survives a reopen unchanged (the rollup is durable, not a
+    // process-local accumulator).
+    drop(store);
+    let reopened = SqliteControlPlaneStore::open(&dir.path().join("billing.db")).unwrap();
+    assert_eq!(reopened.credit_balance(&org()).unwrap().granted_micro, want);
+}
+
+/// The `i64::MAX` boundary is accepted exactly; the next grant overflows the
+/// u64 aggregate or exceeds the durable i64 column and is refused TYPED
+/// without poisoning the ledger or changing the balance.
+#[test]
+fn i64_max_credit_grants_overflow_typed_and_never_clamp() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SqliteControlPlaneStore::open(&dir.path().join("billing.db")).unwrap();
+    let grant = |id: &str, amount: u64| CreditEntry {
+        id: CreditEntryId::try_new(id).unwrap(),
+        organization: org(),
+        billing_account_id: account(),
+        kind: CreditKind::Grant,
+        amount_micro: amount,
+        reference: None,
+        usage_event_id: None,
+        reason: "boundary".into(),
+        occurred_at_ms: 1,
+        idempotency_key: None,
+    };
+    let max = i64::MAX as u64;
+    assert_eq!(
+        store.append_credit_entry(&grant("crd_max_1", max)),
+        Ok(CreditAppend::Appended)
+    );
+    assert_eq!(
+        store.append_credit_entry(&grant("crd_max_2", max)),
+        Ok(CreditAppend::Appended)
+    );
+    assert_eq!(store.credit_balance(&org()).unwrap().granted_micro, max * 2);
+    // A third i64::MAX leaves the u64 aggregate: typed Overlfow, not a
+    // saturated balance.
+    let third = store
+        .append_credit_entry(&grant("crd_max_3", max))
+        .unwrap_err();
+    assert!(
+        matches!(
+            third,
+            BillingStoreError::Ledger(CreditLedgerError::Overflow {
+                field: "granted_micro",
+                ..
+            })
+        ),
+        "{third:?}"
+    );
+    // One micro over the durable column domain is refused before any row.
+    let over = store
+        .append_credit_entry(&grant("crd_max_over", max + 1))
+        .unwrap_err();
+    assert!(matches!(over, BillingStoreError::Malformed(_)), "{over:?}");
+    assert_eq!(
+        store.credit_balance(&org()).unwrap().granted_micro,
+        max * 2,
+        "refusals never change the balance or clamp it"
+    );
+}
+
+/// The durable usage fold equals the independent pure fold BYTE-FOR-BYTE
+/// while several writers append (including correction rows) concurrently,
+/// and the same bytes survive a crash/reopen. This extends the existing
+/// single-writer rollup test with the concurrent-writer and crash shapes the
+/// billing row calls out.
+#[test]
+fn usage_fold_matches_the_ledger_byte_for_byte_with_concurrent_writers_crash_and_corrections() {
+    const THREADS: usize = 6;
+    const PER_THREAD: usize = 30;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("billing.db");
+    let store = Arc::new(SqliteControlPlaneStore::open(&path).unwrap());
+    let next_at = Arc::new(AtomicI64::new(1_700_000_000_000));
+    let all: Arc<std::sync::Mutex<Vec<UsageEvent>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let start = Arc::new(Barrier::new(THREADS + 1));
+    let mut writers = Vec::new();
+    for thread in 0..THREADS {
+        let store = store.clone();
+        let start = start.clone();
+        let next_at = next_at.clone();
+        let all = all.clone();
+        writers.push(std::thread::spawn(move || {
+            start.wait();
+            for step in 0..PER_THREAD {
+                let at = next_at.fetch_add(1, Ordering::SeqCst);
+                let id = format!("uev_{:016x}", at as u64);
+                let base = event(
+                    (thread * PER_THREAD + step) + 1,
+                    (thread as u64 % 3) + 1,
+                    thread as u64,
+                    at - 1_700_000_000_000,
+                );
+                let mut base = base;
+                base.id = UsageEventId::try_new(id.clone()).unwrap();
+                assert_eq!(
+                    store.append_usage_event(&base).unwrap(),
+                    UsageAppend::Appended
+                );
+                all.lock().unwrap().push(base.clone());
+                // Every third base gets a correction naming exactly it; the
+                // correction has a later unique timestamp so the pure fold
+                // picks it deterministically.
+                if step % 3 == 0 {
+                    let correction_at = next_at.fetch_add(1, Ordering::SeqCst);
+                    let cid = format!("uev_{:016x}", correction_at as u64);
+                    let mut corrected = correction(
+                        (thread * PER_THREAD + step) + 100_000,
+                        &base,
+                        correction_at - 1_700_000_000_000,
+                        7 + step as u64,
+                    );
+                    corrected.id = UsageEventId::try_new(cid).unwrap();
+                    assert_eq!(
+                        store.append_usage_event(&corrected).unwrap(),
+                        UsageAppend::Appended
+                    );
+                    all.lock().unwrap().push(corrected);
+                }
+            }
+        }));
+    }
+    start.wait();
+    // Fold while the writers are still appending: every observed fold is a
+    // valid snapshot (no partial row, no typed corruption).
+    let mut observed = 0usize;
+    while writers.iter().any(|w| !w.is_finished()) {
+        let fold = store
+            .usage_fold(&org())
+            .expect("a concurrent fold is consistent");
+        let bytes = serde_json::to_vec(&fold).unwrap();
+        assert!(!bytes.is_empty());
+        observed += 1;
+    }
+    for writer in writers {
+        writer.join().unwrap();
+    }
+    assert!(observed > 0, "the fold ran during the writer window");
+    let events = all.lock().unwrap().clone();
+    let want = fold_usage(&org(), &events).unwrap();
+    let got = store.usage_fold(&org()).unwrap();
+    assert_eq!(
+        serde_json::to_vec(&got).unwrap(),
+        serde_json::to_vec(&want).unwrap(),
+        "durable fold must be byte-identical to the pure ledger fold"
+    );
+    assert!(got.totals.corrected_events > 0, "corrections were folded");
+    // Crash/reopen: the rolled-up projection and the ledger agree with the
+    // same bytes (no repair pass may change the answer).
+    drop(store);
+    let reopened = SqliteControlPlaneStore::open(&path).unwrap();
+    assert_eq!(
+        serde_json::to_vec(&reopened.usage_fold(&org()).unwrap()).unwrap(),
+        serde_json::to_vec(&want).unwrap(),
+        "crash/reopen must preserve the exact fold"
     );
 }

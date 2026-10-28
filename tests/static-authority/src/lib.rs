@@ -2453,6 +2453,11 @@ mod scans {
                 ("crates/cli/src/daemon/builder.rs", 1),
                 ("crates/orchestrator/src/task_executor/mod.rs", 2),
                 ("crates/orchestrator/src/task_executor/settlement.rs", 1),
+                // Child cost-scope enrollment at spawn (audit 9/H): the
+                // spawn path is the ONLY place that can attach a child to
+                // its root's budget subscope, so the run cap bounds the SUM
+                // of its children instead of NULL-capped child reservations.
+                ("crates/orchestrator/src/runtime.rs", 1),
                 ("crates/server/src/api/deps.rs", 1),
                 ("crates/session/src/manager.rs", 1),
                 ("crates/session/src/task/mod.rs", 2),
@@ -7087,6 +7092,11 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         // plus job/process handle use, all inside this platform module.
         ("crates/terminal/src/win_spawn.rs", 1),
         ("crates/winjob/src/lib.rs", 1),
+        // Data-dir serve ownership: one `kill(pid, 0)` process-existence
+        // probe (signal 0 never delivers) plus OpenProcess on Windows for
+        // the singleton lock's stale-holder verdict — the CLI's process
+        // boundary; every site carries a SAFETY justification.
+        ("crates/cli/src/daemon/serve_lock.rs", 1),
         // Storage Governor per-filesystem capacity: the one Windows
         // `GetDiskFreeSpaceExW` call (free/total bytes for a path) sits behind
         // `#[allow(unsafe_code)]` with a per-site SAFETY comment; POSIX uses

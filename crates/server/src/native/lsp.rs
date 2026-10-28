@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! Workspace-scoped language-server diagnostics and code actions (F225/F226).
 //!
 //! The daemon serves the SAME [`faktor_lsp::LspManager`] the semantic
@@ -29,9 +30,13 @@ const MAX_WAIT_MS: u64 = 60_000;
 const CODE_ACTION_TIMEOUT_MS: u64 = 15_000;
 
 fn conflict(code: &str, message: String) -> Response {
+    conflict_with(code, message, false)
+}
+
+fn conflict_with(code: &str, message: String, retryable: bool) -> Response {
     (
         StatusCode::CONFLICT,
-        Json(json!({"error": {"code": code, "message": message, "retryable": false}})),
+        Json(json!({"error": {"code": code, "message": message, "retryable": retryable}})),
     )
         .into_response()
 }
@@ -45,6 +50,64 @@ fn lsp_disabled() -> Response {
 
 fn lsp_unavailable(reason: String) -> Response {
     conflict("lsp_unavailable", reason)
+}
+
+/// A start refusal whose underlying typed error says whether a retry can
+/// succeed (a server that crashed/OOM-died at initialize is transient; a
+/// protocol refusal is permanent). The wire flag mirrors that verdict so
+/// clients never retry a permanent verdict and never give up on a transient
+/// one.
+fn lsp_unavailable_with(reason: String, retryable: bool) -> Response {
+    conflict_with("lsp_unavailable", reason, retryable)
+}
+
+/// A language-server START failure is retryable exactly when its typed kind
+/// says so (the LSP crate marks a server process that exited at initialize
+/// as `Provider { code: "lsp", retryable: true }`; protocol refusals stay
+/// false). The wire flag mirrors that verdict — the single place a start
+/// refusal becomes an HTTP body.
+fn start_failure_retryable(error: &faktor_core::Error) -> bool {
+    matches!(
+        &error.kind,
+        faktor_core::error::ErrorKind::Provider { retryable, .. } if *retryable
+    )
+}
+
+#[cfg(test)]
+mod start_failure_tests {
+    use faktor_core::error::{Error, ErrorKind};
+
+    use super::start_failure_retryable;
+
+    /// The wire's retryable flag must mirror the typed verdict in BOTH
+    /// directions: a crashed server (transient) is retryable; a protocol
+    /// refusal and a timeout are never silently retried.
+    #[test]
+    fn start_failure_retryable_mirrors_the_typed_verdict() {
+        let crashed = Error::new(
+            ErrorKind::Provider {
+                code: "lsp".into(),
+                retryable: true,
+            },
+            "lsp initialize: exited",
+        );
+        assert!(start_failure_retryable(&crashed));
+
+        let refused = Error::new(
+            ErrorKind::Provider {
+                code: "lsp".into(),
+                retryable: false,
+            },
+            "lsp initialize: -32603",
+        );
+        assert!(!start_failure_retryable(&refused));
+
+        let missing = Error::new(ErrorKind::NotFound, "lsp spawn: ENOENT");
+        assert!(!start_failure_retryable(&missing));
+
+        let timed_out = Error::timeout("lsp initialize exceeded 30000ms");
+        assert!(!start_failure_retryable(&timed_out));
+    }
 }
 
 fn lsp_timeout(uri: &str, wait_ms: u64) -> Response {
@@ -174,7 +237,12 @@ async fn resolve_lsp(state: &AppState, session: &str, raw_path: &str) -> LspResu
     )
     .await
     .map_err(|_| lsp_unavailable("language-server start exceeded the 180s bound".to_string()))?
-    .map_err(|e| lsp_unavailable(format!("language-server start failed: {e}")))?;
+    .map_err(|e| {
+        lsp_unavailable_with(
+            format!("language-server start failed: {e}"),
+            start_failure_retryable(&e),
+        )
+    })?;
     let text = read_document(&path).await?;
     Ok(ResolvedLsp {
         client,

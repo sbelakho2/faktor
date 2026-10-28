@@ -2299,7 +2299,9 @@ pub(crate) struct NativeCompareBody {
     pub criteria: Vec<String>,
     #[serde(default)]
     pub max_tokens: Option<u64>,
-    #[serde(default)]
+    /// Money input: decimal string or legacy JSON integer (see
+    /// `faktor_cloud::money`), exactly like the task-start boundary.
+    #[serde(default, with = "faktor_cloud::money::option")]
     pub max_cost_micro: Option<u64>,
 }
 
@@ -2374,8 +2376,30 @@ pub(crate) async fn native_models_compare(
         }
     }
     let count = body.candidates.len() as u64;
-    let per_candidate_cost = body.max_cost_micro.map(|cap| cap / count);
-    let per_candidate_tokens = body.max_tokens.map(|cap| cap / count);
+    // A shared budget is split evenly across the candidates. Zero means "no
+    // override" (the same rule as the task-start boundary), but a POSITIVE
+    // budget smaller than the candidate count would truncate to 0 per
+    // candidate and the store reads 0 as UNLIMITED — the exact opposite of
+    // the caller's 1-micro intent. Refuse that split typed instead of
+    // silently buying unlimited spend.
+    let total_cost = body.max_cost_micro.filter(|cap| *cap > 0);
+    if let Some(cap) = total_cost {
+        if cap < count {
+            return wire_status(malformed_body(&format!(
+                "maxCostMicro {cap} cannot fund {count} comparison candidates at >=1 micro each; raise it to at least {count} or omit it"
+            )));
+        }
+    }
+    let total_tokens = body.max_tokens.filter(|cap| *cap > 0);
+    if let Some(cap) = total_tokens {
+        if cap < count {
+            return wire_status(malformed_body(&format!(
+                "maxTokens {cap} cannot fund {count} comparison candidates at >=1 token each; raise it to at least {count} or omit it"
+            )));
+        }
+    }
+    let per_candidate_cost = total_cost.map(|cap| cap / count);
+    let per_candidate_tokens = total_tokens.map(|cap| cap / count);
     let submission = body
         .submission_id
         .unwrap_or_else(|| format!("{:x}-{:x}", context.id().raw(), state.deps.started_ms));
@@ -2418,7 +2442,7 @@ pub(crate) async fn native_models_compare(
             "runId": receipt.run_id,
             "opId": receipt.op_id.map(|op| op.raw().to_string()),
             "actualModel": format!("{}/{}", candidate.provider, candidate.model),
-            "maxCostMicro": per_candidate_cost,
+            "maxCostMicro": faktor_cloud::money::json_opt(per_candidate_cost),
             "maxTokens": per_candidate_tokens,
         }));
     }
@@ -2427,9 +2451,9 @@ pub(crate) async fn native_models_compare(
         "workspaceId": workspace.raw().to_string(),
         "mainRunUnchanged": true,
         "budget": {
-            "maxCostMicro": body.max_cost_micro,
-            "maxTokens": body.max_tokens,
-            "perCandidateCostMicro": per_candidate_cost,
+            "maxCostMicro": faktor_cloud::money::json_opt(total_cost),
+            "maxTokens": total_tokens,
+            "perCandidateCostMicro": faktor_cloud::money::json_opt(per_candidate_cost),
             "perCandidateTokens": per_candidate_tokens,
         },
         "candidates": candidates,

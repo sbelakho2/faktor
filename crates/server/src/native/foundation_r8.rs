@@ -1291,6 +1291,14 @@ pub(crate) async fn native_task_budget_put(
     };
     let cap = match (req.clear, req.max_cost_micro) {
         (true, None) => None,
+        // The durable task-row cap is 1..=i64::MAX: zero is ambiguous (the
+        // store reads NULL/0 as unlimited) and must use clear:true instead,
+        // while a larger value cannot be stored without clamping.
+        (false, Some(cap)) if cap == 0 || cap > faktor_session::budget::MAX_TASK_COST_CAP_MICRO => {
+            return malformed(
+                "maxCostMicro must be 1..=i64::MAX; use clear:true to remove the cap",
+            );
+        }
         (false, Some(cap)) => Some(cap),
         _ => {
             return malformed("send exactly one of maxCostMicro or clear:true");

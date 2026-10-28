@@ -1172,6 +1172,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1865,6 +1866,7 @@ dependencies = [
  "faktor-snapshot",
  "faktor-store",
  "faktor-terminal",
+ "faktor-test-mocks",
  "faktor-updater",
  "faktor-worker",
  "futures-util",
@@ -2331,6 +2333,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -480,11 +480,12 @@ mod streams_tests {
     }
 
     #[tokio::test]
-    async fn chat_usage_on_content_frame_is_not_a_chunk() {
-        // (f) A usage object that shares its frame with a content delta is
-        // NEVER surfaced (the frame yields its first chunk — the text — and
-        // the rest of the frame is not re-scanned). Documented actual
-        // behavior: usage reaches the agent only on dedicated frames.
+    async fn chat_usage_on_content_frame_rides_behind_the_text_chunk() {
+        // (f) A usage object that shares its frame with a content delta IS
+        // surfaced — dropped usage rows silently undercounted tokens and cost
+        // (the adapter streaming fix). The usage chunk rides BEHIND the text
+        // chunk this frame produced: never reordered ahead of it, never
+        // duplicated.
         let norms = chat_sse_norms(vec![
             sse_frame(&json!({
                 "choices": [{"delta": {"content": "hi"}, "finish_reason": "stop"}],
@@ -495,8 +496,15 @@ mod streams_tests {
         .await;
         assert_eq!(
             norms,
-            vec![Norm::Text("hi".into()), Norm::Done],
-            "in-frame usage after a content delta is dropped, not reordered or duplicated"
+            vec![
+                Norm::Text("hi".into()),
+                Norm::Usage {
+                    uncached_input_tokens: 7,
+                    output_tokens: 3,
+                },
+                Norm::Done,
+            ],
+            "in-frame usage rides behind the text chunk in wire order, exactly once"
         );
     }
 

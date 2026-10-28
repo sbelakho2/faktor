@@ -102,6 +102,7 @@ fn spend_row(
         reasoning_tokens: 0,
         provider_cost_micro: cost,
         provider_reported_micro: cost,
+        price_authority: Some(faktor_core::model::PriceAuthority::Exact),
         state: "settled".into(),
         occurred_at_ms: 1000 + reservation,
         source_operation: "session.cost_reservation.settled".into(),
@@ -1160,6 +1161,13 @@ fn legacy_task_id_db(path: &std::path::Path, rows: &[(i64, String, String)]) {
     let conn = rusqlite::Connection::open(path).unwrap();
     conn.execute_batch(
         "DROP TABLE usage_event;
+         -- A true v5 database predates the v8/v9 rollups: drop them so the
+         -- replayed ladder recreates the tables EXACTLY as that version did
+         -- (the v10 column then arrives through its own migration step).
+         DROP TABLE IF EXISTS billing_usage_total;
+         DROP TABLE IF EXISTS billing_usage_task;
+         DROP TABLE IF EXISTS billing_usage_period;
+         DROP TABLE IF EXISTS billing_usage_period_task;
          CREATE TABLE usage_event (
             id TEXT PRIMARY KEY,
             organization_id TEXT NOT NULL,
@@ -3227,4 +3235,76 @@ fn memory_store_refuses_reused_usage_and_credit_ids_like_sqlite() {
             "the first credit row is untouched"
         );
     }
+}
+
+/// Unknown pricing must never ingest as a settled $0: the call is recorded
+/// as an UNPRICED call (a distinct usage unit), the fold reports it beside
+/// the cost totals, and a genuinely zero-priced authority (LocalZero) is not
+/// conflated with it.
+#[test]
+fn unknown_pricing_is_recorded_as_an_unpriced_call_never_a_settled_zero() {
+    let service = service_with(
+        Arc::new(SqliteControlPlaneStore::open_in_memory().unwrap()),
+        Arc::new(ManualClock::new(1_000)),
+    );
+    let organization = org("org_a");
+    let acct = account("acct_unpriced_managed");
+    service
+        .ensure_account(&organization, &acct, "managed", true)
+        .unwrap();
+
+    let mut unpriced = spend_row(11, 0, 10, 20, 0);
+    unpriced.provider_cost_micro = 0;
+    unpriced.provider_reported_micro = 0;
+    unpriced.price_authority = None; // no pricing authority could price it
+    let report = service
+        .ingest_spend_row(&organization, &acct, &unpriced, SpendCategory::Managed)
+        .unwrap();
+    assert_eq!(
+        report.unpriced, 1,
+        "the unpriced settlement is counted: {report:?}"
+    );
+    let fold = service.fold(&organization).unwrap();
+    assert_eq!(fold.totals.unpriced_calls, 1);
+    assert_eq!(
+        fold.totals.provider_cost_micro, 0,
+        "unknown pricing contributes no cost at all — never a fake settled zero"
+    );
+    assert_eq!(
+        fold.totals.input_tokens, 10,
+        "the token truth is still ingested beside the unpriced marker"
+    );
+
+    // A LocalZero authority is a MEASURED $0, not unknown pricing.
+    let mut local = spend_row(12, 0, 5, 5, 0);
+    local.provider_cost_micro = 0;
+    local.provider_reported_micro = 0;
+    local.price_authority = Some(faktor_core::model::PriceAuthority::LocalZero);
+    let report = service
+        .ingest_spend_row(&organization, &acct, &local, SpendCategory::Managed)
+        .unwrap();
+    assert_eq!(
+        report.unpriced, 0,
+        "a measured local zero is priced: {report:?}"
+    );
+    let fold = service.fold(&organization).unwrap();
+    assert_eq!(
+        fold.totals.unpriced_calls, 1,
+        "the local zero adds no unpriced call"
+    );
+    assert_eq!(fold.totals.input_tokens, 15);
+
+    // Replay of the same durable rows appends nothing (idempotent).
+    let replay = service
+        .ingest_spend_row(&organization, &acct, &unpriced, SpendCategory::Managed)
+        .unwrap();
+    assert_eq!(replay.appended, 0);
+    assert_eq!(
+        replay.unpriced, 1,
+        "a replayed unpriced row is reported, not re-appended"
+    );
+    assert_eq!(
+        service.fold(&organization).unwrap().totals.unpriced_calls,
+        1
+    );
 }

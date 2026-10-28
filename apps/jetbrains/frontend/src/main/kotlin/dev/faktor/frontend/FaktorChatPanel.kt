@@ -2344,6 +2344,16 @@ class FaktorChatPanel(
                 runAsync("recheck change basis") { recheckChangeBasisBlocking() }
             }
         })
+        verificationPanel.setListener(object : VerificationPanel.Listener {
+            override fun onEvidenceSelected(ref: EvidenceRef) {
+                selectEvidenceRef(ref)
+            }
+
+            override fun onViewFinishActions() {
+                selectCluster("Inspect")
+                selectInspectDetail("Verification", "Verification")
+            }
+        })
         blockersPanel.setListener(object : BlockersPanel.Listener {
             override fun onBlockerAction(row: BlockerRow, action: BlockerAction) {
                 runAsync("blocker ${action.label} ${row.childId}") {

@@ -13,7 +13,6 @@
 
 import * as vscode from 'vscode';
 import { randomBytes } from 'node:crypto';
-import { writeFileSync } from 'node:fs';
 import type { FaktorSnapshot } from './state';
 import type { UserErrorProjection } from './errors';
 import { renderEdition8AppMarkup } from './edition8/html';
@@ -143,22 +142,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private handleMessage(message: unknown): void {
-    const rawDump = message as { type?: string; html?: string; mode?: string; version?: string } | null;
-    if (rawDump && typeof rawDump.html === 'string') {
-      switch (rawDump.type) {
-        case 'uiDomDump': {
-          try {
-            writeFileSync('/tmp/faktor-ui-dump.html', rawDump.html);
-            writeFileSync('/tmp/faktor-ui-meta.json', JSON.stringify({ mode: rawDump.mode, version: rawDump.version, at: Date.now() }));
-          } catch {
-            /* diagnostic only */
-          }
-          return;
-        }
-        default:
-          break;
-      }
-    }
     if (!validChatMessage(message)) return;
     if (message.type.startsWith('e8')) {
       if (message.type === 'e8Ready' && this.pendingSettings !== null) {

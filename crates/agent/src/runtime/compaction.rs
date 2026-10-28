@@ -410,7 +410,14 @@ pub(crate) fn archive_manifest_is_retrievable(
         // (decompress + rehash) within the declared cap, so the manifest's
         // totals equal the sum of the REAL parts — never the declared
         // fiction. (DOM-67: manifest totals equal parts.)
-        match cas.get_bounded(hash, usize::try_from(size).unwrap_or(usize::MAX)) {
+        // A declared size that does not fit the address space cannot be
+        // verified by a bounded in-memory read: refuse (not retrievable)
+        // instead of widening the cap to usize::MAX, which a forged
+        // manifest could exploit for an unbounded decode.
+        let Ok(bound) = usize::try_from(size) else {
+            return false;
+        };
+        match cas.get_bounded(hash, bound) {
             Ok(Some(bytes)) if bytes.len() as u64 == size => {}
             _ => return false,
         }

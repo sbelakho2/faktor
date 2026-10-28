@@ -857,14 +857,14 @@ const UIUX_CONTRACT = [
   // ------------------------------------------------------------------ shell / I01
   {
     id: 'UIUX-SHELL-VSC-SWITCHER',
-    spec: 'I01 [L1394-1404] "Shared Work/Inspect/History shell ... VS Code visible History"',
+    spec: 'I01 [L1394-1404] "Shared Work/Inspect/History shell ... VS Code visible History"; destinations live in the overflow menu (Ask-first single-surface redesign: no persistent nav-* tab bar)',
     host: 'vscode',
     must: [
-      ['apps/vscode/src/webview.ts', 'id="nav-work"'],
-      ['apps/vscode/src/webview.ts', 'id="nav-inspect"'],
-      ['apps/vscode/src/webview.ts', 'id="nav-history"'],
+      ['apps/vscode/src/webview.ts', 'id="menu-chat"'],
+      ['apps/vscode/src/webview.ts', 'id="menu-inspect"'],
+      ['apps/vscode/src/webview.ts', 'id="menu-history"'],
     ],
-    tests: { vscode: ['nav-work', 'nav-inspect', 'nav-history'] },
+    tests: { vscode: ['menu-chat', 'menu-inspect', 'menu-history'] },
   },
   {
     id: 'UIUX-SHELL-VSC-INSPECT-SUBVIEWS',
@@ -931,8 +931,8 @@ const UIUX_CONTRACT = [
     spec: 'I02 [L1406-1415] "normalized task options ... draft capture"; DEC-VSC-COMPOSER [L68] "Task options disclose criteria, contract, finish, attachments and per-run budget"',
     host: 'vscode',
     must: [
-      ['apps/vscode/src/webview.ts', '<summary>Finish when done</summary>'],
-      ['apps/vscode/src/webview.ts', 'Acceptance &amp; contract'],
+      ['apps/vscode/src/webview.ts', 'id="contract-options"'],
+      ['apps/vscode/src/webview.ts', 'id="contract-constraints"'],
       ['apps/vscode/src/webview.ts', 'id="contract-budget-tokens"'],
       ['apps/vscode/src/webview.ts', 'id="contract-budget-cost"'],
     ],
@@ -973,7 +973,7 @@ const UIUX_CONTRACT = [
     spec: 'I02 [L1406-1415] "normalized task options ... draft capture"; DEC-JB-COMPOSER [L107] "Task options open in a bounded scrollable host sheet"',
     host: 'jetbrains',
     must: [
-      ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/FaktorChatPanel.kt', 'FaktorToggleButton("Task options ▸")'],
+      ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/FaktorChatPanel.kt', 'FaktorToggleButton("Task options")'],
       ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/FaktorChatPanel.kt', 'sectionHeader("Task options")'],
       ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/FaktorChatPanel.kt', 'sectionHeader("Per-run budget (empty = machine/run defaults)"'],
       ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/FaktorChatPanel.kt', 'budgetTokensField'],
@@ -984,13 +984,15 @@ const UIUX_CONTRACT = [
   // ------------------------------------------------------------------ modes
   {
     id: 'UIUX-MODE-VSC',
-    spec: 'COPY-MODES [L107] "clear Task/Ask mode" via DEC-VSC-COMPOSER "Run task primary, Ask as an explicit alternate mode"',
+    spec: 'COPY-MODES [L107] "clear Task/Ask mode" via DEC-VSC-COMPOSER (Ask-first redesign: the ONE composer carries an explicit Ask/Task intent radiogroup; btn-send is the single primary action that submits with the selected intent)',
     host: 'vscode',
     must: [
-      ['apps/vscode/src/webview.ts', 'Ask Faktor…'],
-      ['apps/vscode/src/webview.ts', '>Run task</button>'],
+      ['apps/vscode/src/webview.ts', 'id="composer-intent"'],
+      ['apps/vscode/src/webview.ts', 'id="btn-intent-ask"'],
+      ['apps/vscode/src/webview.ts', 'id="btn-intent-task"'],
+      ['apps/vscode/src/webview.ts', 'id="btn-send"'],
     ],
-    tests: { vscode: ['>Ask Faktor…</label>'] },
+    tests: { vscode: ['btn-intent-ask', 'btn-intent-task'] },
   },
   {
     id: 'UIUX-MODE-JB',
@@ -1085,11 +1087,11 @@ const UIUX_CONTRACT = [
   },
   {
     id: 'UIUX-T06-JB',
-    spec: 'T06 [L1044-1045] "Ready" / "Describe a task or ask a question." / "Run task"; renders the composer empty-state hint (FaktorChatPanel composerReadyLabel/composerHint from RunStateCopy.READY_LABEL/READY_COPY); the useful action stays the EXISTING Run task control',
+    spec: 'T06 [L1044-1045] "Ready" / "Describe a task or ask a question." / "Run task"; JB renders the composer empty-state hint (FaktorChatPanel composerReadyLabel/composerHint from RunStateCopy.READY_LABEL/READY_COPY; READY_COPY was rewritten for the Ask-first redesign); the useful action stays the EXISTING Run task control',
     host: 'jetbrains',
     must: [
       ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/TaskTreeModel.kt', 'const val READY_LABEL = "Ready"'],
-      ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/TaskTreeModel.kt', 'const val READY_COPY = "Describe a task or ask a question."'],
+      ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/TaskTreeModel.kt', 'const val READY_COPY = "Ask a question, or choose Task for an isolated run."'],
       ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/FaktorChatPanel.kt', 'sectionHeader(RunStateCopy.READY_LABEL, muted = true)'],
       ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/FaktorChatPanel.kt', 'wrappedMutedLabel(RunStateCopy.READY_COPY)'],
     ],
@@ -1121,11 +1123,11 @@ const UIUX_CONTRACT = [
   },
   {
     id: 'UIUX-T08-VSC',
-    spec: 'T08 [L1052-1055] "Start response unavailable" / "The draft was kept. Retry checks the same logical submission." / "Review and retry"; renders the retryable start-result strip (chat.js COMPOSER_STATES.startUnavailable ONLY when the host result classified the failure retryable); the useful action stays the EXISTING Review and retry control and the strip adds no duplicate button',
+    spec: 'T08 [L1052-1055] "Start response unavailable" / "The draft was kept. Retry checks the same logical submission." / "Review and retry"; renders the retryable start-result strip (chat.js COMPOSER_STATES.startUnavailable ONLY when the host result classified the failure retryable); the Ask-first composer rework rewrote the VS strip copy to "Couldn\'t start" / "The draft was kept. Retry uses the same request." (pinned by the VS selftest; JB keeps the original T08 copy); the useful action stays the EXISTING Review and retry control and the strip adds no duplicate button',
     host: 'vscode',
     must: [
-      ['apps/vscode/media/chat.js', "label: 'Start response unavailable'"],
-      ['apps/vscode/media/chat.js', "copy: 'The draft was kept. Retry checks the same logical submission.'"],
+      ['apps/vscode/media/chat.js', 'label: "Couldn\'t start"'],
+      ['apps/vscode/media/chat.js', "copy: 'The draft was kept. Retry uses the same request.'"],
       ['apps/vscode/media/chat.js', 'spec = COMPOSER_STATES.startUnavailable;'],
       ['apps/vscode/media/chat.js', 'startFailed = !ok && message.retryable === true;'],
     ],
@@ -1139,7 +1141,7 @@ const UIUX_CONTRACT = [
       ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/TaskTreeModel.kt', 'const val START_RESPONSE_UNAVAILABLE_LABEL = "Start response unavailable"'],
       ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/TaskTreeModel.kt', '"The draft was kept. Retry checks the same logical submission."'],
       ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/TaskTreeModel.kt', 'submissionRetained -> RunStateView('],
-      ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/FaktorChatPanel.kt', 'pendingTaskSubmission != null'],
+      ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/FaktorChatPanel.kt', 'val pending = pendingTaskSubmission'],
     ],
     tests: { jetbrains: ['task start single-flight: transport failure re-enables and keeps draft + attachments', 'run-state copy: T06-T26 exact labels render only under their served conditions'] },
   },
@@ -1200,7 +1202,7 @@ const UIUX_CONTRACT = [
       ['apps/vscode/media/chat.js', "proofState === 'verifying' || proofState === 'needs_verification'"],
       ['apps/vscode/src/extension.ts', 'proofTaskState: proofRead.proof?.task?.state ?? null,'],
     ],
-    tests: { vscode: ['T12 checking renders only from the proof body embedded task state'] },
+    tests: { vscode: ['T12 checking is named by the header only from the proof body embedded state'] },
   },
   {
     id: 'UIUX-T12-JB',
@@ -1273,12 +1275,14 @@ const UIUX_CONTRACT = [
   },
   {
     id: 'UIUX-T17-JB',
-    spec: 'T17 [L1107-1111] "Candidate checks passed"; JB renders "Candidate checks passed · <facts>" (OverviewPanel verification row)',
+    spec: 'T17 [L1107-1111] "Candidate checks passed"; JB renders the T17 family as the Verification summary line "Verified/Not verified yet · criteria N of M passed" (VerificationPanel; the Overview verification row was removed by the Ask-first redesign — the exact "Candidate checks passed" label now renders only in the VS cockpit)',
     host: 'jetbrains',
     must: [
-      ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/OverviewPanel.kt', '"Candidate checks passed · "'],
+      ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/VerificationPanel.kt', 'append(if (verification.verified) "Verified" else "Not verified yet")'],
+      ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/VerificationPanel.kt', 'append(" · criteria ").append(verification.criteriaPassed)'],
+      ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/VerificationPanel.kt', 'append(" of ").append(verification.criteriaTotal).append(" passed")'],
     ],
-    tests: { jetbrains: ['Candidate checks passed'] },
+    tests: { jetbrains: ['verification summary renders VERIFIED only under the strict verified proof', 'summaryText().startsWith("Not verified yet")'] },
   },
   // ------------------------------------------------------------------ T10
   {
@@ -1419,7 +1423,7 @@ const UIUX_CONTRACT = [
   },
   {
     id: 'UIUX-T21-JB',
-    spec: 'T21 [L1138-1140] "Finish action pending" / "A requested action lacks a succeeded durable result." / "View finish actions"; renders on the Overview Finish actions row when CompletionView.finishActionPending (TaskTreeModel) holds; the row is the EXISTING finish-actions inspection surface',
+    spec: 'T21 [L1138-1140] "Finish action pending" / "A requested action lacks a succeeded durable result." / "View finish actions"; renders on the Verification "Completion contract" card when CompletionView.finishActionPending (TaskTreeModel) holds (the Ask-first redesign moved finish detail off the Overview summary row); the card is the EXISTING finish-actions inspection home',
     host: 'jetbrains',
     must: [
       ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/TaskTreeModel.kt', 'const val FINISH_ACTION_PENDING_LABEL = "Finish action pending"'],
@@ -1484,7 +1488,7 @@ const UIUX_CONTRACT = [
       ['apps/vscode/src/preflight.ts', "label: 'Wait'"],
       ['apps/vscode/src/preflight.ts', "label: 'Refresh'"],
     ],
-    tests: { vscode: ['T27_RECONNECTING'] },
+    tests: { vscode: ['T27/T28 stream recovery merges into the single attention card copy'] },
   },
   {
     id: 'UIUX-T27-JB',
@@ -1673,14 +1677,14 @@ const UIUX_CONTRACT = [
     host: 'jetbrains',
     must: [
       ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/TaskTreeModel.kt', '"VERIFIED"'],
-      ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/OverviewPanel.kt', '"Candidate checks passed · "'],
-      ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/OverviewPanel.kt', '"Cost unavailable"'],
+      ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/VerificationPanel.kt', 'append(" · criteria ").append(verification.criteriaPassed)'],
+      ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/OutcomesPanel.kt', 'OUTCOMES_COST_UNAVAILABLE = "Cost unavailable"'],
       ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/TaskTreeModel.kt', 'Not integrated'],
       ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/TaskTreeModel.kt', 'Landed state matches verified state'],
       ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/TaskTreeModel.kt', '"! Conflict"'],
       ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/TaskTreePanel.kt', '"integration: " + fact'],
     ],
-    tests: { jetbrains: ['verification summary renders VERIFIED only under the strict verified proof', 'overview keeps proof, spend and completed states honest', 'integration: ✓ Landed state matches verified state', '! Conflict'] },
+    tests: { jetbrains: ['verification summary renders VERIFIED only under the strict verified proof', 'overview is concise; proof honesty stays in Verification/Advanced', 'integration: ✓ Landed state matches verified state', '! Conflict'] },
   },
   // ------------------------------------------------------------------ I07
   {
@@ -2037,7 +2041,7 @@ const UIUX_STATE_DISPOSITIONS = [
     spec: 'T21 [L1138-1140] "Finish action pending" / "A requested action lacks a succeeded durable result." / "View finish actions"',
     disposition: 'enforced',
     rows: ['UIUX-T21-VSC', 'UIUX-T21-JB'],
-    note: 'both hosts render the mandated label and copy only when a requested finish step lacks a succeeded durable result: VS cockpit completionPending on the Completion contract section and JB CompletionView.finishActionPending on the Overview Finish actions row; both surfaces are the existing finish-actions inspection home; pinned by UIUX-T21-VSC/UIUX-T21-JB.',
+    note: 'both hosts render the mandated label and copy only when a requested finish step lacks a succeeded durable result: VS cockpit completionPending on the Completion contract section and JB CompletionView.finishActionPending on the Verification Completion contract card; both surfaces are the existing finish-actions inspection home; pinned by UIUX-T21-VSC/UIUX-T21-JB.',
   },
   {
     state: 'T22',

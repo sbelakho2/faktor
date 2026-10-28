@@ -1,7 +1,7 @@
 {
   "id": "INV-EDITION8-ONE-SETTINGS-SURFACE",
   "file": "apps/vscode/src/edition8/html.ts",
-  "find": "    ${mode === 'settings' ? settingsHomeMarkup() : ''}",
+  "find": "    ${mode === 'settings' && !SETTINGS_DETAIL_SCREENS.has(initial) ? settingsHomeMarkup(options.state) : ''}",
   "replace": "    ${''}",
   "gate": "node --no-warnings apps/vscode/scripts/selftest.mjs",
   "expect": "FAIL",

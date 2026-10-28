@@ -7,6 +7,7 @@ pub mod builder;
 pub(crate) mod foundation_settings;
 pub mod semantic;
 pub mod serve;
+pub(crate) mod serve_lock;
 pub mod wiring;
 
 pub use builder::*;

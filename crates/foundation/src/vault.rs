@@ -6,6 +6,8 @@
 //! verification state. Rotation mints a NEW generation; local deletion and
 //! remote revocation are distinct states.
 
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
+
 use std::path::{Path, PathBuf};
 
 use rusqlite::{params, OptionalExtension};
@@ -147,9 +149,13 @@ impl SecretVault {
             .map_err(|e| FoundationError::Store(e.to_string()))
         })?;
         let Some((_generation, revoked)) = row else {
-            return Err(FoundationError::NotFound(format!(
-                "secret reference {handle} does not exist (it is not an opaque foreign handle)"
-            )));
+            // Foreign and missing handles are indistinguishable BY CONTRACT:
+            // the message never echoes the handle, so a 404 body for a
+            // handle minted in another machine's vault is byte-identical to
+            // a 404 for a handle that never existed.
+            return Err(FoundationError::NotFound(
+                "secret reference does not exist".into(),
+            ));
         };
         if revoked != 0 {
             return Err(FoundationError::Conflict(format!(
@@ -187,9 +193,9 @@ impl SecretVault {
                     )
                     .map_err(|e| FoundationError::Store(e.to_string()))?;
                 if changed == 0 {
-                    return Err(FoundationError::NotFound(format!(
-                        "secret reference {handle} does not exist or is revoked"
-                    )));
+                    return Err(FoundationError::NotFound(
+                        "secret reference does not exist or is revoked".into(),
+                    ));
                 }
                 read_ref(conn, handle)
             })
@@ -197,6 +203,49 @@ impl SecretVault {
                 r.verification = state;
                 let _ = id;
                 r
+            })
+    }
+
+    /// Mark a reference verified ONLY when it still has `generation`.
+    ///
+    /// A probe resolves the credential bytes (and this generation) once, at
+    /// call start. If a rotate lands while that call is in flight, the late
+    /// completion belongs to the OLD material and must not mark the NEW
+    /// generation verified: `Ok(None)` reports that the generation moved
+    /// (or the reference was revoked) and nothing was written.
+    pub fn mark_verified_generation(
+        &self,
+        handle: &str,
+        generation: u64,
+        verified: bool,
+    ) -> Result<Option<SecretRef>, FoundationError> {
+        parse_handle(handle)?;
+        let generation = i64::try_from(generation).map_err(|_| {
+            FoundationError::Malformed("secret generation exceeds the stored range".into())
+        })?;
+        self.db
+            .write("vault verify generation", |conn| {
+                let changed = conn
+                    .execute(
+                        "UPDATE secret_ref SET verified = ?3
+                         WHERE handle = ?1 AND generation = ?2 AND revoked = 0",
+                        params![handle, generation, if verified { 1 } else { 0 }],
+                    )
+                    .map_err(|e| FoundationError::Store(e.to_string()))?;
+                if changed == 0 {
+                    return Ok(None);
+                }
+                read_ref(conn, handle).map(Some)
+            })
+            .map(|reference| {
+                reference.map(|mut r| {
+                    r.verification = if verified {
+                        VerificationState::Verified
+                    } else {
+                        VerificationState::Failed
+                    };
+                    r
+                })
             })
     }
 
@@ -226,9 +275,9 @@ impl SecretVault {
                 ))
             }
             None => {
-                return Err(FoundationError::NotFound(format!(
-                    "secret reference {handle} does not exist"
-                )))
+                return Err(FoundationError::NotFound(
+                    "secret reference does not exist".into(),
+                ))
             }
         }
         write_owner_only(&self.material_path(&id), secret)?;
@@ -331,7 +380,7 @@ fn read_ref(conn: &rusqlite::Connection, handle: &str) -> Result<SecretRef, Foun
     )
     .optional()
     .map_err(|e| FoundationError::Store(e.to_string()))?
-    .ok_or_else(|| FoundationError::NotFound(format!("secret reference {handle} does not exist")))
+    .ok_or_else(|| FoundationError::NotFound("secret reference does not exist".into()))
 }
 
 fn validate_kind(kind: &str) -> Result<(), FoundationError> {
@@ -488,5 +537,105 @@ mod tests {
         assert!(vault.reveal("sk-live").is_err());
         assert!(vault.store("bad/kind", "x", b"y").is_err());
         assert!(vault.store("provider", "x", b"").is_err());
+    }
+
+    /// A handle minted by ANOTHER machine vault and a handle that never existed
+    /// are indistinguishable at every operation: the typed NotFound message does
+    /// not echo the opaque handle, so the wire 404 is byte-identical (a probe
+    /// cannot enumerate foreign references by error text).
+    #[test]
+    fn foreign_and_missing_handles_are_indistinguishable_byte_for_byte() {
+        let (dir_a, vault_a) = vault();
+        let (dir_b, vault_b) = vault();
+        let foreign = vault_b
+            .store("provider", "other machine", b"other")
+            .unwrap();
+        let missing = "vault://provider/00000000000000000000000000000000";
+        assert_ne!(foreign.handle, missing);
+        for op in [0u8, 1, 2] {
+            let a = match op {
+                0 => vault_a.reveal(&foreign.handle).unwrap_err().to_string(),
+                1 => vault_a
+                    .rotate(&foreign.handle, b"new")
+                    .unwrap_err()
+                    .to_string(),
+                _ => vault_a.delete(&foreign.handle).unwrap_err().to_string(),
+            };
+            let b = match op {
+                0 => vault_a.reveal(missing).unwrap_err().to_string(),
+                1 => vault_a.rotate(missing, b"new").unwrap_err().to_string(),
+                _ => vault_a.delete(missing).unwrap_err().to_string(),
+            };
+            assert_eq!(
+                a, b,
+                "operation {op} must not distinguish foreign from missing"
+            );
+            assert!(
+                !a.contains(&foreign.handle),
+                "the 404 body echoes the handle: {a}"
+            );
+        }
+        // The vaults themselves are unchanged: no cross-vault delete/rotate.
+        assert_eq!(vault_b.reveal(&foreign.handle).unwrap(), b"other");
+        drop((dir_a, dir_b));
+    }
+
+    /// A deleted reference is a typed CONFLICT on use (not a 404): the row is
+    /// provably local and revoked, and rotate refuses rather than resurrecting
+    /// it. A malformed handle stays a typed Malformed before any store read.
+    #[test]
+    fn delete_then_use_and_rotate_are_typed_and_never_resurrect() {
+        let (_dir, vault) = vault();
+        let reference = vault.store("provider", "p", b"one").unwrap();
+        vault.delete(&reference.handle).unwrap();
+        assert!(matches!(
+            vault.reveal(&reference.handle),
+            Err(FoundationError::Conflict(_))
+        ));
+        assert!(matches!(
+            vault.rotate(&reference.handle, b"two"),
+            Err(FoundationError::Conflict(_))
+        ));
+        assert!(matches!(
+            vault.get(&reference.handle).unwrap().verification,
+            VerificationState::Revoked
+        ));
+        // The material is gone from disk as well as from the row.
+        let id = reference.handle.strip_prefix("vault://provider/").unwrap();
+        assert!(!_dir.path().join("vault/secrets").join(id).exists());
+        for hostile in [
+            "sk-live",
+            "vault://provider",
+            "vault://../x",
+            "vault://provider/x/y",
+        ] {
+            assert!(
+                matches!(vault.reveal(hostile), Err(FoundationError::Malformed(_))),
+                "{hostile:?} must be a typed Malformed, not a fabricated miss"
+            );
+        }
+    }
+
+    /// When the machine secret store cannot be created (for example the vault
+    /// path is occupied by a file, or the OS/volume refuses the directory), the
+    /// store is a typed `Store` degradation: no row is written, no empty secret
+    /// is claimed, and the caller sees an error instead of a fake handle.
+    #[test]
+    fn unavailable_secret_store_degrades_typed_and_writes_no_row() {
+        let dir = tempfile::tempdir().unwrap();
+        // Occupy `<data>/vault` with a regular file: the vault cannot create its
+        // owner-only secrets directory. This is the file-backed equivalent of
+        // "no OS keychain / unavailable OS secret service".
+        std::fs::write(dir.path().join("vault"), b"not a directory").unwrap();
+        let db = FoundationDb::open(dir.path().join("f.db")).unwrap();
+        let vault = SecretVault::new(db, dir.path());
+        let err = vault
+            .store("provider", "unavailable", b"sk-planted")
+            .unwrap_err();
+        assert!(matches!(err, FoundationError::Store(_)), "{err:?}");
+        assert!(
+            vault.list().unwrap().is_empty(),
+            "a degraded store must not journal a secret reference"
+        );
     }
 }

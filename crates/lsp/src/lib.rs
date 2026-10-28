@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! faktor-lsp — workspace-scoped language server integration (spec §32).
 //!
 //! Language servers are workspace resources, not session resources: one
@@ -133,6 +134,13 @@ fn executable_on_path(name: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// True for the TRANSIENT exit class only: a provider error coded `lsp`
+/// with `retryable: true` is produced EXCLUSIVELY by
+/// [`LspClient::rpc_failure`] for a server process that ended mid-request.
+fn is_server_exit(error: &Error) -> bool {
+    matches!(&error.kind, ErrorKind::Provider { code, retryable } if code == "lsp" && *retryable)
 }
 
 /// Stable [`ErrorKind::Provider`] code for a capability-gated method on the
@@ -595,6 +603,51 @@ impl LspClient {
         }))
     }
 
+    /// Map one JSON-RPC error object onto the typed surface. Our OWN
+    /// synthesized EOF error (`data.faktor_exit`) means the server PROCESS
+    /// ended mid-request — a TRANSIENT class (crash/OOM-kill/watchdog):
+    /// retryable, carrying the child's captured stderr tail as evidence so
+    /// the operator (and the next start) can see WHY. Any error the server
+    /// itself produced is a permanent provider verdict.
+    fn rpc_failure(&self, method: &str, error: &serde_json::Value) -> Error {
+        let exited = error
+            .get("data")
+            .and_then(|data| data.get("faktor_exit"))
+            .is_some();
+        if exited {
+            let tail = self.stderr_tail();
+            let tail = tail.trim();
+            let evidence = if tail.is_empty() {
+                "no stderr was captured".to_string()
+            } else {
+                format!(
+                    "stderr tail: {}",
+                    tail.chars().take(1200).collect::<String>()
+                )
+            };
+            let reason = error
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("no reason reported");
+            return Error::new(
+                ErrorKind::Provider {
+                    code: "lsp".into(),
+                    retryable: true,
+                },
+                format!(
+                    "lsp {method}: the language server exited during the request                      ({reason}); {evidence}"
+                ),
+            );
+        }
+        Error::new(
+            ErrorKind::Provider {
+                code: "lsp".into(),
+                retryable: false,
+            },
+            format!("lsp {method}: {error}"),
+        )
+    }
+
     /// REQUEST path: carries an id, registers a pending entry, awaits the
     /// response (bounded by `deadline`). A server that never answers is a
     /// timeout — never a hang.
@@ -616,13 +669,7 @@ impl LspClient {
                 deadline.as_millis()
             ))),
             Err(RequestFailure::Cancelled) => Err(Error::cancelled()),
-            Err(RequestFailure::Rpc(error)) => Err(Error::new(
-                ErrorKind::Provider {
-                    code: "lsp".into(),
-                    retryable: false,
-                },
-                format!("lsp {method}: {error}"),
-            )),
+            Err(RequestFailure::Rpc(error)) => Err(self.rpc_failure(method, &error)),
         }
     }
 
@@ -1088,13 +1135,7 @@ impl LspClient {
                 deadline.as_millis()
             ))),
             Err(RequestFailure::Cancelled) => Err(Error::cancelled()),
-            Err(RequestFailure::Rpc(error)) => Err(Error::new(
-                ErrorKind::Provider {
-                    code: "lsp".into(),
-                    retryable: false,
-                },
-                format!("lsp {method}: {error}"),
-            )),
+            Err(RequestFailure::Rpc(error)) => Err(self.rpc_failure(method, &error)),
         }
     }
 
@@ -1333,8 +1374,33 @@ impl LspManager {
         }
     }
 
-    /// Connect one client and run its initialize handshake.
+    /// Connect one client and run its initialize handshake. A server that
+    /// EXITED at initialize (crash/OOM-kill) is retried ONCE with a fresh
+    /// child before the typed transient failure surfaces: a killed server
+    /// must not read as a permanent capability loss, and a deterministic
+    /// crash still fails after the single bounded retry with BOTH children's
+    /// stderr evidence merged.
     async fn connect_and_initialize(
+        &self,
+        workspace: WorkspaceId,
+        cfg: &LspConfig,
+    ) -> Result<Arc<LspClient>, Error> {
+        match self.connect_once(workspace, cfg).await {
+            Err(first) if is_server_exit(&first) => match self.connect_once(workspace, cfg).await {
+                Ok(client) => Ok(client),
+                Err(second) => Err(Error::new(
+                    ErrorKind::Provider {
+                        code: "lsp".into(),
+                        retryable: true,
+                    },
+                    format!("{first}; after one restart: {second}"),
+                )),
+            },
+            other => other,
+        }
+    }
+
+    async fn connect_once(
         &self,
         workspace: WorkspaceId,
         cfg: &LspConfig,
@@ -1347,8 +1413,38 @@ impl LspManager {
         )
         .await?;
         // Handshake: initialize REQUEST (awaited) → initialized NOTIFICATION
-        // (fire-and-forget, before any didOpen).
-        client.initialize(&cfg.root).await?;
+        // (fire-and-forget, before any didOpen). Two crash sub-classes are
+        // the SAME transient class: the child exited before answering (the
+        // EOF marker already carries evidence) and the child was already
+        // gone when the request was written (EPIPE → Network; for stdio the
+        // only Network shape during the handshake IS a dead child).
+        if let Err(error) = client.initialize(&cfg.root).await {
+            let tail = client.stderr_tail();
+            let tail = tail.trim();
+            let evidence = if tail.is_empty() {
+                "no stderr was captured".to_string()
+            } else {
+                format!(
+                    "stderr tail: {}",
+                    tail.chars().take(1200).collect::<String>()
+                )
+            };
+            return Err(match error.kind.clone() {
+                ErrorKind::Provider { code, .. } if code == "lsp" => error,
+                ErrorKind::Network => Error::new(
+                    ErrorKind::Provider {
+                        code: "lsp".into(),
+                        retryable: true,
+                    },
+                    format!(
+                        "lsp initialize: the language server exited before the request was \
+                         written ({}); {evidence}",
+                        error.message
+                    ),
+                ),
+                _ => error,
+            });
+        }
         client.notify_initialized()?;
         Ok(client)
     }
@@ -1501,7 +1597,16 @@ fn read_loop(
     exited.store(true, Ordering::SeqCst);
     let mut guard = recover_lock(&conn);
     for (_, tx) in guard.pending.drain() {
-        let _ = tx.send(serde_json::json!({"error": {"code": -32000, "message": "server closed"}}));
+        let _ = tx.send(serde_json::json!({
+            "error": {
+                "code": -32000,
+                "message": "server closed",
+                // Exact classification marker: the SERVER PROCESS ended
+                // mid-request (crash/OOM/watchdog/external kill), never a
+                // protocol verdict the server itself produced.
+                "data": {"faktor_exit": true}
+            }
+        }));
     }
 }
 
@@ -2172,6 +2277,158 @@ mod tests {
             .unwrap();
         assert_eq!(consumed, 23);
         assert_eq!(value, serde_json::json!({}));
+    }
+
+    /// The EPIPE sub-class: the child exits BEFORE reading the initialize
+    /// frame, so the failure arrives as a write error rather than the EOF
+    /// marker. It is the SAME transient class: retryable, one bounded
+    /// restart, stderr evidence merged.
+    #[tokio::test]
+    async fn initialize_early_exit_before_read_is_transient_retryable() {
+        let root_dir = tempdir().unwrap();
+        let (_cas_dir, sup) = supervisor();
+        let mgr = LspManager::new(sup);
+        let root = root_dir.path().to_path_buf();
+        let expected = file_uri(&root);
+        let (cfg, _script) = cfg_with(root, "exit-immediately", &expected);
+        let error = tokio::time::timeout(
+            Duration::from_secs(20),
+            mgr.start(WorkspaceId::new(76), cfg),
+        )
+        .await
+        .expect("start timeout")
+        .err()
+        .expect("an immediately-exiting server must fail the start");
+        assert!(
+            matches!(
+                &error.kind,
+                ErrorKind::Provider { code, retryable } if code == "lsp" && *retryable
+            ),
+            "the early-exit class is transient and retryable: {:?}",
+            error.kind
+        );
+        let message = format!("{error}");
+        assert!(
+            message.contains("exited before the request was written")
+                || message.contains("exited during the request"),
+            "the message must name the exit class: {message}"
+        );
+        assert!(
+            message.contains("simulated early exit before reading the request"),
+            "the drained stderr must be the evidence: {message}"
+        );
+        assert!(message.contains("after one restart"), "{message}");
+    }
+
+    /// Crash-class contract (the live "server closed at initialize" report):
+    /// a child that EXITS before answering initialize is TRANSIENT —
+    /// retryable, retried exactly once, and the typed message carries the
+    /// child's captured stderr as evidence (both attempts merged).
+    #[tokio::test]
+    async fn initialize_child_exit_is_transient_retryable_with_stderr_and_one_restart() {
+        let root_dir = tempdir().unwrap();
+        let (_cas_dir, sup) = supervisor();
+        let mgr = LspManager::new(sup);
+        let root = root_dir.path().to_path_buf();
+        let expected = file_uri(&root);
+        let (cfg, _script) = cfg_with(root, "exit-at-initialize", &expected);
+        let started = tokio::time::timeout(
+            Duration::from_secs(20),
+            mgr.start(WorkspaceId::new(77), cfg),
+        )
+        .await
+        .expect("start timeout");
+        let error = started.err().expect("exit-at-initialize must fail");
+        assert!(
+            matches!(
+                &error.kind,
+                ErrorKind::Provider { code, retryable } if code == "lsp" && *retryable
+            ),
+            "a child exit at initialize must be the retryable lsp class: {:?}",
+            error.kind
+        );
+        let message = format!("{error}");
+        assert!(
+            message.contains("exited during the request"),
+            "message must name the exit class: {message}"
+        );
+        assert!(
+            message.contains("simulated crash before initialize"),
+            "message must carry the child's stderr evidence: {message}"
+        );
+        assert!(
+            message.contains("after one restart"),
+            "a deterministic crash must surface AFTER the single bounded restart: {message}"
+        );
+        // The rollback released the slot: a follow-up start must be a fresh
+        // attempt, never a cached dead client.
+        assert!(mgr.client(WorkspaceId::new(77)).await.is_err());
+    }
+
+    /// Crash-once recovery: the FIRST child crashes at initialize, the
+    /// SECOND (fresh spawn) answers normally — start must succeed, with the
+    /// surviving client's stderr free of the crash evidence.
+    #[tokio::test]
+    async fn initialize_crash_once_recovers_after_one_restart() {
+        let root_dir = tempdir().unwrap();
+        let (_cas_dir, sup) = supervisor();
+        let mgr = LspManager::new(sup);
+        let root = root_dir.path().to_path_buf();
+        let expected = file_uri(&root);
+        let counter = root_dir.path().join("crash-once.marker");
+        let (mut cfg, _script) = cfg_with(root, "crash-once", &expected);
+        cfg.args.push(counter.to_string_lossy().into_owned());
+        let client = tokio::time::timeout(
+            Duration::from_secs(20),
+            mgr.start(WorkspaceId::new(78), cfg),
+        )
+        .await
+        .expect("start timeout")
+        .expect("a crash-once server must recover through the single restart");
+        assert!(
+            counter.exists(),
+            "the first child must have recorded its crash"
+        );
+        assert!(
+            !client.stderr_tail().contains("first start crashes"),
+            "the surviving client is the healthy second child: {}",
+            client.stderr_tail()
+        );
+        client.shutdown().await.unwrap();
+    }
+
+    /// A JSON-RPC error the SERVER itself answered is a PERMANENT provider
+    /// verdict: non-retryable, no restart woven into the message.
+    #[tokio::test]
+    async fn initialize_server_rpc_error_is_permanent_and_not_retried() {
+        let root_dir = tempdir().unwrap();
+        let (_cas_dir, sup) = supervisor();
+        let mgr = LspManager::new(sup);
+        let root = root_dir.path().to_path_buf();
+        let expected = file_uri(&root);
+        let (cfg, _script) = cfg_with(root, "rpc-error-initialize", &expected);
+        let started = tokio::time::timeout(
+            Duration::from_secs(20),
+            mgr.start(WorkspaceId::new(79), cfg),
+        )
+        .await
+        .expect("start timeout");
+        let error = started.err().expect("rpc-error-initialize must fail");
+        assert!(
+            matches!(
+                &error.kind,
+                ErrorKind::Provider { code, retryable } if code == "lsp" && !*retryable
+            ),
+            "a server-answered error is permanent: {:?}",
+            error.kind
+        );
+        let message = format!("{error}");
+        assert!(message.contains("internal mock refusal"), "{message}");
+        assert!(
+            !message.contains("exited during the request")
+                && !message.contains("after one restart"),
+            "a server verdict must never be described as a crash/retry: {message}"
+        );
     }
 
     /// (i) connect sends initialize with the REAL rootUri and cwd, receives

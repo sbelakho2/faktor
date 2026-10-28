@@ -215,7 +215,7 @@
       "reason": "manual fault/scale probe outside the nightly fault lane's package set: run explicitly with `cargo test -- --ignored`"
     },
     {
-      "file": "crates/fs/src/lib.rs",
+      "file": "crates/fs/src/lib_tests.rs",
       "fn": "fault_probe_1000_shadow_turns_with_real_watchers_census_os_resources",
       "tag": "fault",
       "reason": "manual fault/scale probe outside the nightly fault lane's package set: run explicitly with `cargo test -- --ignored`"

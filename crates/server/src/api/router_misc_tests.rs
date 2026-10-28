@@ -2513,10 +2513,10 @@ async fn native_models_compare_starts_isolated_candidates() {
         candidates[0]["sessionId"], candidates[1]["sessionId"],
         "each candidate has its own session scope"
     );
-    assert_eq!(body["budget"]["perCandidateCostMicro"], 500);
+    assert_eq!(body["budget"]["perCandidateCostMicro"], "500");
     assert_eq!(body["budget"]["perCandidateTokens"], 50);
     for candidate in candidates {
-        assert_eq!(candidate["maxCostMicro"], 500, "{candidate}");
+        assert_eq!(candidate["maxCostMicro"], "500", "{candidate}");
         assert!(candidate["actualModel"].as_str().unwrap().contains('/'));
     }
     // Unserved candidates are refused typed before any session is created.

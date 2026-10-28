@@ -13,6 +13,7 @@
 // response.
 
 import * as vscode from 'vscode';
+import { writeFileSync } from 'node:fs';
 import { basename, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
@@ -1353,6 +1354,15 @@ async function startServer(
     // arrived before the supervisor's resume callback completed.
     await ensureSession(active.client, context);
     startStream();
+  }
+  // An explicit start gesture that RESOLVES means the service answers now:
+  // any earlier "could not be reached" card must drop with the next
+  // snapshot. launchService clears lastError on a fresh launch; the
+  // already-running path (in-memory handle reuse or a cross-host
+  // serve.lock adoption) reaches here without it, and without this clear
+  // the ONE actionable card outlives its own condition forever.
+  if (active.client && store.snapshot().lastError !== null) {
+    store.patch({ lastError: null });
   }
 }
 
@@ -4179,6 +4189,28 @@ async function handleWebviewMessage(
     case 'ready':
       chatProvider?.postSnapshot(store.snapshot());
       return;
+    case 'uiDomDump': {
+      // One-shot webview DOM diagnostic (stale/wrong-surface evidence):
+      // written host-side so every webview->host message has exactly ONE
+      // dispatcher (the registry's message-wiring law).
+      const dump = message as { html?: unknown; mode?: unknown; version?: unknown };
+      if (typeof dump.html === 'string') {
+        try {
+          writeFileSync('/tmp/faktor-ui-dump.html', dump.html);
+          writeFileSync(
+            '/tmp/faktor-ui-meta.json',
+            JSON.stringify({
+              mode: typeof dump.mode === 'string' ? dump.mode : null,
+              version: typeof dump.version === 'string' ? dump.version : null,
+              at: Date.now(),
+            }),
+          );
+        } catch {
+          /* diagnostic only */
+        }
+      }
+      return;
+    }
     case 'startDaemon':
       try {
         await startServer(context);

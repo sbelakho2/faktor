@@ -91,6 +91,10 @@ pub const UNIT_CACHE_READ_TOKENS: &str = "cache_read_tokens";
 pub const UNIT_CACHE_WRITE_TOKENS: &str = "cache_write_tokens";
 pub const UNIT_REASONING_TOKENS: &str = "reasoning_tokens";
 pub const UNIT_PROVIDER_COST: &str = "provider_cost_micro";
+/// A settled call whose pricing authority is UNKNOWN: it carries no cost
+/// (never a fake zero). Folds report it as an unpriced-call count so a
+/// usage total can never read as a complete $0 when pricing was unknown.
+pub const UNIT_UNPRICED_COST: &str = "unpriced_provider_cost";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -101,6 +105,8 @@ pub enum UsageUnit {
     CacheWriteTokens,
     ReasoningTokens,
     ProviderCostMicro,
+    /// Unknown pricing: quantity 1, amount 0 — counted, never costed.
+    UnpricedProviderCost,
 }
 
 impl UsageUnit {
@@ -112,6 +118,7 @@ impl UsageUnit {
             UsageUnit::CacheWriteTokens => UNIT_CACHE_WRITE_TOKENS,
             UsageUnit::ReasoningTokens => UNIT_REASONING_TOKENS,
             UsageUnit::ProviderCostMicro => UNIT_PROVIDER_COST,
+            UsageUnit::UnpricedProviderCost => UNIT_UNPRICED_COST,
         }
     }
 
@@ -123,6 +130,7 @@ impl UsageUnit {
             UNIT_CACHE_WRITE_TOKENS => UsageUnit::CacheWriteTokens,
             UNIT_REASONING_TOKENS => UsageUnit::ReasoningTokens,
             UNIT_PROVIDER_COST => UsageUnit::ProviderCostMicro,
+            UNIT_UNPRICED_COST => UsageUnit::UnpricedProviderCost,
             _ => return None,
         })
     }
@@ -294,6 +302,18 @@ impl UsageEvent {
             ));
         }
         match self.unit {
+            UsageUnit::UnpricedProviderCost => {
+                if self.quantity != 1 {
+                    return Err(ControlPlaneError::Malformed(
+                        "an unpriced-call event carries quantity 1".into(),
+                    ));
+                }
+                if self.provider_cost_micro != 0 {
+                    return Err(ControlPlaneError::Malformed(
+                        "an unpriced-call event carries no cost".into(),
+                    ));
+                }
+            }
             UsageUnit::ProviderCostMicro => {
                 if self.quantity != 1 {
                     return Err(ControlPlaneError::Malformed(
@@ -1524,6 +1544,9 @@ pub struct UsageTotals {
     pub managed_cost_micro: u64,
     pub byok_cost_micro: u64,
     pub events: u64,
+    /// Settled calls whose pricing was UNKNOWN: they contribute no cost and
+    /// must be reported beside the cost totals, never as $0.
+    pub unpriced_calls: u64,
     /// Events whose row was superseded by a correction (they contribute
     /// nothing; the correction's values are folded instead).
     pub corrected_events: u64,
@@ -1599,6 +1622,10 @@ fn add_event(totals: &mut UsageTotals, event: &UsageEvent) -> Result<(), CreditL
         UsageUnit::ReasoningTokens => {
             totals.reasoning_tokens =
                 checked_ledger_sum("reasoning_tokens", totals.reasoning_tokens, event.quantity)?
+        }
+        UsageUnit::UnpricedProviderCost => {
+            totals.unpriced_calls =
+                checked_ledger_sum("unpriced_calls", totals.unpriced_calls, event.quantity)?
         }
         UsageUnit::ProviderCostMicro => {
             totals.provider_cost_micro = checked_ledger_sum(

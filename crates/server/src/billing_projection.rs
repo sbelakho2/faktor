@@ -189,6 +189,7 @@ impl BillingSpendProjector {
                     cache_write_tokens: row.cache_write_tokens,
                     reasoning_tokens: row.reasoning_tokens,
                     provider_cost_micro: row.provider_cost_micro,
+                    price_authority: row.price_authority,
                     provider_reported_micro: row.provider_reported_micro.unwrap_or(0),
                     state: row.state.clone(),
                     occurred_at_ms: row.occurred_at_ms,

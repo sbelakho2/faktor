@@ -113,5 +113,14 @@ blake3.workspace = true
 rusqlite = { version = "0.40", features = ["bundled"] }
 libc = "0.2"
 
+# The included faktor-cli source tree compiles in THIS crate outside
+# `cfg(test)` too (the lib is the binary source): the serve-lock OS boundary
+# needs the same reviewed target dependencies as faktor-cli itself.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
 [lints]
 workspace = true

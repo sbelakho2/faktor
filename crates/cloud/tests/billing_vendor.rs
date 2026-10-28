@@ -161,6 +161,7 @@ fn seed_usage(
             reasoning_tokens: 0,
             provider_cost_micro: cost,
             provider_reported_micro: cost,
+            price_authority: Some(faktor_core::model::PriceAuthority::Exact),
             state: "settled".into(),
             occurred_at_ms: 1_789_600_000_000,
             source_operation: "provider_call".into(),

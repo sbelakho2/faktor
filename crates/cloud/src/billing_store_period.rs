@@ -305,7 +305,7 @@ pub(super) fn write_period_total(
         &format!(
             "INSERT INTO billing_usage_period
                 (organization_id, period_id, {USAGE_TOTAL_COLUMNS})
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(organization_id, period_id) DO UPDATE SET
                 input_tokens = excluded.input_tokens,
                 output_tokens = excluded.output_tokens,
@@ -316,7 +316,8 @@ pub(super) fn write_period_total(
                 managed_cost_micro = excluded.managed_cost_micro,
                 byok_cost_micro = excluded.byok_cost_micro,
                 events = excluded.events,
-                corrected_events = excluded.corrected_events"
+                corrected_events = excluded.corrected_events,
+                unpriced_calls = excluded.unpriced_calls"
         ),
         params![
             organization.as_str(),
@@ -331,6 +332,7 @@ pub(super) fn write_period_total(
             totals.byok_cost_micro.to_string(),
             totals.events.to_string(),
             totals.corrected_events.to_string(),
+            totals.unpriced_calls.to_string(),
         ],
     )
     .map_err(backend)?;
@@ -348,7 +350,7 @@ pub(super) fn write_period_bucket(
         &format!(
             "INSERT INTO billing_usage_period_task
                 (organization_id, period_id, task_id, run_id, {USAGE_TOTAL_COLUMNS})
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
              ON CONFLICT(organization_id, period_id, task_id, run_id) DO UPDATE SET
                 input_tokens = excluded.input_tokens,
                 output_tokens = excluded.output_tokens,
@@ -359,7 +361,8 @@ pub(super) fn write_period_bucket(
                 managed_cost_micro = excluded.managed_cost_micro,
                 byok_cost_micro = excluded.byok_cost_micro,
                 events = excluded.events,
-                corrected_events = excluded.corrected_events"
+                corrected_events = excluded.corrected_events,
+                unpriced_calls = excluded.unpriced_calls"
         ),
         params![
             organization.as_str(),
@@ -376,6 +379,7 @@ pub(super) fn write_period_bucket(
             totals.byok_cost_micro.to_string(),
             totals.events.to_string(),
             totals.corrected_events.to_string(),
+            totals.unpriced_calls.to_string(),
         ],
     )
     .map_err(backend)?;

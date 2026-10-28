@@ -74,6 +74,7 @@ faktor-mcp = { workspace = true, features = ["test-utils"] }
 rusqlite.workspace = true
 faktor-session = { path = "../session", features = ["test-utils"] }
 faktor-provider = { workspace = true, features = ["test-utils"] }
+faktor-test-mocks = { path = "../test-mocks" }
 # Router tests drive the deterministic crash seams: the orchestrator's
 # execution seam vocabulary and the store's crash-arm boundaries.
 faktor-orchestrator = { workspace = true, features = ["fault-injection", "test-utils"] }

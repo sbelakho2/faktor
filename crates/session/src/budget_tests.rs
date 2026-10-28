@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 use super::*;
 use crate::handle::tests::{session, test_manager};
 use faktor_core::state::TaskState;
@@ -2263,5 +2264,395 @@ fn change_budget_read_is_point_addressed_under_turn_churn() {
     assert!(
         elapsed < std::time::Duration::from_millis(500),
         "change budget paid for unrelated fact churn: {elapsed:?}"
+    );
+}
+
+/// Every durable cost-cap entry point enforces the SAME domain: a real cap
+/// of 1 microUSD is accepted and admits exactly 1 micro, while 0 (ambiguous
+/// with the store's unlimited NULL/0), a value above `i64::MAX` (which the
+/// signed task column would silently clamp) and fractional/negative wire
+/// forms are refused typed. The child-cap entry point validates the same
+/// domain before it touches any child row.
+#[tokio::test]
+async fn every_cost_cap_entry_refuses_zero_and_over_domain_and_enforces_one_micro() {
+    let (_d, m, ledger) = fresh_ledger();
+    let s = session(&m);
+    let task = seeded_task(&s, Some(1));
+    // A 1-micro cap admits exactly 1 micro and refuses the next paid call.
+    let r = ledger
+        .reserve(
+            s.id,
+            task,
+            OpId::new(700),
+            1,
+            None,
+            faktor_core::model::ExecutionClass::Unknown,
+        )
+        .await
+        .unwrap();
+    let err = ledger
+        .reserve(
+            s.id,
+            task,
+            OpId::new(701),
+            1,
+            None,
+            faktor_core::model::ExecutionClass::Unknown,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        BudgetError::BudgetExceeded {
+            free: 0,
+            predicted: 1,
+        }
+    );
+    ledger
+        .settle_usage(s.id, r, 0, 0, 0, 0, Some(1), None)
+        .await
+        .unwrap();
+    assert_eq!(ledger.view(s.id, task).spent_cost_micro, 1);
+
+    // Zero is not "clear" and not "unlimited": the typed Malformed names the
+    // ambiguity; `None` is the only clear form.
+    let zero = ledger.set_task_max_cost(s.id, task, Some(0)).unwrap_err();
+    assert!(
+        matches!(zero, BudgetError::Malformed(ref m) if m.contains(">= 1")),
+        "{zero:?}"
+    );
+    ledger.set_task_max_cost(s.id, task, None).unwrap();
+    assert_eq!(ledger.view(s.id, task).max_cost_micro, None);
+
+    // The durable maximum is i64::MAX; a larger cap is refused, never
+    // clamped, and the boundary itself is accepted.
+    let over = ledger
+        .set_task_max_cost(s.id, task, Some(i64::MAX as u64 + 1))
+        .unwrap_err();
+    assert!(
+        matches!(over, BudgetError::Malformed(ref m) if m.contains("i64::MAX")),
+        "{over:?}"
+    );
+    ledger
+        .set_task_max_cost(s.id, task, Some(i64::MAX as u64))
+        .unwrap();
+    assert_eq!(
+        ledger.view(s.id, task).max_cost_micro,
+        Some(i64::MAX as u64)
+    );
+    ledger.set_task_max_cost(s.id, task, None).unwrap();
+}
+
+/// The cap domain is enforced BEFORE a child scope is seeded or enrolled, so
+/// a refused change cannot leave a half-written child row behind. A valid
+/// cap proceeds to the ordinary "not an orchestrated child" refusal.
+#[tokio::test]
+async fn child_cost_cap_entry_validates_the_domain_before_any_child_effect() {
+    let (_d, m, ledger) = fresh_ledger();
+    let s = session(&m);
+    for bad in [Some(0u64), Some(i64::MAX as u64 + 1)] {
+        let err = ledger
+            .change_child_scope_cap(s.id, "child-x", bad)
+            .unwrap_err();
+        assert!(matches!(err, BudgetError::Malformed(_)), "{bad:?}: {err:?}");
+    }
+    let err = ledger
+        .change_child_scope_cap(s.id, "child-x", Some(1))
+        .unwrap_err();
+    assert!(
+        matches!(err, BudgetError::NotAnOrchestratedChild(_)),
+        "a valid cap reaches the real child-identity check: {err:?}"
+    );
+    assert!(
+        ledger.scope_of(s.id).unwrap().is_none(),
+        "refused caps enroll nothing"
+    );
+}
+
+/// Micro-unit rounding loop: a 1-microUSD-per-million price over 1 token
+/// still costs 1 microUSD (never a free zero), every remainder rounds UP
+/// once, `i64::MAX` tokens stays exact, and repeated halving never
+/// understates or overstates the independent ceiling formula.
+#[tokio::test]
+async fn settlement_rounding_loop_never_truncates_to_zero_or_understates() {
+    use faktor_core::model::{MicroUsdPerMillionTokens, PriceQuote};
+    let (_d, m, ledger) = fresh_ledger();
+    let s = session(&m);
+    let tiny = PriceQuote {
+        input: MicroUsdPerMillionTokens(1),
+        output: MicroUsdPerMillionTokens(1),
+        cache_read: MicroUsdPerMillionTokens(1),
+        cache_write: MicroUsdPerMillionTokens(1),
+    };
+    let snapshot = PricingSnapshot::exact(tiny, 1, "tiny-1ppm".into());
+    let task = seeded_task(&s, Some(i64::MAX as u64));
+    // The ceiling oracle is independent of the SUT: ceil(tokens * 1 / 1e6).
+    let expect =
+        |tokens: u64| -> u64 { u64::try_from((tokens as u128).div_ceil(1_000_000)).unwrap() };
+    let mut cases = vec![1u64, 2, 999_999, 1_000_000, 1_000_001];
+    let mut halving = i64::MAX as u64 / 4;
+    while halving > 0 {
+        cases.push(halving);
+        halving /= 2;
+    }
+    let mut total = 0u64;
+    for (i, tokens) in cases.into_iter().enumerate() {
+        let r = ledger
+            .reserve(
+                s.id,
+                task,
+                OpId::new(800 + i as u64),
+                1,
+                Some(snapshot.clone()),
+                faktor_core::model::ExecutionClass::Unknown,
+            )
+            .await
+            .unwrap();
+        let actual = ledger
+            .settle_usage(s.id, r, tokens, 0, 0, 0, None, None)
+            .await
+            .unwrap()
+            .expect("an exact quote always settles a number");
+        let want = expect(tokens);
+        assert_eq!(actual, want, "tokens={tokens} must round up exactly once");
+        if tokens > 0 {
+            assert!(
+                actual >= 1,
+                "positive usage at a positive price is never free"
+            );
+        }
+        total = total.checked_add(want).expect("case sum fits u64");
+        assert_eq!(ledger.view(s.id, task).spent_cost_micro, total);
+    }
+    // The hostile maximum fits the u64 aggregate and its own i64::MAX cap.
+    let r = ledger
+        .reserve(
+            s.id,
+            task,
+            OpId::new(900),
+            1,
+            Some(snapshot),
+            faktor_core::model::ExecutionClass::Unknown,
+        )
+        .await
+        .unwrap();
+    let actual = ledger
+        .settle_usage(s.id, r, i64::MAX as u64, 0, 0, 0, None, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(actual, expect(i64::MAX as u64));
+    total = total.checked_add(actual).unwrap();
+    assert_eq!(ledger.view(s.id, task).spent_cost_micro, total);
+}
+
+/// Crash loop between reservation and settlement: a dispatched-but-unsettled
+/// reservation is never lost (it survives reopen), recovery never charges it
+/// twice (it becomes UNCERTAIN and keeps consuming free), and the completion
+/// finalize charges the estimate exactly once. A never-dispatched sibling is
+/// refunded, never charged.
+#[tokio::test]
+async fn crash_recovery_loop_never_double_charges_and_never_loses_a_reservation() {
+    for round in 0..12u64 {
+        let dir = tempfile::tempdir().unwrap();
+        let amount = 100 + round * 7;
+        let (sid, task, op_base);
+        {
+            let m =
+                crate::SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                    .unwrap();
+            let s = session(&m);
+            let ledger = DurableBudgetLedger::new(m.clone());
+            task = seeded_task(&s, Some(10_000));
+            sid = s.id;
+            op_base = 1_000 + round * 10;
+            let dispatched = ledger
+                .reserve(
+                    sid,
+                    task,
+                    OpId::new(op_base),
+                    amount,
+                    None,
+                    faktor_core::model::ExecutionClass::Unknown,
+                )
+                .await
+                .unwrap();
+            ledger.mark_dispatched(sid, dispatched).await.unwrap();
+            let never_sent = ledger
+                .reserve(
+                    sid,
+                    task,
+                    OpId::new(op_base + 1),
+                    amount,
+                    None,
+                    faktor_core::model::ExecutionClass::Unknown,
+                )
+                .await
+                .unwrap();
+            assert!(never_sent.raw() > 0);
+            // "Crash": both rows stay open on disk.
+        }
+        let m2 =
+            crate::SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                .unwrap();
+        let ledger2 = DurableBudgetLedger::new(m2.clone());
+        // Nothing is lost before recovery: both rows are still present and
+        // still hold their money.
+        let before = ledger2.view(sid, task);
+        assert_eq!(before.open_reservations, 2, "round {round}: rows survived");
+        assert_eq!(before.open_reserved_micro, amount * 2);
+        ledger2.recover_after_restart();
+        let after = ledger2.view(sid, task);
+        assert_eq!(after.open_reservations, 0);
+        assert_eq!(after.uncertain_reservations, 1);
+        assert_eq!(after.uncertain_reserved_micro, amount);
+        assert_eq!(
+            after.spent_cost_micro, 0,
+            "recovery never charges a may-have-billed row"
+        );
+        // A second idempotent recovery changes nothing.
+        ledger2.recover_after_restart();
+        assert_eq!(ledger2.view(sid, task).spent_cost_micro, 0);
+        let report = ledger2.finalize_uncertain(sid, task).await.unwrap();
+        assert_eq!(report.settled, 1);
+        assert_eq!(report.charged_micro, amount);
+        let view = ledger2.view(sid, task);
+        assert_eq!(view.spent_cost_micro, amount, "charged exactly once");
+        assert_eq!(view.uncertain_reservations, 0);
+        // A repeated finalize is a no-op: never a double charge.
+        let again = ledger2.finalize_uncertain(sid, task).await.unwrap();
+        assert_eq!(again.settled, 0);
+        assert_eq!(again.charged_micro, 0);
+        assert_eq!(ledger2.view(sid, task).spent_cost_micro, amount);
+        let rows = ledger2.reservations_of(sid, task, 10).unwrap();
+        assert_eq!(rows.len(), 2, "neither reservation was lost");
+        assert_eq!(
+            rows.iter().filter(|r| r.status == "refunded").count(),
+            1,
+            "the never-dispatched sibling is refunded"
+        );
+    }
+}
+
+// ------------------- spawn-time cost-scope enrollment (audit 9/H wiring)
+//
+// The reported hole: orchestrated children reserved against a NULL child
+// cap (unlimited), so a run-level cap only bounded the root row. The ledger
+// enrollment is the fix the orchestrator now calls for every child.
+
+#[tokio::test]
+async fn spawn_enrollment_makes_children_consume_a_finite_root_cap() {
+    let (_d, m, ledger) = fresh_ledger();
+    let root = session(&m);
+    let root_task = seeded_task(&root, Some(10_000_000));
+    ledger
+        .set_task_max_cost(root.id, root_task, Some(10_000_000))
+        .unwrap();
+    let a = child_session(&m, root.id, "a");
+    let a_task = a.task_id().unwrap();
+    // The hole before enrollment: no child row cap, no root enrollment.
+    assert!(m.store().cost_task_row(a.id, a_task).unwrap().is_none());
+    assert!(ledger.scope_of(a.id).unwrap().is_none());
+
+    ledger
+        .enroll_child_in_root_scope(a.id, "child-a", None)
+        .unwrap();
+
+    let row = m
+        .store()
+        .cost_task_row(a.id, a_task)
+        .unwrap()
+        .expect("enrollment seeds the child task row");
+    assert_eq!(
+        row.max_cost_micro,
+        Some(10_000_000),
+        "the child must inherit the finite run cap, never a NULL (unlimited) cap"
+    );
+    let scope = ledger
+        .scope_of(a.id)
+        .unwrap()
+        .expect("root subscope enrollment");
+    assert_eq!(scope.root_session_id, root.id);
+    assert_eq!(scope.consumer_session_id, a.id);
+    assert_eq!(scope.consumer_task_id, a_task);
+    assert_eq!(scope.child_cap_micro, Some(10_000_000));
+
+    // Re-attach / crash resume runs the same enrollment again: idempotent.
+    ledger
+        .enroll_child_in_root_scope(a.id, "child-a", None)
+        .unwrap();
+    assert_eq!(
+        m.store()
+            .cost_task_row(a.id, a_task)
+            .unwrap()
+            .unwrap()
+            .max_cost_micro,
+        Some(10_000_000)
+    );
+}
+
+#[tokio::test]
+async fn an_unlimited_root_enrolls_nothing_and_children_stay_null() {
+    let (_d, m, ledger) = fresh_ledger();
+    let root = session(&m);
+    let root_task = seeded_task(&root, None);
+    ledger.set_task_max_cost(root.id, root_task, None).unwrap();
+    let a = child_session(&m, root.id, "a");
+    let a_task = a.task_id().unwrap();
+
+    ledger
+        .enroll_child_in_root_scope(a.id, "child-a", None)
+        .unwrap();
+
+    assert!(
+        m.store().cost_task_row(a.id, a_task).unwrap().is_none(),
+        "an unlimited run has nothing to bound; no child row is written"
+    );
+    assert!(ledger.scope_of(a.id).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn explicit_child_cap_wins_and_non_children_are_documented_no_ops() {
+    let (_d, m, ledger) = fresh_ledger();
+    let root = session(&m);
+    let root_task = seeded_task(&root, Some(10_000_000));
+    ledger
+        .set_task_max_cost(root.id, root_task, Some(10_000_000))
+        .unwrap();
+    let a = child_session(&m, root.id, "a");
+    let a_task = a.task_id().unwrap();
+
+    ledger
+        .enroll_child_in_root_scope(a.id, "child-a", Some(3_000_000))
+        .unwrap();
+    assert_eq!(
+        m.store()
+            .cost_task_row(a.id, a_task)
+            .unwrap()
+            .unwrap()
+            .max_cost_micro,
+        Some(3_000_000),
+        "an explicit per-child budget overrides the inherited root cap"
+    );
+    assert_eq!(
+        ledger.scope_of(a.id).unwrap().unwrap().child_cap_micro,
+        Some(3_000_000)
+    );
+
+    // A session without an orchestrated child identity has no root scope:
+    // documented no-op, never a refusal, and it must not enroll itself.
+    ledger
+        .enroll_child_in_root_scope(root.id, "root-as-child", None)
+        .unwrap();
+    assert!(ledger.scope_of(root.id).unwrap().is_none());
+
+    // Hostile child id: the same bounded validation as the direct API.
+    let too_long = "x".repeat(crate::budget::MAX_SCOPE_CHILD_ID_CHARS + 1);
+    let err = ledger
+        .enroll_child_in_root_scope(a.id, &too_long, None)
+        .unwrap_err();
+    assert!(
+        matches!(err, crate::budget::BudgetError::Malformed(_)),
+        "{err}"
     );
 }

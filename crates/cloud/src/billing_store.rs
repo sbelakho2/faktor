@@ -1363,8 +1363,8 @@ fn usage_totals_from_row(
     row: &rusqlite::Row<'_>,
     offset: usize,
 ) -> Result<UsageTotals, BillingStoreError> {
-    let mut fields = Vec::with_capacity(10);
-    for index in 0..10 {
+    let mut fields = Vec::with_capacity(11);
+    for index in 0..11 {
         fields.push(row.get::<_, String>(offset + index).map_err(backend)?);
     }
     let totals = UsageTotals {
@@ -1378,13 +1378,14 @@ fn usage_totals_from_row(
         byok_cost_micro: rollup_u64("byok_cost_micro", &fields[7])?,
         events: rollup_u64("events", &fields[8])?,
         corrected_events: rollup_u64("corrected_events", &fields[9])?,
+        unpriced_calls: rollup_u64("unpriced_calls", &fields[10])?,
     };
     Ok(totals)
 }
 
 const USAGE_TOTAL_COLUMNS: &str = "input_tokens, output_tokens, cache_read_tokens, \
      cache_write_tokens, reasoning_tokens, provider_cost_micro, managed_cost_micro, \
-     byok_cost_micro, events, corrected_events";
+     byok_cost_micro, events, corrected_events, unpriced_calls";
 
 fn read_usage_projection(
     conn: &Connection,
@@ -1402,7 +1403,7 @@ fn read_usage_projection(
     match rows.next().map_err(backend)? {
         Some(row) => {
             let totals = usage_totals_from_row(row, 0)?;
-            let watermark: i64 = row.get(10).map_err(backend)?;
+            let watermark: i64 = row.get(11).map_err(backend)?;
             Ok(Some((totals, watermark)))
         }
         None => Ok(None),
@@ -1507,6 +1508,11 @@ fn combine_totals(
             &mut target.corrected_events,
             delta.corrected_events,
         ),
+        (
+            "unpriced_calls",
+            &mut target.unpriced_calls,
+            delta.unpriced_calls,
+        ),
     ] {
         combine(field, left, right, sign, context)?;
     }
@@ -1524,6 +1530,7 @@ fn event_values(event: &UsageEvent) -> UsageTotals {
         UsageUnit::CacheReadTokens => values.cache_read_tokens = event.quantity,
         UsageUnit::CacheWriteTokens => values.cache_write_tokens = event.quantity,
         UsageUnit::ReasoningTokens => values.reasoning_tokens = event.quantity,
+        UsageUnit::UnpricedProviderCost => values.unpriced_calls = event.quantity,
         UsageUnit::ProviderCostMicro => {
             values.provider_cost_micro = event.provider_cost_micro;
             match event.category {
@@ -1786,7 +1793,7 @@ fn write_usage_total(
         &format!(
             "INSERT INTO billing_usage_total
                 (organization_id, {USAGE_TOTAL_COLUMNS}, watermark)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(organization_id) DO UPDATE SET
                 input_tokens = excluded.input_tokens,
                 output_tokens = excluded.output_tokens,
@@ -1798,6 +1805,7 @@ fn write_usage_total(
                 byok_cost_micro = excluded.byok_cost_micro,
                 events = excluded.events,
                 corrected_events = excluded.corrected_events,
+                unpriced_calls = excluded.unpriced_calls,
                 watermark = excluded.watermark"
         ),
         params![
@@ -1812,6 +1820,7 @@ fn write_usage_total(
             totals.byok_cost_micro.to_string(),
             totals.events.to_string(),
             totals.corrected_events.to_string(),
+            totals.unpriced_calls.to_string(),
             watermark,
         ],
     )
@@ -1829,7 +1838,7 @@ fn write_usage_bucket(
         &format!(
             "INSERT INTO billing_usage_task
                 (organization_id, task_id, run_id, {USAGE_TOTAL_COLUMNS})
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
              ON CONFLICT(organization_id, task_id, run_id) DO UPDATE SET
                 input_tokens = excluded.input_tokens,
                 output_tokens = excluded.output_tokens,
@@ -1840,7 +1849,8 @@ fn write_usage_bucket(
                 managed_cost_micro = excluded.managed_cost_micro,
                 byok_cost_micro = excluded.byok_cost_micro,
                 events = excluded.events,
-                corrected_events = excluded.corrected_events"
+                corrected_events = excluded.corrected_events,
+                unpriced_calls = excluded.unpriced_calls"
         ),
         params![
             organization.as_str(),
@@ -1856,6 +1866,7 @@ fn write_usage_bucket(
             totals.byok_cost_micro.to_string(),
             totals.events.to_string(),
             totals.corrected_events.to_string(),
+            totals.unpriced_calls.to_string(),
         ],
     )
     .map_err(backend)?;

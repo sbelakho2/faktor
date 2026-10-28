@@ -1,8 +1,8 @@
 {
   "schema": "faktor-test-programme-registry/v1",
-  "generated_at": "2026-10-27T02:23:05.529Z",
-  "commit": "4c437030341a8a575e2ff58a8c22399d5d232bf7",
-  "tree": "c0c5690cd95ca9620902ddd06ded784c7d5c6643",
+  "generated_at": "2026-10-28T08:39:57.428Z",
+  "commit": "0d6e7744b8e58f689720fa84a8f663093c9179cf",
+  "tree": "3141f9c34a46ca6f196c6c4d032240040556caa0",
   "layers": [
     "structural",
     "unit",
@@ -19,42 +19,42 @@
     "release"
   ],
   "counts": {
-    "rows": 1073,
+    "rows": 1080,
     "by_kind": {
       "acceptance-scenario": 40,
       "act-now": 8,
       "adapter": 8,
       "builtin-tool": 14,
-      "cli-command": 49,
+      "cli-command": 50,
       "config-key": 53,
       "control": 200,
-      "invariant": 251,
+      "invariant": 258,
       "jetbrains-contribution": 1,
       "native-route": 299,
       "provider-adapter": 6,
       "screen": 72,
-      "vscode-contribution": 39,
+      "vscode-contribution": 38,
       "vscode-setting": 17,
       "workflow": 16
     },
     "by_status": {
-      "deferred": 950,
+      "deferred": 956,
       "failed": 1,
-      "proven": 54,
+      "proven": 55,
       "stub": 68
     },
     "by_lane": {
-      "nightly": 605,
-      "pull": 742,
-      "trusted": 1072,
+      "nightly": 612,
+      "pull": 749,
+      "trusted": 1079,
       "weekly-live": 342
     },
     "by_layer": {
       "agent-evals": 1,
-      "contracts": 436,
-      "ide-screen-readers": 385,
-      "state-model-crash": 349,
-      "unit-property": 334
+      "contracts": 437,
+      "ide-screen-readers": 384,
+      "state-model-crash": 356,
+      "unit-property": 341
     }
   },
   "rows": [
@@ -1252,7 +1252,7 @@
       ],
       "evidence": {
         "passed": false,
-        "reason": "Error: route probe daemon did not start: \u001b[2m2026-10-27T02:23:04.225894Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mfaktor_cli::daemon::serve\u001b[0m\u001b[2m:\u001b[0m daemon build failed: routing_mode Economy admits no candidate for 2 configured model(s) (p1/default, p1/m); a first model call would otherwise fail as NoCapableModel. Every configured model has Unknown pricing (p1/default, p1/m), which economy cannot cost or budget. Configure an exact quote or a pricing ceiling for that endpoint, point base_url at a canonical official endpoint, or use routing_mode maximum_quality/pinned.\n"
+        "reason": "Error: route probe daemon did not start: \u001b[2m2026-10-28T08:39:56.581837Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mfaktor_cli::daemon::serve\u001b[0m\u001b[2m:\u001b[0m daemon build failed: routing_mode Economy admits no candidate for 2 configured model(s) (p1/default, p1/m); a first model call would otherwise fail as NoCapableModel. Every configured model has Unknown pricing (p1/default, p1/m), which economy cannot cost or budget. Configure an exact quote or a pricing ceiling for that endpoint, point base_url at a canonical official endpoint, or use routing_mode maximum_quality/pinned.\n"
       }
     },
     {
@@ -2753,6 +2753,43 @@
         "observed": {
           "command": "impact",
           "help_bytes": 576,
+          "unknown_flag_exit": 2
+        }
+      }
+    },
+    {
+      "id": "cli.install",
+      "kind": "cli-command",
+      "path": "crates/cli/src/main.rs",
+      "layers": [
+        "contracts"
+      ],
+      "lanes": [
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "cli.exit-codes.install",
+        "cli.help.install"
+      ],
+      "evidence_kind": "exact-value",
+      "oracle": "Golden help resolves the exact command; success/usage/refusal exit codes are distinct and unknown flags fail rather than being ignored.",
+      "status": "proven",
+      "meta": {
+        "command": "install"
+      },
+      "adversarial": [
+        "help",
+        "unknown-flag",
+        "missing-daemon",
+        "redaction",
+        "idempotence"
+      ],
+      "evidence": {
+        "passed": true,
+        "observed": {
+          "command": "install",
+          "help_bytes": 868,
           "unknown_flag_exit": 2
         }
       }
@@ -14161,6 +14198,36 @@
       "evidence": null
     },
     {
+      "id": "invariant.INV-CHAT-BOARD-NOT-IN-WORK",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "script.INV-CHAT-BOARD-NOT-IN-WORK"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-CHAT-BOARD-NOT-IN-WORK",
+        "unit_test": "",
+        "wiring_test": ""
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
       "id": "invariant.INV-CHECKPOINT-EVIDENCE-STORE-FAILURE",
       "kind": "invariant",
       "path": "tests/invariants.toml",
@@ -15599,6 +15666,36 @@
       "evidence": null
     },
     {
+      "id": "invariant.INV-EDITION8-ONE-SETTINGS-SURFACE",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "script.INV-EDITION8-ONE-SETTINGS-SURFACE"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-EDITION8-ONE-SETTINGS-SURFACE",
+        "unit_test": "",
+        "wiring_test": ""
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
       "id": "invariant.INV-EDITION8-ORG-SCOPED-COMMERCIAL-READS",
       "kind": "invariant",
       "path": "tests/invariants.toml",
@@ -15679,6 +15776,36 @@
       "status": "deferred",
       "meta": {
         "mutation": "node scripts/mutation-run.mjs INV-EDITION8-S55-CONNECT-PRIMARY",
+        "unit_test": "",
+        "wiring_test": ""
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-EDITION8-SETTINGS-WIRING",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "script.INV-EDITION8-SETTINGS-WIRING"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-EDITION8-SETTINGS-WIRING",
         "unit_test": "",
         "wiring_test": ""
       },
@@ -19589,6 +19716,36 @@
       "evidence": null
     },
     {
+      "id": "invariant.INV-VSCODE-ASK-ISOLATION",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "script.INV-VSCODE-ASK-ISOLATION"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-VSCODE-ASK-ISOLATION",
+        "unit_test": "",
+        "wiring_test": ""
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
       "id": "invariant.INV-VSCODE-ATTACHMENT-UI-REACHABILITY",
       "kind": "invariant",
       "path": "tests/invariants.toml",
@@ -19609,6 +19766,36 @@
       "status": "deferred",
       "meta": {
         "mutation": "node scripts/mutation-run.mjs INV-VSCODE-ATTACHMENT-UI-REACHABILITY",
+        "unit_test": "",
+        "wiring_test": ""
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-VSCODE-ATTENTION-AGGREGATION",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "script.INV-VSCODE-ATTENTION-AGGREGATION"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-VSCODE-ATTENTION-AGGREGATION",
         "unit_test": "",
         "wiring_test": ""
       },
@@ -19669,6 +19856,66 @@
       "status": "deferred",
       "meta": {
         "mutation": "node scripts/mutation-run.mjs INV-VSCODE-KEYBOARD-SUBMISSION",
+        "unit_test": "",
+        "wiring_test": ""
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-VSCODE-NO-BILLING-REFRESH",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "script.INV-VSCODE-NO-BILLING-REFRESH"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-VSCODE-NO-BILLING-REFRESH",
+        "unit_test": "",
+        "wiring_test": ""
+      },
+      "adversarial": [
+        "planted-mutation",
+        "wiring"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "invariant.INV-VSCODE-STATE-MAPPING",
+      "kind": "invariant",
+      "path": "tests/invariants.toml",
+      "layers": [
+        "state-model-crash",
+        "unit-property"
+      ],
+      "lanes": [
+        "nightly",
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "script.INV-VSCODE-STATE-MAPPING"
+      ],
+      "evidence_kind": "property",
+      "oracle": "The unit test proves the statement, the wiring test proves production reaches it, and a planted mutation makes the oracle fire.",
+      "status": "deferred",
+      "meta": {
+        "mutation": "node scripts/mutation-run.mjs INV-VSCODE-STATE-MAPPING",
         "unit_test": "",
         "wiring_test": ""
       },
@@ -35472,32 +35719,6 @@
       ],
       "test_ids": [
         "vscode.contract.vscode.view.faktor.chat"
-      ],
-      "evidence_kind": "exact-value",
-      "oracle": "The contribution/setting exists with its declared id, is reachable from the packaged extension, and its effect is exercised against the daemon (not only the name).",
-      "status": "deferred",
-      "meta": {},
-      "adversarial": [
-        "registered",
-        "arg-schema",
-        "disabled-state",
-        "host-parity"
-      ],
-      "evidence": null
-    },
-    {
-      "id": "vscode.view.faktor.edition8",
-      "kind": "vscode-contribution",
-      "path": "apps/vscode/package.json",
-      "layers": [
-        "ide-screen-readers"
-      ],
-      "lanes": [
-        "pull",
-        "trusted"
-      ],
-      "test_ids": [
-        "vscode.contract.vscode.view.faktor.edition8"
       ],
       "evidence_kind": "exact-value",
       "oracle": "The contribution/setting exists with its declared id, is reachable from the packaged extension, and its effect is exercised against the daemon (not only the name).",

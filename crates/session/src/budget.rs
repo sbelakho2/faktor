@@ -363,6 +363,33 @@ const MAX_SCOPE_FACT_PAGES: usize = 8;
 /// Memory-fact page size of the enrollment scan.
 const SCOPE_FACT_PAGE: i64 = 200;
 
+/// The largest legal durable task cost cap in microUSD. The task row's
+/// monetary columns are signed 64-bit INTEGERs (schema v15) and the billing
+/// credit domain is bounded at the same `i64::MAX`; accepting a larger cap
+/// would silently clamp it at the store boundary. Both entry points
+/// ([`DurableBudgetLedger::set_task_max_cost`],
+/// [`DurableBudgetLedger::change_child_scope_cap`]) refuse it typed instead.
+pub const MAX_TASK_COST_CAP_MICRO: u64 = i64::MAX as u64;
+
+/// The ONE cost-cap domain rule shared by every ledger entry point: `None`
+/// clears (unlimited), `Some(1..=i64::MAX)` is a real cap, and `Some(0)` is
+/// refused as ambiguous because the store reads `NULL`/`0` as unlimited
+/// (removing a cap must be `None`, never a silent zero). An out-of-domain
+/// maximum is refused rather than clamped.
+fn validate_task_cost_cap(max_cost_micro: Option<u64>) -> Result<(), BudgetError> {
+    match max_cost_micro {
+        None => Ok(()),
+        Some(0) => Err(BudgetError::Malformed(
+            "max_cost_micro must be >= 1 (0 is ambiguous: the store reads a NULL/0 cap as unlimited; clear the cap with None instead)"
+                .into(),
+        )),
+        Some(cap) if cap > MAX_TASK_COST_CAP_MICRO => Err(BudgetError::Malformed(format!(
+            "max_cost_micro {cap} exceeds the durable maximum {MAX_TASK_COST_CAP_MICRO} (i64::MAX): the task row cannot store a larger cap without clamping"
+        ))),
+        Some(_) => Ok(()),
+    }
+}
+
 /// The durable enrollment of one child task under a root task (subscope
 /// admission). Written as one memory-fact row under the ROOT session; the
 /// authoritative child cap stays on the child's own task row (this row's
@@ -748,12 +775,63 @@ impl DurableBudgetLedger {
         task_id: TaskId,
         max_cost_micro: Option<u64>,
     ) -> Result<(), BudgetError> {
+        validate_task_cost_cap(max_cost_micro)?;
         let guard = budget_admission_lock()
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         self.set_task_max_cost_locked(session_id, task_id, max_cost_micro, true)?;
         drop(guard);
         Ok(())
+    }
+
+    /// Enroll an orchestrated child in its ROOT's budget subscope with the
+    /// child's cost cap. `explicit` wins; otherwise the child INHERITS a
+    /// finite root cap — the orchestrator spawn path calls this for every
+    /// child, so a run-level cap bounds the SUM of its children instead of
+    /// children reserving against a NULL (unlimited) child cap. An
+    /// unlimited root enrolls nothing (nothing to bound). A session without
+    /// an orchestrated child identity, or whose root row is gone, has no
+    /// root scope: a documented no-op, never a spawn refusal.
+    pub fn enroll_child_in_root_scope(
+        &self,
+        child_session: SessionId,
+        child_id: &str,
+        explicit: Option<u64>,
+    ) -> Result<(), BudgetError> {
+        if child_id.is_empty() || child_id.chars().count() > MAX_SCOPE_CHILD_ID_CHARS {
+            return Err(BudgetError::Malformed(format!(
+                "child id must be 1..={MAX_SCOPE_CHILD_ID_CHARS} characters"
+            )));
+        }
+        validate_task_cost_cap(explicit)?;
+        let manager = self.session.clone();
+        let child_handle = match manager.get_session(child_session) {
+            Ok(Some(handle)) => handle,
+            Ok(None) => return Ok(()),
+            Err(e) => return Err(BudgetError::Store(e.to_string())),
+        };
+        let identity = match child_handle.orchestrator_child_identity_get() {
+            Ok(Some(identity)) => identity,
+            Ok(None) => return Ok(()),
+            Err(e) => return Err(BudgetError::Store(e.message)),
+        };
+        let root_cap = match manager.get_session(identity.parent_session_id) {
+            Ok(Some(root)) => {
+                // A root without its task row cannot be inherited FROM: fail
+                // loud instead of silently leaving the child unlimited.
+                let root_task = root.task_id().map_err(|e| BudgetError::Store(e.message))?;
+                self.store()
+                    .cost_task_row(identity.parent_session_id, root_task)
+                    .map_err(|e| BudgetError::Store(e.to_string()))?
+                    .and_then(|row| row.max_cost_micro)
+            }
+            Ok(None) => None,
+            Err(e) => return Err(BudgetError::Store(e.to_string())),
+        };
+        match explicit.or(root_cap) {
+            Some(cap) => self.change_child_scope_cap(child_session, child_id, Some(cap)),
+            None => Ok(()),
+        }
     }
 
     /// The child cost-cap effect of a typed budget change (audit 9/H): the
@@ -779,6 +857,7 @@ impl DurableBudgetLedger {
                 "child id must be 1..={MAX_SCOPE_CHILD_ID_CHARS} characters"
             )));
         }
+        validate_task_cost_cap(max_cost_micro)?;
         let manager = self.session.clone();
         let child_handle = match manager.get_session(child_session) {
             Ok(Some(h)) => h,

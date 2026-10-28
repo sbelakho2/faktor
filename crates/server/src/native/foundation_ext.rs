@@ -2500,16 +2500,27 @@ pub(crate) async fn native_change_accept(
     let Some(shadows) = state.deps.tasks.shadows() else {
         return unavailable("the shadow change-set authority is not wired in this host");
     };
-    let change_set = match shadows.present_change_set(handle.id()) {
-        Ok(change_set) => change_set,
-        Err(e) => return super::agents::exec_error_response(&e),
-    };
-    let change_set_id = format!("{}-cs", change_set.base_id);
-    let digest = change_receipt_digest(&body, &change_set_id);
     let foundation = match foundation(&state) {
         Ok(f) => f,
         Err(r) => return r,
     };
+    // Resolve the change-set identity from the DURABLE shadow row (the same
+    // `base-<shadow_id>-cs` the orchestrator derives) and consult the
+    // stored receipt FIRST. An accepted change set is Integrated, and
+    // `present_change_set` rightly refuses to stage it again; a replay of
+    // the SAME decision must still return the stored receipt instead of a
+    // misleading conflict.
+    let shadow_row = match shadows.active_shadow(handle.id()) {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            return unavailable(
+                "the session has no candidate change set; stage one before accepting",
+            )
+        }
+        Err(e) => return super::agents::exec_error_response(&e),
+    };
+    let change_set_id = format!("base-{}-cs", shadow_row.shadow_id);
+    let digest = change_receipt_digest(&body, &change_set_id);
     match foundation
         .session_settings
         .change_receipt(handle.id().raw(), &change_set_id)
@@ -2525,6 +2536,9 @@ pub(crate) async fn native_change_accept(
         }
         Ok(None) => {}
         Err(e) => return foundation_error(e),
+    }
+    if let Err(e) = shadows.present_change_set(handle.id()) {
+        return super::agents::exec_error_response(&e);
     }
     let approved: Vec<std::path::PathBuf> =
         body.approved.iter().map(std::path::PathBuf::from).collect();
@@ -2729,6 +2743,20 @@ pub(crate) async fn native_session_delete(
     if active {
         if let Err(e) = handle.abort(None) {
             return api_err(&e);
+        }
+        // `abort` deliberately leaves the session READY for the next prompt
+        // (Stop cancels a turn, not the session). That landing state still
+        // counts as active for `delete_session`, which would then refuse the
+        // very deletion the caller explicitly authorized with abort=true.
+        // Move it to a non-active lifecycle; a deletion is not a turn.
+        let state = match handle.state() {
+            Ok(state) => state,
+            Err(e) => return api_err(&e),
+        };
+        if state.is_active() {
+            if let Err(e) = handle.suspend() {
+                return api_err(&e);
+            }
         }
     }
     if !row.lifecycle.is_terminal() {

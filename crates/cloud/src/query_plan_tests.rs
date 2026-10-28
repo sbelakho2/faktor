@@ -233,7 +233,11 @@ fn v7_upgrade_recreates_indexes_from_the_previous_head() {
             .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap();
         conn.execute_batch(
-            "DROP INDEX IF EXISTS idx_cp_idempotency_created;
+            "DROP TABLE IF EXISTS billing_usage_total;
+             DROP TABLE IF EXISTS billing_usage_task;
+             DROP TABLE IF EXISTS billing_usage_period;
+             DROP TABLE IF EXISTS billing_usage_period_task;
+             DROP INDEX IF EXISTS idx_cp_idempotency_created;
              DROP INDEX IF EXISTS idx_cp_approval_org_id;
              DROP INDEX IF EXISTS idx_ent_audit_org_occurred;
              DROP INDEX IF EXISTS idx_billing_report_period_org_seen;

@@ -41,6 +41,22 @@ internal fun overviewAttentionItems(model: TaskTreeModel, max: Int = 3): List<St
     return head
 }
 
+/**
+ * T21's single served condition: TRUE only when a requested finish action
+ * lacks a succeeded durable result. The Ask-first redesign removed the
+ * Overview "Finish actions" summary row and moved the mandated label/copy
+ * strip to the Verification surface ([VerificationPanel]). The predicate
+ * stays beside the overview model helpers so both surfaces consult exactly
+ * one condition; a null completion never claims pending work.
+ */
+internal fun finishActionPending(completion: CompletionView?): Boolean {
+    if (completion == null) return false
+    if (completion.finishActionPending) {
+        return true
+    }
+    return false
+}
+
 class OverviewPanel : JPanel(BorderLayout()) {
 
     private val header = WrappedLabel("overview: no run yet")
