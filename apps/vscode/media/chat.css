@@ -1780,29 +1780,16 @@ button.intent-option:focus-visible {
 /* ------------------------------------------------ ONE attention problem
    Every failure source merges here: one title, one short cause, one action
    and an optional Technical details disclosure. No stacked error cards. */
-/* The attention surface is a WARNING surface by default (unproven checks,
-   reconnection churn, authority notes). Red ERROR styling is reserved for
-   the user-error source — a verification verdict is not a service error. */
 .attention-card {
   flex: none;
   max-height: 34vh;
   overflow-y: auto;
   padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--vscode-inputValidation-warningBorder, rgba(210, 153, 34, 0.4));
-  border-left: 3px solid var(--vscode-editorWarning-foreground, #d29922);
-  border-radius: var(--faktor-radius);
-  background: var(--vscode-inputValidation-warningBackground, rgba(210, 153, 34, 0.1));
-  min-width: 0;
-}
-
-.attention-card[data-problem-kind="user"] {
   border: 1px solid var(--vscode-inputValidation-errorBorder, rgba(248, 81, 73, 0.4));
   border-left: 3px solid var(--vscode-testing-iconFailed, #f85149);
+  border-radius: var(--faktor-radius);
   background: var(--vscode-inputValidation-errorBackground, rgba(248, 81, 73, 0.12));
-}
-
-.attention-card[data-problem-kind="user"] .attention-icon {
-  background: var(--vscode-testing-iconFailed, #f85149);
+  min-width: 0;
 }
 
 .attention-head {
@@ -1818,7 +1805,7 @@ button.intent-option:focus-visible {
   height: 8px;
   margin-top: 5px;
   border-radius: 50%;
-  background: var(--vscode-editorWarning-foreground, #d29922);
+  background: var(--vscode-testing-iconFailed, #f85149);
 }
 
 .attention-icon-authority,

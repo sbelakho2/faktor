@@ -15132,6 +15132,7 @@ async function preflightTests() {
     // of rows instead of the summary), fold duplicates, and omit absent
     // groups entirely.
     const sink = {
+      activeRunId: 'run-1',
       lastError: 'invalid api key for provider (401)',
       verification: { status: 'failed', checksFailed: 2 },
       task: { blockers: ['which approach should I pick?', 'repository is read-only'] },
@@ -15154,6 +15155,7 @@ async function preflightTests() {
     // A failed verification with ZERO findings must not invent a
     // "0 checks found a problem" row: the verdict itself is the label.
     const failedWithoutFindings = ux.aggregateAttention({
+      activeRunId: 'run-1',
       verification: { status: 'failed', checksFailed: 0 },
     });
     assertEqual(failedWithoutFindings.length, 1, 'the verdict still surfaces');
@@ -15167,6 +15169,7 @@ async function preflightTests() {
     // Interrupted runs leave required checks UNPROVEN: verdict-first label
     // with the unproven count in the detail.
     const unprovenChecks = ux.aggregateAttention({
+      activeRunId: 'run-1',
       proof: { checks: { total: 2, failed: 0, requiredFailed: 2 } },
     });
     assertEqual(unprovenChecks.length, 1);
@@ -15176,6 +15179,13 @@ async function preflightTests() {
       `the unproven count must be the detail: ${unprovenChecks[0].detail}`,
     );
     assertEqual(unprovenChecks[0].count, 2);
+    // A finished run's verdict is HISTORY: with no live run the same proof
+    // must pin NO attention card at all (the transcript and the
+    // Verification surface carry the fact).
+    const settledVerdict = ux.aggregateAttention({
+      proof: { checks: { total: 2, failed: 0, requiredFailed: 2 } },
+    });
+    assertEqual(settledVerdict.length, 0, 'a finished run never pins an attention card');
   });
 
   await test('run state uses the shared cause-specific labels and never says resend', () => {

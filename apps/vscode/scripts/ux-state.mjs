@@ -121,6 +121,7 @@ test('needs-input, failed check and unrecoverable failures have distinct labels'
   // verdict-first label with the unproven count in the detail — never "0
   // checks found a problem".
   const unproven = aggregateAttention({
+    activeRunId: 'run-1',
     proof: { checks: { total: 2, failed: 0, requiredFailed: 2 } },
   });
   assert.equal(unproven.length, 1);
@@ -128,6 +129,12 @@ test('needs-input, failed check and unrecoverable failures have distinct labels'
   assert.equal(unproven[0].label, 'Verification did not pass');
   assert.ok(/2 required checks did not complete/.test(unproven[0].detail ?? ''), unproven[0].detail ?? 'null');
   assert.equal(unproven[0].count, 2);
+  // The SAME verdict with NO live run is history: no attention row at all
+  // (the dead run's verdict lives in the transcript/Verification surface).
+  const settledVerdict = aggregateAttention({
+    proof: { checks: { total: 2, failed: 0, requiredFailed: 2 } },
+  });
+  assert.equal(settledVerdict.length, 0, 'a finished run never pins an attention card');
   const unrecoverable = projectUx({
     machineState: 'failed',
     lastError: 'durable state is corrupt',

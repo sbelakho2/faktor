@@ -467,7 +467,13 @@ export function aggregateAttention(input: UxInput): readonly AttentionItem[] {
   if (cause?.kind === 'MissingCredential') {
     groups.push(attentionItem('MissingCredential', 'Provider connection needs attention', cause.detail, 1, OPEN_PROVIDER));
   }
-  if (checksFailed) {
+  // The checks verdict is a LIVE-run concern: while a run is executing, a
+  // failing/unproven verification needs the operator. Once the run is over
+  // (finished, cancelled, or killed) its verdict is HISTORY — recorded in
+  // the transcript and the Verification surface — and must not pin a
+  // permanent attention card over the conversation.
+  const runLive = input.activeRunId != null || input.busy === true;
+  if (checksFailed && runLive) {
     const checks = checksOf(input);
     // A failed verification with ZERO findings (the run was interrupted
     // before any check executed, or only required checks are unproven) must

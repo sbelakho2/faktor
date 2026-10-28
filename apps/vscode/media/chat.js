@@ -4557,11 +4557,11 @@
       toolHost = document.createElement('div');
       toolHost.className = 'activity-group-body';
       toolGroup.appendChild(toolHost);
-      // A settled batch stays collapsed; live or failed work opens because
-      // its output is the part worth reading.
+      // Only LIVE work auto-opens. A settled batch — including a batch of
+      // failures from a dead/interrupted run — stays collapsed behind its
+      // one-line summary so it never blocks the conversation surface.
       toolGroup.open = tools.some(function (tool) {
-        var tone = toolOutcome(tool).tone;
-        return tone === 'run' || tone === 'fail';
+        return toolOutcome(tool).tone === 'run';
       });
       wrapper.appendChild(toolGroup);
     }
@@ -4591,14 +4591,31 @@
     }
     var failed = 0;
     var running = 0;
+    var interrupted = 0;
     for (var i = 0; i < tools.length; i++) {
       var tone = toolOutcome(tools[i]).tone;
       if (tone === 'fail') failed += 1;
       else if (tone === 'run') running += 1;
+      var state = String(tools[i].state == null ? '' : tools[i].state).toLowerCase();
+      var detail = String(tools[i].excerpt == null ? '' : tools[i].excerpt);
+      if (state === 'unresolved' || detail.indexOf('tool call unresolved (interrupted)') === 0) {
+        interrupted += 1;
+      }
     }
-    var parts = [tools.length + (tools.length === 1 ? ' tool call' : ' tool calls')];
-    if (failed > 0) parts.push(failed + ' failed');
-    if (running > 0) parts.push(running + ' running');
+    var parts;
+    if (interrupted === tools.length && running === 0) {
+      // Every call in the batch died with the run: say so once, terminally —
+      // not as a wall of "failed" cards.
+      parts = [
+        'Run interrupted — ' +
+          tools.length +
+          (tools.length === 1 ? ' tool call did not complete' : ' tool calls did not complete'),
+      ];
+    } else {
+      parts = [tools.length + (tools.length === 1 ? ' tool call' : ' tool calls')];
+      if (failed > 0) parts.push(failed + ' failed');
+      if (running > 0) parts.push(running + ' running');
+    }
     summary.textContent = parts.join(' · ');
     summary.setAttribute('aria-label', 'Tool activity: ' + parts.join(', '));
   }
