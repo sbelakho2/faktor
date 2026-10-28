@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! Machine-scoped provider credential env file.
 //!
 //! `provider_env_file` names ONE absolute, owner-only file of `KEY=VALUE`

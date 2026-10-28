@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-browser-profile, read-only-artifacts
 // Live Ask harness: a real HTTP server + the real NativeClient + the real
 // extension Ask helpers. It proves over the wire that Ask posts ONE ordinary
 // prompt and reads conversation data only — no task run, contract, proof,

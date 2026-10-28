@@ -1561,3 +1561,67 @@ fn active_compaction_registration_is_raii_and_mutation_sensitive() {
         "the witness must detect a reintroduced manual registration path"
     );
 }
+
+// ------------------------------------------------ transient store retryable wire
+
+/// Retention/memory admin errors must surface transient store contention as
+/// retryable and everything else as terminal (see store contention_tests for
+/// the classifier's own adversarial matrix).
+#[tokio::test]
+async fn memory_error_marks_only_transient_store_contention_retryable() {
+    use super::memory_error;
+    use faktor_memory::MemoryAdminError;
+    use faktor_store::StoreError;
+
+    async fn body_of(error: MemoryAdminError) -> (u16, Value) {
+        let response = memory_error(error);
+        let status = response.status().as_u16();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    let busy = StoreError::Sqlite(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(5), // SQLITE_BUSY
+        Some("database is locked".to_string()),
+    ));
+    let (status, body) = body_of(MemoryAdminError::Store(busy)).await;
+    assert_eq!(status, 500);
+    assert_eq!(body["error"]["code"], "memory_store_unavailable");
+    assert_eq!(
+        body["error"]["retryable"], true,
+        "busy retention pass: {body}"
+    );
+
+    for transient in [
+        StoreError::Busy("reader pool busy: deadline exceeded".into()),
+        StoreError::WriterQueueFull {
+            operation: "save",
+            pending: 1,
+            capacity: 1,
+        },
+    ] {
+        let label = transient.to_string();
+        let (status, body) = body_of(MemoryAdminError::Store(transient)).await;
+        assert_eq!(status, 500, "{label}");
+        assert_eq!(body["error"]["retryable"], true, "{label}: {body}");
+    }
+
+    for permanent in [
+        StoreError::Corrupt(vec!["integrity check failed".into()]),
+        StoreError::Malformed("value rejected".into()),
+        StoreError::StorageRefused("quota exhausted".into()),
+    ] {
+        let label = permanent.to_string();
+        let (status, body) = body_of(MemoryAdminError::Store(permanent)).await;
+        assert_eq!(status, 500, "{label}");
+        assert_eq!(body["error"]["retryable"], false, "{label}: {body}");
+    }
+
+    // Non-store classes keep their frozen shapes.
+    let (status, body) = body_of(MemoryAdminError::NotFound).await;
+    assert_eq!(status, 404);
+    assert_eq!(body["error"]["code"], "memory_not_found");
+    assert_eq!(body["error"]["retryable"], false, "{body}");
+}

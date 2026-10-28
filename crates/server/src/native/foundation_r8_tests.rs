@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! Production-wiring and adversarial tests for the Revision 8 daemon
 //! contract routes. Every test starts the real native listener and speaks
 //! HTTP with the daemon password; nothing is called through a private seam.
@@ -1272,4 +1273,72 @@ async fn retention_zero_disables_automatic_deletion_instead_of_using_90_days() {
     assert_eq!(pass["disabled"], true);
     assert_eq!(pass["wouldDelete"], 0);
     assert_eq!(pass["deleted"], 0);
+}
+
+// ------------------------------------------------ transient store retryable wire
+
+/// The wire must say retryable=true ONLY for transient store contention and
+/// never for permanent failures — a wrong true makes clients loop on a dead
+/// store, a wrong false makes them give up through a settlement lock storm.
+#[tokio::test]
+async fn foundation_store_errors_are_retryable_only_for_transient_contention() {
+    use crate::native::foundation::foundation_error;
+    use faktor_foundation::FoundationError;
+
+    async fn body_of(error: FoundationError) -> (u16, Value) {
+        let response = foundation_error(error);
+        let status = response.status().as_u16();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    // Real shapes from the settlement writer storm, including the wrapped form.
+    for message in [
+        "sqlite error: database is locked",
+        "sqlite error: Error code 5: database is locked",
+        "session provider unavailable: sqlite error: DATABASE IS LOCKED",
+        "writer queue full: 64 pending (capacity 64); `save` refused",
+        "reader pool busy: deadline exceeded",
+    ] {
+        let (status, body) = body_of(FoundationError::Store(message.to_string())).await;
+        assert_eq!(status, 500, "{message}");
+        assert_eq!(body["code"], "store", "{message}");
+        assert_eq!(
+            body["retryable"], true,
+            "transient {message} must be retryable: {body}"
+        );
+    }
+
+    // Permanent store-class failures stay non-retryable.
+    for message in [
+        "io error: No space left on device",
+        "store is corrupted: integrity check failed",
+        "malformed value rejected: bad key",
+    ] {
+        let (status, body) = body_of(FoundationError::Store(message.to_string())).await;
+        assert_eq!(status, 500, "{message}");
+        assert_eq!(
+            body["retryable"], false,
+            "permanent {message} must not be retryable: {body}"
+        );
+    }
+
+    // Hostile: a non-Store arm that merely quotes a lock phrase must never
+    // become retryable — only the Store arm consults the classifier.
+    let (status, body) = body_of(FoundationError::Corrupt(
+        "integrity check failed while reading sqlite error: database is locked".to_string(),
+    ))
+    .await;
+    assert_eq!(status, 500);
+    assert_eq!(body["retryable"], false, "corrupt quoting a lock: {body}");
+
+    let (status, body) = body_of(FoundationError::Malformed(
+        "user text: sqlite error: database is locked".to_string(),
+    ))
+    .await;
+    assert_eq!(status, 400);
+    assert_eq!(body["code"], "malformed");
+    assert_eq!(body["retryable"], false, "malformed quoting a lock: {body}");
 }

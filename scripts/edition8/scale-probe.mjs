@@ -555,8 +555,9 @@ async function postJson(base, token, path, body, lockRetries = 0) {
   };
   let result = await send();
   let lockWaitMs = 0;
-  // Post-turn background writers hold the store in bursts (the daemon marks
-  // the resulting SQLITE_BUSY 500 non-retryable — reported separately).
+  // Post-turn background writers hold the store in bursts (the daemon now
+  // marks the resulting SQLITE_BUSY 500 retryable:true; the shim stays so
+  // latency samples exclude burst-wait time).
   // Callers that re-send the SAME idempotent body may opt into a bounded
   // wait for the burst to drain; prompt/compaction paths deliberately do
   // not (their submission/operation ids carry their own retry semantics).
@@ -1039,8 +1040,8 @@ async function main() {
       // Post-turn background writers drain for a bounded window (10-15s
       // observed after a single turn; minutes after a full 1,000-turn
       // session) and the retention route surfaces their SQLITE_BUSY as a
-      // 500 `database is locked` (the daemon currently marks it
-      // non-retryable — reported separately). Retry the SAME call while the
+      // 500 `database is locked` with retryable:true (store contention
+      // classifier). Retry the SAME call while the
       // body still carries the typed lock error. A failed attempt may have
       // already applied part of its bounded delete loop, so the LAST 200
       // response's `deleted` under-reports: the contract is verified as the

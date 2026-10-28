@@ -84,11 +84,16 @@ fn memory_error(error: MemoryAdminError) -> Response {
         MemoryAdminError::Oversized(_) => StatusCode::PAYLOAD_TOO_LARGE,
         MemoryAdminError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
+    // A transient lock/backpressure store refusal is retryable on the wire
+    // (SQLITE_BUSY under the settlement writer storm, reader-pool busy and
+    // bounded writer-queue backpressure all clear on their own); every
+    // other error class keeps retryable=false.
+    let retryable = matches!(&error, MemoryAdminError::Store(e) if e.is_transient_contention());
     let mut body = serde_json::json!({
         "error": {
             "code": error.code(),
             "message": error.to_string(),
-            "retryable": false,
+            "retryable": retryable,
         }
     });
     match &error {

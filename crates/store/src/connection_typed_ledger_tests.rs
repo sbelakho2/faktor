@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 use super::*;
 
 pub(crate) fn tmp_store() -> (tempfile::TempDir, Store) {

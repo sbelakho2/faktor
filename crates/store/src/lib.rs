@@ -210,6 +210,38 @@ impl StoreError {
                 )
         )
     }
+
+    /// True for every TRANSIENT contention refusal an API caller may safely
+    /// retry: a SQLite lock (see [`StoreError::is_busy`]), the reader-pool
+    /// busy wait, or the bounded writer-queue backpressure. Corruption,
+    /// malformed input and permanent failures stay false, so the wire's
+    /// `retryable` flag never lies in either direction.
+    pub fn is_transient_contention(&self) -> bool {
+        self.is_busy()
+            || matches!(
+                self,
+                StoreError::Busy(_) | StoreError::WriterQueueFull { .. }
+            )
+    }
+
+    /// Message form of [`StoreError::is_transient_contention`] for surfaces
+    /// that only carry the formatted error (e.g. `FoundationError::Store(String)`).
+    /// Case-insensitive. Reader-pool and writer-queue phrases are
+    /// store-authored and stand alone; lock text counts only inside the
+    /// store's own `sqlite error:` framing and never alongside
+    /// malformed/corrupt markers, so a payload that merely quotes a lock
+    /// phrase can never flip the wire's `retryable` flag.
+    pub fn is_transient_contention_message(message: &str) -> bool {
+        let haystack = message.to_ascii_lowercase();
+        if haystack.contains("reader pool busy") || haystack.contains("writer queue full") {
+            return true;
+        }
+        let lock_text = haystack.contains("database is locked")
+            || haystack.contains("database table is locked");
+        let store_framed = haystack.contains("sqlite error");
+        let disqualified = haystack.contains("malformed") || haystack.contains("corrupt");
+        lock_text && store_framed && !disqualified
+    }
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;
@@ -270,6 +302,10 @@ pub(crate) fn drop_verification_scope_for_rewind(conn: &rusqlite::Connection) {
     let _ = conn.execute("ALTER TABLE session DROP COLUMN listing_revision", []);
     let _ = conn.execute_batch("DROP TABLE IF EXISTS listing_revision_seq;");
 }
+
+#[cfg(test)]
+#[path = "contention_tests.rs"]
+mod contention_tests;
 
 #[cfg(test)]
 #[path = "verification_scope_tests.rs"]

@@ -43,10 +43,15 @@ pub(crate) fn foundation(state: &AppState) -> Result<&Foundation, Response> {
 
 pub(crate) fn foundation_error(e: FoundationError) -> Response {
     let status = StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    // Only a Store-class message goes through the store's contention
+    // classifier (see StoreError::is_transient_contention_message);
+    // Corrupt/Malformed/Conflict/Validation never become retryable.
+    let retryable = matches!(&e, FoundationError::Store(message)
+        if faktor_store::StoreError::is_transient_contention_message(message));
     let mut body = serde_json::json!({
         "code": e.code(),
         "message": e.to_string(),
-        "retryable": false,
+        "retryable": retryable,
     });
     let fields = e.field_errors();
     if !fields.is_empty() {

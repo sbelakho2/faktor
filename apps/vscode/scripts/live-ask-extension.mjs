@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-browser-profile, read-only-artifacts
 // LIVE Ask through the INSTALLED Faktor VS Code extension (activity-bar sidebar).
 //
 // A clean VS Code profile launches the installed `faktor.faktor` extension on a

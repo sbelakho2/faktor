@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-browser-profile, read-only-artifacts
 // Registry-driven live exercise of EVERY Revision 8 VS Code control.
 //
 // For each of the 200 controls on its declared screen it:

@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! @authority-collapse: authority-bearing
 //!
 //! Durable rows for orchestrated child agents (audits 20-24 wiring).

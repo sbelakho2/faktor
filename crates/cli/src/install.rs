@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! `faktor install` — the reproducible trusted-install step.
 //!
 //! The VS Code extension auto-starts an executable only when it is a

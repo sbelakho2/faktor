@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-browser-profile, read-only-artifacts
 // Headless checks for the shared UX state model. These are the mutation
 // witnesses' gates: Ask isolation, no-billing-in-run, attention aggregation
 // and cause-specific state mapping.

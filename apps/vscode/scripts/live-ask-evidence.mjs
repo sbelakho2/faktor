@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-browser-profile, read-only-artifacts
 // LIVE Ask evidence over the real installed extension host modules:
 //   * start the verified Faktor daemon from the live install (DeepSeek config
 //     comes from the live data dir's faktor-plus.json + provider_env_file),

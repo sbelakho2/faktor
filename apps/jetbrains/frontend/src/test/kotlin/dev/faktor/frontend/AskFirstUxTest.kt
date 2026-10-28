@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=separate-process, read-only-artifacts
 // The Ask-first product model: ONE composer intent (Ask default), ONE submit
 // action, Task options behind one disclosure, cause-specific run states, a
 // lazy Account surface, a concise Overview and developer-only diagnostics.
