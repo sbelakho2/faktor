@@ -469,13 +469,24 @@ export function aggregateAttention(input: UxInput): readonly AttentionItem[] {
   }
   if (checksFailed) {
     const checks = checksOf(input);
-    const count = checks?.failed ?? verificationOf(input)?.checksFailed ?? 1;
+    // A failed verification with ZERO findings (the run was interrupted
+    // before any check executed, or only required checks are unproven) must
+    // still surface as NOT passed — but it must never invent a
+    // "0 checks found a problem" finding: the verdict itself becomes the
+    // row's label and the count stays at least one.
+    const failedCount = checks?.failed ?? verificationOf(input)?.checksFailed ?? 0;
+    const requiredCount = checks?.requiredFailed ?? 0;
+    const findings = Math.max(failedCount, requiredCount, 0);
     groups.push(
       attentionItem(
         'FailedCheck',
-        countLabel(count, 'check found a problem', 'checks found a problem'),
-        verificationOf(input)?.status === 'failed' ? 'Verification did not pass.' : null,
-        count,
+        findings > 0
+          ? countLabel(findings, 'check found a problem', 'checks found a problem')
+          : 'Verification did not pass',
+        findings > 0 && verificationOf(input)?.status === 'failed'
+          ? 'Verification did not pass.'
+          : null,
+        Math.max(1, findings),
         OPEN_CHECKS,
       ),
     );

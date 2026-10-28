@@ -106,6 +106,17 @@ test('needs-input, failed check and unrecoverable failures have distinct labels'
   assert.equal(failedCheck.presentationLabel, 'Checks found a problem');
   assert.equal(failedCheck.presentationAction.key, 'openChecks');
   assert.equal(failedCheck.attention[0].kind, 'FailedCheck');
+  // A failed verification with ZERO findings (interrupted before checks ran)
+  // surfaces as NOT passed without inventing a "0 checks" finding row.
+  const noFindings = projectUx({
+    activeRunId: 'run-1',
+    verification: { status: 'failed', checksFailed: 0 },
+  });
+  assert.equal(noFindings.attention.length, 1);
+  assert.equal(noFindings.attention[0].kind, 'FailedCheck');
+  assert.equal(noFindings.attention[0].label, 'Verification did not pass');
+  assert.ok(!/0 checks/.test(noFindings.attention[0].label), 'never a "0 checks" finding');
+  assert.ok(noFindings.attention[0].count >= 1, 'the verdict row counts at least one');
   const unrecoverable = projectUx({
     machineState: 'failed',
     lastError: 'durable state is corrupt',

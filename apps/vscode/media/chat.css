@@ -111,7 +111,6 @@ body {
 /* One active destination at a time. Order is explicit because the semantic
    DOM keeps Diagnostics before Chat for its legacy ids. */
 #app > header { order: 0; }
-#app > #overflow-menu { order: 1; }
 #app > #diagnostics { order: 2; }
 #app > #notices { order: 3; }
 #app > #work-panel { order: 4; }

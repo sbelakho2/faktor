@@ -15151,6 +15151,19 @@ async function preflightTests() {
       !unknownChecks.some((item) => item.kind === 'FailedCheck'),
       'unknown checks never become a disclosure item',
     );
+    // A failed verification with ZERO findings must not invent a
+    // "0 checks found a problem" row: the verdict itself is the label.
+    const failedWithoutFindings = ux.aggregateAttention({
+      verification: { status: 'failed', checksFailed: 0 },
+    });
+    assertEqual(failedWithoutFindings.length, 1, 'the verdict still surfaces');
+    assertEqual(failedWithoutFindings[0].kind, 'FailedCheck');
+    assert(
+      !/0 checks/.test(failedWithoutFindings[0].label),
+      `a zero-findings failure must not claim '0 checks': ${failedWithoutFindings[0].label}`,
+    );
+    assertEqual(failedWithoutFindings[0].label, 'Verification did not pass');
+    assert(failedWithoutFindings[0].count >= 1, 'the verdict row counts at least one');
   });
 
   await test('run state uses the shared cause-specific labels and never says resend', () => {

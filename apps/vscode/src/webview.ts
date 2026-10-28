@@ -465,16 +465,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     <span class="spacer"></span>
     <button id="btn-overflow" class="toggle overflow-toggle" type="button" aria-expanded="false" aria-haspopup="menu" aria-controls="overflow-menu" title="Faktor menu" aria-label="Faktor menu">⋯</button>
     <button id="btn-control-center" class="toggle control-center-toggle" type="button" title="Open Faktor Settings (providers, context, tools, permissions, billing, appearance)" aria-label="Open Faktor Settings"><span class="control-center-label">Settings</span><span class="control-center-glyph" aria-hidden="true">⚙</span></button>
-  </header>
-  <nav id="overflow-menu" class="overflow-menu" role="menu" aria-label="Faktor menu" hidden>
+    <nav id="overflow-menu" class="overflow-menu" role="menu" aria-label="Faktor menu" hidden>
     <button id="menu-chat" class="menu-item" tabindex="-1" type="button" role="menuitem">Chat</button>
     <button id="menu-run-action" class="menu-item" tabindex="-1" type="button" role="menuitem" hidden></button>
     <button id="menu-inspect" class="menu-item" tabindex="-1" type="button" role="menuitem">Inspect</button>
     <button id="menu-history" class="menu-item" tabindex="-1" type="button" role="menuitem">History</button>
     <button id="menu-settings" class="menu-item" tabindex="-1" type="button" role="menuitem">Settings</button>
     <button id="menu-diagnostics" class="menu-item" tabindex="-1" type="button" role="menuitem">Diagnostics</button>
-    <button id="menu-stop" class="menu-item destructive" tabindex="-1" type="button" role="menuitem" hidden>Stop current run</button>
-  </nav>
+      <button id="menu-stop" class="menu-item destructive" tabindex="-1" type="button" role="menuitem" hidden>Stop current run</button>
+    </nav>
+  </header>
   <section id="diagnostics" class="view-panel diagnostics-view" role="region" aria-labelledby="diagnostics-title" tabindex="-1" hidden>
     <h2 id="diagnostics-title">Diagnostics</h2>
     <section id="service-diagnostics" class="service-diagnostics" aria-labelledby="service-diagnostics-title">
