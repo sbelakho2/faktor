@@ -4442,9 +4442,11 @@
 
     var details = document.createElement('details');
     details.className = 'activity-details';
-    // A running or failed row opens itself: the live/broken output is the
-    // part worth showing; settled rows stay compact until asked.
-    if (outcome.tone === 'fail' || outcome.tone === 'run') {
+    // Only a RUNNING row opens itself (its live output is the part worth
+    // showing). Settled rows — including failures — stay collapsed until
+    // asked: an interrupted run can leave several large failed tool cards
+    // and auto-opening them swallows the conversation.
+    if (outcome.tone === 'run') {
       details.open = true;
     }
     var summary = document.createElement('summary');

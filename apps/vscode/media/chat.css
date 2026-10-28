@@ -188,6 +188,15 @@ header {
   flex: 1;
 }
 
+/* Header text spans may shrink and ellipsize so the row's fixed controls
+   (menu, Settings) never overflow or wrap at any panel width. */
+header > span {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
 #brand {
   font-weight: 600;
   flex: none;
@@ -1133,7 +1142,17 @@ button.toggle[aria-expanded='true'] {
   background: var(--vscode-textBlockQuote-background, transparent);
 }
 
+/* Open tool rows are bounded: an expanded (or interrupted) tool card never
+   floods the conversation with one card's output. */
+.activity-details[open] .excerpt {
+  max-height: 9.5em;
+  overflow-y: auto;
+}
+
 .activity-summary {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   display: flex;
   align-items: center;
   gap: var(--space-2);
@@ -1761,16 +1780,29 @@ button.intent-option:focus-visible {
 /* ------------------------------------------------ ONE attention problem
    Every failure source merges here: one title, one short cause, one action
    and an optional Technical details disclosure. No stacked error cards. */
+/* The attention surface is a WARNING surface by default (unproven checks,
+   reconnection churn, authority notes). Red ERROR styling is reserved for
+   the user-error source — a verification verdict is not a service error. */
 .attention-card {
   flex: none;
   max-height: 34vh;
   overflow-y: auto;
   padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--vscode-inputValidation-warningBorder, rgba(210, 153, 34, 0.4));
+  border-left: 3px solid var(--vscode-editorWarning-foreground, #d29922);
+  border-radius: var(--faktor-radius);
+  background: var(--vscode-inputValidation-warningBackground, rgba(210, 153, 34, 0.1));
+  min-width: 0;
+}
+
+.attention-card[data-problem-kind="user"] {
   border: 1px solid var(--vscode-inputValidation-errorBorder, rgba(248, 81, 73, 0.4));
   border-left: 3px solid var(--vscode-testing-iconFailed, #f85149);
-  border-radius: var(--faktor-radius);
   background: var(--vscode-inputValidation-errorBackground, rgba(248, 81, 73, 0.12));
-  min-width: 0;
+}
+
+.attention-card[data-problem-kind="user"] .attention-icon {
+  background: var(--vscode-testing-iconFailed, #f85149);
 }
 
 .attention-head {
@@ -1786,7 +1818,7 @@ button.intent-option:focus-visible {
   height: 8px;
   margin-top: 5px;
   border-radius: 50%;
-  background: var(--vscode-testing-iconFailed, #f85149);
+  background: var(--vscode-editorWarning-foreground, #d29922);
 }
 
 .attention-icon-authority,
@@ -2465,8 +2497,19 @@ button.intent-option:focus-visible {
     gap: 0;
   }
   header {
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
     padding: 4px var(--space-1);
+  }
+  /* One header row at the narrowest widths: the version badge is
+     cosmetic, and the Settings target shrinks while staying a real
+     touch target (>= 24px). Text spans may shrink and ellipsize. */
+  #ui-version {
+    display: none;
+  }
+  .control-center-toggle {
+    min-width: 40px;
+    min-height: 34px;
+    padding: 4px 8px;
   }
   .spacer {
     display: none;
