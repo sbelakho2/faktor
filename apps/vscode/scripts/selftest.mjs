@@ -9582,6 +9582,33 @@ async function attentionWebviewTests() {
     assertEqual(card.hidden, true, 'a recovered error is omitted');
   });
 
+  await test('a posted service card retires on the FIRST clean snapshot (postUserError cannot beat recovery)', () => {
+    const harness = runChatWebview(webviewSnapshot([]));
+    const projection = ue.projectError({
+      kind: 'daemon_unreachable',
+      message: 'POST /native/session/{id}/prompt: connect ECONNREFUSED 127.0.0.1:61234',
+      code: 'daemon_unreachable',
+    });
+    harness.deliver({ type: 'userError', error: projection });
+    const card = harness.dom.document.getElementById('attention-card');
+    assertEqual(card.hidden, false, 'the unreachable card renders');
+    // The live race: recovery nulls lastError BEFORE any snapshot carries the
+    // posted error, so the mirror flag never arms — the FIRST snapshot the
+    // card sees is clean, and it must still retire the store-condition card
+    // (the sticky "The Faktor service could not be reached" bug).
+    harness.deliver({ type: 'snapshot', snapshot: { ...webviewSnapshot([]), lastError: null } });
+    assertEqual(card.hidden, true, 'a clean snapshot retires the store-condition card');
+    // A webview-LOCAL refusal is not a store condition: a clean snapshot
+    // must never discard it before the operator acts.
+    harness.deliver({
+      type: 'userError',
+      error: ue.projectError({ kind: 'attachment_refused', message: 'clipboard image is too large' }),
+    });
+    assertEqual(card.hidden, false, 'the local refusal renders');
+    harness.deliver({ type: 'snapshot', snapshot: { ...webviewSnapshot([]), lastError: null } });
+    assertEqual(card.hidden, false, 'a clean snapshot never discards a local refusal');
+  });
+
   await test('a raw snapshot lastError stays in Diagnostics and never makes a chat card', () => {
     const harness = runChatWebview(webviewSnapshot([]));
     const snapshot = { ...webviewSnapshot([]), lastError: 'native API error 500 internal: boom' };

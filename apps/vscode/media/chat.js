@@ -264,6 +264,25 @@
   // error) writes its LATEST distinct problem here; the renderer chooses the
   // highest-priority active one and never stacks duplicate cards.
   var problemSources = { attention: null, authority: null, stream: null, user: null };
+  // User-error kinds that MIRROR a store/host condition (as opposed to a
+  // webview-local refusal): when a snapshot reports no error at all, these
+  // cards must go with their condition — they must never outlive the state
+  // they describe.
+  var SERVICE_CONDITION_KINDS = [
+    'daemon_down',
+    'daemon_unreachable',
+    'daemon_start_failed',
+    'service_not_ready',
+    'service_binary_missing',
+    'service_trust_changed',
+    'service_trust_unverified',
+    'service_budget_exhausted',
+    'service_configuration_invalid',
+    'service_untrusted_install',
+    'run_failure',
+    'conversation_missing',
+    'unexpected',
+  ];
   var renderedProblemKey = null;
   var activeMenuAction = null;
   var VIEW_PANELS = {
@@ -5439,7 +5458,7 @@
         ? error.technical
         : 'no further detail was provided';
     var code = typeof error.code === 'string' && error.code.length > 0 ? error.code : null;
-    return attentionProblem(
+    var problem = attentionProblem(
       typeof error.summary === 'string' && error.summary.length > 0
         ? error.summary
         : 'Faktor hit a problem',
@@ -5449,6 +5468,12 @@
       code !== null ? '[' + code + '] ' + technical : technical,
       'user',
     );
+    if (problem !== null && typeof error.kind === 'string') {
+      // The mirror class: lets a clean snapshot retire store-condition cards
+      // even when the posted error raced ahead of the mirroring snapshot.
+      problem.errorKind = error.kind;
+    }
+    return problem;
   }
 
   function dispatchProblem(problem) {
@@ -5732,6 +5757,19 @@
       // A raw failure that the host no longer serves is gone; clear its user
       // problem so the ONE card never outlives the condition.
       if (lastRenderedError !== null) {
+        setProblemSource('user', null);
+      } else if (
+        problemSources.user !== null &&
+        typeof problemSources.user.errorKind === 'string' &&
+        SERVICE_CONDITION_KINDS.indexOf(problemSources.user.errorKind) !== -1
+      ) {
+        // The posted card is the FIRST thing a failure produces; recovery can
+        // null lastError before any snapshot ever carried the string, so the
+        // mirror flag above never arms. A clean snapshot must still retire a
+        // store-condition card (the condition it describes is gone) — this is
+        // the sticky "service could not be reached" card. Local refusals
+        // (attachment_refused, permission_expired) carry no mirror class and
+        // stay until acted on.
         setProblemSource('user', null);
       }
       lastRenderedError = null;
