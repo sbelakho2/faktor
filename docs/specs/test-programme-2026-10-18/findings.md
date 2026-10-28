@@ -237,9 +237,13 @@ have no row, and HEAD fixes expose new defects.
   a panic hook that fails the run.
 - **Current state — PARTIAL.** `compaction.rs` now refuses histories below
   `MIN_COMPACTABLE_HISTORY_TOKENS = 128` (`crates/agent/src/runtime/
-  compaction.rs:480-493`). A repo-wide scan finds no literal `clamp(1, 0)`,
-  but there is no route-wide boundary fuzz + panic hook. The report's class
-  fix is not enforced.
+  compaction.rs:480-493`), and the adversarial size matrix landed: token
+  sizes 0/2/3/127 refuse typed with zero compaction-model calls, 128
+  journals CompactRejected, the wire layer pins 1-token as unconstructible,
+  and the durable layer rejects `before`<=2/-growth as Malformed. A
+  repo-wide scan finds no literal `clamp(1, 0)`, but there is no
+  ROUTE-wide boundary fuzz + panic hook. The report's class fix is not
+  yet fully enforced.
 - **Severity: S1.**
 
 ### AG-12 — Budget caps accepted on plain prompts (Row 12, p.5)
@@ -535,12 +539,12 @@ PARTIAL; the full required test is in `programme.md` §4.
 | DOM-02 | Typed ledger: corrupt a row inside the verified prefix; scheduled full sweep fails loudly; 1,000,000 entries open bounded (pp.19,4) | PARTIAL: incremental verify; no full sweep, no 1M test | S1 |
 | DOM-03 | Admission: same submission from two IDEs; crash between receipt and spawn; replay after restart (p.19) | PARTIAL: `INV-TASK-START-IDEMPOTENT`, `INV-PROMPT-START-IDEMPOTENT`; no two-IDE/crash-between test | S1 |
 | DOM-04 | SQLite: every version migrates; restore each backup and compare; busy/disk-full/corrupt-page; writer-queue concurrency (p.19) | PARTIAL: 313 store tests, plan tests, per-version migration matrix; no full schema compare, no store-fault injection | S1 |
-| DOM-05 | Memory facts: plan test on every fact query; 1,000,000 churn rows keep activation/control/memory pages unchanged in result and time (p.19) | PARTIAL: churn regressions at HEAD; LIKE remains; no 1M test | S0/S1 |
+| DOM-05 | Memory facts: plan test on every fact query; 1,000,000 churn rows keep activation/control/memory pages unchanged in result and time (p.19) | PARTIAL: the 1M test landed (PERF-09: control/identity/activation pages EXPLAIN-asserted SEARCH and p95-flat at 1,000,000 rows, 100k CI tiers) and the memory pagers are range-predicate + EXPLAIN-asserted at 200k churn; remaining: a plan test on every still-unaudited fact-query statement and 1M memory-page timing. Severity moved S0->S1. | S1 |
 | DOM-06 | Checkpoints: generated trees with symlinks, permissions, binaries, empty folders, 1 GB files; one flipped byte refused; cleanup during concurrent snapshots (p.20) | PARTIAL: CAS fault campaign, `INV-CAS-COPY-TO-VERIFIED-STREAM`; no generated-tree/1GB/concurrent-cleanup suite | S2 |
 | DOM-07 | Transactional editing: random concurrent writer always triggers stale-hash refusal; parse-before-accept per language; crash mid-write leaves old or new (p.20) | PARTIAL: edit fault campaign, 54 edit tests; no random concurrent writer/crash-at-write suite | S1 |
 | DOM-08 | Git worktrees: two daemons on one repo; stale lock after crash; detached HEAD, submodules, sparse checkout, LFS pointers (p.20) | PARTIAL: 66 git tests, `INV-GIT-LEASE-UNREADABLE-NOT-STOLEN`; no two-daemon/stale-lock corpus | S2 |
 | DOM-09 | Workspace files/watchers: symlink and junction escapes per OS; 1,000 shadowed turns with real watchers; in-use durable root never evicted (p.20) | PARTIAL: 198 fs tests, 64-root cap; test uses 1 ms deadline, no real watcher | S1 |
-| DOM-10 | Bounded context: 10,000-turn soak with bounded growth; compaction never drops immutable instructions or task state; sizes 0/1/2 refused typed (p.21) | PARTIAL: `INV-COMPACTION-SUMMARY-CAP`, tiny-history floor; no 10k soak or 0/1/2 token matrix | S1 |
+| DOM-10 | Bounded context: 10,000-turn soak with bounded growth; compaction never drops immutable instructions or task state; sizes 0/1/2 refused typed (p.21) | DONE. 1k and 10k turn soaks force 50/500 real compactions with the configured minimum reduction held every time (min 0.250/0.252), retained <=3500 tokens/227 rows, goal/criteria/decision markers on every compacted wire, and task/memory/learning/pinned state byte-identical; 0/2/3/127/128 token size matrix refuses typed below the floor with zero compaction-model calls (1-token is wire-unconstructible and pinned at the durable layer) and journals CompactRejected at the floor; non-ignored 10k tier runs 8.6s. | S1 |
 | DOM-11 | Retrieval/index: labelled queries per fixture repo with recall@10 floors; renaming a symbol moves results; deterministic eviction under caps (p.21) | PARTIAL: production-wiring retrieval tests, tree-sitter for Rust/Python/TS/JS; no labelled recall corpus | S2 |
 | DOM-12 | Scheduler: random DAGs; concurrency check of budget accounting; breaker state-machine model (p.21) | PARTIAL: DAG campaign, 71 tests; no random DAG/concurrency/model check | S2 |
 | DOM-13 | Process supervision: kill daemon mid-build, scan process table per OS; double-fork and fork-bomb children contained (p.21) | PARTIAL: 173 terminal, 107 PTY, 8 Job Object tests; no kill-mid-build process-table scan | S1 |
@@ -595,7 +599,7 @@ PARTIAL; the full required test is in `programme.md` §4.
 | DOM-47 | Message pages: random appends during walk; `before` at 0, 1, newest seq, past it (p.31) | PARTIAL: 100,000-message probe; no random-append page walk | S2 |
 | DOM-48 | Transcript search: reference oracle over visible decoded text; JSON-key/quote queries; Unicode folding; 100,000 rows within page bound (p.31) | PARTIAL: part rows included; raw JSON/ASCII lower | S1 |
 | DOM-49 | Transcript rendering: window-edge orphan; every outcome × exit-code; 16 sessions streaming with no cross-session text (p.31) | PARTIAL: denied-call merge; no window-edge/outcome matrix/16-stream test | S1 |
-| DOM-50 | Switching conversations: switch during streaming, approval prompt and compaction (p.31) | PARTIAL: A38/S72; no mid-stream/mid-approval/mid-compaction switch test | S1 |
+| DOM-50 | Switching conversations: switch during streaming, approval prompt and compaction (p.31) | DONE. Webview selftest drives a switch during streaming, an approval prompt and an active compaction: old run/pending-approval/session panels drop on id change, org/daemon-scoped panels survive, the old approval card goes un-actionable, and host fences (bumpLifecycle, streamRefresh.reset, activeRunId=null, taskStartGate.reset, stream stop, sessionId/generation fences) are pinned; selftest 328/0. | S1 |
 | DOM-51 | Turns/usage/efficiency: per-session totals equal provider calls for 1,000 turns; mixed known/unknown pricing (p.31) | PARTIAL: usage routes; K-12 audited missing | S2 |
 
 ### 4.5 Configuration, credentials and settings (pp.32–34)
@@ -622,7 +626,7 @@ PARTIAL; the full required test is in `programme.md` §4.
 | DOM-64 | MCP servers: start twice; stop during call; connect with expired token; resources/prompts (p.35) | PARTIAL: start/stop/connect/tools/resources named by no test | S1 |
 | DOM-65 | Presets/agents: fallback cycles; deleted model in chain; envelope caps on children (p.35) | PARTIAL: roles/fallback Rev8 routes have no coverage row | S1 |
 | DOM-66 | Permissions/approvals: rule-matching corpus (quoting, env vars, `&&`, subshells, Unicode look-alikes); preview equals decision; double reply applies once; expired approvals (p.35) | PARTIAL: rule delete named by no test | S1 |
-| DOM-67 | Context: pins survive compaction; manifest totals equal parts; cancel mid-compaction leaves original (p.35) | PARTIAL: compaction status/cancel named by no test | S1 |
+| DOM-67 | Context: pins survive compaction; manifest totals equal parts; cancel mid-compaction leaves original (p.35) | DONE. Pinned decision/learning/task rows byte-identical across real compactions and carried in report.pinned; manifest hardening in production (each part hash-verified against its declared size via a bounded read, total_bytes required and equal to the sum) with 6 forgeries refused (lying total/size, missing total, truncated, wrong version, empty) and refs replaced by archive-evicted markers; deterministic mid-compaction cancel leaves the page byte-identical with checkpoint None and zero journal events; truncated checkpoint is typed Malformed, never silent loss. | S1 |
 
 ### 4.7 Enterprise, cloud, billing, workers, updater (p.36)
 
@@ -710,10 +714,10 @@ when its tests pass in every lane at one commit").
 | PERF-06 | 10,000 claims: totals exact, page bounded | Scale probe; runs in CI in the nightly `scale` lane. | S2 |
 | PERF-07 | 500 MCP servers, 500 skills, 500 hooks: every item reachable, listing bounded | Scale probe; runs in CI in the nightly `scale` lane (save latencies tracked as p50 with lock-shim time excluded). | S1 |
 | PERF-08 | 16 concurrent live event streams: no cross-session frames, bounded queues | Scale probe; runs in CI in the nightly `scale` lane (stable submission id, bounded lock retry). | S1 |
-| PERF-09 | 1,000,000 internal fact churn: point lookups and kind pages flat; plan tests green | MISSING | S0/S1 |
-| PERF-10 | 1,000 shadowed turns per OS with real watchers: thread/handle counts flat | PARTIAL: 1 ms-deadline test | S1 |
-| PERF-11 | Every workload records RSS; growth beyond reviewed per-platform baseline fails | PARTIAL. Daemon RSS start/peak/end is sampled over the canonical run with absolute 512 MiB growth bounds and compared against the reviewed per-platform section of `scripts/edition8/scale-baseline.json` (regressions beyond per-metric multiplier+floor fail naming metric/baseline/current/delta; a missing platform section fails loudly — darwin reviewed, linux section still to be generated via `--write-baseline` and reviewed). RSS is one daemon-wide stream, not yet per individual workload. | S2 |
-| PERF-12 | Baselines committed only after review; never written by the comparing run | DONE for the CI-reachable paths. `--bootstrap-baselines` removed from the PR and trusted edition8 lanes (comparing runs never write a baseline; a missing reviewed baseline fails loudly), and the scale baseline is written only by the explicit `--write-baseline` flag (missing-file and corrupted-metric failure paths proven). Residual: a linux perf baseline must be reviewed+committed in `tests/edition8/perf-baseline.json` or the linux edition8 perf gate fails loudly (that file sits outside the perf-gate file set). | S1 |
+| PERF-09 | 1,000,000 internal fact churn: point lookups and kind pages flat; plan tests green | DONE. Child control queue + identity and agent tool-activation lookups proven index-flat at 1,000,000 churn rows (100k CI tiers + 1M [fault] probes; EXPLAIN SEARCH on sqlite_autoindex_memory_fact_1 / idx_memory_fact_kind_updated, any SCAN memory_fact fails); p95 flat vs zero-churn baseline (median 10us->11us session, 2.4us->2.8us agent); hostile 5,001-row control space still refuses typed at scale and corrupt/missing activation rows stay typed ReadFailed/Absent; green in 2.3s/4.7s. | S0/S1 |
+| PERF-10 | 1,000 shadowed turns per OS with real watchers: thread/handle counts flat | DONE. 128-cycle fast tier and a 1,000-cycle [fault] probe run on the REAL watcher backend (registration-deadline path, not the degraded preflight): macOS/Linux thread+fd census returns exactly to baseline (5/4) after settle versus >500 threads historically, singleton-worker spawn reuse, registry <= MAX_CACHED_ROOTS, eviction-candidate probe <=2/insert, durable root survives and stays writable; deterministic counters only, no wall-clock deadlines; 46s green. | S1 |
+| PERF-11 | Every workload records RSS; growth beyond reviewed per-platform baseline fails | PARTIAL. Daemon RSS start/peak/end is sampled over the canonical run with absolute 512 MiB growth bounds and compared against the reviewed per-platform section of `scripts/edition8/scale-baseline.json` (regressions beyond per-metric multiplier+floor fail naming metric/baseline/current/delta; a missing platform section fails loudly — darwin and linux sections both reviewed and committed). RSS is one daemon-wide stream, not yet per individual workload. | S2 |
+| PERF-12 | Baselines committed only after review; never written by the comparing run | DONE. `--bootstrap-baselines` removed from the PR and trusted edition8 lanes (comparing runs never write a baseline; a missing reviewed baseline fails loudly), the scale baseline is written only by the explicit `--write-baseline` flag (missing-file and corrupted-metric failure paths proven), and both per-platform baselines are now reviewed+committed: `tests/edition8/perf-baseline.json` gained the linux section measured on the CI execution class (linux/amd64 under Rosetta; qemu-emulated numbers rejected) with three consecutive green checks, and `scripts/edition8/scale-baseline.json` gained its linux section from a canonical `--turns 1000` run with a compare-mode proof. | S1 |
 
 ### 5.2 Agent quality evals (p.42) — DOM-95, S1
 200 tasks (bug fixes, features, migrations, security, multi-repo, embedded
@@ -797,10 +801,13 @@ Already covered in `programme.md` §7. Findings:
 - **Performance/evals/revenue/lanes/dogfood/visual/hygiene:** 28
   (PERF-01…12, DOM-95…96, LANE-01…06, DOG-01, VIS-01…03, HYG-01…03).
 - **Total named findings/proof gaps: 171.**
-- **S0:** AG-01, REG-01, DOM-05, DOM-42, DOM-55, DOM-71, PERF-09. Everything
-  else is S1–S3 as marked.
-- **Act-now:** four items (AG-19, AG-05, AG-01, HAR-13/PERF-01), plus the
-  report's build-order step 1 "1-micro cap regression" (AG-12).
+- **S0:** AG-01, REG-01, DOM-42, DOM-55, DOM-71. Everything else is
+  S1–S3 as marked (DOM-05 and PERF-09 landed their 1M/plan proofs and
+  moved to S1/DONE).
+- **Act-now:** three items (AG-19, AG-05, AG-01), plus the report's
+  build-order step 1 "1-micro cap regression" (AG-12). HAR-13/PERF-01
+  are DONE (nightly scale lane with committed per-platform baselines and
+  the superlinearity gate in PR+nightly).
 
 Overlap is intentional: the At-a-glance rows are the HEAD-change view; the
 DOM/PERF rows are the same obligations at surface granularity. A programme
