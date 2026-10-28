@@ -880,7 +880,11 @@ steps:
   # workspace where the linux lane built target/debug/faktor-cli and the
   # jetbrains-smoke lane produced the real Swing evidence. A runner without a
   # checked-in reviewed baseline records an explicit unreviewed platform
-  # boundary; the isolated real-daemon dogfood for both hosts runs in the
+  # boundary. Baselines are committed only after review (PERF-12): this
+  # comparing run never bootstraps or writes one — `--bootstrap-baselines` is
+  # deliberately absent, so a missing reviewed platform baseline fails loudly
+  # instead of measuring a runner-local baseline and passing against itself.
+  # The isolated real-daemon dogfood for both hosts runs in the
   # darwin-edition8 lane where the host toolchain exists.
   - name: edition8
     image: mcr.microsoft.com/playwright:v1.55.0-noble@sha256:ffc33305f7b4b04057ae4a0caa70aad4fde87454fb403a1a22e7f931707dfcf9 # linux/amd64 manifest of playwright:v1.55.0-noble (same digest as vscode-e2e; chromium runtime included)
@@ -901,7 +905,7 @@ steps:
         fi
         chmod +x "$chrome_wrapper"
         export FAKTOR_CHROME="$chrome_wrapper"
-        node scripts/edition8/run.mjs --bootstrap-baselines --allow-unreviewed-platform
+        node scripts/edition8/run.mjs --allow-unreviewed-platform
       - |
         set -eu
         mkdir -p target/certification/lanes
@@ -913,7 +917,7 @@ steps:
         printf '#!/bin/sh\nexec "%s" --no-sandbox "$@"\n' "$chrome_bin" > "$chrome_wrapper"
         chmod +x "$chrome_wrapper"
         export FAKTOR_CHROME="$chrome_wrapper"
-        node scripts/edition8/run.mjs --bootstrap-baselines --allow-unreviewed-platform
+        node scripts/edition8/run.mjs --allow-unreviewed-platform
         CMDS
         )"
         printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \

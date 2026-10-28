@@ -168,6 +168,12 @@ steps:
       - node scripts/check-blob-hygiene.mjs
       - node scripts/check-test-separation.mjs --selftest
       - node scripts/check-test-separation.mjs --check
+      # Static superlinearity budget (PERF/HAR gate): the --selftest plants
+      # the violation shapes and asserts they fire, so "an injected
+      # super-linear query fails CI" is mechanical; the scan then gates the
+      # tree against scripts/superlinearity-budget.json.
+      - node scripts/check-superlinearity.mjs --selftest
+      - node scripts/check-superlinearity.mjs
       - node scripts/mutation-run.mjs --check-specs
       - node scripts/programme/release-gate.mjs --selftest
       - node scripts/programme/select-tests.mjs --mode pull --base "${CI_COMMIT_BEFORE_SHA:-HEAD~1}" --fallback-full --out target/certification/programme/selection.json
@@ -192,6 +198,8 @@ steps:
         node scripts/check-blob-hygiene.mjs
         node scripts/check-test-separation.mjs --selftest
         node scripts/check-test-separation.mjs --check
+        node scripts/check-superlinearity.mjs --selftest
+        node scripts/check-superlinearity.mjs
         node scripts/mutation-run.mjs --check-specs
         node scripts/programme/release-gate.mjs --selftest
         node scripts/programme/select-tests.mjs --mode pull --base "${CI_COMMIT_BEFORE_SHA:-HEAD~1}" --fallback-full --out target/certification/programme/selection.json
@@ -613,8 +621,12 @@ steps:
   # Edition8ControlExercise/Acceptance/Workflow/Evidence and the ZIP host
   # matrix); this lane converts it and verifies every gate. A Linux runner
   # with no checked-in reviewed baseline records an explicit unreviewed
-  # platform boundary, never a cross-platform inheritance. The isolated
-  # real-daemon dogfood runs in the trusted darwin lane (both hosts).
+  # platform boundary, never a cross-platform inheritance. Baselines are
+  # committed only after review (PERF-12): this comparing run never
+  # bootstraps or writes one — `--bootstrap-baselines` is deliberately
+  # absent, so a missing reviewed platform baseline fails loudly instead of
+  # measuring a runner-local baseline and passing against itself. The
+  # isolated real-daemon dogfood runs in the trusted darwin lane (both hosts).
   - name: edition8
     image: mcr.microsoft.com/playwright:v1.55.0-noble@sha256:ffc33305f7b4b04057ae4a0caa70aad4fde87454fb403a1a22e7f931707dfcf9 # linux/amd64 manifest of playwright:v1.55.0-noble (same digest as vscode-render/vscode-e2e; chromium runtime included)
     depends_on: [linux, vscode, vscode-render, jetbrains-smoke, edition5]
@@ -637,7 +649,7 @@ steps:
         fi
         chmod +x "$chrome_wrapper"
         export FAKTOR_CHROME="$chrome_wrapper"
-        node scripts/edition8/run.mjs --bootstrap-baselines --allow-unreviewed-platform
+        node scripts/edition8/run.mjs --allow-unreviewed-platform
       - |
         set -eu
         mkdir -p target/certification/lanes
@@ -650,7 +662,7 @@ steps:
         printf '#!/bin/sh\nexec "%s" %s "$@"\n' "$chrome_bin" "$no_sandbox" > "$chrome_wrapper"
         chmod +x "$chrome_wrapper"
         export FAKTOR_CHROME="$chrome_wrapper"
-        node scripts/edition8/run.mjs --bootstrap-baselines --allow-unreviewed-platform
+        node scripts/edition8/run.mjs --allow-unreviewed-platform
         CMDS
         )"
         sh scripts/certification/lane-marker.sh write \

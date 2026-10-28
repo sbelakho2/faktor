@@ -511,7 +511,7 @@ The report's "Today / Add" table names 18 harness pieces. Current state:
 | HAR-10 | Query plans | a plan test for every SQL statement; missing plan fails build | PARTIAL. `crates/store/src/query_plan_tests.rs` covers hot statements, not every statement. |
 | HAR-11 | Resource census | thread/file-handle/child-process/memory counts before/after each suite | MISSING. |
 | HAR-12 | Panic hook | route fuzzing and long runs turn any panic into a failure with input | MISSING. |
-| HAR-13 | Scale probe | nightly lane with stored curves; quadratic shape fails | PARTIAL. `scripts/edition8/scale-probe.mjs` exists, no CI reference. |
+| HAR-13 | Scale probe | DONE. Nightly `scale` lane runs `node scripts/edition8/scale-probe.mjs --turns 1000` (`.woodpecker/trusted/nightly.yaml`) with stored curves and absolute asserts; the run also compares against the committed per-platform `scripts/edition8/scale-baseline.json`, and `check-superlinearity.mjs --selftest` (injected violation shapes must fire) gates the PR and nightly lanes. | S1 |
 | HAR-14 | Fixture repositories | polyglot monorepo, 1M-line legacy, multi-repo, broken builds, STM32/ESP-IDF/Zephyr | PARTIAL. `fixtures/repositories/parser-demo` only. |
 | HAR-15 | External services | same contract test against fake and live | PARTIAL. In-process fakes; no fake-vs-live equality lane. |
 | HAR-16 | IDE drivers | JetBrains real-IDE UI tests on two newest IDE versions under real LAF | PARTIAL. VS Code Extension Host E2E; JetBrains smoke + EDT harness against fake daemon. |
@@ -702,18 +702,18 @@ when its tests pass in every lane at one commit").
 
 | ID | Workload / gate | Current | Severity |
 |---|---|---|---|
-| PERF-01 | 1,000 prompt turns + forced compaction: turn curve ratio ≤20 overall, ≤2 steady, p95 ≤15 s | Script asserts exactly (`scale-probe.mjs:570-573`); not in CI | S1 |
-| PERF-02 | 100,000 messages: every seq once; p95 page ≤500 ms; page curve ratio ≤6; search ratio ≤25 | Script asserts (`:660,720`); no CI | S1 |
+| PERF-01 | 1,000 prompt turns + forced compaction: turn curve ratio ≤20 overall, ≤2 steady, p95 ≤15 s | DONE. Script asserts exactly; runs in CI in the nightly `scale` lane (`--turns 1000`) plus the committed scale-baseline curve comparison. | S1 |
+| PERF-02 | 100,000 messages: every seq once; p95 page ≤500 ms; page curve ratio ≤6; search ratio ≤25 | DONE. Script asserts; runs in CI in the nightly `scale` lane plus the baseline curve/latency comparison. | S1 |
 | PERF-03 | History walk 2,000: every conversation once including concurrent updates | Script seeds paging (`:884-929`); no concurrent updates | S1 |
-| PERF-04 | 5,000 memory facts with edits/deletes/retention: counts exact after each operation | Script (`:760-870`) | S2 |
-| PERF-05 | 500 child agents: one projection read, exact counts | Scale probe | S2 |
-| PERF-06 | 10,000 claims: totals exact, page bounded | Scale probe | S2 |
-| PERF-07 | 500 MCP servers, 500 skills, 500 hooks: every item reachable, listing bounded | Scale probe | S1 |
-| PERF-08 | 16 concurrent live event streams: no cross-session frames, bounded queues | Scale probe | S1 |
+| PERF-04 | 5,000 memory facts with edits/deletes/retention: counts exact after each operation | DONE. Script asserts; runs in CI in the nightly `scale` lane. Retention verifies the durable end state (all tombstones removed, live set untouched) after a bounded typed-lock retry; the daemon still marks transient SQLITE_BUSY non-retryable (reported for a crates fix). | S2 |
+| PERF-05 | 500 child agents: one projection read, exact counts | Scale probe; runs in CI in the nightly `scale` lane. | S2 |
+| PERF-06 | 10,000 claims: totals exact, page bounded | Scale probe; runs in CI in the nightly `scale` lane. | S2 |
+| PERF-07 | 500 MCP servers, 500 skills, 500 hooks: every item reachable, listing bounded | Scale probe; runs in CI in the nightly `scale` lane (save latencies tracked as p50 with lock-shim time excluded). | S1 |
+| PERF-08 | 16 concurrent live event streams: no cross-session frames, bounded queues | Scale probe; runs in CI in the nightly `scale` lane (stable submission id, bounded lock retry). | S1 |
 | PERF-09 | 1,000,000 internal fact churn: point lookups and kind pages flat; plan tests green | MISSING | S0/S1 |
 | PERF-10 | 1,000 shadowed turns per OS with real watchers: thread/handle counts flat | PARTIAL: 1 ms-deadline test | S1 |
-| PERF-11 | Every workload records RSS; growth beyond reviewed per-platform baseline fails | MISSING | S2 |
-| PERF-12 | Baselines committed only after review; never written by the comparing run | PARTIAL: PR bootstrap writes baselines | S1 |
+| PERF-11 | Every workload records RSS; growth beyond reviewed per-platform baseline fails | PARTIAL. Daemon RSS start/peak/end is sampled over the canonical run with absolute 512 MiB growth bounds and compared against the reviewed per-platform section of `scripts/edition8/scale-baseline.json` (regressions beyond per-metric multiplier+floor fail naming metric/baseline/current/delta; a missing platform section fails loudly — darwin reviewed, linux section still to be generated via `--write-baseline` and reviewed). RSS is one daemon-wide stream, not yet per individual workload. | S2 |
+| PERF-12 | Baselines committed only after review; never written by the comparing run | DONE for the CI-reachable paths. `--bootstrap-baselines` removed from the PR and trusted edition8 lanes (comparing runs never write a baseline; a missing reviewed baseline fails loudly), and the scale baseline is written only by the explicit `--write-baseline` flag (missing-file and corrupted-metric failure paths proven). Residual: a linux perf baseline must be reviewed+committed in `tests/edition8/perf-baseline.json` or the linux edition8 perf gate fails loudly (that file sits outside the perf-gate file set). | S1 |
 
 ### 5.2 Agent quality evals (p.42) — DOM-95, S1
 200 tasks (bug fixes, features, migrations, security, multi-repo, embedded

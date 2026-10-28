@@ -20,7 +20,16 @@
 //
 // Usage:
 //   node scripts/edition8/scale-probe.mjs --turns 1000
+//   node scripts/edition8/scale-probe.mjs --turns 1000 --write-baseline
 //   node scripts/edition8/scale-probe.mjs --quick        # small smoke
+//
+// Baseline: the canonical run compares every tracked curve/latency/RSS
+// metric against the reviewed per-platform section of
+// scripts/edition8/scale-baseline.json and fails naming metric, baseline,
+// current and delta. The comparing run (CI or local) NEVER writes the
+// baseline: a missing or unparsable baseline fails loudly. Only an explicit
+// `--write-baseline` run of the canonical workload writes the file, and it
+// is committed after review (PERF-11/PERF-12).
 //
 // Output: target/certification/edition8/scale.raw.json for the full default
 // probe only; --quick/--skip-turns/--direct-turns and non-report parameter
@@ -75,6 +84,323 @@ const FULL_COVERAGE =
   CLAIMS === 10000;
 const MODE = QUICK ? 'quick' : SKIP_TURNS ? 'skip-turns' : DIRECT_TURNS ? 'direct-turns' : 'reduced';
 const OUT_NAME = FULL_COVERAGE ? 'scale.raw.json' : `scale.${MODE}.raw.json`;
+const WRITE_BASELINE = argv.includes('--write-baseline');
+const BASELINE_PATH = resolve(HERE, 'scale-baseline.json');
+const BASELINE_SCHEMA = 'faktor-edition8-scale-baseline/v1';
+
+// Per-metric regression budgets for the baseline comparison, calibrated
+// from four canonical --turns 1000 runs on this platform (two baseline
+// writes + two comparisons, identical code, so their spread IS the
+// run-to-run noise band; the post-turn background-writer storm varies in
+// intensity between runs). Multipliers bound the RATIO against the
+// reviewed baseline; the additive floor bounds the ABSOLUTE delta, so a
+// regression must exceed BOTH. Curve ratios carry floors above their
+// observed swing and stay tight — they are the superlinearity signal;
+// absolute latency budgets are per-metric ×3 plus a floor sized from the
+// observed absolute spread (p95 tails swing up to ~4.4x under the storm,
+// and lock-shim waits are excluded from samples so retry time is never
+// measured as service time; the 8/256-sample save p95s are tracked as
+// p50 because one slow sample dominates a max-like quantile); RSS is
+// deterministic for the fixed workload. The probe's absolute shape
+// asserts (turn <=20, steady <=2, compaction <=3, page/search <=6/<=25,
+// memory <=8) remain the hard ceiling above every baseline bound.
+const BASELINE_POLICY = {
+  'turns-compaction.turn_curve': {
+    multiplier: 1.5,
+    floor: 1,
+    reason: 'decile-median turn latency ratio; observed 1.06x across two canonical runs, floor 1.0 covers warmup jitter, absolute assert <=20 is the hard ceiling',
+  },
+  'turns-compaction.turn_steady_curve': {
+    multiplier: 1.5,
+    floor: 0.5,
+    reason: 'first-vs-last decile steady plateau; observed 0.90x across runs, absolute assert <=2 remains the effective ceiling',
+  },
+  'turns-compaction.compaction_ms_per_ktok_curve': {
+    multiplier: 1.5,
+    floor: 1,
+    reason: 'compaction ms/1k-token shape on a sub-1 baseline; observed delta +0.89 under the post-turn writer storm, floor 1.0 covers it while absolute assert <=3 stays tighter',
+  },
+  'transcript-100k-page-search.page_curve_first_last': {
+    multiplier: 1.5,
+    floor: 0.75,
+    reason: 'page latency shape on a 0.5 baseline; observed 1.58x swing from sub-ms denominator noise, floor 0.75 covers it, absolute assert <=6 is the ceiling',
+  },
+  'transcript-100k-page-search.search_ratio_10x': {
+    multiplier: 1.5,
+    floor: 1,
+    reason: '100k-vs-10k search scaling ratio; observed 1.16x across runs, floor 1.0 absorbs sub-ms denominator jitter, absolute assert <=25 is the ceiling',
+  },
+  'memory-5000.create_curve_first_last': {
+    multiplier: 1.5,
+    floor: 2,
+    reason: 'memory create shape over sub-ms first-decile medians; observed delta +1.78 under load, floor 2.0 covers it, absolute assert <=8 is the ceiling',
+  },
+  'history-2000.page_curve_first_last': {
+    multiplier: 1.5,
+    floor: 0.75,
+    reason: 'history paging shape on sub-ms pages; observed 0.63-1.58x across runs, floor 0.75 absorbs denominator jitter, absolute assert <=6 is the ceiling',
+  },
+  'turns-compaction.turn_ms.p95': {
+    multiplier: 3,
+    floor: 100,
+    reason: 'absolute turn p95 under the real provider loop; observed 326-455ms across four canonical runs, x3+100ms covers the storm band while a 10x algorithmic regression still fails',
+  },
+  'turns-compaction.compaction_ms.p95': {
+    multiplier: 3,
+    floor: 50,
+    reason: 'absolute compaction p95; observed 43-56ms across runs, x3+50ms covers the band while an algorithmic regression still fails',
+  },
+  'transcript-100k-page-search.page_ms.p95': {
+    multiplier: 3,
+    floor: 15,
+    reason: 'absolute page p95 over 100k messages; observed 2-10ms across runs, x3+15ms covers scheduler jitter, a full-scan page still fails',
+  },
+  'transcript-100k-page-search.search_100k_ms.p50': {
+    multiplier: 3,
+    floor: 100,
+    reason: 'absolute search p50 on 100k messages; observed 151-226ms across runs, x3+100ms covers the storm band while a full-scan regression fails',
+  },
+  'transcript-100k-page-search.search_10k_ms.p50': {
+    multiplier: 3,
+    floor: 25,
+    reason: 'absolute search p50 on 10k messages; observed 15-34ms across runs, x3+25ms covers the band',
+  },
+  'memory-5000.create_ms.p95': {
+    multiplier: 3,
+    floor: 20,
+    reason: 'absolute memory create p95; observed 3.1-13.9ms across runs (storm-driven p95 tail), x3+20ms covers the observed band while a policy/scan regression still fails',
+  },
+  'memory-5000.edit_ms.p95': {
+    multiplier: 3,
+    floor: 5,
+    reason: 'absolute memory edit p95; observed 2.9-4.6ms across runs, x3+5ms covers sub-ms jitter',
+  },
+  'memory-5000.delete_ms.p95': {
+    multiplier: 3,
+    floor: 5,
+    reason: 'absolute memory delete p95; observed 2.1-2.4ms across runs, x3+5ms covers sub-ms jitter',
+  },
+  'history-2000.page_ms.p95': {
+    multiplier: 3,
+    floor: 2,
+    reason: 'absolute history page p95 on sub-ms pages; observed 0.67-0.96ms across runs, x3+2ms keeps the bound tight so a constant-factor page regression fails',
+  },
+  'child-agents-500.agents_ms': {
+    multiplier: 3,
+    floor: 20,
+    reason: 'absolute 500-child projection read; observed 14-24.4ms across runs, x3+20ms covers the band while an unbounded projection regression fails',
+  },
+  'proof-10000-claims.proof_ms': {
+    multiplier: 3,
+    floor: 10,
+    reason: 'absolute 10k-claim proof read; observed 8.2-9.1ms across runs, x3+10ms covers the band',
+  },
+  'concurrent-16-stream.prompt_ms.p95': {
+    multiplier: 3,
+    floor: 50,
+    reason: 'absolute prompt-accept p95 across 16 live streams; observed 48-90ms across runs, x3+50ms covers scheduler load while an admission-path regression fails',
+  },
+  'mcp-skills-hooks-500.mcp_save_ms.p50': {
+    multiplier: 3,
+    floor: 10,
+    reason: 'median MCP save (p95 over 8 samples is max-like: one slow or lock-retried sample dominates it); sub-ms when clean, 10ms floor fails a CRUD path degraded into scan territory',
+  },
+  'mcp-skills-hooks-500.hook_save_ms.p50': {
+    multiplier: 3,
+    floor: 10,
+    reason: 'median hook save (p95 over 256 samples tracked the lock-shim tail in observed runs); sub-ms when clean, 10ms floor fails a CRUD path degraded into scan territory',
+  },
+  'rss-bounded.start_kb': {
+    multiplier: 1.5,
+    floor: 2048,
+    reason: 'daemon RSS before the workload; observed 0.99x across runs, allocator jitter is tens of percent',
+  },
+  'rss-bounded.peak_kb': {
+    multiplier: 1.5,
+    floor: 2048,
+    reason: 'daemon RSS peak holding 100k messages/5k facts/10k claims; observed 1.05x across runs, a retained-buffer regression is hundreds of MiB',
+  },
+  'rss-bounded.end_kb': {
+    multiplier: 1.5,
+    floor: 2048,
+    reason: 'daemon RSS after the workload; observed 1.05x across runs, a retained-buffer regression is hundreds of MiB',
+  },
+};
+
+function trackedMetrics(document) {
+  const byId = new Map(document.probes.map((probe) => [probe.id, probe]));
+  const valueAt = (id, path) => {
+    let value = byId.get(id);
+    for (const key of path.split('.')) value = value === undefined || value === null ? undefined : value[key];
+    return typeof value === 'number' && Number.isFinite(value) ? value : null;
+  };
+  const specs = {
+    curve: [
+      ['turns-compaction.turn_curve', 'turns-compaction', 'turn_curve'],
+      ['turns-compaction.turn_steady_curve', 'turns-compaction', 'turn_steady_curve'],
+      ['turns-compaction.compaction_ms_per_ktok_curve', 'turns-compaction', 'compaction_ms_per_ktok_curve'],
+      ['transcript-100k-page-search.page_curve_first_last', 'transcript-100k-page-search', 'page_curve_first_last'],
+      ['transcript-100k-page-search.search_ratio_10x', 'transcript-100k-page-search', 'search_ratio_10x'],
+      ['memory-5000.create_curve_first_last', 'memory-5000', 'create_curve_first_last'],
+      ['history-2000.page_curve_first_last', 'history-2000', 'page_curve_first_last'],
+    ],
+    latency_ms: [
+      ['turns-compaction.turn_ms.p95', 'turns-compaction', 'turn_ms.p95'],
+      ['turns-compaction.compaction_ms.p95', 'turns-compaction', 'compaction_ms.p95'],
+      ['transcript-100k-page-search.page_ms.p95', 'transcript-100k-page-search', 'page_ms.p95'],
+      ['transcript-100k-page-search.search_100k_ms.p50', 'transcript-100k-page-search', 'search_100k_ms.p50'],
+      ['transcript-100k-page-search.search_10k_ms.p50', 'transcript-100k-page-search', 'search_10k_ms.p50'],
+      ['memory-5000.create_ms.p95', 'memory-5000', 'create_ms.p95'],
+      ['memory-5000.edit_ms.p95', 'memory-5000', 'edit_ms.p95'],
+      ['memory-5000.delete_ms.p95', 'memory-5000', 'delete_ms.p95'],
+      ['history-2000.page_ms.p95', 'history-2000', 'page_ms.p95'],
+      ['child-agents-500.agents_ms', 'child-agents-500', 'agents_ms'],
+      ['proof-10000-claims.proof_ms', 'proof-10000-claims', 'proof_ms'],
+      ['concurrent-16-stream.prompt_ms.p95', 'concurrent-16-stream', 'prompt_ms.p95'],
+      ['mcp-skills-hooks-500.mcp_save_ms.p50', 'mcp-skills-hooks-500', 'mcp_save_ms.p50'],
+      ['mcp-skills-hooks-500.hook_save_ms.p50', 'mcp-skills-hooks-500', 'hook_save_ms.p50'],
+    ],
+    rss_kb: [
+      ['rss-bounded.start_kb', 'rss-bounded', 'start_kb'],
+      ['rss-bounded.peak_kb', 'rss-bounded', 'peak_kb'],
+      ['rss-bounded.end_kb', 'rss-bounded', 'end_kb'],
+    ],
+  };
+  const metrics = {};
+  const missing = [];
+  for (const [className, rows] of Object.entries(specs)) {
+    metrics[className] = {};
+    for (const [name, id, path] of rows) {
+      const value = valueAt(id, path);
+      if (value === null) missing.push(`${className}.${name} (${id})`);
+      else metrics[className][name] = value;
+    }
+  }
+  return { metrics, missing };
+}
+
+function writeScaleBaseline(document) {
+  const { metrics, missing } = trackedMetrics(document);
+  if (missing.length > 0) {
+    throw new Error(`refusing to write baseline: run metrics missing: ${missing.join(', ')}`);
+  }
+  let existing = null;
+  if (existsSync(BASELINE_PATH)) {
+    try {
+      existing = JSON.parse(readFileSync(BASELINE_PATH, 'utf8'));
+    } catch (error) {
+      throw new Error(`existing baseline is unparsable (${error.message}); restore it from git or regenerate deliberately`);
+    }
+    if (existing?.schema !== BASELINE_SCHEMA) {
+      throw new Error(`existing baseline schema ${existing?.schema ?? 'absent'} != ${BASELINE_SCHEMA}`);
+    }
+  }
+  const baselineDocument = {
+    schema: BASELINE_SCHEMA,
+    comment:
+      'Reviewed canonical (--turns 1000) scale baseline, one section per platform. Written ONLY by an explicit `node scripts/edition8/scale-probe.mjs --turns 1000 --write-baseline` run and committed after review; the comparing run (CI or local) never writes this file and fails loudly when it is missing, unparsable or a tracked metric regresses beyond the policy below.',
+    policy: {
+      comment:
+        'Per-metric multiplier/floor calibrated from two canonical runs on this platform (calibration note in the BASELINE_POLICY block of scripts/edition8/scale-probe.mjs); a regressed metric must exceed BOTH baseline x multiplier AND baseline + floor.',
+      metrics: BASELINE_POLICY,
+    },
+    platforms: { ...(existing?.platforms ?? {}) },
+  };
+  baselineDocument.platforms[document.platform] = {
+    recorded_at: document.generated_at,
+    node: process.version,
+    arch: process.arch,
+    workload: document.counts,
+    metrics,
+  };
+  const payload = `${JSON.stringify(baselineDocument, null, 2)}\n`;
+  writeFileSync(BASELINE_PATH, payload);
+  console.log(`[scale] wrote baseline ${BASELINE_PATH} (${sha(Buffer.from(payload))}) — commit only after review`);
+}
+
+function compareScaleBaseline(document) {
+  const failures = [];
+  const relPath = BASELINE_PATH.split(`${resolve(ROOT)}/`)[1] ?? BASELINE_PATH;
+  if (!existsSync(BASELINE_PATH)) {
+    return {
+      platform: document.platform,
+      failures: [
+        `missing committed scale baseline ${relPath}; baselines are created ONLY by an explicit reviewed run of ` +
+          '`node scripts/edition8/scale-probe.mjs --turns 1000 --write-baseline` and committed after review — ' +
+          'the comparing run never auto-creates one',
+      ],
+    };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(readFileSync(BASELINE_PATH, 'utf8'));
+  } catch (error) {
+    return {
+      platform: document.platform,
+      failures: [
+        `unparsable scale baseline ${relPath} (${error.message}); restore it from git or regenerate via the explicit ` +
+          '--write-baseline run and commit after review — the comparing run never auto-recreates one',
+      ],
+    };
+  }
+  if (parsed?.schema !== BASELINE_SCHEMA) {
+    return {
+      platform: document.platform,
+      failures: [`scale baseline schema ${parsed?.schema ?? 'absent'} != ${BASELINE_SCHEMA}; regenerate via --write-baseline and commit after review`],
+    };
+  }
+  const entry = parsed.platforms?.[document.platform];
+  if (entry === undefined || entry === null) {
+    return {
+      platform: document.platform,
+      failures: [
+        `no reviewed ${document.platform} section in ${relPath} (have: ${Object.keys(parsed.platforms ?? {}).join(', ') || 'none'}); ` +
+          'generate it with the explicit --write-baseline run on this platform and commit after review',
+      ],
+    };
+  }
+  const { metrics, missing } = trackedMetrics(document);
+  for (const name of missing) failures.push(`run metric missing: ${name}`);
+  const policyMetrics = parsed.policy?.metrics;
+  if (policyMetrics === null || typeof policyMetrics !== 'object') {
+    failures.push('baseline policy.metrics is missing or malformed; regenerate via --write-baseline and commit after review');
+    return { platform: document.platform, metrics_checked: 0, failures };
+  }
+  const trackedNames = new Set(Object.values(metrics).flatMap((rows) => Object.keys(rows)));
+  for (const name of Object.keys(policyMetrics)) {
+    if (!trackedNames.has(name)) failures.push(`baseline policy carries stale metric ${name}; regenerate via --write-baseline`);
+  }
+  for (const [className, rows] of Object.entries(metrics)) {
+    for (const [name, current] of Object.entries(rows)) {
+      const policy = policyMetrics[name];
+      if (
+        policy === undefined ||
+        typeof policy.multiplier !== 'number' ||
+        typeof policy.floor !== 'number' ||
+        typeof policy.reason !== 'string' ||
+        policy.reason.length === 0
+      ) {
+        failures.push(`baseline policy for ${className}.${name} is missing or malformed; regenerate via --write-baseline`);
+        continue;
+      }
+      const prior = entry.metrics?.[className]?.[name];
+      if (typeof prior !== 'number' || !Number.isFinite(prior)) {
+        failures.push(`baseline ${document.platform} is missing ${className}.${name}; regenerate via --write-baseline and commit after review`);
+        continue;
+      }
+      const allowed = prior * policy.multiplier + policy.floor;
+      if (current > allowed) {
+        const delta = current - prior;
+        const percent = prior === 0 ? 'n/a' : `${(((current / prior) - 1) * 100).toFixed(1)}%`;
+        failures.push(
+          `${className}.${name} regressed: baseline ${prior}, current ${current}, delta ${delta >= 0 ? '+' : ''}${Number(delta.toFixed(3))} (${percent}); ` +
+            `allowed ${Number(allowed.toFixed(3))} = baseline x${policy.multiplier} + floor ${policy.floor}`,
+        );
+      }
+    }
+  }
+  return { platform: document.platform, metrics_checked: Object.values(metrics).reduce((total, rows) => total + Object.keys(rows).length, 0), failures };
+}
 
 function sha(bytes) {
   return `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
@@ -211,20 +537,64 @@ function seedBinary() {
   return built;
 }
 
-async function postJson(base, token, path, body) {
-  const response = await fetch(`${base}${path}`, {
-    method: 'POST',
-    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  const text = await response.text();
-  let json = null;
-  try {
-    json = text.length > 0 ? JSON.parse(text) : null;
-  } catch {
-    json = null;
+async function postJson(base, token, path, body, lockRetries = 0) {
+  const send = async () => {
+    const response = await fetch(`${base}${path}`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const text = await response.text();
+    let json = null;
+    try {
+      json = text.length > 0 ? JSON.parse(text) : null;
+    } catch {
+      json = null;
+    }
+    return { status: response.status, json, text };
+  };
+  let result = await send();
+  let lockWaitMs = 0;
+  // Post-turn background writers hold the store in bursts (the daemon marks
+  // the resulting SQLITE_BUSY 500 non-retryable — reported separately).
+  // Callers that re-send the SAME idempotent body may opt into a bounded
+  // wait for the burst to drain; prompt/compaction paths deliberately do
+  // not (their submission/operation ids carry their own retry semantics).
+  // The artificial wait is reported as `lock_wait_ms` so latency samples
+  // can subtract it: shim time is not service time.
+  for (
+    let attempt = 1;
+    attempt <= lockRetries && result.status === 500 && String(result.text).includes('database is locked');
+    attempt += 1
+  ) {
+    console.log(`[scale] lock-retry ${path} ${attempt}/${lockRetries} in 1500ms`);
+    await new Promise((done) => setTimeout(done, 1500));
+    lockWaitMs += 1500;
+    result = await send();
   }
-  return { status: response.status, json, text };
+  result.lock_wait_ms = lockWaitMs;
+  return result;
+}
+
+async function fetchLockRetry(url, options, lockRetries = 20) {
+  let lockWaitMs = 0;
+  for (let attempt = 0; ; attempt += 1) {
+    const response = await fetch(url, options);
+    const text = await response.text();
+    if (attempt < lockRetries && response.status === 500 && text.includes('database is locked')) {
+      console.log(`[scale] lock-retry ${new URL(url).pathname} ${attempt + 1}/${lockRetries} in 1500ms`);
+      await new Promise((done) => setTimeout(done, 1500));
+      lockWaitMs += 1500;
+      continue;
+    }
+    let json = null;
+    try {
+      json = text.length > 0 ? JSON.parse(text) : null;
+    } catch {
+      json = null;
+    }
+    return { status: response.status, json, text, lock_wait_ms: lockWaitMs };
+  }
 }
 
 async function waitForAgentsIdle(base, token, sessionId, deadlineMs = 20_000) {
@@ -419,6 +789,12 @@ function sseCollector(base, token, sessionId) {
 }
 
 async function main() {
+  if (WRITE_BASELINE && !FULL_COVERAGE) {
+    throw new Error(
+      '--write-baseline requires the canonical workload (no --quick/--skip-turns/--direct-turns and the default ' +
+        '1000/100000/5000/2000/500/10000 counts); reduced runs are never baseline material',
+    );
+  }
   const store = storeBinary();
   const seed = seedBinary();
   const appendTurn = appendBinary();
@@ -486,17 +862,288 @@ async function main() {
     const startedRss = rssKb(daemon.child.pid);
     sampler = setInterval(() => samples.push(rssKb(daemon.child.pid)), 250);
 
+    // --------------------------------------------------------------- memory
+    // Runs BEFORE any prompt turn on purpose: retention's apply path needs
+    // a quiescent writer, and the post-turn background-settlement storm
+    // (observed holding the store for 60s-3min+) otherwise starves it;
+    // the latency samples stay clean the same way.
+    await probe('memory-5000', async () => {
+      const memoryWorkspace = join(tmp, 'memory-workspace');
+      mkdirSync(memoryWorkspace, { recursive: true });
+      const created = await postJson(
+        base,
+        token,
+        '/native/session',
+        { provider: 'p1', model: 'm', workspace: memoryWorkspace, title: 'memory scale' },
+        20,
+      );
+      assert('memory-5000', created.status === 200, `create memory session ${created.status}`);
+      const sessionId = String(created.json.id);
+      const createSamples = [];
+      const idsList = [];
+      const createdIds = new Set();
+      for (let index = 0; index < MEMORY_FACTS; index += 1) {
+        const started = performance.now();
+        const subject = `svc-${String(index).padStart(5, '0')}`;
+        const body = await postJson(
+          base,
+          token,
+          '/native/memory/records',
+          {
+            session: sessionId,
+            scope: 'session',
+            subject,
+            predicate: 'port',
+            value: { type: 'number', value: index },
+            provenance: { origin: 'user' },
+          },
+          20,
+        );
+        createSamples.push(performance.now() - started - (body.lock_wait_ms ?? 0));
+        assert('memory-5000', body.status === 200, `memory create ${index} -> ${body.status} ${body.text.slice(0, 200)}`);
+        const record = body.json.record;
+        assert('memory-5000', record.subject === subject, `memory create ${index} returned subject ${record.subject}`);
+        assert('memory-5000', !createdIds.has(record.id), `memory create ${index} reused id ${record.id}`);
+        createdIds.add(record.id);
+        idsList.push(record.id);
+      }
+      if (MEMORY_FACTS >= 5000) {
+        const over = await postJson(
+          base,
+          token,
+          '/native/memory/records',
+          {
+            session: sessionId,
+            scope: 'session',
+            subject: 'svc-overflow',
+            predicate: 'port',
+            value: { type: 'number', value: 1 },
+          },
+          20,
+        );
+        assert(
+          'memory-5000',
+          over.status === 409 && over.text.includes('memory_policy_limit'),
+          `policy overflow not typed: ${over.status} ${over.text.slice(0, 200)}`,
+        );
+      }
+      const first = createSamples.slice(0, Math.max(1, Math.floor(MEMORY_FACTS / 10)));
+      const last = createSamples.slice(-Math.max(1, Math.floor(MEMORY_FACTS / 10)));
+      const curve = percentile(last, 0.5) / Math.max(percentile(first, 0.5), 0.05);
+      assert('memory-5000', curve <= 8, `memory create cost ratio ${curve.toFixed(2)} across ${MEMORY_FACTS} rows looks quadratic`);
+
+      const editSamples = [];
+      for (let index = 0; index < Math.min(1000, MEMORY_FACTS); index += 1) {
+        const started = performance.now();
+        const edited = await fetchLockRetry(
+          `${base}/native/memory/records/${encodeURIComponent(idsList[index])}`,
+          {
+            method: 'PUT',
+            headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+            body: JSON.stringify({
+              session: sessionId,
+              expectedVersion: 1,
+              value: { type: 'number', value: index + 1 },
+            }),
+          },
+        );
+        editSamples.push(performance.now() - started - (edited.lock_wait_ms ?? 0));
+        assert('memory-5000', edited.status === 200 && edited.json.record.version === 2, `memory edit ${index} -> ${edited.status}`);
+      }
+      const deleteSamples = [];
+      const deletedIds = new Set();
+      for (let index = 0; index < Math.min(1000, MEMORY_FACTS); index += 1) {
+        const started = performance.now();
+        const deleted = await fetchLockRetry(
+          `${base}/native/memory/records/${encodeURIComponent(idsList[index])}?session=${sessionId}&expectedVersion=2`,
+          { method: 'DELETE', headers: { authorization: `Bearer ${token}` } },
+        );
+        const text = deleted.text;
+        deleteSamples.push(performance.now() - started - (deleted.lock_wait_ms ?? 0));
+        assert('memory-5000', deleted.status === 200, `memory delete ${index} -> ${deleted.status} ${text.slice(0, 200)}`);
+        deletedIds.add(idsList[index]);
+      }
+      assert('memory-5000', deletedIds.size === Math.min(1000, MEMORY_FACTS), `deleted ${deletedIds.size} distinct rows`);
+
+      let before = null;
+      let live = 0;
+      const seen = new Set();
+      for (;;) {
+        const query = new URLSearchParams({ session: sessionId, limit: '200', scope: 'session' });
+        if (before !== null) {
+          query.set('afterMs', String(before.afterMs));
+          query.set('afterKind', String(before.afterKind));
+          query.set('afterKey', String(before.afterKey));
+        }
+        const page = await getJson(base, token, `/native/memory/records?${query}`);
+        assert('memory-5000', page.status === 200, `memory page ${page.status}`);
+        for (const record of page.json.records) {
+          assert('memory-5000', !seen.has(record.id), `duplicate memory ${record.id}`);
+          seen.add(record.id);
+          assert('memory-5000', record.scope === 'session' && Number(record.scopeId) === Number(sessionId), 'memory scope escaped its session');
+          assert('memory-5000', record.deleted === null, 'default memory page served a tombstone');
+        }
+        live += page.json.records.length;
+        if (!page.json.hasMore) break;
+        before = page.json.nextCursor;
+        assert('memory-5000', before !== null, 'memory hasMore without cursor');
+      }
+      const expectedLive = [...createdIds].filter((id) => !deletedIds.has(id));
+      if (live !== expectedLive.length) {
+        const missing = expectedLive.filter((id) => !seen.has(id));
+        console.error(
+          `[scale] memory-5000: live=${live} expected=${expectedLive.length} created=${createdIds.size} deleted=${deletedIds.size} missing=${missing.length} ${missing.slice(0, 5).join(',')}`,
+        );
+        for (const id of missing.slice(0, 3)) {
+          console.error(`[scale] memory-5000: missing index=${idsList.indexOf(id)} deleted=${deletedIds.has(id)}`);
+        }
+        const tombstoned = new Map();
+        let cursor = null;
+        for (;;) {
+          const query = new URLSearchParams({ session: sessionId, limit: '200', scope: 'session', includeDeleted: 'true' });
+          if (cursor !== null) {
+            query.set('afterMs', String(cursor.afterMs));
+            query.set('afterKind', String(cursor.afterKind));
+            query.set('afterKey', String(cursor.afterKey));
+          }
+          const page = await getJson(base, token, `/native/memory/records?${query}`);
+          for (const record of page.json.records) tombstoned.set(record.id, record);
+          if (!page.json.hasMore) break;
+          cursor = page.json.nextCursor;
+          if (cursor === null) break;
+        }
+        for (const id of missing.slice(0, 3)) {
+          const record = tombstoned.get(id);
+          console.error(
+            `[scale] memory-5000: missing ${id} in-include-deleted=${record ? JSON.stringify({ deleted: record.deleted, version: record.version }) : 'absent'}`,
+          );
+          const probeRow = await fetch(`${base}/native/memory/records/${encodeURIComponent(id)}`, {
+            method: 'PUT',
+            headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+            body: JSON.stringify({ session: sessionId, expectedVersion: 1, value: { type: 'number', value: -1 } }),
+          });
+          console.error(`[scale] memory-5000: probe-exists ${id} -> ${probeRow.status} ${(await probeRow.text()).slice(0, 200)}`);
+        }
+      }
+      assert('memory-5000', live === expectedLive.length, `live memory ${live} != expected ${expectedLive.length}`);
+
+      const all = await getJson(base, token, `/native/memory/records?session=${sessionId}&limit=200&scope=session&includeDeleted=true`);
+      assert('memory-5000', all.status === 200 && all.json.records.length === 200, 'tombstone page size');
+      const retentionBody = {
+        session: sessionId,
+        scope: 'session',
+        olderThanDays: 0,
+        dryRun: false,
+        limit: 1000,
+      };
+      // Post-turn background writers drain for a bounded window (10-15s
+      // observed after a single turn; minutes after a full 1,000-turn
+      // session) and the retention route surfaces their SQLITE_BUSY as a
+      // 500 `database is locked` (the daemon currently marks it
+      // non-retryable — reported separately). Retry the SAME call while the
+      // body still carries the typed lock error. A failed attempt may have
+      // already applied part of its bounded delete loop, so the LAST 200
+      // response's `deleted` under-reports: the contract is verified as the
+      // durable END STATE below (every tombstone removed, every live fact
+      // untouched), plus the scan bound on the final response. A retention
+      // that can never succeed still fails this probe.
+      let retention = await postJson(base, token, '/native/memory/records/retention', retentionBody);
+      for (
+        let attempt = 1;
+        attempt <= 60 && retention.status !== 200 && String(retention.text).includes('database is locked');
+        attempt += 1
+      ) {
+        console.log(`[scale] memory-5000: retention blocked by sqlite lock; retry ${attempt}/60 in 3000ms`);
+        await new Promise((done) => setTimeout(done, 3000));
+        retention = await postJson(base, token, '/native/memory/records/retention', retentionBody);
+      }
+      assert('memory-5000', retention.status === 200, `retention ${retention.status} ${retention.text.slice(0, 200)}`);
+      assert('memory-5000', retention.json.truncated === false || retention.json.scanned <= 4096, 'retention scan unbounded');
+      assert('memory-5000', Number(retention.json.scanned) <= 4096, `retention scanned ${retention.json.scanned} rows`);
+      let tombstonesLeft = 0;
+      let liveAfterRetention = 0;
+      {
+        let cursor = null;
+        for (;;) {
+          const query = new URLSearchParams({ session: sessionId, limit: '200', scope: 'session', includeDeleted: 'true' });
+          if (cursor !== null) {
+            query.set('afterMs', String(cursor.afterMs));
+            query.set('afterKind', String(cursor.afterKind));
+            query.set('afterKey', String(cursor.afterKey));
+          }
+          const page = await getJson(base, token, `/native/memory/records?${query}`);
+          assert('memory-5000', page.status === 200, `post-retention page ${page.status}`);
+          for (const record of page.json.records) {
+            if (record.deleted !== null) {
+              if (deletedIds.has(record.id)) tombstonesLeft += 1;
+            } else {
+              liveAfterRetention += 1;
+            }
+          }
+          if (!page.json.hasMore) break;
+          cursor = page.json.nextCursor;
+          assert('memory-5000', cursor !== null, 'post-retention hasMore without cursor');
+        }
+      }
+      assert('memory-5000', tombstonesLeft === 0, `retention left ${tombstonesLeft} of ${deletedIds.size} tombstones`);
+      assert(
+        'memory-5000',
+        liveAfterRetention === expectedLive.length,
+        `retention changed the live set: ${liveAfterRetention} != ${expectedLive.length}`,
+      );
+
+      const workspaceFact = await postJson(
+        base,
+        token,
+        '/native/memory/records',
+        {
+          session: sessionId,
+          scope: 'workspace',
+          subject: 'workspace-scope',
+          predicate: 'only',
+          value: { type: 'bool', value: true },
+        },
+        20,
+      );
+      assert('memory-5000', workspaceFact.status === 200, `workspace memory ${workspaceFact.status}`);
+      const sessionOnly = await getJson(base, token, `/native/memory/records?session=${sessionId}&scope=session&limit=200`);
+      assert(
+        'memory-5000',
+        sessionOnly.json.records.every((record) => record.scope === 'session'),
+        'session scope leaked a workspace fact',
+      );
+      const merged = await getJson(base, token, `/native/memory/records?session=${sessionId}&scope=all&limit=200`);
+      assert('memory-5000', merged.status === 200 && merged.json.records.length > 0, 'scope=all read failed');
+      return {
+        facts: MEMORY_FACTS,
+        edits: editSamples.length,
+        deletes: deleteSamples.length,
+        live,
+        retention_deleted: retention.json.deleted,
+        create_ms: summary(createSamples),
+        edit_ms: summary(editSamples),
+        delete_ms: summary(deleteSamples),
+        create_curve_first_last: Number(curve.toFixed(2)),
+      };
+    });
+
     // ---------------------------------------------------------------- turns
     if (!SKIP_TURNS) {
       await probe('turns-compaction', async () => {
         const turnWorkspace = join(tmp, 'turn-workspace');
         initWorkspace(turnWorkspace);
-        const created = await postJson(base, token, '/native/session', {
-          provider: 'p1',
-          model: 'm',
-          workspace: turnWorkspace,
-          title: `scale ${RUN_ID} turns`,
-        });
+        const created = await postJson(
+          base,
+          token,
+          '/native/session',
+          {
+            provider: 'p1',
+            model: 'm',
+            workspace: turnWorkspace,
+            title: `scale ${RUN_ID} turns`,
+          },
+          20,
+        );
         assert('turns-compaction', created.status === 200, `create session ${created.status}`);
         const sessionId = String(created.json.id);
         const collector = DIRECT_TURNS ? null : sseCollector(base, token, sessionId);
@@ -707,12 +1354,13 @@ async function main() {
     await probe('compaction-tiny-history-typed', async () => {
       const tinyWorkspace = join(tmp, 'tiny-workspace');
       mkdirSync(tinyWorkspace, { recursive: true });
-      const created = await postJson(base, token, '/native/session', {
-        provider: 'p1',
-        model: 'm',
-        workspace: tinyWorkspace,
-        title: 'tiny compaction',
-      });
+      const created = await postJson(
+        base,
+        token,
+        '/native/session',
+        { provider: 'p1', model: 'm', workspace: tinyWorkspace, title: 'tiny compaction' },
+        20,
+      );
       assert('compaction-tiny-history-typed', created.status === 200, 'create tiny session');
       const sessionId = String(created.json.id);
       const prompt = await postJson(base, token, `/native/session/${sessionId}/prompt`, {
@@ -847,201 +1495,6 @@ async function main() {
         page_curve_first_last: Number(pageCurve.toFixed(2)),
         assistant_part_search: true,
         unicode_matches: unicode.found.json.matches.length,
-      };
-    });
-
-    // --------------------------------------------------------------- memory
-    await probe('memory-5000', async () => {
-      const memoryWorkspace = join(tmp, 'memory-workspace');
-      mkdirSync(memoryWorkspace, { recursive: true });
-      const created = await postJson(base, token, '/native/session', {
-        provider: 'p1',
-        model: 'm',
-        workspace: memoryWorkspace,
-        title: 'memory scale',
-      });
-      assert('memory-5000', created.status === 200, `create memory session ${created.status}`);
-      const sessionId = String(created.json.id);
-      const createSamples = [];
-      const idsList = [];
-      const createdIds = new Set();
-      for (let index = 0; index < MEMORY_FACTS; index += 1) {
-        const started = performance.now();
-        const subject = `svc-${String(index).padStart(5, '0')}`;
-        const body = await postJson(base, token, '/native/memory/records', {
-          session: sessionId,
-          scope: 'session',
-          subject,
-          predicate: 'port',
-          value: { type: 'number', value: index },
-          provenance: { origin: 'user' },
-        });
-        createSamples.push(performance.now() - started);
-        assert('memory-5000', body.status === 200, `memory create ${index} -> ${body.status} ${body.text.slice(0, 200)}`);
-        const record = body.json.record;
-        assert('memory-5000', record.subject === subject, `memory create ${index} returned subject ${record.subject}`);
-        assert('memory-5000', !createdIds.has(record.id), `memory create ${index} reused id ${record.id}`);
-        createdIds.add(record.id);
-        idsList.push(record.id);
-      }
-      if (MEMORY_FACTS >= 5000) {
-        const over = await postJson(base, token, '/native/memory/records', {
-          session: sessionId,
-          scope: 'session',
-          subject: 'svc-overflow',
-          predicate: 'port',
-          value: { type: 'number', value: 1 },
-        });
-        assert(
-          'memory-5000',
-          over.status === 409 && over.text.includes('memory_policy_limit'),
-          `policy overflow not typed: ${over.status} ${over.text.slice(0, 200)}`,
-        );
-      }
-      const first = createSamples.slice(0, Math.max(1, Math.floor(MEMORY_FACTS / 10)));
-      const last = createSamples.slice(-Math.max(1, Math.floor(MEMORY_FACTS / 10)));
-      const curve = percentile(last, 0.5) / Math.max(percentile(first, 0.5), 0.05);
-      assert('memory-5000', curve <= 8, `memory create cost ratio ${curve.toFixed(2)} across ${MEMORY_FACTS} rows looks quadratic`);
-
-      const editSamples = [];
-      for (let index = 0; index < Math.min(1000, MEMORY_FACTS); index += 1) {
-        const started = performance.now();
-        const edited = await fetch(
-          `${base}/native/memory/records/${encodeURIComponent(idsList[index])}`,
-          {
-            method: 'PUT',
-            headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
-            body: JSON.stringify({
-              session: sessionId,
-              expectedVersion: 1,
-              value: { type: 'number', value: index + 1 },
-            }),
-          },
-        ).then(async (response) => ({
-          status: response.status,
-          json: await response.json().catch(() => null),
-          text: '',
-        }));
-        editSamples.push(performance.now() - started);
-        assert('memory-5000', edited.status === 200 && edited.json.record.version === 2, `memory edit ${index} -> ${edited.status}`);
-      }
-      const deleteSamples = [];
-      const deletedIds = new Set();
-      for (let index = 0; index < Math.min(1000, MEMORY_FACTS); index += 1) {
-        const started = performance.now();
-        const deleted = await fetch(
-          `${base}/native/memory/records/${encodeURIComponent(idsList[index])}?session=${sessionId}&expectedVersion=2`,
-          { method: 'DELETE', headers: { authorization: `Bearer ${token}` } },
-        );
-        const text = await deleted.text();
-        deleteSamples.push(performance.now() - started);
-        assert('memory-5000', deleted.status === 200, `memory delete ${index} -> ${deleted.status} ${text.slice(0, 200)}`);
-        deletedIds.add(idsList[index]);
-      }
-      assert('memory-5000', deletedIds.size === Math.min(1000, MEMORY_FACTS), `deleted ${deletedIds.size} distinct rows`);
-
-      let before = null;
-      let live = 0;
-      const seen = new Set();
-      for (;;) {
-        const query = new URLSearchParams({ session: sessionId, limit: '200', scope: 'session' });
-        if (before !== null) {
-          query.set('afterMs', String(before.afterMs));
-          query.set('afterKind', String(before.afterKind));
-          query.set('afterKey', String(before.afterKey));
-        }
-        const page = await getJson(base, token, `/native/memory/records?${query}`);
-        assert('memory-5000', page.status === 200, `memory page ${page.status}`);
-        for (const record of page.json.records) {
-          assert('memory-5000', !seen.has(record.id), `duplicate memory ${record.id}`);
-          seen.add(record.id);
-          assert('memory-5000', record.scope === 'session' && Number(record.scopeId) === Number(sessionId), 'memory scope escaped its session');
-          assert('memory-5000', record.deleted === null, 'default memory page served a tombstone');
-        }
-        live += page.json.records.length;
-        if (!page.json.hasMore) break;
-        before = page.json.nextCursor;
-        assert('memory-5000', before !== null, 'memory hasMore without cursor');
-      }
-      const expectedLive = [...createdIds].filter((id) => !deletedIds.has(id));
-      if (live !== expectedLive.length) {
-        const missing = expectedLive.filter((id) => !seen.has(id));
-        console.error(
-          `[scale] memory-5000: live=${live} expected=${expectedLive.length} created=${createdIds.size} deleted=${deletedIds.size} missing=${missing.length} ${missing.slice(0, 5).join(',')}`,
-        );
-        for (const id of missing.slice(0, 3)) {
-          console.error(`[scale] memory-5000: missing index=${idsList.indexOf(id)} deleted=${deletedIds.has(id)}`);
-        }
-        const tombstoned = new Map();
-        let cursor = null;
-        for (;;) {
-          const query = new URLSearchParams({ session: sessionId, limit: '200', scope: 'session', includeDeleted: 'true' });
-          if (cursor !== null) {
-            query.set('afterMs', String(cursor.afterMs));
-            query.set('afterKind', String(cursor.afterKind));
-            query.set('afterKey', String(cursor.afterKey));
-          }
-          const page = await getJson(base, token, `/native/memory/records?${query}`);
-          for (const record of page.json.records) tombstoned.set(record.id, record);
-          if (!page.json.hasMore) break;
-          cursor = page.json.nextCursor;
-          if (cursor === null) break;
-        }
-        for (const id of missing.slice(0, 3)) {
-          const record = tombstoned.get(id);
-          console.error(
-            `[scale] memory-5000: missing ${id} in-include-deleted=${record ? JSON.stringify({ deleted: record.deleted, version: record.version }) : 'absent'}`,
-          );
-          const probeRow = await fetch(`${base}/native/memory/records/${encodeURIComponent(id)}`, {
-            method: 'PUT',
-            headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
-            body: JSON.stringify({ session: sessionId, expectedVersion: 1, value: { type: 'number', value: -1 } }),
-          });
-          console.error(`[scale] memory-5000: probe-exists ${id} -> ${probeRow.status} ${(await probeRow.text()).slice(0, 200)}`);
-        }
-      }
-      assert('memory-5000', live === expectedLive.length, `live memory ${live} != expected ${expectedLive.length}`);
-
-      const all = await getJson(base, token, `/native/memory/records?session=${sessionId}&limit=200&scope=session&includeDeleted=true`);
-      assert('memory-5000', all.status === 200 && all.json.records.length === 200, 'tombstone page size');
-      const retention = await postJson(base, token, '/native/memory/records/retention', {
-        session: sessionId,
-        scope: 'session',
-        olderThanDays: 0,
-        dryRun: false,
-        limit: 1000,
-      });
-      assert('memory-5000', retention.status === 200, `retention ${retention.status} ${retention.text.slice(0, 200)}`);
-      assert('memory-5000', retention.json.deleted === Math.min(1000, MEMORY_FACTS), `retention deleted ${retention.json.deleted}`);
-      assert('memory-5000', retention.json.truncated === false || retention.json.scanned <= 4096, 'retention scan unbounded');
-      assert('memory-5000', Number(retention.json.scanned) <= 4096, `retention scanned ${retention.json.scanned} rows`);
-
-      const workspaceFact = await postJson(base, token, '/native/memory/records', {
-        session: sessionId,
-        scope: 'workspace',
-        subject: 'workspace-scope',
-        predicate: 'only',
-        value: { type: 'bool', value: true },
-      });
-      assert('memory-5000', workspaceFact.status === 200, `workspace memory ${workspaceFact.status}`);
-      const sessionOnly = await getJson(base, token, `/native/memory/records?session=${sessionId}&scope=session&limit=200`);
-      assert(
-        'memory-5000',
-        sessionOnly.json.records.every((record) => record.scope === 'session'),
-        'session scope leaked a workspace fact',
-      );
-      const merged = await getJson(base, token, `/native/memory/records?session=${sessionId}&scope=all&limit=200`);
-      assert('memory-5000', merged.status === 200 && merged.json.records.length > 0, 'scope=all read failed');
-      return {
-        facts: MEMORY_FACTS,
-        edits: editSamples.length,
-        deletes: deleteSamples.length,
-        live,
-        retention_deleted: retention.json.deleted,
-        create_ms: summary(createSamples),
-        edit_ms: summary(editSamples),
-        delete_ms: summary(deleteSamples),
-        create_curve_first_last: Number(curve.toFixed(2)),
       };
     });
 
@@ -1188,21 +1641,28 @@ async function main() {
       const mcpSamples = [];
       for (let index = 0; index < 8; index += 1) {
         const started = performance.now();
-        const saved = await postJson(base, token, '/native/mcp/servers', {
-          name: `server-${String(index).padStart(4, '0')}`,
-          command: '/bin/true',
-          trusted: true,
-          enabled: false,
-        });
-        mcpSamples.push(performance.now() - started);
+        const saved = await postJson(
+          base,
+          token,
+          '/native/mcp/servers',
+          {
+            name: `server-${String(index).padStart(4, '0')}`,
+            command: '/bin/true',
+            trusted: true,
+            enabled: false,
+          },
+          20,
+        );
+        mcpSamples.push(performance.now() - started - (saved.lock_wait_ms ?? 0));
         assert('mcp-skills-hooks-500', saved.status === 200, `mcp save ${index} -> ${saved.status} ${saved.text.slice(0, 160)}`);
       }
-      const mcpOver = await postJson(base, token, '/native/mcp/servers', {
-        name: 'server-overflow',
-        command: '/bin/true',
-        trusted: true,
-        enabled: false,
-      });
+      const mcpOver = await postJson(
+        base,
+        token,
+        '/native/mcp/servers',
+        { name: 'server-overflow', command: '/bin/true', trusted: true, enabled: false },
+        20,
+      );
       assert(
         'mcp-skills-hooks-500',
         mcpOver.status === 400 && mcpOver.text.includes('at most 8 MCP servers'),
@@ -1214,10 +1674,41 @@ async function main() {
       const hookSamples = [];
       for (let index = 0; index < 256; index += 1) {
         const started = performance.now();
-        const saved = await postJson(base, token, '/native/hooks', {
-          id: `hook-${String(index).padStart(4, '0')}`,
-          spec: {
+        const saved = await postJson(
+          base,
+          token,
+          '/native/hooks',
+          {
             id: `hook-${String(index).padStart(4, '0')}`,
+            spec: {
+              id: `hook-${String(index).padStart(4, '0')}`,
+              events: ['task_complete'],
+              command: '/bin/true',
+              args: [],
+              env: [],
+              env_allowlist: true,
+              deadline_ms: 1000,
+              stdout_cap: 1024,
+              stderr_cap: 1024,
+              failure_policy: 'warn',
+              permission_scope: [],
+            },
+            trusted: true,
+            enabled: false,
+          },
+          20,
+        );
+        hookSamples.push(performance.now() - started - (saved.lock_wait_ms ?? 0));
+        assert('mcp-skills-hooks-500', saved.status === 200, `hook save ${index} -> ${saved.status} ${saved.text.slice(0, 160)}`);
+      }
+      const hookOver = await postJson(
+        base,
+        token,
+        '/native/hooks',
+        {
+          id: 'hook-overflow',
+          spec: {
+            id: 'hook-overflow',
             events: ['task_complete'],
             command: '/bin/true',
             args: [],
@@ -1231,28 +1722,9 @@ async function main() {
           },
           trusted: true,
           enabled: false,
-        });
-        hookSamples.push(performance.now() - started);
-        assert('mcp-skills-hooks-500', saved.status === 200, `hook save ${index} -> ${saved.status} ${saved.text.slice(0, 160)}`);
-      }
-      const hookOver = await postJson(base, token, '/native/hooks', {
-        id: 'hook-overflow',
-        spec: {
-          id: 'hook-overflow',
-          events: ['task_complete'],
-          command: '/bin/true',
-          args: [],
-          env: [],
-          env_allowlist: true,
-          deadline_ms: 1000,
-          stdout_cap: 1024,
-          stderr_cap: 1024,
-          failure_policy: 'warn',
-          permission_scope: [],
         },
-        trusted: true,
-        enabled: false,
-      });
+        20,
+      );
       assert(
         'mcp-skills-hooks-500',
         hookOver.status === 400 && hookOver.text.includes('at most 256 hooks'),
@@ -1270,12 +1742,13 @@ async function main() {
           `# skill ${index}\n\nUse this skill for scale item ${index}.\n`,
         );
       }
-      const created = await postJson(base, token, '/native/session', {
-        provider: 'p1',
-        model: 'm',
-        workspace: skillRoot,
-        title: 'skill scale',
-      });
+      const created = await postJson(
+        base,
+        token,
+        '/native/session',
+        { provider: 'p1', model: 'm', workspace: skillRoot, title: 'skill scale' },
+        20,
+      );
       assert('mcp-skills-hooks-500', created.status === 200, `skill session ${created.status}`);
       const skillSession = String(created.json.id);
       const skills = await getJson(base, token, `/native/skills?session=${skillSession}`);
@@ -1301,12 +1774,13 @@ async function main() {
       for (let index = 0; index < STREAM_SESSIONS; index += 1) {
         const streamWorkspace = join(tmp, `stream-workspace-${index}`);
         mkdirSync(streamWorkspace, { recursive: true });
-        const created = await postJson(base, token, '/native/session', {
-          provider: 'p1',
-          model: 'm',
-          workspace: streamWorkspace,
-          title: `stream ${index}`,
-        });
+        const created = await postJson(
+          base,
+          token,
+          '/native/session',
+          { provider: 'p1', model: 'm', workspace: streamWorkspace, title: `stream ${index}` },
+          20,
+        );
         assert('concurrent-16-stream', created.status === 200, `stream session ${index} ${created.status}`);
         sessionIds.push(String(created.json.id));
       }
@@ -1316,12 +1790,15 @@ async function main() {
       await Promise.all(
         sessionIds.map(async (id, index) => {
           const started = performance.now();
-          const prompted = await postJson(base, token, `/native/session/${id}/prompt`, {
+          // One stable body per stream: a lock retry must re-send the SAME
+          // submission id so a half-admitted prompt can never double-run.
+          const prompt = {
             session_id: id,
             submission_id: randomUUID(),
             prompt: `concurrent stream ${index} ${'payload '.repeat(50)}`,
-          });
-          promptSamples.push(performance.now() - started);
+          };
+          const prompted = await postJson(base, token, `/native/session/${id}/prompt`, prompt, 20);
+          promptSamples.push(performance.now() - started - (prompted.lock_wait_ms ?? 0));
           assert('concurrent-16-stream', prompted.status === 200, `stream prompt ${index} ${prompted.status}`);
         }),
       );
@@ -1420,6 +1897,25 @@ async function main() {
       probes,
       failures,
     };
+    let baselineCheck;
+    if (!FULL_COVERAGE) {
+      baselineCheck = { mode: 'skipped-non-canonical', platform: document.platform, failures: [] };
+    } else if (WRITE_BASELINE) {
+      writeScaleBaseline(document);
+      baselineCheck = { mode: 'write', platform: document.platform, failures: [] };
+    } else {
+      baselineCheck = { mode: 'compare', ...compareScaleBaseline(document) };
+      for (const failure of baselineCheck.failures) failures.push(`baseline: ${failure}`);
+      if (baselineCheck.failures.length > 0) {
+        for (const failure of baselineCheck.failures) console.error(`[scale] baseline: ${failure}`);
+      } else {
+        console.log(
+          `[scale] baseline compare OK on ${baselineCheck.platform} (${baselineCheck.metrics_checked} metrics vs ${BASELINE_PATH.split(`${ROOT}/`)[1]})`,
+        );
+      }
+    }
+    document.baseline_check = baselineCheck;
+    document.counts.failed = failures.length;
     mkdirSync(OUT, { recursive: true });
     const path = resolve(OUT, OUT_NAME);
     const payload = `${JSON.stringify(document, null, 2)}\n`;

@@ -18,9 +18,11 @@
 #
 # Coverage: [fault] campaigns at scale, the longrun suite (release), the
 # supply-chain evidence job (missing advisory tools stay loud recorded skips
-# inside target/certification/supply-chain-status.json), and the nightly UI
-# smoke lanes (`ui-smoke-vscode` real headless-chromium render check +
-# selftest; `ui-smoke-jetbrains` packaged-plugin host-matrix ZIP proof).
+# inside target/certification/supply-chain-status.json), the `superlinearity`
+# static n²-shape budget lane (selftest-injected violations must fire), and
+# the nightly UI smoke lanes (`ui-smoke-vscode` real headless-chromium
+# render check + selftest; `ui-smoke-jetbrains` packaged-plugin host-matrix
+# ZIP proof).
 #
 # Toolchain authority: `rust-toolchain.toml` pins channel 1.98.0 with
 # components rustfmt+clippy (profile minimal). Every `rust:1.98.0` image
@@ -316,6 +318,18 @@ steps:
           --lane ui-smoke-jetbrains --status passed \
           --artifact target/certification/jetbrains-host-matrix.json \
           --out target/certification/lanes/ui-smoke-jetbrains.json
+  # -------------------------------------------------------- superlinearity
+  # Static superlinearity budget, re-run on the nightly checkout as an
+  # always-run node-only lane. The --selftest plants the known violation
+  # shapes and asserts every rule fires, so "an injected super-linear query
+  # fails the lane" is mechanical; the scan then gates the tree against
+  # scripts/superlinearity-budget.json. No toolchain beyond node is needed,
+  # so the step starts at pipeline head beside the rust lanes.
+  - name: superlinearity
+    image: node:24@sha256:64af3819f9275802414d7cdc38c27e9d82bd564dec4d4da87d008255d36c63b4 # node:24 @ 2026-09-23 (same digest-pinned baseline as the nightly certificate)
+    commands:
+      - node scripts/check-superlinearity.mjs --selftest
+      - node scripts/check-superlinearity.mjs
   - name: certificate-nightly
     image: node:24@sha256:64af3819f9275802414d7cdc38c27e9d82bd564dec4d4da87d008255d36c63b4 # node:24 @ 2026-09-23
     depends_on:
@@ -325,6 +339,7 @@ steps:
       - ui-smoke-vscode
       - ui-smoke-jetbrains
       - scale
+      - superlinearity
     when:
       status: [success, failure]
     # Lane-bound auth verification (opt-in): map every registered lane token

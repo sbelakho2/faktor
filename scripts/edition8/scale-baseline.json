@@ -1,0 +1,183 @@
+{
+  "schema": "faktor-edition8-scale-baseline/v1",
+  "comment": "Reviewed canonical (--turns 1000) scale baseline, one section per platform. Written ONLY by an explicit `node scripts/edition8/scale-probe.mjs --turns 1000 --write-baseline` run and committed after review; the comparing run (CI or local) never writes this file and fails loudly when it is missing, unparsable or a tracked metric regresses beyond the policy below.",
+  "policy": {
+    "comment": "Per-metric multiplier/floor calibrated from two canonical runs on this platform (calibration note in the BASELINE_POLICY block of scripts/edition8/scale-probe.mjs); a regressed metric must exceed BOTH baseline x multiplier AND baseline + floor.",
+    "metrics": {
+      "turns-compaction.turn_curve": {
+        "multiplier": 1.5,
+        "floor": 1,
+        "reason": "decile-median turn latency ratio; observed 1.06x across two canonical runs, floor 1.0 covers warmup jitter, absolute assert <=20 is the hard ceiling"
+      },
+      "turns-compaction.turn_steady_curve": {
+        "multiplier": 1.5,
+        "floor": 0.5,
+        "reason": "first-vs-last decile steady plateau; observed 0.90x across runs, absolute assert <=2 remains the effective ceiling"
+      },
+      "turns-compaction.compaction_ms_per_ktok_curve": {
+        "multiplier": 1.5,
+        "floor": 1,
+        "reason": "compaction ms/1k-token shape on a sub-1 baseline; observed delta +0.89 under the post-turn writer storm, floor 1.0 covers it while absolute assert <=3 stays tighter"
+      },
+      "transcript-100k-page-search.page_curve_first_last": {
+        "multiplier": 1.5,
+        "floor": 0.75,
+        "reason": "page latency shape on a 0.5 baseline; observed 1.58x swing from sub-ms denominator noise, floor 0.75 covers it, absolute assert <=6 is the ceiling"
+      },
+      "transcript-100k-page-search.search_ratio_10x": {
+        "multiplier": 1.5,
+        "floor": 1,
+        "reason": "100k-vs-10k search scaling ratio; observed 1.16x across runs, floor 1.0 absorbs sub-ms denominator jitter, absolute assert <=25 is the ceiling"
+      },
+      "memory-5000.create_curve_first_last": {
+        "multiplier": 1.5,
+        "floor": 2,
+        "reason": "memory create shape over sub-ms first-decile medians; observed delta +1.78 under load, floor 2.0 covers it, absolute assert <=8 is the ceiling"
+      },
+      "history-2000.page_curve_first_last": {
+        "multiplier": 1.5,
+        "floor": 0.75,
+        "reason": "history paging shape on sub-ms pages; observed 0.63-1.58x across runs, floor 0.75 absorbs denominator jitter, absolute assert <=6 is the ceiling"
+      },
+      "turns-compaction.turn_ms.p95": {
+        "multiplier": 3,
+        "floor": 100,
+        "reason": "absolute turn p95 under the real provider loop; observed 326-455ms across four canonical runs, x3+100ms covers the storm band while a 10x algorithmic regression still fails"
+      },
+      "turns-compaction.compaction_ms.p95": {
+        "multiplier": 3,
+        "floor": 50,
+        "reason": "absolute compaction p95; observed 43-56ms across runs, x3+50ms covers the band while an algorithmic regression still fails"
+      },
+      "transcript-100k-page-search.page_ms.p95": {
+        "multiplier": 3,
+        "floor": 15,
+        "reason": "absolute page p95 over 100k messages; observed 2-10ms across runs, x3+15ms covers scheduler jitter, a full-scan page still fails"
+      },
+      "transcript-100k-page-search.search_100k_ms.p50": {
+        "multiplier": 3,
+        "floor": 100,
+        "reason": "absolute search p50 on 100k messages; observed 151-226ms across runs, x3+100ms covers the storm band while a full-scan regression fails"
+      },
+      "transcript-100k-page-search.search_10k_ms.p50": {
+        "multiplier": 3,
+        "floor": 25,
+        "reason": "absolute search p50 on 10k messages; observed 15-34ms across runs, x3+25ms covers the band"
+      },
+      "memory-5000.create_ms.p95": {
+        "multiplier": 3,
+        "floor": 20,
+        "reason": "absolute memory create p95; observed 3.1-13.9ms across runs (storm-driven p95 tail), x3+20ms covers the observed band while a policy/scan regression still fails"
+      },
+      "memory-5000.edit_ms.p95": {
+        "multiplier": 3,
+        "floor": 5,
+        "reason": "absolute memory edit p95; observed 2.9-4.6ms across runs, x3+5ms covers sub-ms jitter"
+      },
+      "memory-5000.delete_ms.p95": {
+        "multiplier": 3,
+        "floor": 5,
+        "reason": "absolute memory delete p95; observed 2.1-2.4ms across runs, x3+5ms covers sub-ms jitter"
+      },
+      "history-2000.page_ms.p95": {
+        "multiplier": 3,
+        "floor": 2,
+        "reason": "absolute history page p95 on sub-ms pages; observed 0.67-0.96ms across runs, x3+2ms keeps the bound tight so a constant-factor page regression fails"
+      },
+      "child-agents-500.agents_ms": {
+        "multiplier": 3,
+        "floor": 20,
+        "reason": "absolute 500-child projection read; observed 14-24.4ms across runs, x3+20ms covers the band while an unbounded projection regression fails"
+      },
+      "proof-10000-claims.proof_ms": {
+        "multiplier": 3,
+        "floor": 10,
+        "reason": "absolute 10k-claim proof read; observed 8.2-9.1ms across runs, x3+10ms covers the band"
+      },
+      "concurrent-16-stream.prompt_ms.p95": {
+        "multiplier": 3,
+        "floor": 50,
+        "reason": "absolute prompt-accept p95 across 16 live streams; observed 48-90ms across runs, x3+50ms covers scheduler load while an admission-path regression fails"
+      },
+      "mcp-skills-hooks-500.mcp_save_ms.p50": {
+        "multiplier": 3,
+        "floor": 10,
+        "reason": "median MCP save (p95 over 8 samples is max-like: one slow or lock-retried sample dominates it); sub-ms when clean, 10ms floor fails a CRUD path degraded into scan territory"
+      },
+      "mcp-skills-hooks-500.hook_save_ms.p50": {
+        "multiplier": 3,
+        "floor": 10,
+        "reason": "median hook save (p95 over 256 samples tracked the lock-shim tail in observed runs); sub-ms when clean, 10ms floor fails a CRUD path degraded into scan territory"
+      },
+      "rss-bounded.start_kb": {
+        "multiplier": 1.5,
+        "floor": 2048,
+        "reason": "daemon RSS before the workload; observed 0.99x across runs, allocator jitter is tens of percent"
+      },
+      "rss-bounded.peak_kb": {
+        "multiplier": 1.5,
+        "floor": 2048,
+        "reason": "daemon RSS peak holding 100k messages/5k facts/10k claims; observed 1.05x across runs, a retained-buffer regression is hundreds of MiB"
+      },
+      "rss-bounded.end_kb": {
+        "multiplier": 1.5,
+        "floor": 2048,
+        "reason": "daemon RSS after the workload; observed 1.05x across runs, a retained-buffer regression is hundreds of MiB"
+      }
+    }
+  },
+  "platforms": {
+    "darwin": {
+      "recorded_at": "2026-10-28T02:45:45.864Z",
+      "node": "v26.12.1",
+      "arch": "arm64",
+      "workload": {
+        "turns": 1000,
+        "compactions": 1000,
+        "messages": 100000,
+        "memory_facts": 5000,
+        "history_sessions": 2000,
+        "children": 500,
+        "claims": 10000,
+        "mcp_servers": 8,
+        "skills": 500,
+        "hooks": 256,
+        "concurrent_sessions": 16,
+        "failed": 0,
+        "probes": 10
+      },
+      "metrics": {
+        "curve": {
+          "turns-compaction.turn_curve": 3.32,
+          "turns-compaction.turn_steady_curve": 1.43,
+          "turns-compaction.compaction_ms_per_ktok_curve": 1.74,
+          "transcript-100k-page-search.page_curve_first_last": 0.63,
+          "transcript-100k-page-search.search_ratio_10x": 6.78,
+          "memory-5000.create_curve_first_last": 2.4,
+          "history-2000.page_curve_first_last": 0.85
+        },
+        "latency_ms": {
+          "turns-compaction.turn_ms.p95": 378.019,
+          "turns-compaction.compaction_ms.p95": 42.909,
+          "transcript-100k-page-search.page_ms.p95": 15.173,
+          "transcript-100k-page-search.search_100k_ms.p50": 218.758,
+          "transcript-100k-page-search.search_10k_ms.p50": 32.251,
+          "memory-5000.create_ms.p95": 1.244,
+          "memory-5000.edit_ms.p95": 1.276,
+          "memory-5000.delete_ms.p95": 0.706,
+          "history-2000.page_ms.p95": 1.49,
+          "child-agents-500.agents_ms": 23.026,
+          "proof-10000-claims.proof_ms": 40.032,
+          "concurrent-16-stream.prompt_ms.p95": 123.787,
+          "mcp-skills-hooks-500.mcp_save_ms.p50": 0.269,
+          "mcp-skills-hooks-500.hook_save_ms.p50": 0.192
+        },
+        "rss_kb": {
+          "rss-bounded.start_kb": 149392,
+          "rss-bounded.peak_kb": 263984,
+          "rss-bounded.end_kb": 261680
+        }
+      }
+    }
+  }
+}
