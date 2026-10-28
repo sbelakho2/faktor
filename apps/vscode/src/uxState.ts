@@ -476,17 +476,27 @@ export function aggregateAttention(input: UxInput): readonly AttentionItem[] {
     // row's label and the count stays at least one.
     const failedCount = checks?.failed ?? verificationOf(input)?.checksFailed ?? 0;
     const requiredCount = checks?.requiredFailed ?? 0;
-    const findings = Math.max(failedCount, requiredCount, 0);
+    const statusFailed = verificationOf(input)?.status === 'failed';
+    // Verdict-first when no check FAILED: an interrupted run leaves required
+    // checks UNPROVEN (failed=0, requiredFailed>0) — never label that "0
+    // checks found a problem", and never invent failing checks that did not
+    // fail; the verdict is the row and the detail names the unproven work.
     groups.push(
       attentionItem(
         'FailedCheck',
-        findings > 0
-          ? countLabel(findings, 'check found a problem', 'checks found a problem')
+        failedCount > 0
+          ? countLabel(failedCount, 'check found a problem', 'checks found a problem')
           : 'Verification did not pass',
-        findings > 0 && verificationOf(input)?.status === 'failed'
-          ? 'Verification did not pass.'
-          : null,
-        Math.max(1, findings),
+        failedCount > 0
+          ? statusFailed
+            ? 'Verification did not pass.'
+            : null
+          : requiredCount > 0
+            ? `${countLabel(requiredCount, 'required check did not complete', 'required checks did not complete')}.`
+            : statusFailed
+              ? 'The verification ended without a passing result.'
+              : null,
+        Math.max(1, failedCount > 0 ? failedCount : requiredCount),
         OPEN_CHECKS,
       ),
     );

@@ -15164,6 +15164,18 @@ async function preflightTests() {
     );
     assertEqual(failedWithoutFindings[0].label, 'Verification did not pass');
     assert(failedWithoutFindings[0].count >= 1, 'the verdict row counts at least one');
+    // Interrupted runs leave required checks UNPROVEN: verdict-first label
+    // with the unproven count in the detail.
+    const unprovenChecks = ux.aggregateAttention({
+      proof: { checks: { total: 2, failed: 0, requiredFailed: 2 } },
+    });
+    assertEqual(unprovenChecks.length, 1);
+    assertEqual(unprovenChecks[0].label, 'Verification did not pass');
+    assert(
+      /2 required checks did not complete/.test(unprovenChecks[0].detail ?? ''),
+      `the unproven count must be the detail: ${unprovenChecks[0].detail}`,
+    );
+    assertEqual(unprovenChecks[0].count, 2);
   });
 
   await test('run state uses the shared cause-specific labels and never says resend', () => {

@@ -117,6 +117,17 @@ test('needs-input, failed check and unrecoverable failures have distinct labels'
   assert.equal(noFindings.attention[0].label, 'Verification did not pass');
   assert.ok(!/0 checks/.test(noFindings.attention[0].label), 'never a "0 checks" finding');
   assert.ok(noFindings.attention[0].count >= 1, 'the verdict row counts at least one');
+  // Interrupted runs leave REQUIRED checks unproven (failed=0, required>0):
+  // verdict-first label with the unproven count in the detail — never "0
+  // checks found a problem".
+  const unproven = aggregateAttention({
+    proof: { checks: { total: 2, failed: 0, requiredFailed: 2 } },
+  });
+  assert.equal(unproven.length, 1);
+  assert.equal(unproven[0].kind, 'FailedCheck');
+  assert.equal(unproven[0].label, 'Verification did not pass');
+  assert.ok(/2 required checks did not complete/.test(unproven[0].detail ?? ''), unproven[0].detail ?? 'null');
+  assert.equal(unproven[0].count, 2);
   const unrecoverable = projectUx({
     machineState: 'failed',
     lastError: 'durable state is corrupt',

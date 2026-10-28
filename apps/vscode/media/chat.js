@@ -2092,9 +2092,10 @@
     // The product header carries the run status; there is no second status
     // row in the chat body. Run detail (goal, tokens, plan, candidate
     // boundary) lives in Inspect, and Stop lives in the overflow menu.
-    var hasRun =
-      task !== null ||
-      (snapshot ? snapshot.busy === true || snapshot.activeRunId != null : false);
+    // Stop is offered only while a run is LIVE. `task` is the durable last
+    // task (it outlives interrupted/finished runs) — keying on it left
+    // "Stop current run" stuck in the menu with nothing to stop.
+    var hasRun = snapshot ? snapshot.busy === true || snapshot.activeRunId != null : false;
     var stopItem = byId('menu-stop');
     if (stopItem) {
       stopItem.hidden = !hasRun;
