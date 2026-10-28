@@ -178,6 +178,58 @@
           "rss-bounded.end_kb": 261680
         }
       }
+    },
+    "linux": {
+      "recorded_at": "2026-10-28T04:12:14.697Z",
+      "node": "v24.22.1",
+      "arch": "x64",
+      "workload": {
+        "turns": 1000,
+        "compactions": 1000,
+        "messages": 100000,
+        "memory_facts": 5000,
+        "history_sessions": 2000,
+        "children": 500,
+        "claims": 10000,
+        "mcp_servers": 8,
+        "skills": 500,
+        "hooks": 256,
+        "concurrent_sessions": 16,
+        "failed": 0,
+        "probes": 10
+      },
+      "metrics": {
+        "curve": {
+          "turns-compaction.turn_curve": 4.14,
+          "turns-compaction.turn_steady_curve": 1.44,
+          "turns-compaction.compaction_ms_per_ktok_curve": 2.81,
+          "transcript-100k-page-search.page_curve_first_last": 0.81,
+          "transcript-100k-page-search.search_ratio_10x": 8.72,
+          "memory-5000.create_curve_first_last": 2.2,
+          "history-2000.page_curve_first_last": 0.55
+        },
+        "latency_ms": {
+          "turns-compaction.turn_ms.p95": 577.559,
+          "turns-compaction.compaction_ms.p95": 64.927,
+          "transcript-100k-page-search.page_ms.p95": 6.277,
+          "transcript-100k-page-search.search_100k_ms.p50": 784.502,
+          "transcript-100k-page-search.search_10k_ms.p50": 89.938,
+          "memory-5000.create_ms.p95": 2.399,
+          "memory-5000.edit_ms.p95": 2.052,
+          "memory-5000.delete_ms.p95": 1.156,
+          "history-2000.page_ms.p95": 21.897,
+          "child-agents-500.agents_ms": 48.38,
+          "proof-10000-claims.proof_ms": 26.401,
+          "concurrent-16-stream.prompt_ms.p95": 73.56,
+          "mcp-skills-hooks-500.mcp_save_ms.p50": 3.46,
+          "mcp-skills-hooks-500.hook_save_ms.p50": 0.527
+        },
+        "rss_kb": {
+          "rss-bounded.start_kb": 214876,
+          "rss-bounded.peak_kb": 362732,
+          "rss-bounded.end_kb": 363152
+        }
+      }
     }
   }
 }

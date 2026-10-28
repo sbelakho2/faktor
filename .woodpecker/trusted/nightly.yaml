@@ -131,7 +131,13 @@ steps:
     commands:
       - cargo build --release -p faktor-cli --bins --examples
   - name: scale
-    image: node:24@sha256:64af3819f9275802414d7cdc38c27e9d82bd564dec4d4da87d008255d36c63b4 # node:24 @ 2026-09-23 (same digest-pinned baseline as the nightly certificate)
+    # Base-compatibility law: this step EXECUTES the binaries that
+    # `scale-build` compiles in rust:1.98.0 (Debian trixie), so the runner must
+    # carry a >= glibc: a real linux/amd64 build needs GLIBC_2.39, and the
+    # bookworm node:24 (glibc 2.36) refuses it with
+    # `libc.so.6: version 'GLIBC_2.39' not found` — verified on both exact
+    # pinned images. Same node:24-trixie pin as the PR programme-selection step.
+    image: node:24-trixie@sha256:016f604a11c4c725f0a4c62e29ff11adab153d297bf97046c9bf2ddb9f1011d3 # node:24-trixie @ 2026-10-24 (trixie pair for the rust:1.98.0 build image)
     depends_on: [scale-build]
     environment:
       # The probe reads these instead of guessing target/<profile> paths.
