@@ -81,7 +81,7 @@ export type FaktorView = 'work' | 'settings' | 'inspect' | 'history' | 'diagnost
 
 /**
  * The ONE Faktor surface. It is the primary activity-bar webview view
- * (`faktor.launcher`): a full-height sidebar conversation, never an editor
+ * (`faktor.chat`): a full-height sidebar conversation, never an editor
  * tab by default. Chat, Settings, Inspect, History and Diagnostics are
  * internal destinations of this same webview: the host never creates a
  * panel per surface and never splits an editor column.

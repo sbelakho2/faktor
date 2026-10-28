@@ -3,7 +3,7 @@
 // Change-scoped verification for the ONE Faktor surface.
 //
 // 1. Static architecture: ChatViewProvider is the primary activity-bar
-//    webview view (`faktor.launcher`); no editor-area panel is created by
+//    webview view (`faktor.chat`); no editor-area panel is created by
 //    default; Settings/Inspect/History/Diagnostics remain internal views.
 // 2. Host idempotence: focusing re-shows the same view; internal view moves
 //    reuse the same document; a disposed view re-focuses the sidebar view.
@@ -73,7 +73,7 @@ function staticChecks() {
     assert(!text.includes('class Edition8ViewProvider'), `${path} must not define a sidebar settings view`);
   }
   const webview = read(join(SRC, 'webview.ts'));
-  assert(webview.includes("viewType = 'faktor.launcher'"), 'the primary surface is faktor.launcher');
+  assert(webview.includes("viewType = 'faktor.chat'"), 'the primary surface is faktor.chat');
   assert(webview.includes('implements vscode.WebviewViewProvider'), 'the chat is a webview view');
   assert(webview.includes('resolveWebviewView('), 'the view resolves into the activity bar');
   assert(webview.includes('view.show(true)'), 'focus reveals the existing sidebar view');
@@ -115,14 +115,14 @@ function staticChecks() {
   assert(container !== undefined, 'the Faktor activity-bar container is contributed');
   const views = Object.values(pkg.contributes.views).flat();
   assert(views.length === 1, `one activity-bar view, found ${views.length}`);
-  assert(views[0].id === 'faktor.launcher', 'the activity-bar entry hosts the chat view');
+  assert(views[0].id === 'faktor.chat', 'the activity-bar entry hosts the chat view');
   assert(views[0].type === 'webview', 'the activity-bar entry is a webview view');
   assert(
-    !views.some((entry) => entry.id === 'faktor.chat' || entry.id === 'faktor.edition8'),
-    'no duplicate chat/settings sidebar views remain',
+    !views.some((entry) => entry.id === 'faktor.edition8'),
+    'no duplicate settings sidebar views remain',
   );
   assert(
-    pkg.activationEvents.includes('onView:faktor.launcher'),
+    pkg.activationEvents.includes('onView:faktor.chat'),
     'activation follows the primary sidebar view',
   );
   if (process.exitCode !== 1) {
@@ -183,6 +183,9 @@ async function hostChecks() {
   }
   const vscode = {
     Uri: FakeUri,
+    // assetVersion() reads the installed extension's own package version at
+    // render time; the mock must serve it or the render crashes.
+    extensions: { getExtension: () => ({ packageJSON: { version: '0.0.0-arch-check' } }) },
     ViewColumn: { Active: -1, One: 1, Two: 2 },
     window: {
       createWebviewPanel() {
@@ -212,7 +215,7 @@ async function hostChecks() {
     provider.focus();
     assert(panels.length === 0, 'the default surface never creates an editor panel');
     assert(
-      commands.includes('faktor.launcher.focus'),
+      commands.includes('faktor.chat.focus'),
       'focus before resolution reveals the activity-bar view',
     );
 
@@ -278,7 +281,7 @@ async function hostChecks() {
     provider.focus();
     assert(panels.length === 0, 'a disposed view still never creates an editor panel');
     assert(
-      commands.includes('faktor.launcher.focus'),
+      commands.includes('faktor.chat.focus'),
       'a disposed view re-focuses the primary activity-bar view',
     );
 

@@ -2475,6 +2475,20 @@ button.intent-option:focus-visible {
   }
 }
 
+/* Extreme header budget (<= 159 CSS px, the 200%-zoom 120px case): the brand
+   is secondary chrome — collapse it and tighten the gaps BEFORE the primary
+   Settings target can clip (the zoom200@120px layout gate). */
+@media (max-width: 159px) {
+  #brand {
+    display: none;
+  }
+  header {
+    gap: 3px;
+    padding-left: var(--space-1);
+    padding-right: var(--space-1);
+  }
+}
+
 /* The narrowest sidebar range (240-319px): ONE compact header row (brand,
    ellipsized status, `⋯`, gear); everything is one column and the primary
    decisions stay visible. No view tabs exist in the chat body. */
