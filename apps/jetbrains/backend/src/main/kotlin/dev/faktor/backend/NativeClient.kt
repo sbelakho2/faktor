@@ -293,6 +293,33 @@ class NativeClient(
             )
         )
 
+    /**
+     * The AUTHORITATIVE part snapshot behind an explicit live-output resync
+     * (`GET /native/session/{id}/live/snapshot[?message=&kind=]`). The
+     * optional filter must be supplied as a pair; a hostile body is a typed
+     * [NativeProtocolException], never a silently wrong transcript.
+     */
+    fun liveSnapshot(
+        sessionId: String,
+        message: Long? = null,
+        kind: String? = null
+    ): LiveSnapshot {
+        val path = "GET /native/session/{id}/live/snapshot"
+        if ((message == null) != (kind == null)) {
+            throw NativeProtocolException(path, "message and kind must be provided together")
+        }
+        val params = if (message != null && kind != null) {
+            listOf(Pair("message", message.toString()), Pair("kind", kind))
+        } else {
+            null
+        }
+        return LivePayloads.parseSnapshot(
+            request(
+                "GET", "/native/session/" + encode(sessionId) + "/live/snapshot", params
+            )
+        )
+    }
+
     fun projection(sessionId: String): NativeProjection =
         parseNativeProjection(
             request("GET", "/session/" + encode(sessionId) + "/projection")

@@ -22,6 +22,7 @@ import {
   NativeProtocolError,
   NativeTransportError,
   type NativePromptReceipt,
+  type ProtocolAttachmentId,
 } from './nativeClient.ts';
 import { sendAskTurn, type AskPromptClient } from './askFlow.ts';
 
@@ -89,6 +90,8 @@ export interface AskTurnRequest {
   readonly prompt: string;
   readonly files: readonly string[];
   readonly submissionId: string;
+  /** Durable typed attachment ids carried with the turn. */
+  readonly attachments?: readonly ProtocolAttachmentId[];
 }
 
 export interface AskTurnOutcome {
@@ -118,6 +121,7 @@ export async function sendAskTurnWithRecovery(
         prompt: request.prompt,
         files: request.files,
         submissionId: request.submissionId,
+        attachments: request.attachments,
       });
       return { receipt, connection, recovered, attempts };
     } catch (error) {

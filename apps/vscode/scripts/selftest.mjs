@@ -9627,6 +9627,47 @@ async function attentionWebviewTests() {
     assertEqual(card.hidden, true, 'a recovered error is omitted');
   });
 
+  await test('ask sends execution=ask with attachments and never receives the engineering protocol', () => {
+    const askFlowSource = readFileSync(new URL('../src/askFlow.ts', import.meta.url), 'utf8');
+    const clientSource = readFileSync(new URL('../src/nativeClient.ts', import.meta.url), 'utf8');
+    const driveSource = readFileSync(
+      new URL('../../../crates/agent/src/runtime/turn/drive_phases.rs', import.meta.url),
+      'utf8',
+    );
+    const chatSource = readFileSync(new URL('../media/chat.js', import.meta.url), 'utf8');
+    // The conversational path MUST carry the protocol execution kind: without
+    // it the daemon's legacy default admits an engineering task for a chat.
+    assert(askFlowSource.includes("execution: 'ask'"), 'the ask path sends execution=ask');
+    assert(
+      clientSource.includes('execution: options.execution') ||
+        clientSource.includes('{ execution: options.execution }'),
+      'the native client threads the execution kind into the prompt body',
+    );
+    // Attachments ride the SAME submission and the body carries their ids.
+    assert(
+      askFlowSource.includes('attachments: (input.attachments') &&
+        clientSource.includes('attachments: [...options.attachments]'),
+      'ask attachments are carried by the submission body',
+    );
+    // The ask instruction profile is CONVERSATIONAL: never the engineering
+    // protocol (LOCATE→PLAN→EDIT→VERIFY→FINISH).
+    assert(
+      driveSource.includes('ASK_CONVERSATIONAL_PROFILE'),
+      'the ask instruction profile exists',
+    );
+    const askProfile = driveSource.slice(
+      driveSource.indexOf('const ASK_CONVERSATIONAL_PROFILE'),
+      driveSource.indexOf('const ASK_CONVERSATIONAL_PROFILE') + 2000,
+    );
+    assert(!/LOCATE/.test(askProfile), 'the ask profile never commands LOCATE');
+    assert(!/changed files/i.test(askProfile), 'the ask profile never demands a changed-file list');
+    // A successful ask settles to Ready, never a job-like Completed.
+    assert(
+      chatSource.includes("turnStateSource === 'ask' && turnStatePhase === 'completed'"),
+      'a completed ask falls back to Ready',
+    );
+  });
+
   await test('a posted service card retires on the FIRST clean snapshot (postUserError cannot beat recovery)', () => {
     const harness = runChatWebview(webviewSnapshot([]));
     const projection = ue.projectError({

@@ -822,6 +822,7 @@ export type NativeTaskRunCancelled = ProtocolTaskRunCancelled;
  * from the canonical schema (`ProtocolAttachmentId`).
  */
 export type NativeAttachmentId = ProtocolAttachmentId;
+export type { ProtocolAttachmentId };
 
 /**
  * One durable attachment REFERENCE: the surrogate `ref_id` the retrieval
@@ -4462,7 +4463,16 @@ export class NativeClient {
   prompt(
     sessionId: string,
     prompt: string,
-    options: { readonly files?: readonly string[]; readonly submissionId: string },
+    options: {
+      readonly files?: readonly string[];
+      readonly submissionId: string;
+      /** Protocol-level execution kind. Omitted = legacy `task` (explicit
+       * compatibility); the conversational path MUST send `ask` so the
+       * daemon admits a conversational turn instead of an engineering task. */
+      readonly execution?: 'ask' | 'task';
+      /** Durable typed attachment ids (turn-owned on the daemon side). */
+      readonly attachments?: readonly ProtocolAttachmentId[];
+    },
   ): Promise<NativePromptReceipt> {
     return this.request('POST', `/native/session/${encodeURIComponent(sessionId)}/prompt`, {
       body: {
@@ -4471,6 +4481,12 @@ export class NativeClient {
         prompt,
         ...(options.files !== undefined && options.files.length > 0
           ? { files: [...options.files] }
+          : {}),
+        ...(options.execution !== undefined ? { execution: options.execution } : {}),
+        ...(options.attachments !== undefined && options.attachments.length > 0
+          ? // ProtocolAttachmentId is the generated JSON shape; the request
+            // body type is the generic Json union, so the array is narrowed.
+            { attachments: [...options.attachments] as unknown as ProtocolJson }
           : {}),
       },
       validate: (value, path) =>

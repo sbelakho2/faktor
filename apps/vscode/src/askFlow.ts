@@ -12,6 +12,7 @@ import type {
   NativeMessagePage,
   NativePromptReceipt,
   NativeSessionSummary,
+  ProtocolAttachmentId,
 } from './nativeClient.ts';
 
 export interface AskPromptInput {
@@ -19,13 +20,21 @@ export interface AskPromptInput {
   readonly prompt: string;
   readonly files: readonly string[];
   readonly submissionId: string;
+  /** Durable typed attachment ids: the daemon injects them turn-owned so an
+   * image question reaches the provider WITH its image. */
+  readonly attachments?: readonly ProtocolAttachmentId[];
 }
 
 export interface AskPromptClient {
   prompt(
     sessionId: string,
     prompt: string,
-    options: { readonly files?: readonly string[]; readonly submissionId: string },
+    options: {
+    readonly files?: readonly string[];
+    readonly submissionId: string;
+    readonly execution?: 'ask' | 'task';
+    readonly attachments?: readonly ProtocolAttachmentId[];
+  },
   ): Promise<NativePromptReceipt>;
 }
 
@@ -37,6 +46,10 @@ export async function sendAskTurn(
   return client.prompt(input.sessionId, input.prompt, {
     files: input.files.length > 0 ? input.files : undefined,
     submissionId: input.submissionId,
+    // The conversational execution kind is EXPLICIT here: without it the
+    // daemon's legacy default would admit an engineering task for a chat.
+    execution: 'ask',
+    attachments: (input.attachments ?? []).length > 0 ? input.attachments : undefined,
   });
 }
 

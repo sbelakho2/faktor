@@ -59,7 +59,9 @@ import {
   CoalescingRefreshScheduler,
   nodeSchedulerTimers,
 } from './refreshScheduler';
-import {
+import {  attachmentIdOf,
+  type ProtocolAttachmentId,
+
   FetchLike,
   NativeApiError,
   NativeTransportError,
@@ -106,6 +108,7 @@ import {
   turnDisplayPhase,
   turnLifecycleIsLive,
   turnReducer,
+  turnDisplaySource,
   turnStopOpId,
 } from './turnState';
 import {
@@ -167,6 +170,7 @@ import {
   EvidenceAuthorityCache,
   MAX_COMPOSER_ATTACHMENTS,
   MAX_PENDING_ATTACHMENT_BYTES,
+  PendingBinaryAttachment,
   PendingSubmission,
   PendingSubmissionRetainer,
   StartSubmissionSnapshot,
@@ -2113,17 +2117,18 @@ function dispatchTurn(event: TurnEvent): void {
   }
   const phase = turnDisplayPhase(turns);
   const stopOp = turnStopOpId(turns);
-  const key = `${phase}:${stopOp ?? ''}`;
+  const source = turnDisplaySource(turns);
+  const key = `${phase}:${stopOp ?? ''}:${source ?? ''}`;
   if (key !== lastPostedTurnKey) {
     lastPostedTurnKey = key;
-    chatProvider?.postTurnState(phase, stopOp);
+    chatProvider?.postTurnState(phase, stopOp, source);
   }
 }
 
 function resetTurnLifecycle(): void {
   turns = emptyTurnLifecycle();
   lastPostedTurnKey = null;
-  chatProvider?.postTurnState('idle', null);
+  chatProvider?.postTurnState('idle', null, null);
 }
 
 /** Host-side live batching: frames accumulate for one flush window. */
@@ -3531,6 +3536,26 @@ async function sendAskTurnFromComposer(
       }),
     );
   }
+
+  // Ask attachments (audit: the daemon injects turn-owned attachments, so the
+  // composer snapshot must CARRY them). Host-side entries are selected and
+  // uploaded BEFORE submission: a refusal keeps the draft AND the visible
+  // chips, and nothing clears before the durable acceptance below.
+  const askAttachmentSelection = message.attachmentIds;
+  let askStagedIds: readonly string[] = [];
+  let askStagedAttachments: readonly PendingBinaryAttachment[] = [];
+  if (askAttachmentSelection !== undefined && askAttachmentSelection !== null) {
+    const selected = composerAttachments.select(askAttachmentSelection);
+    if (selected.reason !== null) {
+      chatProvider?.postUserError(
+        attachmentRefusalProjection([`${selected.reason}; the draft was kept`]),
+      );
+      chatProvider?.postStartResult(goal, false, true, undefined);
+      return;
+    }
+    askStagedIds = selected.ids;
+    askStagedAttachments = selected.attachments;
+  }
   const generation = lifecycle.current();
   const viewEpoch = conversationViewEpoch;
   const submissionId = randomUUID();
@@ -3569,6 +3594,37 @@ async function sendAskTurnFromComposer(
     } catch (error) {
       recordBackgroundError(error);
     }
+    // Binary attachments are uploaded BEFORE the prompt so the turn carries
+    // durable typed ids: an image question must reach the provider WITH its
+    // image. A failed upload keeps the draft and chips; nothing is cleared.
+    const askUploaded: ProtocolAttachmentId[] = [];
+    if (askStagedAttachments.length > 0) {
+      const uploadClient = active.client;
+      const uploadSession = active.sessionId;
+      if (!uploadClient || !uploadSession) {
+        throw new Error('the Faktor service is not reachable yet');
+      }
+      for (const attachment of askStagedAttachments) {
+        try {
+          const ref = await uploadClient.uploadAttachment(uploadSession, {
+            mime: attachment.mime,
+            filename: attachment.filename,
+            data_base64: attachment.dataBase64,
+          });
+          askUploaded.push(attachmentIdOf(ref));
+        } catch (error) {
+          if (stillVisible()) {
+            chatProvider?.postUserError(
+              attachmentRefusalProjection([
+                `the attachment upload failed (${messageOf(error)}); the draft was kept`,
+              ]),
+            );
+            chatProvider?.postStartResult(goal, false, true, correlation());
+          }
+          return;
+        }
+      }
+    }
     const outcome = await sendAskTurnWithRecovery(
       {
         ensureConnection: () => ensureAskConnection(context),
@@ -3578,6 +3634,7 @@ async function sendAskTurnFromComposer(
       {
         prompt: goal,
         files,
+        attachments: askUploaded,
         // Stable across the one retry: the daemon's prompt admission replays
         // an accepted receipt byte-for-byte instead of duplicating the turn.
         submissionId,
@@ -3598,6 +3655,14 @@ async function sendAskTurnFromComposer(
     active.askOnly = true;
     active.activeRunId = null;
     active.completionContract = null;
+    // Durable acceptance: clear exactly the chips this snapshot selected (an
+    // attachment added for the next message keeps its id and survives).
+    if (askStagedIds.length > 0) {
+      const removed = composerAttachments.removeMany(askStagedIds);
+      if (removed > 0) {
+        postComposerAttachments(await composerAttachmentPolicy());
+      }
+    }
     // The receipt's operation/execution ids are stored as INTERNAL
     // correlation (queued → `queued`, accepted → `starting`). HTTP
     // acceptance is admission only: it never completes a turn and never

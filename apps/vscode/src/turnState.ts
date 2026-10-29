@@ -103,6 +103,25 @@ export function turnStopOpId(state: TurnLifecycle): string | null {
  * therefore renders `queued` while an earlier turn still streams), else
  * the newest live entry, else the newest terminal outcome, else idle.
  */
+/** The display entry's source, mirroring [`turnDisplayPhase`]: the settled
+ * Ask path needs it to fall back to `Ready` instead of a job-like
+ * `Completed` (audit: normal chat must not read like a task execution). */
+export function turnDisplaySource(state: TurnLifecycle): TurnSource | null {
+  if (state.entries.length === 0) {
+    return null;
+  }
+  const newest = state.entries[state.entries.length - 1];
+  if (newest.phase !== 'idle') {
+    return newest.source;
+  }
+  for (let i = state.entries.length - 1; i >= 0; i -= 1) {
+    if (state.entries[i].phase !== 'idle') {
+      return state.entries[i].source;
+    }
+  }
+  return null;
+}
+
 export function turnDisplayPhase(state: TurnLifecycle): TurnPhase {
   if (state.entries.length === 0) {
     return 'idle';

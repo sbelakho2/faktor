@@ -301,8 +301,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    * the turn-state rendering source (label + Stop visibility) — distinct
    * from the task-run snapshot fields.
    */
-  postTurnState(phase: string, opId: string | null): void {
-    this.post({ type: 'turnState', phase, opId });
+  postTurnState(phase: string, opId: string | null, source: 'ask' | 'task' | null): void {
+    this.post({ type: 'turnState', phase, opId, source });
   }
 
   /**

@@ -250,6 +250,7 @@
   // Stop visibility. `idle` until the host posts a `turnState`.
   var turnStatePhase = 'idle';
   var turnStateStopOp = null;
+  var turnStateSource = null;
   /** The last rendered snapshot (header/Stop re-render without a snapshot). */
   var lastSnapshotForHeader = null;
   var transcriptPinRequested = false;
@@ -5086,9 +5087,12 @@ function renderToolNode(tool) {
       return model.length > 0 ? spec.label + ' · ' + model : spec.label;
     }
     if (turnLabel !== null) {
-      // A settled Ask keeps its exact outcome (Completed / Stopped /
-      // Failed) where the base line would only say Ready — the partial
-      // reply after Stop stays labelled until the next submission.
+      // A successful Ask falls back to Ready — normal chat must not read
+      // like a finished job. Abnormal settled states (Stopped / Failed)
+      // stay labelled, as does every Task outcome.
+      if (turnStateSource === 'ask' && turnStatePhase === 'completed') {
+        return model.length > 0 ? 'Ready · ' + model : 'Ready';
+      }
       return model.length > 0 ? turnLabel + ' · ' + model : turnLabel;
     }
     return model.length > 0 ? 'Ready · ' + model : 'Ready';
@@ -7035,9 +7039,13 @@ function renderToolNode(tool) {
       typeof message.opId === 'string' && message.opId.length > 0 && message.opId.length <= 64
         ? message.opId
         : null;
-    var changed = phase !== turnStatePhase || stopOp !== turnStateStopOp;
+    var source =
+      message.source === 'ask' || message.source === 'task' ? message.source : null;
+    var changed =
+      phase !== turnStatePhase || stopOp !== turnStateStopOp || source !== turnStateSource;
     turnStatePhase = phase;
     turnStateStopOp = stopOp;
+    turnStateSource = source;
     if (!changed) {
       return;
     }

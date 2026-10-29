@@ -1,8 +1,8 @@
 {
   "schema": "faktor-test-programme-registry/v1",
-  "generated_at": "2026-10-29T00:58:43.205Z",
-  "commit": "57dcbace56d4d5923bcc2f6aa52c8296b191f146",
-  "tree": "1a059637e63a5785258f435800d726e893b3f0f7",
+  "generated_at": "2026-10-29T14:35:19.512Z",
+  "commit": "687cb88d48b55f0a9391db465e49381323512d44",
+  "tree": "0ffe351c3683c847363f104e3b9e88e9a82ed8da",
   "layers": [
     "structural",
     "unit",
@@ -19,7 +19,7 @@
     "release"
   ],
   "counts": {
-    "rows": 1082,
+    "rows": 1083,
     "by_kind": {
       "acceptance-scenario": 40,
       "act-now": 8,
@@ -30,7 +30,7 @@
       "control": 200,
       "invariant": 258,
       "jetbrains-contribution": 1,
-      "native-route": 301,
+      "native-route": 302,
       "provider-adapter": 6,
       "screen": 72,
       "vscode-contribution": 38,
@@ -38,20 +38,20 @@
       "workflow": 16
     },
     "by_status": {
-      "deferred": 958,
+      "deferred": 959,
       "failed": 1,
       "proven": 55,
       "stub": 68
     },
     "by_lane": {
       "nightly": 612,
-      "pull": 751,
-      "trusted": 1081,
+      "pull": 752,
+      "trusted": 1082,
       "weekly-live": 342
     },
     "by_layer": {
       "agent-evals": 1,
-      "contracts": 439,
+      "contracts": 440,
       "ide-screen-readers": 384,
       "state-model-crash": 356,
       "unit-property": 341
@@ -1252,7 +1252,7 @@
       ],
       "evidence": {
         "passed": false,
-        "reason": "Error: route probe daemon did not start: \u001b[2m2026-10-29T00:58:41.013593Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mfaktor_cli::daemon::serve\u001b[0m\u001b[2m:\u001b[0m daemon build failed: routing_mode Economy admits no candidate for 2 configured model(s) (p1/default, p1/m); a first model call would otherwise fail as NoCapableModel. Every configured model has Unknown pricing (p1/default, p1/m), which economy cannot cost or budget. Configure an exact quote or a pricing ceiling for that endpoint, point base_url at a canonical official endpoint, or use routing_mode maximum_quality/pinned.\n"
+        "reason": "Error: route probe daemon did not start: \u001b[2m2026-10-29T14:35:18.753611Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mfaktor_cli::daemon::serve\u001b[0m\u001b[2m:\u001b[0m daemon build failed: routing_mode Economy admits no candidate for 2 configured model(s) (p1/default, p1/m); a first model call would otherwise fail as NoCapableModel. Every configured model has Unknown pricing (p1/default, p1/m), which economy cannot cost or budget. Configure an exact quote or a pricing ceiling for that endpoint, point base_url at a canonical official endpoint, or use routing_mode maximum_quality/pinned.\n"
       }
     },
     {
@@ -29679,6 +29679,41 @@
         "credential": false,
         "method": "post",
         "surface_path": "native/session/id/task-runs/run-id/cancel"
+      },
+      "adversarial": [
+        "auth",
+        "strict-body",
+        "typed-error",
+        "bounds",
+        "traversal",
+        "duplicate",
+        "isolation",
+        "no-secret"
+      ],
+      "evidence": null
+    },
+    {
+      "id": "native.post.native.session.id.task-runs.run-id.resume",
+      "kind": "native-route",
+      "path": "crates/server/src",
+      "layers": [
+        "contracts"
+      ],
+      "lanes": [
+        "pull",
+        "trusted"
+      ],
+      "test_ids": [
+        "native.route-contract.native.post.native.session.id.task-runs.run-id.resume"
+      ],
+      "evidence_kind": "exact-value",
+      "oracle": "Authenticated malformed/boundary requests return the typed refusal (never 5xx or a panic); auth is refused before the effect; the route is present at its exact method+path.",
+      "status": "deferred",
+      "meta": {
+        "rev8": false,
+        "credential": false,
+        "method": "post",
+        "surface_path": "native/session/id/task-runs/run-id/resume"
       },
       "adversarial": [
         "auth",
