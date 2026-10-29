@@ -189,7 +189,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 5270,
+            "line": 5335,
             "note": "VS Code native host action (no daemon write is invented).",
             "line_text": "        case 'M-03': {"
           },
@@ -219,7 +219,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 5270,
+            "line": 5335,
             "note": "Host-owned control: the daemon has no route for this effect.",
             "line_text": "        case 'M-03': {"
           },
@@ -4015,7 +4015,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 5275,
+            "line": 5340,
             "note": "VS Code native host action (no daemon write is invented).",
             "line_text": "        case 'C-04': {"
           },
@@ -4045,7 +4045,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 5275,
+            "line": 5340,
             "note": "Host-owned control: the daemon has no route for this effect.",
             "line_text": "        case 'C-04': {"
           },
@@ -4523,7 +4523,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1418,
+            "line": 1422,
             "note": "Daemon route GET /native/index/coverage?session=:session.",
             "line_text": "        .route(\"/native/index/coverage\", get(native_index_coverage))"
           },
@@ -8558,7 +8558,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 5323,
+            "line": 5388,
             "note": "VS Code native host action (no daemon write is invented).",
             "line_text": "        case 'S-05':"
           },
@@ -8588,7 +8588,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 5323,
+            "line": 5388,
             "note": "Host-owned control: the daemon has no route for this effect.",
             "line_text": "        case 'S-05':"
           },
@@ -9864,7 +9864,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 5289,
+            "line": 5354,
             "note": "VS Code native host action (no daemon write is invented).",
             "line_text": "        case 'X-10': {"
           },
@@ -9894,7 +9894,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 5289,
+            "line": 5354,
             "note": "Host-owned control: the daemon has no route for this effect.",
             "line_text": "        case 'X-10': {"
           },
@@ -9935,7 +9935,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 5303,
+            "line": 5368,
             "note": "VS Code native host action (no daemon write is invented).",
             "line_text": "        case 'X-11': {"
           },
@@ -9965,7 +9965,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 5303,
+            "line": 5368,
             "note": "Host-owned control: the daemon has no route for this effect.",
             "line_text": "        case 'X-11': {"
           },
@@ -11674,7 +11674,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1442,
+            "line": 1446,
             "note": "Daemon route GET /native/repositories.",
             "line_text": "        .route(\"/native/repositories\", get(native_repositories))"
           },
@@ -12251,7 +12251,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 5326,
+            "line": 5391,
             "note": "VS Code native host action (no daemon write is invented).",
             "line_text": "        case 'D-08':"
           },
@@ -12281,7 +12281,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 5326,
+            "line": 5391,
             "note": "Host-owned control: the daemon has no route for this effect.",
             "line_text": "        case 'D-08':"
           },
@@ -12319,7 +12319,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 5328,
+            "line": 5393,
             "note": "VS Code native host action (no daemon write is invented).",
             "line_text": "        case 'D-09':"
           },
@@ -12349,7 +12349,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 5328,
+            "line": 5393,
             "note": "Host-owned control: the daemon has no route for this effect.",
             "line_text": "        case 'D-09':"
           },
@@ -12387,7 +12387,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 5331,
+            "line": 5396,
             "note": "VS Code native host action (no daemon write is invented).",
             "line_text": "        case 'D-10':"
           },
@@ -12417,7 +12417,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 5331,
+            "line": 5396,
             "note": "Host-owned control: the daemon has no route for this effect.",
             "line_text": "        case 'D-10':"
           },
@@ -12455,7 +12455,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 5334,
+            "line": 5399,
             "note": "VS Code native host action (no daemon write is invented).",
             "line_text": "        case 'D-11':"
           },
@@ -12485,7 +12485,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 5334,
+            "line": 5399,
             "note": "Host-owned control: the daemon has no route for this effect.",
             "line_text": "        case 'D-11':"
           },
@@ -12655,7 +12655,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 5337,
+            "line": 5402,
             "note": "VS Code native host action (no daemon write is invented).",
             "line_text": "        case 'D-14':"
           },
@@ -12685,7 +12685,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 5337,
+            "line": 5402,
             "note": "Host-owned control: the daemon has no route for this effect.",
             "line_text": "        case 'D-14':"
           },
@@ -13097,7 +13097,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1464,
+            "line": 1468,
             "note": "Daemon route POST /native/updater/check.",
             "line_text": "        .route(\"/native/updater/check\", post(native_updater_check))"
           },
@@ -13237,7 +13237,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1428,
+            "line": 1432,
             "note": "Daemon route GET /native/identity.",
             "line_text": "        .route(\"/native/identity\", get(native_identity))"
           },
@@ -13522,7 +13522,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1475,
+            "line": 1479,
             "note": "Daemon route GET /native/workers.",
             "line_text": "        .route(\"/native/workers\", get(native_workers_list))"
           },
@@ -13662,7 +13662,7 @@
           "status": "exists",
           "implementation": {
             "file": "crates/server/src/api/lifecycle.rs",
-            "line": 1398,
+            "line": 1394,
             "note": "Daemon route GET /native/semantic/capabilities.",
             "line_text": "        .route("
           },
