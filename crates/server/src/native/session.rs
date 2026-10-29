@@ -1699,6 +1699,17 @@ pub(crate) const MAX_NATIVE_SESSION_LISTING: usize = 1000;
 /// the same normalized body replays the original receipt byte-for-byte, a
 /// pending key refuses in flight, and a different body under the same key
 /// is a typed 409.
+///
+/// Two ADDITIVE fields (audit P0-ASK / P0-ATTACH):
+/// - `execution` — the protocol-level execution kind. Absent (every older
+///   client) decodes to `task`: EXPLICIT compatibility, never a silent
+///   behavior change for task-capable clients; an unknown value is a typed
+///   400 at the wire boundary.
+/// - `attachments` — typed SESSION-OWNED `AttachmentId` references (CAS
+///   bytes by digest), admitted through the SAME resolution as the task
+///   path (ownership, digest, media type, size, effective model
+///   capability) BEFORE any admission claim; accepted ids persist on the
+///   turn. Absent/empty = the attachment-free prompt.
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct NativePromptRequestBody {
@@ -1707,6 +1718,15 @@ pub(crate) struct NativePromptRequestBody {
     pub prompt: String,
     #[serde(default)]
     pub files: Option<Vec<String>>,
+    /// The execution semantics; absent = `task` (legacy-compatible
+    /// default). Strict enum: `"ask"` | `"task"`, anything else 400s.
+    #[serde(default)]
+    pub execution: faktor_protocol::ExecutionKind,
+    /// Session-owned typed attachments (`AttachmentId` rows uploaded
+    /// through `POST /native/session/{id}/attachments` first). Strict
+    /// (`deny_unknown_fields` on each id); never workspace paths.
+    #[serde(default)]
+    pub attachments: Option<Vec<faktor_core::attachment::AttachmentId>>,
 }
 
 /// The strict shape of the required prompt `submission_id`: the SAME
@@ -1728,20 +1748,58 @@ fn validate_prompt_submission_id(id: &str) -> Result<(), ApiError> {
     })
 }
 
-/// The canonical request digest of ONE ordinary prompt: the session id, the
-/// prompt text and the attached file paths under a domain-separated BLAKE3
-/// (the crate's canonical authority-digest construction). Computed
-/// caller-side, before the admission claim enqueues anything.
+/// The canonical request digest of ONE ordinary prompt under a
+/// domain-separated BLAKE3 (the crate's canonical authority-digest
+/// construction). Computed caller-side, before the admission claim
+/// enqueues anything.
+///
+/// The DOMAIN is the execution/body split, so idempotency stays honest
+/// across the additive fields:
+/// - `task` with no attachments → the byte-identical LEGACY domain and
+///   fields (every pre-upgrade pending key still replays its receipt);
+/// - `task` with attachments → `v2` (the attachments are body, so a
+///   different set under the same key is a typed 409, never a replay);
+/// - `ask` (any attachments) → `ask/v1` (flipping `execution` under the
+///   same key is a different body → typed 409, never the other
+///   semantics' receipt).
 fn prompt_admission_digest(
     session: faktor_core::id::SessionId,
     prompt: &str,
     files: &[String],
+    execution: faktor_protocol::ExecutionKind,
+    attachments: &[faktor_core::attachment::AttachmentId],
 ) -> String {
-    let fields = faktor_core::authority::Fields::new()
-        .text(&session.to_string())
-        .text(prompt)
-        .list(files);
-    faktor_core::authority::authority_digest_hex(b"faktor.native-prompt-admission/v1", 1, fields)
+    let refs: Vec<String> = attachments
+        .iter()
+        .map(|id| format!("{}:{}", id.digest, id.mime))
+        .collect();
+    let base = || {
+        faktor_core::authority::Fields::new()
+            .text(&session.to_string())
+            .text(prompt)
+            .list(files)
+    };
+    match (execution, attachments.is_empty()) {
+        (faktor_protocol::ExecutionKind::Task, true) => {
+            faktor_core::authority::authority_digest_hex(
+                b"faktor.native-prompt-admission/v1",
+                1,
+                base(),
+            )
+        }
+        (faktor_protocol::ExecutionKind::Task, false) => {
+            faktor_core::authority::authority_digest_hex(
+                b"faktor.native-prompt-admission/v2",
+                1,
+                base().list(&refs),
+            )
+        }
+        (faktor_protocol::ExecutionKind::Ask, _) => faktor_core::authority::authority_digest_hex(
+            b"faktor.native-prompt-admission/ask/v1",
+            1,
+            base().list(&refs),
+        ),
+    }
 }
 
 /// Serialize one accepted prompt receipt into the exact response bytes the
@@ -1839,11 +1897,22 @@ pub(crate) async fn native_prompt(
     // execution journals; startup recovery then rebuilds the receipt from
     // the durable turn/queue facts instead of guessing.
     let files = req.files.unwrap_or_default();
+    // Audit P0-ATTACH: binary attachments run the SAME resolution/admission
+    // the task path uses (session ownership, byte-identical digest, media
+    // type, size, effective model capability) BEFORE the admission claim —
+    // a typed refusal (foreign/mismatched/unsupported/oversized) leaves no
+    // claimed key, no partial turn, and the stored bytes/draft intact.
+    // NEVER a silent text-only degradation: a refused attachment set is a
+    // loud 4xx, never an accepted prompt without its attachments.
+    let attachments = req.attachments.unwrap_or_default();
+    if let Err(e) = validate_wire_attachments(&state, &_handle, None, &attachments) {
+        return wire_status(e);
+    }
     if let Err(response) = super::task::write_tool_enablement(&state, &_handle, None) {
         return response;
     }
     let store = state.deps.session.store();
-    let digest = prompt_admission_digest(sid, &req.prompt, &files);
+    let digest = prompt_admission_digest(sid, &req.prompt, &files, req.execution, &attachments);
     let reserved_op = match state.deps.session.try_next_op_id() {
         Ok(op) => op,
         Err(e) => return api_err(&faktor_core::Error::from(e)),
@@ -1936,6 +2005,8 @@ pub(crate) async fn native_prompt(
     let request = PromptRequest {
         prompt: req.prompt,
         files,
+        attachments,
+        execution: req.execution,
         // The server-level admission IS this path's durable key: the
         // executor is called unkeyed so a prompt key can never alias a
         // task-start key (separate tables, separate semantics). The
@@ -1944,7 +2015,15 @@ pub(crate) async fn native_prompt(
         submission_id: None,
         reserved_op_id: Some(reserved_op),
         admission_digest: Some(digest),
-        max_turns: super::task::session_turn_cap(&state, sid),
+        // The configured max-turns bound is TASK-scoped (it lives on the
+        // durable task row an ask never creates). It is decided HERE —
+        // explicitly, for `ask` only — rather than dropped anywhere inside
+        // the service (which refuses an ask that carries it).
+        max_turns: if req.execution.is_ask() {
+            None
+        } else {
+            super::task::session_turn_cap(&state, sid)
+        },
         ..Default::default()
     };
     match service.prompt(sid, request).await {

@@ -66,6 +66,9 @@ use faktor_core::state::{
     CriterionVerification, EnvironmentFingerprint, NoOpDisposition, TaskState, TaskTransition,
     VerificationStatus,
 };
+use faktor_protocol::{
+    turn_execution_row_key, ExecutionKind, TurnExecution, TURN_EXECUTION_ROW_KIND,
+};
 use faktor_session::task::{ProofBasis, ProofBasisCheck, ProofBasisCriterion, ProofReuse};
 use faktor_session::{
     CompletionContractGate, SessionManager, ShadowRow, TaskBudget, MAX_TASK_CRITERIA,
@@ -434,6 +437,17 @@ pub fn valid_submission_id(id: &str) -> bool {
 pub struct TaskRunRequest {
     pub goal: String,
     pub work_items: Vec<WorkItem>,
+    /// The execution semantics of this start (protocol-level `ask` vs
+    /// `task`, audit P0-ASK). `Task` — the default — keeps every existing
+    /// caller's engineering behavior byte-identical (isolated candidate,
+    /// durable task row, engineering contract, verification + completion
+    /// gate). `Ask` is a CONVERSATIONAL in-session turn through the SAME
+    /// executor, permissions, cancellation, recovery and ownership
+    /// infrastructure: exactly one read-permitted work item, NO shadow
+    /// copy, NO task-row create/advance/re-goal, NO contract, NO budget
+    /// seam, NO verification/completion gate; its accepted attachment ids
+    /// ride the durable turn-execution row instead of a task row.
+    pub execution: ExecutionKind,
     /// The client's submission UUID of this logical start (idempotency
     /// finding 1): `Some` claims a durable admission row BEFORE any task
     /// mutation and completes it with the exact run receipt once the run was
@@ -539,6 +553,7 @@ impl Default for TaskRunRequest {
         Self {
             goal: String::new(),
             work_items: Vec::new(),
+            execution: ExecutionKind::default(),
             submission_id: None,
             model: None,
             reserved_op_id: None,
@@ -588,6 +603,50 @@ impl TaskRunRequest {
             return Err(ExecError::InvalidPlan(
                 "a task needs at least one work item".into(),
             ));
+        }
+        // Ask admission (audit P0-ASK): a conversational ask is exactly ONE
+        // read-permitted in-session turn. Every engineering seam is a TYPED
+        // refusal here — never a silent drop, never a half-applied task
+        // behavior.
+        if self.execution.is_ask() {
+            if self.work_items.len() != 1 {
+                return Err(ExecError::InvalidPlan(
+                    "an ask is one conversational work item; multi-item plans are task runs".into(),
+                ));
+            }
+            if self.work_items[0].kind.is_mutating() {
+                return Err(ExecError::InvalidPlan(
+                    "an ask work item must be a read-only kind (never an implementation item)"
+                        .into(),
+                ));
+            }
+            if !self.criteria.is_empty() || self.criteria_patch.is_some() {
+                return Err(ExecError::InvalidPlan(
+                    "an ask carries no acceptance criteria; acceptance gates belong to a task run"
+                        .into(),
+                ));
+            }
+            if self.completion_contract.is_some() {
+                return Err(ExecError::InvalidPlan(
+                    "an ask carries no completion contract; contract steps belong to a task run"
+                        .into(),
+                ));
+            }
+            if self.max_tokens.is_some() || self.max_cost_micro.is_some() {
+                return Err(ExecError::InvalidPlan(
+                    "an ask carries no engineering budget seam (token/money caps bind to a durable task row); start a task run for budgeted work"
+                        .into(),
+                ));
+            }
+            if self
+                .no_op_disposition
+                .is_some_and(|d| d != NoOpDisposition::Allowed)
+            {
+                return Err(ExecError::InvalidPlan(
+                    "an ask's empty change set is the expected outcome (no-op policy is Allowed); a completion-gate disposition belongs to a task run"
+                        .into(),
+                ));
+            }
         }
         if self.criteria.len() > MAX_TASK_CRITERIA {
             return Err(ExecError::Oversized(format!(
@@ -765,6 +824,12 @@ enum StartAdmission {
 /// run envelope) under a domain-separated BLAKE3. Computed on the caller's
 /// thread, never on the store's writer owner.
 pub(crate) fn task_start_digest(req: &TaskRunRequest) -> Result<String, ExecError> {
+    /// serde `skip_serializing_if` predicate: the DEFAULT `task` kind never
+    /// rides the digest (byte-identical to every pre-ask admission digest
+    /// ever written), so a legacy pending key still replays its receipt.
+    fn digest_skips_default_execution(e: &ExecutionKind) -> bool {
+        e.is_task()
+    }
     #[derive(serde::Serialize)]
     struct DigestInput<'a> {
         goal: &'a str,
@@ -776,6 +841,14 @@ pub(crate) fn task_start_digest(req: &TaskRunRequest) -> Result<String, ExecErro
         max_tokens: Option<u64>,
         max_cost_micro: Option<u64>,
         work_items: &'a [WorkItem],
+        /// The execution kind rides the digest ONLY when it differs from
+        /// the default (`task`): every pre-ask admission digest stays
+        /// byte-identical (a legacy replay still matches), while the SAME
+        /// key flipped to `ask` (or back) is a different body — a typed
+        /// KeyReused conflict, never a receipt replay of the other
+        /// semantics.
+        #[serde(skip_serializing_if = "digest_skips_default_execution")]
+        execution: ExecutionKind,
     }
     let attachments = req.effective_attachments_patch().unwrap_or_default();
     let criteria = req.effective_criteria_patch();
@@ -789,6 +862,7 @@ pub(crate) fn task_start_digest(req: &TaskRunRequest) -> Result<String, ExecErro
         max_tokens: req.max_tokens,
         max_cost_micro: req.max_cost_micro,
         work_items: &req.work_items,
+        execution: req.execution,
     };
     let bytes = serde_json::to_vec(&input)
         .map_err(|e| ExecError::Internal(format!("task start digest serialization: {e}")))?;
@@ -2141,6 +2215,12 @@ impl TaskExecutor {
         max_turns: Option<u32>,
     ) -> Result<TaskRunReceipt, ExecError> {
         req.validate()?;
+        if req.execution.is_ask() && max_turns.is_some() {
+            return Err(ExecError::InvalidPlan(
+                "an ask carries no task-scoped turn budget; a configured max-turns bound applies to task runs only"
+                    .into(),
+            ));
+        }
         let handle = self
             .session
             .get_session(parent)?
@@ -2211,7 +2291,11 @@ impl TaskExecutor {
         // plane and starts NOTHING locally; a local decision (or a disabled
         // seam) falls through to the unchanged path below. A seam failure
         // is a typed refusal — never a silent local run.
-        if self.worker_placement_enabled() {
+        // ASK (audit P0-ASK): a conversational turn NEVER places remotely —
+        // the remote job contract carries no execution kind, so a remote
+        // ask would silently drive as a task. Only task runs consult the
+        // seam.
+        if self.worker_placement_enabled() && req.execution.is_task() {
             let spec = Self::placement_spec_for(parent, &req);
             match self.place_new_run(&spec)? {
                 PlacementDecision::Remote {
@@ -2564,7 +2648,10 @@ impl TaskExecutor {
         // compatibility only — the sole decodable value is Shadow, and the
         // decision below never consults it. Only the cfg-gated test seam
         // (no shadow service) drives the owner directly.
-        let shadowed = self.shadows.is_some() && item.kind.is_mutating();
+        // ASK (audit P0-ASK): NEVER shadowed — an ask is a conversational
+        // turn with NO implementation work, so there is no candidate copy
+        // (defense in depth behind the read-only work-kind rule).
+        let shadowed = self.shadows.is_some() && item.kind.is_mutating() && req.execution.is_task();
         let base_root = if shadowed {
             Some(self.owner_root_of(parent, handle)?)
         } else {
@@ -2592,108 +2679,118 @@ impl TaskExecutor {
                 return Err(refusal);
             }
         }
-        // Durable task row (wave 9/16): one row per session task. A fresh
-        // session seeds with the run's goal; a non-terminal existing row is
-        // re-goaled; a TERMINAL row is frozen (the task certified its
-        // lifetime) — a new task needs a fresh session.
-        let mut task_id = handle.task_id()?;
         let now = handle.now_ms();
-        let goal = truncate_bytes(&req.goal, MAX_TASK_GOAL_BYTES);
-        let mut existing = handle.get_task(task_id)?;
-        // Multi-turn sessions: a completion-relevant or terminal row belongs
-        // to the run that CLOSED it. A new prompt opens the NEXT task row on
-        // the same session instead of re-goaling a row the provider-op gate
-        // refuses (or 409ing "start a fresh session" for a chat turn).
-        if existing
-            .as_ref()
-            .is_some_and(|t| t.state.is_completion_relevant() || t.state.is_terminal())
-        {
-            let next = faktor_core::id::TaskId::new(task_id.raw() + 1);
-            let worktree = handle
-                .worktree_id()
-                .map_err(|e| ExecError::Internal(format!("session worktree id: {e}")))?;
-            self.session
-                .adopt_identity(parent, worktree, next)
-                .map_err(|e| ExecError::Internal(format!("task identity advance: {e}")))?;
-            task_id = next;
-            existing = None;
+        // allowed-task-id-read: admission-time identity binding. TASK runs
+        // then create/advance/re-goal the durable row below; ASK runs
+        // (audit P0-ASK) NEVER touch it — no create, no re-goal, no
+        // identity advance (a greeting/ask produces ZERO task rows), and a
+        // terminal row never refuses a conversational turn.
+        let mut task_id = handle.task_id()?;
+        if req.execution.is_task() {
+            // Durable task row (wave 9/16): one row per session task. A fresh
+            // session seeds with the run's goal; a non-terminal existing row is
+            // re-goaled; a TERMINAL row is frozen (the task certified its
+            // lifetime) — a new task needs a fresh session.
+            let goal = truncate_bytes(&req.goal, MAX_TASK_GOAL_BYTES);
+            let mut existing = handle.get_task(task_id)?;
+            // Multi-turn sessions: a completion-relevant or terminal row belongs
+            // to the run that CLOSED it. A new prompt opens the NEXT task row on
+            // the same session instead of re-goaling a row the provider-op gate
+            // refuses (or 409ing "start a fresh session" for a chat turn).
+            if existing
+                .as_ref()
+                .is_some_and(|t| t.state.is_completion_relevant() || t.state.is_terminal())
+            {
+                let next = faktor_core::id::TaskId::new(task_id.raw() + 1);
+                let worktree = handle
+                    .worktree_id()
+                    .map_err(|e| ExecError::Internal(format!("session worktree id: {e}")))?;
+                self.session
+                    .adopt_identity(parent, worktree, next)
+                    .map_err(|e| ExecError::Internal(format!("task identity advance: {e}")))?;
+                task_id = next;
+                existing = None;
+            }
+            match existing {
+                Some(t) if t.state.is_terminal() => {
+                    return Err(ExecError::Conflict(format!(
+                        "session task {task_id} is terminal ({:?}); its row is frozen once certified — start the task on a fresh session",
+                        t.state
+                    )));
+                }
+                Some(_) => {
+                    // FIX 3 tri-state re-goal: `None` = continuation (the row
+                    // keeps its durable criteria/attachment set), `Some(vec![])`
+                    // = explicitly CLEAR, `Some(items)` = REPLACE. The dedicated
+                    // patch fields win; the legacy vectors keep their historical
+                    // empty-means-continuation mapping through the effective
+                    // accessors. Re-goaling keeps the SAME durable TaskId: every
+                    // settlement path re-reads the session's task identity via
+                    // `handle.task_id()`, so minting a new id for a new goal mid-
+                    // conversation would strand an in-flight run's settlement on
+                    // the wrong task row. A distinctly new goal instead lands a
+                    // new CONTRACT (fresh criteria/attachments + a revision bump
+                    // that invalidates prior proofs) on that identity.
+                    handle
+                        .update_task(
+                            task_id,
+                            faktor_session::TaskPatch {
+                                goal: Some(goal.clone()),
+                                acceptance_criteria: req.effective_criteria_patch(),
+                                attachments: req.effective_attachments_patch(),
+                                ..Default::default()
+                            },
+                        )
+                        .map_err(|e| ExecError::Internal(format!("task row goal update: {e}")))?;
+                }
+                None => {
+                    handle
+                        .create_task(faktor_session::Task {
+                            task_id,
+                            session_id: parent,
+                            goal,
+                            // A fresh row has nothing to continue: `None` seeds
+                            // empty (the effective accessor's continuation
+                            // policy); an explicit patch seeds its items.
+                            acceptance_criteria: req.effective_criteria_patch().unwrap_or_default(),
+                            plan: Vec::new(),
+                            attachments: req.effective_attachments_patch().unwrap_or_default(),
+                            contract: Default::default(),
+                            budget: TaskBudget {
+                                max_tokens: req.max_tokens,
+                                max_turns,
+                                spent_tokens: 0,
+                                spent_turns: 0,
+                            },
+                            state: TaskState::Pending,
+                            created_ms: now,
+                            updated_ms: now,
+                        })
+                        .map_err(|e| {
+                            // Two admissions racing the same next id: the loser
+                            // answers a typed 409, never a 500.
+                            let message = format!("task row seed: {e}");
+                            if message.contains("already exists") {
+                                ExecError::Conflict(message)
+                            } else {
+                                ExecError::Internal(message)
+                            }
+                        })?;
+                }
+            }
+            // P2 record-first: the accepted completion contract lands durably
+            // BEFORE the run's first model call (the submit below drives it).
+            // ASK never reaches here: `validate()` refuses a contract on an
+            // ask request, so no engineering contract row exists for it.
+            record_completion_contract(handle, task_id, req.completion_contract)?;
         }
-        match existing {
-            Some(t) if t.state.is_terminal() => {
-                return Err(ExecError::Conflict(format!(
-                    "session task {task_id} is terminal ({:?}); its row is frozen once certified — start the task on a fresh session",
-                    t.state
-                )));
-            }
-            Some(_) => {
-                // FIX 3 tri-state re-goal: `None` = continuation (the row
-                // keeps its durable criteria/attachment set), `Some(vec![])`
-                // = explicitly CLEAR, `Some(items)` = REPLACE. The dedicated
-                // patch fields win; the legacy vectors keep their historical
-                // empty-means-continuation mapping through the effective
-                // accessors. Re-goaling keeps the SAME durable TaskId: every
-                // settlement path re-reads the session's task identity via
-                // `handle.task_id()`, so minting a new id for a new goal mid-
-                // conversation would strand an in-flight run's settlement on
-                // the wrong task row. A distinctly new goal instead lands a
-                // new CONTRACT (fresh criteria/attachments + a revision bump
-                // that invalidates prior proofs) on that identity.
-                handle
-                    .update_task(
-                        task_id,
-                        faktor_session::TaskPatch {
-                            goal: Some(goal.clone()),
-                            acceptance_criteria: req.effective_criteria_patch(),
-                            attachments: req.effective_attachments_patch(),
-                            ..Default::default()
-                        },
-                    )
-                    .map_err(|e| ExecError::Internal(format!("task row goal update: {e}")))?;
-            }
-            None => {
-                handle
-                    .create_task(faktor_session::Task {
-                        task_id,
-                        session_id: parent,
-                        goal,
-                        // A fresh row has nothing to continue: `None` seeds
-                        // empty (the effective accessor's continuation
-                        // policy); an explicit patch seeds its items.
-                        acceptance_criteria: req.effective_criteria_patch().unwrap_or_default(),
-                        plan: Vec::new(),
-                        attachments: req.effective_attachments_patch().unwrap_or_default(),
-                        contract: Default::default(),
-                        budget: TaskBudget {
-                            max_tokens: req.max_tokens,
-                            max_turns,
-                            spent_tokens: 0,
-                            spent_turns: 0,
-                        },
-                        state: TaskState::Pending,
-                        created_ms: now,
-                        updated_ms: now,
-                    })
-                    .map_err(|e| {
-                        // Two admissions racing the same next id: the loser
-                        // answers a typed 409, never a 500.
-                        let message = format!("task row seed: {e}");
-                        if message.contains("already exists") {
-                            ExecError::Conflict(message)
-                        } else {
-                            ExecError::Internal(message)
-                        }
-                    })?;
-            }
-        }
-        // P2 record-first: the accepted completion contract lands durably
-        // BEFORE the run's first model call (the submit below drives it).
-        record_completion_contract(handle, task_id, req.completion_contract)?;
         // Durable monetary cap (audit 9/H): `TaskRunRequest.max_cost_micro`
         // flows to the task row's cost cap — the single authority every paid
         // model call of this drive is admitted against (the guarded ledger
         // set refuses a reduction below what the row already committed:
         // spend never rewinds). `None` leaves whatever cap the row carries;
-        // only `Some` writes.
+        // only `Some` writes. Unreachable for ASK: `validate()` refuses
+        // token/money caps on an ask (they have no task row to bind to).
         if let Some(max_cost_micro) = req.max_cost_micro {
             faktor_session::DurableBudgetLedger::new(self.session.clone())
                 .set_task_max_cost(parent, task_id, Some(max_cost_micro))
@@ -2744,23 +2841,62 @@ impl TaskExecutor {
             budget_max_tokens: req.max_tokens,
             created_ms: now,
             submission_digest: admission_digest,
-            task_id: Some(task_id.raw()),
+            // TASK runs bind to the admitted task identity; ASK runs bind
+            // to NO engineering task (a settlement that resolved this row
+            // must refuse typed rather than fold a conversational turn into
+            // a task row).
+            task_id: if req.execution.is_ask() {
+                None
+            } else {
+                Some(task_id.raw())
+            },
         };
         put_run_row(handle, &run_id, &row)?;
-        // P0 no-op policy: the run's disposition is durable BEFORE the drive
-        // is dispatched. The shadow settlement reads it under the synthetic
-        // per-session run id (`tx-session-<session>`), so the row is written
-        // under BOTH the real run id and that id. Both rows carry the ADMITTED
-        // task id: the no-task-id settlement paths (queued prompt, recovery,
-        // shadow watcher) therefore resolve the run's own task instead of the
-        // session's current (possibly advanced) identity.
-        write_run_policy_row(handle, &run_id, req.no_op_disposition, Some(task_id.raw()))?;
-        write_run_policy_row(
-            handle,
-            &format!("tx-session-{}", parent.raw()),
-            req.no_op_disposition,
-            Some(task_id.raw()),
-        )?;
+        if req.execution.is_ask() {
+            // ASK (audit P0-ASK): the durable turn-execution row. It is the
+            // drive's authority for conversational semantics (read-permitted
+            // tools, no task/contract/verification surface) and it carries
+            // the ACCEPTED attachment ids ON THE TURN — an ask creates no
+            // task row, so the turn row is where its attachments persist.
+            // Written BEFORE acceptance/spawn: a failed write releases the
+            // admission (pre-acceptance), never a half-admitted ask.
+            let turn_execution = TurnExecution {
+                execution: ExecutionKind::Ask,
+                attachments: req.effective_attachments_patch().unwrap_or_default(),
+            };
+            let value = turn_execution
+                .encode()
+                .map_err(|e| ExecError::Internal(format!("turn execution row encode: {e}")))?;
+            handle
+                .upsert_memory_fact(
+                    TURN_EXECUTION_ROW_KIND,
+                    &turn_execution_row_key(receipt.op_id.raw()),
+                    &value,
+                )
+                .map_err(|e| ExecError::Internal(format!("turn execution row write: {e}")))?;
+            // Conversational policy row: NO task binding (settlement of an
+            // ask must refuse typed, never guess an identity) and the
+            // Allowed no-op disposition — an ask's empty change set is the
+            // EXPECTED outcome. The synthetic `tx-session-<id>` shadow row
+            // is deliberately NOT written: an ask never shadows, and
+            // clobbering that row would erase a live task run's binding.
+            write_run_policy_row(handle, &run_id, Some(NoOpDisposition::Allowed), None)?;
+        } else {
+            // P0 no-op policy: the run's disposition is durable BEFORE the drive
+            // is dispatched. The shadow settlement reads it under the synthetic
+            // per-session run id (`tx-session-<session>`), so the row is written
+            // under BOTH the real run id and that id. Both rows carry the ADMITTED
+            // task id: the no-task-id settlement paths (queued prompt, recovery,
+            // shadow watcher) therefore resolve the run's own task instead of the
+            // session's current (possibly advanced) identity.
+            write_run_policy_row(handle, &run_id, req.no_op_disposition, Some(task_id.raw()))?;
+            write_run_policy_row(
+                handle,
+                &format!("tx-session-{}", parent.raw()),
+                req.no_op_disposition,
+                Some(task_id.raw()),
+            )?;
+        }
         // Acceptance: the prompt is durably recorded and the run's linkage +
         // policy rows exist. The exact receipt is admitted BEFORE the spawn
         // attempt, so a shut-down refusal below keeps the completed receipt
@@ -2778,6 +2914,13 @@ impl TaskExecutor {
         // interrupted drive resumes the SAME recorded turn on daemon start).
         // Shadowed runs additionally finalize the shadow once the drive
         // returns (integrate on verified-complete, discard on failure).
+        // ASK (audit P0-ASK): the drive runs the SAME entries (runtime,
+        // permissions, cancellation, recovery), but the POST-run
+        // engineering settlement (`after_shadowed_drive`: shadow finalize,
+        // completion steps, terminal outcome) never runs for a
+        // conversational turn — it has no shadow, no contract and no
+        // completion claim to settle.
+        let settle_after = req.execution.is_task();
         let exec = self.clone();
         if receipt.queued {
             let agent = self.agent.clone();
@@ -2792,7 +2935,9 @@ impl TaskExecutor {
                 // here (the runtime gate arms a live runner or this spawns a
                 // fresh one — exactly one drive ever claims the head).
                 exec.kick_pending_queue(parent);
-                exec.after_shadowed_drive(parent, Some(task_id)).await;
+                if settle_after {
+                    exec.after_shadowed_drive(parent, Some(task_id)).await;
+                }
             });
             if !spawned {
                 return Err(ExecError::Conflict(format!(
@@ -2848,7 +2993,9 @@ impl TaskExecutor {
                     // runtime gate; a dead one is replaced here. A shut-down
                     // registry leaves the row pending for recovery.
                     exec.kick_pending_queue(parent);
-                    exec.after_shadowed_drive(parent, Some(task_id)).await;
+                    if settle_after {
+                        exec.after_shadowed_drive(parent, Some(task_id)).await;
+                    }
                 });
                 if !spawned {
                     return Err(ExecError::Conflict(format!(

@@ -574,7 +574,20 @@ pub struct TournamentSettlementRow {
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum LedgerPayload {
     /// The task goal (last wins). `{goal}`.
-    GoalSet { goal: String },
+    ///
+    /// OPTIONAL task binding (audit P0-GOAL-BINDING): when the appender
+    /// knows the ADMITTED engineering task identity, `task_id` + `revision`
+    /// ride the entry so the head (and any replay/rebuild of it) can prove
+    /// WHICH task this goal projection belongs to. Entries written before
+    /// the binding existed decode with `None` (an UNBOUND goal — never a
+    /// guessed identity).
+    GoalSet {
+        goal: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        revision: Option<u64>,
+    },
     /// The wave-8 acceptance criteria as derived: full row list plus the
     /// canonical joined text (last wins). `{criteria, canonical}`.
     CriteriaSet {
@@ -880,6 +893,20 @@ pub struct LedgerHead {
     /// Head JSON schema version ([`LEDGER_HEAD_SCHEMA_V`]).
     pub schema_ver: i64,
     pub goal: String,
+    /// The ADMITTED engineering task identity this goal projection is
+    /// bound to (audit P0-GOAL-BINDING). `None` = an UNBOUND legacy goal
+    /// (entries written before the binding existed); never a guessed id.
+    /// Additive with a serde default so heads written before the binding
+    /// decode unchanged; the entry stream remains the authority and the
+    /// field is rebuilt by replay when a head is missing.
+    #[serde(default)]
+    pub goal_task_id: Option<u64>,
+    /// The task-row revision at the moment the binding was recorded: a
+    /// later drive refuses a REWOUND bound revision (the row was tampered
+    /// with or rolled back — typed, never silently trusted) while a moved-
+    /// FORWARD revision is the normal progress of the same task.
+    #[serde(default)]
+    pub goal_revision: Option<u64>,
     pub criteria: Vec<String>,
     pub canonical_criteria: String,
     pub open_blockers: Vec<String>,
@@ -1699,8 +1726,16 @@ pub struct LedgerCompactReport {
 
 fn fold(head: &mut LedgerHead, payload: LedgerPayload) -> Result<(), SessionError> {
     match payload {
-        LedgerPayload::GoalSet { goal } => {
+        LedgerPayload::GoalSet {
+            goal,
+            task_id,
+            revision,
+        } => {
             head.goal = goal;
+            // Last wins, binding included: an UNBOUND appender clears the
+            // binding (never a stale id that would outlive its goal).
+            head.goal_task_id = task_id;
+            head.goal_revision = revision;
         }
         LedgerPayload::CriteriaSet {
             criteria,
@@ -2086,11 +2121,41 @@ impl SessionHandle {
     // ---------------------------------------------------- typed appenders
 
     /// Append `GoalSet {goal}` (bounded; a fresh goal replaces the old in
-    /// the projection).
+    /// the projection). UNBOUND: the head's task binding is cleared — use
+    /// [`Self::ledger_goal_set_bound`] from any drive that knows the
+    /// admitted task identity.
     pub fn ledger_goal_set(&self, goal: &str) -> faktor_core::Result<Option<i64>> {
         check_text(goal, "goal")?;
         self.append_entry(LedgerPayload::GoalSet {
             goal: goal.to_string(),
+            task_id: None,
+            revision: None,
+        })
+    }
+
+    /// Append `GoalSet {goal, task_id, revision}`: the goal projection
+    /// BOUND to the admitted engineering task identity + the task-row
+    /// revision at binding time (audit P0-GOAL-BINDING). This is the entry
+    /// a task drive records so a LATER task can never inherit this
+    /// projection: its drive start compares the bound id with its own
+    /// admitted id and rebuilds on mismatch instead of reading the old
+    /// objective. `task_id` must be non-zero (row identities are).
+    pub fn ledger_goal_set_bound(
+        &self,
+        goal: &str,
+        task_id: u64,
+        revision: u64,
+    ) -> faktor_core::Result<Option<i64>> {
+        check_text(goal, "goal")?;
+        if task_id == 0 {
+            return Err(
+                SessionError::Malformed("goal binding requires a non-zero task id".into()).into(),
+            );
+        }
+        self.append_entry(LedgerPayload::GoalSet {
+            goal: goal.to_string(),
+            task_id: Some(task_id),
+            revision: Some(revision),
         })
     }
 

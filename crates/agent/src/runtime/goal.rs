@@ -203,6 +203,158 @@ pub(crate) fn projected_goal_text(handle: &faktor_session::SessionHandle) -> Opt
     }
 }
 
+// --------------------------------------------- turn execution + goal binding
+
+/// The durable execution row of THIS turn (audit P0-ASK): written by task
+/// admission for an `ask`, ABSENT for every engineering-task turn (the
+/// documented legacy default — an unkeyed/direct/legacy turn is a task).
+/// A present-but-undecodable row is a loud typed refusal, never a silent
+/// fallback to either semantics.
+pub(crate) fn read_turn_execution(
+    handle: &faktor_session::SessionHandle,
+    op_id: OpId,
+) -> faktor_core::Result<Option<faktor_protocol::TurnExecution>> {
+    let key = faktor_protocol::turn_execution_row_key(op_id.raw());
+    let value = handle.memory_fact_get(faktor_protocol::TURN_EXECUTION_ROW_KIND, &key)?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let row = faktor_protocol::TurnExecution::decode(&value).map_err(|e| {
+        Error::new(
+            ErrorKind::Malformed,
+            format!(
+                "durable turn-execution row of op {} undecodable: {e}",
+                op_id.raw()
+            ),
+        )
+    })?;
+    Ok(Some(row))
+}
+
+/// The drive-start verdict for the ENGINEERING working projection (audit
+/// P0-GOAL-BINDING): the projection (goal/contract inputs/plan/checks) is
+/// BOUND to the admitted task identity+revision in the typed session
+/// ledger head, so a later task can never read an earlier task's
+/// objective.
+#[derive(Debug)]
+pub(crate) enum GoalProjectionBinding {
+    /// The projection belongs to the admitted task (or is an unbound
+    /// legacy goal): keep it — a continuation keeps the same objective and
+    /// steering only appends (turn facts fold into lists; the goal never
+    /// rotates under it).
+    Keep,
+    /// The projection is bound to a DIFFERENT task: the old objective is
+    /// NEVER read — rebuild from this task's own objective first, before
+    /// any contract compile or request construction.
+    Rebuild { bound_task_id: u64 },
+}
+
+/// Classify the loaded working projection against the ADMITTED task
+/// identity of this drive (captured at drive start, never re-read).
+///
+/// - unbound head → [`GoalProjectionBinding::Keep`] (documented legacy:
+///   the drive-start seeding records the binding for the NEXT drive);
+/// - bound to another task → typed [`GoalProjectionBinding::Rebuild`];
+/// - bound to THIS task with a REWOUND bound revision (the durable row
+///   sits at a LOWER revision than the binding recorded) → typed refusal:
+///   a rolled-back/tampered row is never driven under silently.
+pub(crate) fn classify_goal_projection_binding(
+    handle: &faktor_session::SessionHandle,
+    admitted_task_id: TaskId,
+) -> faktor_core::Result<GoalProjectionBinding> {
+    let view = handle.ledger_view()?;
+    let Some(bound_task_id) = view.head.goal_task_id else {
+        return Ok(GoalProjectionBinding::Keep);
+    };
+    if bound_task_id != admitted_task_id.raw() {
+        return Ok(GoalProjectionBinding::Rebuild { bound_task_id });
+    }
+    if let Some(bound_revision) = view.head.goal_revision {
+        let current = handle.task_revision(admitted_task_id)?;
+        if bound_revision > current.raw() {
+            return Err(Error::new(
+                ErrorKind::Conflict,
+                format!(
+                    "goal projection binding of task {admitted_task_id} records revision {bound_revision} but the durable row is at revision {}: the task row was rolled back or tampered with; refusing the drive under a rewound projection",
+                    current.raw()
+                ),
+            ));
+        }
+    }
+    Ok(GoalProjectionBinding::Keep)
+}
+
+/// Rebuild the engineering working projection from THIS admitted task's
+/// own objective (audit P0-GOAL-BINDING). Called for a bound-mismatch
+/// BEFORE `initialize_durable_goal`/contract compile: the earlier task's
+/// goal/plan/checks/decisions/failures/changed-files/test evidence are
+/// cleared — a new task never reads the old projection. Conversation
+/// history is NOT part of this projection (it stays keyed by the session
+/// and is untouched); `user_preferences` survive (session knowledge, not
+/// task memory).
+///
+/// Typed, not silent: the rebuild lands a durable ledger Decision naming
+/// both tasks, and a task objective that redacts to nothing refuses with
+/// the SAME `goal_unavailable_after_redaction` typed error a fresh
+/// projection would — never the stale inherited goal.
+pub(crate) fn rebuild_goal_projection(
+    handle: &faktor_session::SessionHandle,
+    ledger: &mut TaskLedger,
+    task_id: TaskId,
+    bound_task_id: u64,
+) -> faktor_core::Result<()> {
+    let preferences = std::mem::take(&mut ledger.user_preferences);
+    let task = match handle.get_task(task_id)? {
+        Some(task) => task,
+        None => {
+            // Typed absence: the admitted identity has no row yet, so
+            // there is no objective to inherit FROM — reset to a fresh
+            // (empty) projection and let the prompt adoption below choose
+            // the goal; the OLD task's lists are gone either way.
+            *ledger = TaskLedger::default();
+            ledger.user_preferences = preferences;
+            return Ok(());
+        }
+    };
+    let redacted = durable_goal_text(&task.goal);
+    let redaction_removed_content = redacted != task.goal;
+    let source_message_id = match AgentRuntime::latest_user_prompt_message(handle) {
+        Some((source_message_id, _)) => source_message_id,
+        // Read from the PRE-rebuild projection (before the reset below): a
+        // projection with no newest prompt keeps its prior source anchor.
+        None => ledger.goal_source_message_id.unwrap_or_default(),
+    };
+    *ledger = TaskLedger::default();
+    ledger.user_preferences = preferences;
+    if !has_meaningful_goal(&redacted, redaction_removed_content) {
+        let digest = projection_digest(source_message_id, &redacted);
+        mark_unavailable(ledger, source_message_id, &redacted, &digest);
+        persist_goal(handle, ledger)?;
+        return Err(Error::goal_unavailable_after_redaction(source_message_id));
+    }
+    let digest = projection_digest(source_message_id, &redacted);
+    ledger.goal = operational_goal_excerpt(&redacted);
+    ledger.goal_source_message_id = Some(source_message_id);
+    ledger.goal_redacted_text = Some(redacted);
+    ledger.goal_projection_digest = Some(digest);
+    ledger.goal_projection_state = Some(GoalProjectionState::Available);
+    persist_goal(handle, ledger)?;
+    handle.ledger_decision(
+        "goal binding",
+        "rebuild the working projection from this task's own objective",
+        &format!(
+            "the durable projection was bound to task {bound_task_id}; task {task_id} never reads another task's goal/plan/checks"
+        ),
+    )?;
+    tracing::warn!(
+        session = %handle.id(),
+        %task_id,
+        bound_task_id,
+        "goal projection bound to a previous task rebuilt from this task's own objective before contract/request compilation"
+    );
+    Ok(())
+}
+
 fn adopt_prompt_projection(
     handle: &faktor_session::SessionHandle,
     ledger: &mut TaskLedger,

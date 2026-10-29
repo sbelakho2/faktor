@@ -776,6 +776,11 @@ pub(crate) async fn native_task_run_start(
             // exactly like the explicit task-start path.
             let request = PromptRequest {
                 prompt: req.goal,
+                // The task-start surface is the ENGINEERING surface: its
+                // plain-prompt path is always an execution=`task` prompt
+                // (conversational `ask` prompts arrive on the dedicated
+                // prompt route with their own admission domain).
+                execution: faktor_protocol::ExecutionKind::Task,
                 submission_id: Some(req.submission_id),
                 // The task-start admission inside the executor reserves its
                 // own op id and computes the digest itself.

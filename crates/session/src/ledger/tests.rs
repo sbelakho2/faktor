@@ -1,4 +1,5 @@
 //! Ledger tests (mechanically split from `ledger`).
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 
 use super::*;
 use crate::handle::tests::{session, test_manager};
@@ -137,7 +138,7 @@ fn assert_never_lost(s: &SessionHandle, goal: &str, open_blockers: &[&str]) {
     assert!(
         entries
             .iter()
-            .any(|e| matches!(&e.payload, LedgerPayload::GoalSet { goal: g } if g == goal)),
+            .any(|e| matches!(&e.payload, LedgerPayload::GoalSet { goal: g, .. } if g == goal)),
         "GoalSet entry must survive"
     );
     assert!(

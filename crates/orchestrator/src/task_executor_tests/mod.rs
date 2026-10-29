@@ -74,13 +74,18 @@ impl PermissionRequester for AlwaysAllow {
 }
 
 /// Per-call scripted provider: serves one script per stream call (extra
-/// calls end immediately), counts calls. Deterministic failure-then-recovery
-/// runs need per-call scripts.
+/// calls end immediately), counts calls, and records every request's FULL
+/// text (system + message bodies — the goal block rides the volatile
+/// system slot, so either half alone is not the whole prompt).
+/// Deterministic failure-then-recovery runs need per-call scripts.
 pub(crate) struct PerCallProvider {
     inner: FakeProvider,
     calls: StdMutex<Vec<Vec<ScriptedResponse>>>,
     script_index: AtomicUsize,
     request_count: AtomicUsize,
+    /// Full text of every request, in order (the recording witness for
+    /// request-content assertions: which goal actually reached the model).
+    request_texts: StdMutex<Vec<String>>,
 }
 
 impl PerCallProvider {
@@ -94,11 +99,17 @@ impl PerCallProvider {
             calls: StdMutex::new(per_call_scripts),
             script_index: AtomicUsize::new(0),
             request_count: AtomicUsize::new(0),
+            request_texts: StdMutex::new(Vec::new()),
         }
     }
 
     fn count(&self) -> usize {
         self.request_count.load(Ordering::SeqCst)
+    }
+
+    /// System + every message text of request `idx`.
+    fn text_of(&self, idx: usize) -> Option<String> {
+        self.request_texts.lock().unwrap().get(idx).cloned()
     }
 }
 
@@ -115,9 +126,21 @@ impl Provider for PerCallProvider {
         // Unknown lookup (or vice versa).
         self.inner.capability_resolution(model)
     }
-    fn stream(&self, _req: faktor_provider::GenericAgentRequest) -> ProviderStream {
+    fn stream(&self, req: faktor_provider::GenericAgentRequest) -> ProviderStream {
         use futures::StreamExt;
         self.request_count.fetch_add(1, Ordering::SeqCst);
+        {
+            let mut text = req.system.clone();
+            for message in &req.messages {
+                for part in &message.content {
+                    if let faktor_provider::ContentKind::Text { text: body } = &part.kind {
+                        text.push('\n');
+                        text.push_str(body);
+                    }
+                }
+            }
+            self.request_texts.lock().unwrap().push(text);
+        }
         let i = self.script_index.fetch_add(1, Ordering::SeqCst);
         let script: Vec<ScriptedResponse> = self
             .calls

@@ -1,4 +1,5 @@
 //! `runtime::media_tests`: out-of-line tests.
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 
 use super::*;
 
@@ -164,7 +165,7 @@ async fn attachment_media_visionless_model_is_a_typed_refusal_with_bytes_kept() 
         content: vec![ContentPart::text("what is this?")],
     }];
     let err = runtime
-        .inject_attachment_media(&handle, &mut history, &caps, provider.as_ref())
+        .inject_attachment_media(&handle, &mut history, &caps, provider.as_ref(), None)
         .expect_err("vision-less model must refuse");
     assert!(err.message.contains("does not support vision"), "{err:?}");
     assert_eq!(err.kind, ErrorKind::Malformed);
@@ -338,7 +339,7 @@ async fn attachment_documents_reach_the_request_byte_exact_for_document_capable_
         content: vec![ContentPart::text("read the spec and notes")],
     }];
     runtime
-        .inject_attachment_media(&handle, &mut history, &caps, provider.as_ref())
+        .inject_attachment_media(&handle, &mut history, &caps, provider.as_ref(), None)
         .unwrap();
     let docs: Vec<(&str, Option<&str>, &[u8])> = history
         .iter()
@@ -402,7 +403,7 @@ async fn attachment_documentless_model_is_a_typed_refusal_with_bytes_kept() {
         content: vec![ContentPart::text("read the spec")],
     }];
     let err = runtime
-        .inject_attachment_media(&handle, &mut history, &caps, provider.as_ref())
+        .inject_attachment_media(&handle, &mut history, &caps, provider.as_ref(), None)
         .expect_err("document-less provider must refuse");
     assert_eq!(err.kind, ErrorKind::Malformed);
     assert!(
@@ -465,7 +466,7 @@ async fn attachment_media_missing_or_tampered_blob_is_typed() {
             content: vec![ContentPart::text("q")],
         }];
         let err = runtime
-            .inject_attachment_media(&handle, &mut history, &caps, provider.as_ref())
+            .inject_attachment_media(&handle, &mut history, &caps, provider.as_ref(), None)
             .expect_err("missing/tampered blob must fail typed");
         assert!(
             matches!(err.kind, ErrorKind::NotFound | ErrorKind::Store),
@@ -517,7 +518,7 @@ async fn attachment_media_reattach_reconstructs_identical_request_bytes() {
             content: vec![ContentPart::text("look")],
         }];
         runtime
-            .inject_attachment_media(&handle, &mut history, &caps, provider.as_ref())
+            .inject_attachment_media(&handle, &mut history, &caps, provider.as_ref(), None)
             .unwrap();
         history
     };
@@ -536,4 +537,211 @@ async fn attachment_media_reattach_reconstructs_identical_request_bytes() {
         }
         other => panic!("expected resolved image, got {other:?}"),
     }
+}
+
+/// P0-ATTACH end-to-end for a CONVERSATIONAL ask: the accepted ids ride
+/// the durable TURN (turn-execution row — an ask has no task row), the
+/// provider sees the byte-exact image at request construction, and the
+/// ask's genuine end writes NO task row and NO working-ledger blob.
+#[tokio::test]
+async fn ask_turn_delivers_turn_owned_attachments_byte_exact_and_writes_no_task_rows() {
+    let png: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 7, 7, 7];
+    let expected_png = png.clone();
+    let captured: Arc<std::sync::Mutex<Option<Vec<u8>>>> = Arc::new(std::sync::Mutex::new(None));
+    let captured_hook = captured.clone();
+    let wrapper = Arc::new(InspectingProvider::new(
+        Arc::new(FakeProvider::with_script(
+            "fake",
+            ModelCapabilities {
+                vision: true,
+                ..Default::default()
+            },
+            vec![ScriptedResponse::Text("seen".into()), ScriptedResponse::End],
+        )),
+        move |_n, req| {
+            for m in &req.messages {
+                for p in &m.content {
+                    if let faktor_provider::ContentKind::ImageData { mime, data } = &p.kind {
+                        if mime != "image/png" {
+                            return Err(format!("unexpected mime {mime}"));
+                        }
+                        if data.as_slice() != expected_png.as_slice() {
+                            return Err("the ask's image bytes are not byte-exact".into());
+                        }
+                        *captured_hook.lock().unwrap() = Some(data.as_slice().to_vec());
+                    }
+                }
+            }
+            Ok(())
+        },
+    ));
+    let (deps, _dir) = deps_with(wrapper, vec![]);
+    let runtime = AgentRuntime::new(deps).unwrap();
+    let session = new_session(runtime.deps());
+    let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+    let image = handle
+        .put_attachment("image/png", Some("ask.png"), &png)
+        .unwrap();
+
+    // Admit the conversational turn, write its durable execution row
+    // (exactly what ask admission does), then drive it through the ONE
+    // shared runtime.
+    let receipt = runtime
+        .submit(session, "describe this image", &[])
+        .expect("ask submission");
+    let op_id = receipt.op_id;
+    let row = faktor_protocol::TurnExecution {
+        execution: faktor_protocol::ExecutionKind::Ask,
+        attachments: vec![image],
+    };
+    handle
+        .upsert_memory_fact(
+            faktor_protocol::TURN_EXECUTION_ROW_KIND,
+            &faktor_protocol::turn_execution_row_key(op_id.raw()),
+            &row.encode().unwrap(),
+        )
+        .unwrap();
+    let outcome = runtime
+        .drive_receipt(&handle, receipt, None)
+        .await
+        .expect("the ask turn drives through the shared runtime");
+    assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+    assert_eq!(
+        captured.lock().unwrap().as_deref(),
+        Some(png.as_slice()),
+        "the provider saw the ask's byte-exact attached image"
+    );
+    // ZERO engineering rows for the conversational turn: no task row, no
+    // working-ledger blob, no verification/completion surface.
+    for id in 1..=3u64 {
+        assert!(
+            handle.get_task(TaskId::new(id)).unwrap().is_none(),
+            "the ask never creates task row {id}"
+        );
+        assert!(
+            handle
+                .completion_contract(TaskId::new(id))
+                .unwrap()
+                .is_none(),
+            "the ask never leaves a completion contract row for {id}"
+        );
+    }
+    assert!(
+        handle.get_task_ledger().unwrap().is_none(),
+        "the ask never writes the engineering working ledger"
+    );
+}
+
+/// P0-ATTACH typed refusal set for the TURN-sourced ask attachments:
+/// - an attachment-free ask injects NOTHING even when the session's TASK
+///   row carries a full attachment set (no cross-turn inheritance, no
+///   silent surprise delivery);
+/// - an ask image against a vision-less model refuses TYPED with the
+///   TURN as the source label (never a silent text-only degradation, and
+///   never blaming a task row the ask does not own);
+/// - the turn's own bytes still resolve byte-exact (digest re-hash on the
+///   session layer) when the capabilities allow them.
+#[tokio::test]
+async fn ask_attachment_set_is_turn_owned_and_typed_when_unsupported() {
+    let png: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 5, 6];
+    let (deps, _dir) = deps(
+        FakeProvider::with_script(
+            "fake",
+            ModelCapabilities::default(),
+            vec![ScriptedResponse::End],
+        ),
+        vec![],
+    );
+    let runtime = AgentRuntime::new(deps).unwrap();
+    let session = new_session(runtime.deps());
+    let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+    // The TASK row carries an attachment set the ask must never inherit.
+    let task_image = handle
+        .put_attachment("image/png", Some("task.png"), b"\x89PNG-task")
+        .unwrap();
+    runtime
+        .seed_task_attachments(session, &[task_image])
+        .unwrap();
+    let ask_image = handle
+        .put_attachment("image/png", Some("ask.png"), &png)
+        .unwrap();
+    let provider = runtime.deps.providers.get("fake").unwrap();
+    let caps = provider.capabilities("m");
+    assert!(!caps.vision);
+
+    // 1) An attachment-free ask (`Some(&[])`) injects NOTHING — the task
+    // row's set is a different owner's set.
+    let mut history = vec![RequestMessage {
+        role: Role::User,
+        content: vec![ContentPart::text("hi")],
+    }];
+    runtime
+        .inject_attachment_media(&handle, &mut history, &caps, provider.as_ref(), Some(&[]))
+        .unwrap();
+    assert!(
+        history[0].content.len() == 1,
+        "an attachment-free ask must inject nothing, got {} parts",
+        history[0].content.len()
+    );
+
+    // 2) A vision-less model + ask image: TYPED refusal naming the TURN.
+    let mut history = vec![RequestMessage {
+        role: Role::User,
+        content: vec![ContentPart::text("describe this")],
+    }];
+    let err = runtime
+        .inject_attachment_media(
+            &handle,
+            &mut history,
+            &caps,
+            provider.as_ref(),
+            Some(std::slice::from_ref(&ask_image)),
+        )
+        .expect_err("a vision-less model must refuse the ask's image");
+    assert!(
+        err.message.contains("turn carries"),
+        "the refusal names the TURN as the source: {}",
+        err.message
+    );
+
+    // 3) With vision, the turn's bytes resolve byte-exact (digest re-hash
+    // proves identity at the session layer before delivery).
+    let vision = ModelCapabilities {
+        vision: true,
+        ..Default::default()
+    };
+    let mut history = vec![RequestMessage {
+        role: Role::User,
+        content: vec![ContentPart::text("describe this")],
+    }];
+    runtime
+        .inject_attachment_media(
+            &handle,
+            &mut history,
+            &vision,
+            provider.as_ref(),
+            Some(std::slice::from_ref(&ask_image)),
+        )
+        .unwrap();
+    let delivered: Vec<&[u8]> = history[0]
+        .content
+        .iter()
+        .filter_map(|p| match &p.kind {
+            faktor_provider::ContentKind::ImageData { data, .. } => Some(data.as_slice()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        delivered,
+        vec![png.as_slice()],
+        "the ask's own image bytes, exactly as attached"
+    );
+    let has_task_bytes = history[0].content.iter().any(|p| matches!(
+        &p.kind,
+        faktor_provider::ContentKind::ImageData { data, .. } if data.as_slice() == b"\x89PNG-task"
+    ));
+    assert!(
+        !has_task_bytes,
+        "the task row's image never leaks into the turn-owned ask delivery"
+    );
 }

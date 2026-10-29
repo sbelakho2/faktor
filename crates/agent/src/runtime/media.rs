@@ -22,12 +22,18 @@ impl AgentRuntime {
         })
     }
 
-    /// Resolve the durable task's IMAGE and non-image DOCUMENT attachments
+    /// Resolve the TURN's IMAGE and non-image DOCUMENT attachments
     /// into bounded in-memory media parts at REQUEST CONSTRUCTION and append
     /// them (input order preserved) to the newest user message carrying
     /// TEXT — the turn's own prompt — synthesizing one only when the history
     /// has none (e.g. after compaction dropped it). Non-document
     /// attachments (e.g. archives) are not model content and stay CAS-only.
+    ///
+    /// `turn_attachments` is the explicit SET source (audit P0-ATTACH):
+    /// `Some(ids)` is the TURN's own accepted set (an ask — it has no task
+    /// row, and an attachment-free ask must never inherit another turn's
+    /// attachments); `None` resolves the durable task row exactly as
+    /// before (the task-run behavior is byte-identical).
     ///
     /// Every failure is typed and happens BEFORE any provider call:
     ///
@@ -44,26 +50,36 @@ impl AgentRuntime {
     /// - a missing/tampered CAS blob is a typed error (the session layer
     ///   re-hashes every blob against its digest).
     ///
-    /// The bytes exist only in this request: the durable task row keeps
-    /// `AttachmentId`s, so re-attach re-resolves the byte-identical set.
+    /// The bytes exist only in this request: the durable row (task row, or
+    /// the ask's turn-execution row) keeps `AttachmentId`s, so re-attach
+    /// re-resolves the byte-identical set.
     pub(crate) fn inject_attachment_media(
         &self,
         handle: &faktor_session::SessionHandle,
         history: &mut Vec<RequestMessage>,
         caps: &faktor_core::model::ModelCapabilities,
         provider: &dyn faktor_provider::Provider,
+        turn_attachments: Option<&[faktor_core::attachment::AttachmentId]>,
     ) -> faktor_core::Result<()> {
-        let Some(task) = handle.get_task(handle.task_id()?)? else {
-            return Ok(());
-        };
-        let images: Vec<faktor_core::attachment::AttachmentId> = task
-            .attachments
+        // The SET that drives this turn: an ask's accepted ids ride its
+        // own turn (audit P0-ATTACH — an ask has NO task row, and an
+        // attachment-free ask must never inherit another turn's set);
+        // `None` keeps the task-run behavior byte-identical (the task row
+        // owns the set).
+        let (owner, attachments): (String, Vec<faktor_core::attachment::AttachmentId>) =
+            match turn_attachments {
+                Some(ids) => ("turn".to_string(), ids.to_vec()),
+                None => match handle.get_task(handle.task_id()?)? {
+                    Some(task) => (format!("task {}", task.task_id), task.attachments),
+                    None => return Ok(()),
+                },
+            };
+        let images: Vec<faktor_core::attachment::AttachmentId> = attachments
             .iter()
             .filter(|a| a.is_image())
             .cloned()
             .collect();
-        let documents: Vec<faktor_core::attachment::AttachmentId> = task
-            .attachments
+        let documents: Vec<faktor_core::attachment::AttachmentId> = attachments
             .iter()
             .filter(|a| !a.is_image() && faktor_provider::is_supported_document_mime(&a.mime))
             .cloned()
@@ -76,15 +92,13 @@ impl AgentRuntime {
         // gate that can refuse the whole set has passed.
         if !images.is_empty() && !caps.vision {
             return Err(Error::malformed(format!(
-                "model {model} does not support vision, but task {} carries {} image attachment(s); remove them or select a vision model",
-                task.task_id,
+                "model {model} does not support vision, but {owner} carries {} image attachment(s); remove them or select a vision model",
                 images.len()
             )));
         }
         if !documents.is_empty() && !provider.document_capable(&model) {
             return Err(Error::malformed(format!(
-                "the provider of model {model} does not support document input, but task {} carries {} document attachment(s); remove them or select a document-capable model",
-                task.task_id,
+                "the provider of model {model} does not support document input, but {owner} carries {} document attachment(s); remove them or select a document-capable model",
                 documents.len()
             )));
         }

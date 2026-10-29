@@ -1,14 +1,21 @@
 #![allow(clippy::await_holding_lock)]
 //! TaskExecutor tests: durable submission-keyed start admission (idempotency
 //! finding 1) — replay, key reuse, claim-before-mutation, release-and-retry
-//! and the concurrent double-submit matrix.
+//! and the concurrent double-submit matrix — plus the P0-ASK execution-kind
+//! admission (conversational vs engineering) and the P0-GOAL-BINDING
+//! acceptance sequence.
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 
+use super::tests_core::mutating_request;
 use super::*;
 
 use faktor_core::attachment::AttachmentId;
 use faktor_core::completion::CompletionContract;
 use faktor_core::id::OpId;
 use faktor_core::state::{TaskState, TaskTransition};
+use faktor_protocol::{
+    turn_execution_row_key, ExecutionKind, TurnExecution, TURN_EXECUTION_ROW_KIND,
+};
 use faktor_session::DurableBudgetLedger;
 
 /// The fixed submission keys of this suite (UUID-shaped, lowercase hex).
@@ -975,4 +982,557 @@ pub(crate) async fn post_admission_read_failure_is_typed_and_recovers_exactly_on
         .expect("the durable acceptance replays");
     assert!(replay.op_id.is_some(), "the replay carries the durable op");
     assert_eq!(env.provider.count(), 0, "still zero provider calls");
+}
+
+// ============================================ P0-ASK execution semantics
+
+/// Build an ASK start: conversational execution kind, exactly one
+/// read-only work item (the typed admission rule), no engineering seams.
+fn ask_request(goal: &str, env: &Env) -> TaskRunRequest {
+    let mut req = request(goal, vec![wi("a1", WorkKind::Analysis, &[])], env);
+    req.execution = ExecutionKind::Ask;
+    req
+}
+
+/// Wait for ONE turn: machine ready AND the op's durable turn record closed
+/// (the two writes are separate; readiness alone races the row sync).
+async fn wait_turn_done(env: &Env, op: OpId) {
+    wait_until(
+        || state_of(env, env.parent) == faktor_core::state::AgentState::ReadyForNextTurn,
+        240,
+    )
+    .await;
+    let handle = env.manager.get_session(env.parent).unwrap().unwrap();
+    wait_until(
+        || match handle.turn_record(op) {
+            Ok(Some(record)) => faktor_store::is_terminal_turn_record_status(&record.status),
+            _ => false,
+        },
+        240,
+    )
+    .await;
+}
+
+/// The ZERO witness (audit P0-ASK): an ask leaves no engineering surface
+/// behind — no task row, no completion-contract row, no shadow copy, no
+/// verification record/attempt fact, no goal, and no working-ledger blob.
+async fn assert_ask_left_no_engineering_rows(env: &Env) {
+    let handle = env.manager.get_session(env.parent).unwrap().unwrap();
+    for id in 1..=5u64 {
+        let task_id = TaskId::new(id);
+        assert!(
+            handle.get_task(task_id).unwrap().is_none(),
+            "an ask must never create task row {id}"
+        );
+        assert!(
+            handle.completion_contract(task_id).unwrap().is_none(),
+            "an ask must never leave a completion contract row for {id}"
+        );
+        let records = env
+            .manager
+            .verification_records(env.parent, task_id)
+            .await
+            .unwrap();
+        assert!(
+            records.is_empty(),
+            "an ask must leave zero verification records for {id}"
+        );
+    }
+    assert!(
+        env.manager.shadow_row(env.parent).unwrap().is_none(),
+        "an ask must never open a shadow copy"
+    );
+    let attempts = crate::runtime::facts_of_kind(&handle, "verification_attempt").unwrap();
+    assert!(
+        attempts.is_empty(),
+        "an ask must leave zero verification attempt facts: {attempts:?}"
+    );
+    let view = handle.ledger_view().unwrap();
+    assert!(
+        view.head.goal.is_empty(),
+        "a conversational ask must never become a goal: {}",
+        view.head.goal
+    );
+    assert_eq!(
+        view.head.goal_task_id, None,
+        "an ask never binds an engineering goal"
+    );
+    assert!(
+        handle.get_task_ledger().unwrap().is_none(),
+        "an ask never writes the engineering working-ledger blob"
+    );
+}
+
+/// P0-ASK: a greeting and a conceptual question are CONVERSATIONAL turns —
+/// zero task/contract/shadow/verification rows, no goal (a chat greeting
+/// never becomes one), and the ask's durable identity rides the
+/// turn-execution row with an unbound conversational policy row.
+#[tokio::test]
+async fn greeting_and_conceptual_asks_admit_with_zero_engineering_rows() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_env(&dir.path().join("ask"), done_script());
+
+    // The task-scoped turn budget is a TYPED refusal on an ask, before any
+    // durable mutation — never a silently dropped configured cap.
+    let err = env
+        .executor
+        .start_task_with_turn_cap(env.parent, ask_request("hi", &env), Some(3))
+        .expect_err("an ask carrying a task-scoped turn budget is refused typed");
+    assert!(matches!(err, ExecError::InvalidPlan(_)), "{err}");
+    assert_ask_left_no_engineering_rows(&env).await;
+
+    // Greeting.
+    let greet = env
+        .executor
+        .start_task(env.parent, ask_request("hello there", &env))
+        .expect("greet ask admitted");
+    assert_eq!(greet.mode, TaskRunMode::InSession);
+    let greet_op = greet.op_id.expect("real op id");
+    assert_ask_left_no_engineering_rows(&env).await;
+    wait_turn_done(&env, greet_op).await;
+    assert_ask_left_no_engineering_rows(&env).await;
+    let greet_text = env
+        .provider
+        .text_of(0)
+        .expect("the greeting request is captured");
+    assert!(
+        !greet_text.contains("GOAL:"),
+        "a greeting must never seed a goal block: {greet_text}"
+    );
+
+    // Conceptual ask.
+    let ask = env
+        .executor
+        .start_task(env.parent, ask_request("what is a lexer anyway", &env))
+        .expect("ask admitted");
+    let ask_op = ask.op_id.expect("real op id");
+    wait_turn_done(&env, ask_op).await;
+    assert_ask_left_no_engineering_rows(&env).await;
+
+    // The durable identity of the ask: the turn-execution row (kind=ask,
+    // empty attachment set, OP-scoped) plus ONE unbound conversational
+    // policy row — no synthetic shadow-settlement row, no task binding.
+    let handle = env.manager.get_session(env.parent).unwrap().unwrap();
+    let row_value = handle
+        .memory_fact_get(
+            TURN_EXECUTION_ROW_KIND,
+            &turn_execution_row_key(ask_op.raw()),
+        )
+        .unwrap()
+        .expect("the ask's turn-execution row exists");
+    let turn_execution = TurnExecution::decode(&row_value).expect("the row decodes typed");
+    assert_eq!(turn_execution.execution, ExecutionKind::Ask);
+    assert!(turn_execution.attachments.is_empty());
+    let policy = handle
+        .memory_fact_get(
+            crate::runtime::task_executor::RUN_POLICY_ROW_KIND,
+            &format!("tx-{:016x}", ask_op.raw()),
+        )
+        .unwrap()
+        .expect("the ask's policy row exists");
+    let policy_row: serde_json::Value = serde_json::from_str(&policy).expect("policy JSON");
+    assert!(
+        policy_row["task_id"].is_null(),
+        "an ask run binds to no engineering task (absent or null — never a guessed id): {policy_row}"
+    );
+    assert_eq!(
+        policy_row.get("no_op_disposition"),
+        Some(&serde_json::json!("allowed")),
+        "the conversational no-op policy is Allowed: {policy_row}"
+    );
+    let policy_rows =
+        crate::runtime::facts_of_kind(&handle, crate::runtime::task_executor::RUN_POLICY_ROW_KIND)
+            .unwrap();
+    // Exactly ONE per-run conversational row per ask turn (greet + ask) and
+    // NEVER the synthetic `tx-session-<id>` shadow-settlement row — that row
+    // is the TASK-run identity surface and an ask must not clobber it.
+    assert_eq!(
+        policy_rows.len(),
+        2,
+        "exactly one policy row per ask turn: {policy_rows:?}"
+    );
+    for (key, value) in &policy_rows {
+        assert!(
+            !key.starts_with("tx-session-"),
+            "an ask never writes the synthetic shadow-settlement row: {key}"
+        );
+        let row: serde_json::Value = serde_json::from_str(value).expect("policy JSON");
+        assert!(
+            row["task_id"].is_null(),
+            "every ask policy row is task-unbound: {key} -> {row}"
+        );
+        assert_eq!(
+            row.get("no_op_disposition"),
+            Some(&serde_json::json!("allowed")),
+            "every ask policy row is Allowed: {key} -> {row}"
+        );
+    }
+}
+
+/// P0-GOAL-BINDING acceptance sequence: greet; ask; task A; correct A;
+/// finish A; ask about A; task B — B's PROVIDER REQUEST carries B's goal
+/// and never A's goal block, continuations keep one objective, and the
+/// cross-task rebuild is durable typed history.
+#[tokio::test]
+async fn goal_binding_sequence_b_task_request_carries_b_goal_and_never_as() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_env(&dir.path().join("binding"), done_script());
+    let handle = |env: &Env| env.manager.get_session(env.parent).unwrap().unwrap();
+
+    // greet (ask)
+    let receipt = env
+        .executor
+        .start_task(env.parent, ask_request("hello there", &env))
+        .expect("greet ask");
+    wait_turn_done(&env, receipt.op_id.expect("op")).await;
+    // ask
+    let receipt = env
+        .executor
+        .start_task(env.parent, ask_request("explain recursion briefly", &env))
+        .expect("ask");
+    wait_turn_done(&env, receipt.op_id.expect("op")).await;
+    assert!(
+        handle(&env).get_task(TaskId::new(1)).unwrap().is_none(),
+        "greet+ask before task A leave zero task rows"
+    );
+
+    // task A
+    let goal_a = "restore the alpha parser so streaming reconnects";
+    let before_a = env.provider.count();
+    let receipt = env
+        .executor
+        .start_task(
+            env.parent,
+            request(goal_a, vec![wi("a1", WorkKind::Implementation, &[])], &env),
+        )
+        .expect("task A start");
+    wait_turn_done(&env, receipt.op_id.expect("op")).await;
+    let request_a = env
+        .provider
+        .text_of(before_a)
+        .expect("task A's request captured");
+    assert!(
+        request_a.contains("GOAL: restore the alpha parser"),
+        "task A's own objective reaches the model: {request_a}"
+    );
+    let row_a_before = handle(&env)
+        .get_task(TaskId::new(1))
+        .unwrap()
+        .expect("task A row");
+    let head = handle(&env).ledger_view().unwrap();
+    assert_eq!(
+        head.head.goal_task_id,
+        Some(1),
+        "task A's projection is BOUND to task 1"
+    );
+    assert!(
+        head.head.goal.contains("alpha"),
+        "the bound head goal is A's objective: {}",
+        head.head.goal
+    );
+
+    // correct A (steering on the same task)
+    let receipt = env
+        .executor
+        .start_task(
+            env.parent,
+            request(
+                "also double-check the reconnect backoff",
+                vec![wi("a1", WorkKind::Implementation, &[])],
+                &env,
+            ),
+        )
+        .expect("steering start");
+    wait_turn_done(&env, receipt.op_id.expect("op")).await;
+    let row_a_after = handle(&env)
+        .get_task(TaskId::new(1))
+        .unwrap()
+        .expect("task A row survives steering");
+    assert_eq!(
+        row_a_after.task_id, row_a_before.task_id,
+        "continuation keeps the same durable TaskId"
+    );
+    assert_eq!(
+        row_a_after.goal, row_a_before.goal,
+        "steering never replaces the recorded objective"
+    );
+    let head = handle(&env).ledger_view().unwrap();
+    assert_eq!(
+        head.head.goal_task_id,
+        Some(1),
+        "continuation keeps the binding"
+    );
+    assert!(
+        head.head.goal.contains("alpha"),
+        "the objective survived steering: {}",
+        head.head.goal
+    );
+
+    // finish A (terminal)
+    let revision = handle(&env).task_revision(TaskId::new(1)).unwrap();
+    handle(&env)
+        .transition_task(TaskId::new(1), revision, TaskTransition::Cancel, None)
+        .expect("A finishes");
+
+    // ask about A — zero NEW engineering rows; the ask never advances the
+    // identity nor rebinds/rewrites the projection it merely READS.
+    let receipt = env
+        .executor
+        .start_task(
+            env.parent,
+            ask_request("remind me what we restored for alpha", &env),
+        )
+        .expect("ask about A");
+    wait_turn_done(&env, receipt.op_id.expect("op")).await;
+    assert!(
+        handle(&env).get_task(TaskId::new(2)).unwrap().is_none(),
+        "an ask never advances the task identity"
+    );
+    let head = handle(&env).ledger_view().unwrap();
+    assert_eq!(
+        head.head.goal_task_id,
+        Some(1),
+        "the ask never rebinds the goal projection"
+    );
+    assert!(
+        head.head.goal.contains("alpha"),
+        "the ask never rewrites the goal: {}",
+        head.head.goal
+    );
+
+    // task B — a FRESH objective on a FRESH identity: B's provider request
+    // carries B's goal block and NEVER A's (the conversation history
+    // legitimately quotes A's prompt; the GOAL block is the projection).
+    let goal_b = "build the beta indexer for nightly reports";
+    let before_b = env.provider.count();
+    let receipt = env
+        .executor
+        .start_task(
+            env.parent,
+            request(goal_b, vec![wi("b1", WorkKind::Implementation, &[])], &env),
+        )
+        .expect("task B start");
+    wait_turn_done(&env, receipt.op_id.expect("op")).await;
+    let request_b = env
+        .provider
+        .text_of(before_b)
+        .expect("task B's request captured");
+    assert!(
+        request_b.contains("GOAL: build the beta indexer"),
+        "B's request carries B's goal: {request_b}"
+    );
+    assert!(
+        !request_b.contains("GOAL: restore the alpha parser"),
+        "B must NEVER inherit A's objective: {request_b}"
+    );
+    let row_b = handle(&env)
+        .get_task(TaskId::new(2))
+        .unwrap()
+        .expect("task B row");
+    assert_ne!(row_b.task_id, TaskId::new(1), "B opens its own identity");
+    let head = handle(&env).ledger_view().unwrap();
+    assert_eq!(
+        head.head.goal_task_id,
+        Some(2),
+        "B's projection is bound to task 2"
+    );
+    assert!(
+        head.head.goal.contains("beta"),
+        "B's bound head goal is B's objective: {}",
+        head.head.goal
+    );
+    // TYPED, not silent: the cross-task rebuild landed durable ledger
+    // history — a Decision naming the mismatch.
+    let mut rebuild_decisions = 0usize;
+    let mut page = handle(&env).ledger_entries_page(None, 500).unwrap();
+    loop {
+        for entry in &page.entries {
+            if let faktor_session::LedgerPayload::Decision { step, .. } = &entry.payload {
+                if step == "goal binding" {
+                    rebuild_decisions += 1;
+                }
+            }
+        }
+        if !page.has_more {
+            break;
+        }
+        let cursor = page.entries.last().map(|entry| entry.seq);
+        page = handle(&env).ledger_entries_page(cursor, 500).unwrap();
+    }
+    assert_eq!(
+        rebuild_decisions, 1,
+        "exactly one typed rebuild decision (task 1 -> task 2), never silent"
+    );
+}
+
+/// The INVERSE witness of the ask zeros on the SAME surfaces: a task run
+/// still opens its isolated candidate, creates the durable task row, binds
+/// its run/policy rows to that identity, writes the working-ledger blob and
+/// NEVER writes the ask's turn-execution row.
+#[tokio::test]
+async fn task_runs_keep_isolation_rows_and_task_bound_policy() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_shadow_env(&dir.path().join("task"), done_script());
+    let receipt = env
+        .executor
+        .start_task(
+            env.parent,
+            mutating_request(&env, "implement the gamma widget"),
+        )
+        .expect("task start");
+    let op = receipt.op_id.expect("real op id");
+    wait_turn_done(&env, op).await;
+    let handle = env.manager.get_session(env.parent).unwrap().unwrap();
+
+    let row = handle
+        .get_task(TaskId::new(1))
+        .unwrap()
+        .expect("the task path creates its durable row");
+    assert!(
+        row.goal.contains("gamma"),
+        "the row carries the task goal: {}",
+        row.goal
+    );
+    assert!(
+        env.manager.shadow_row(env.parent).unwrap().is_some(),
+        "the task path still opens its isolated candidate (isolation unchanged)"
+    );
+    let run_value = handle
+        .memory_fact_get(TASK_RUN_ROW_KIND, &receipt.run_id)
+        .unwrap()
+        .expect("the run linkage row exists");
+    let run_row: TaskRunRow = serde_json::from_str(&run_value).expect("run row JSON");
+    assert_eq!(
+        run_row.task_id,
+        Some(1),
+        "the task run binds to its admitted identity"
+    );
+    let policy = handle
+        .memory_fact_get(
+            crate::runtime::task_executor::RUN_POLICY_ROW_KIND,
+            &receipt.run_id,
+        )
+        .unwrap()
+        .expect("the task run's policy row exists");
+    let policy_row: serde_json::Value = serde_json::from_str(&policy).expect("policy JSON");
+    assert_eq!(
+        policy_row.get("task_id"),
+        Some(&serde_json::json!(1)),
+        "the task policy row carries the admitted identity: {policy_row}"
+    );
+    let turn_execution = handle
+        .memory_fact_get(TURN_EXECUTION_ROW_KIND, &turn_execution_row_key(op.raw()))
+        .unwrap();
+    assert!(
+        turn_execution.is_none(),
+        "a task turn never writes the ask's turn-execution row"
+    );
+    assert!(
+        handle.get_task_ledger().unwrap().is_some(),
+        "the task turn persists its engineering working ledger"
+    );
+    let head = handle.ledger_view().unwrap();
+    assert_eq!(
+        head.head.goal_task_id,
+        Some(1),
+        "the task turn binds its goal projection to its identity"
+    );
+}
+
+/// P0-ASK typed refusals (unit): every engineering seam an ask must never
+/// carry is a TYPED InvalidPlan — never a silent drop, never a half-applied
+/// task behavior. The default task run accepts the identical shapes.
+#[test]
+fn ask_validate_refuses_every_engineering_seam_typed() {
+    let bare = || TaskRunRequest {
+        goal: "chat".into(),
+        work_items: vec![WorkItem::new("main", "chat", WorkKind::Analysis)],
+        execution: ExecutionKind::Ask,
+        ..Default::default()
+    };
+    bare().validate().expect("a bare ask is admissible");
+
+    let mut multi = bare();
+    multi.work_items.push(wi("b", WorkKind::Analysis, &[]));
+    let err = multi.validate().expect_err("multi-item ask is refused");
+    assert!(matches!(err, ExecError::InvalidPlan(_)), "{err}");
+    assert!(
+        err.to_string().contains("one conversational work item"),
+        "{err}"
+    );
+
+    let mut implementation = bare();
+    implementation.work_items[0].kind = WorkKind::Implementation;
+    let err = implementation
+        .validate()
+        .expect_err("an implementation work item is refused for ask");
+    assert!(err.to_string().contains("read-only kind"), "{err}");
+
+    let mut criteria = bare();
+    criteria.criteria = vec!["ship it".into()];
+    let err = criteria.validate().expect_err("ask criteria are refused");
+    assert!(err.to_string().contains("no acceptance criteria"), "{err}");
+
+    let mut contract = bare();
+    contract.completion_contract = Some(CompletionContract::default());
+    let err = contract
+        .validate()
+        .expect_err("an ask completion contract is refused");
+    assert!(err.to_string().contains("no completion contract"), "{err}");
+
+    let mut tokens = bare();
+    tokens.max_tokens = Some(100);
+    let err = tokens.validate().expect_err("ask token caps are refused");
+    assert!(err.to_string().contains("budget seam"), "{err}");
+
+    let mut money = bare();
+    money.max_cost_micro = Some(1);
+    let err = money.validate().expect_err("ask money caps are refused");
+    assert!(err.to_string().contains("budget seam"), "{err}");
+
+    let mut gate = bare();
+    gate.no_op_disposition = Some(NoOpDisposition::RequiresCriterionProof);
+    let err = gate
+        .validate()
+        .expect_err("an ask can never carry a completion-gate disposition");
+    assert!(err.to_string().contains("Allowed"), "{err}");
+
+    // The ENGINEERING default accepts the same shape: no silent behavior
+    // change in either direction.
+    let task = TaskRunRequest {
+        goal: "ship".into(),
+        work_items: vec![WorkItem::new("main", "ship", WorkKind::Implementation)],
+        execution: ExecutionKind::Task,
+        ..Default::default()
+    };
+    task.validate().expect("the default task run is unchanged");
+}
+
+/// The submission-keyed admission digest separates the execution kind TYPED:
+/// the SAME body flipped to `ask` is a different digest (KeyReused, never a
+/// receipt replay of the other semantics), while a task body stays stable.
+#[test]
+fn task_start_digest_domain_separates_ask_from_task_typed() {
+    let task = TaskRunRequest {
+        goal: "ship".into(),
+        work_items: vec![WorkItem::new("main", "ship", WorkKind::Analysis)],
+        ..Default::default()
+    };
+    assert_eq!(task.execution, ExecutionKind::Task, "default is task");
+    let task_digest = task_start_digest(&task).expect("task digest");
+    assert_eq!(
+        task_digest,
+        task_start_digest(&task).expect("task digest again"),
+        "a task digest is stable across recomputation"
+    );
+    let mut ask = task.clone();
+    ask.execution = ExecutionKind::Ask;
+    let ask_digest = task_start_digest(&ask).expect("ask digest");
+    assert_ne!(
+        task_digest, ask_digest,
+        "the SAME body flipped to ask must be a different digest — typed KeyReused, never a replay of the other semantics"
+    );
 }

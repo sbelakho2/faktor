@@ -4,6 +4,7 @@
 //! parts), cursor paging metadata and the session state projection shared
 //! by the session layer, the ACP adapter and the HTTP surface. They are
 //! Faktor-owned strict structures — never a frozen foreign wire contract.
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 
 use serde::{Deserialize, Serialize};
 
@@ -91,6 +92,101 @@ pub struct MessagesPage {
     /// adding the applied page size.
     #[serde(default)]
     pub page: PageMeta,
+}
+
+// -------------------------------------------------------- execution kind
+
+/// The execution semantics ONE prompt asks for (audit P0-ASK).
+///
+/// The wire field is `execution` on the strict ordinary-prompt DTO:
+/// `"task"` (the DEFAULT, byte-compatible with every client that predates
+/// the field — an older client's prompt keeps today's engineering-task
+/// behavior with no silent change) or `"ask"` (a conversational turn).
+///
+/// This is a PROTOCOL-level vocabulary shared by the DTO, the executor's
+/// admission and the agent runtime's drive — one enum, never a per-crate
+/// re-spelling. Ask and task share the same runtime, permission,
+/// cancellation, recovery and ownership infrastructure; the kind only
+/// selects which POLICY the shared authority applies (see
+/// [`ExecutionKind::is_ask`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionKind {
+    /// An engineering task run: implementation work items, isolation
+    /// (shadow) admission, the engineering contract, verification and the
+    /// completion gate. The default for older clients.
+    #[default]
+    Task,
+    /// A conversational ask: a durable conversational turn with NO
+    /// implementation work item, NO shadow copy, NO engineering contract
+    /// and NO verification/completion gate. Read-permitted tools only.
+    Ask,
+}
+
+impl ExecutionKind {
+    /// The stable wire spelling (`"task"` / `"ask"`).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ExecutionKind::Task => "task",
+            ExecutionKind::Ask => "ask",
+        }
+    }
+
+    /// True for the default engineering-task semantics.
+    pub const fn is_task(self) -> bool {
+        matches!(self, ExecutionKind::Task)
+    }
+
+    /// True for conversational-ask semantics.
+    pub const fn is_ask(self) -> bool {
+        matches!(self, ExecutionKind::Ask)
+    }
+}
+
+/// Durable memory-fact kind of the per-TURN execution row written by task
+/// admission for runs whose semantics differ from the engineering default
+/// (today: `ask`). Keyed by [`turn_execution_row_key`]; the row's ABSENCE
+/// is the documented legacy default (`task`) for every turn admitted
+/// before the field existed or by an unkeyed/direct path — never a guess
+/// about a present-but-undecodable value (a corrupt row is a loud typed
+/// refusal at decode).
+pub const TURN_EXECUTION_ROW_KIND: &str = "turn_execution";
+
+/// The memory-fact key of ONE turn's execution row: `turn-exec:<op>` (the
+/// turn's durable operation id, zero-padded hex). Keyed by the OP — never
+/// by the session — so a queued ask behind an in-flight turn can never
+/// overwrite the execution semantics of the turn being driven.
+pub fn turn_execution_row_key(op_raw: u64) -> String {
+    format!("turn-exec:{op_raw:016x}")
+}
+
+/// The durable execution row of ONE admitted turn: the execution kind plus
+/// the turn's accepted attachment identities (ask runs carry theirs HERE,
+/// on the turn, because they create no engineering task row; task runs
+/// keep the historical task-row attachment set). Strict: a present row
+/// that does not decode shape-typed is a loud refusal, never a fallback
+/// default.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TurnExecution {
+    pub execution: ExecutionKind,
+    /// The turn's accepted `AttachmentId` set (CAS bytes by digest, never
+    /// workspace paths). Empty = the attachment-free conversational turn.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<faktor_core::attachment::AttachmentId>,
+}
+
+impl TurnExecution {
+    /// Encode this row as its durable JSON value.
+    pub fn encode(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+
+    /// Decode one durable row value. A malformed/tampered value is a typed
+    /// error — the caller refuses the turn loudly, never a silent default.
+    pub fn decode(value: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(value)
+    }
 }
 
 // ------------------------------------------------------------ session state
@@ -214,5 +310,68 @@ mod tests {
         assert!(json["page"].get("total_estimate").is_none());
         let back: MessagesPage = serde_json::from_value(json).unwrap();
         assert_eq!(back, page);
+    }
+
+    /// The execution-kind wire vocabulary is EXPLICIT compatibility: the
+    /// default is `task` (older clients change nothing), the two values
+    /// round-trip, and an unknown value is a typed decode refusal — never
+    /// a silent coercion to either semantics.
+    #[test]
+    fn execution_kind_defaults_to_task_and_refuses_unknown_values() {
+        assert_eq!(ExecutionKind::default(), ExecutionKind::Task);
+        assert!(ExecutionKind::Task.is_task());
+        assert!(ExecutionKind::Ask.is_ask());
+        assert_eq!(ExecutionKind::Task.as_str(), "task");
+        assert_eq!(ExecutionKind::Ask.as_str(), "ask");
+        assert_eq!(
+            serde_json::to_value(ExecutionKind::Ask).unwrap(),
+            serde_json::json!("ask")
+        );
+        assert_eq!(
+            serde_json::from_value::<ExecutionKind>(serde_json::json!("task")).unwrap(),
+            ExecutionKind::Task
+        );
+        assert_eq!(
+            serde_json::from_value::<ExecutionKind>(serde_json::json!("ask")).unwrap(),
+            ExecutionKind::Ask
+        );
+        for hostile in ["implement", "Task", "ASK", "chat", ""] {
+            assert!(
+                serde_json::from_value::<ExecutionKind>(serde_json::json!(hostile)).is_err(),
+                "{hostile:?} must be a typed refusal"
+            );
+        }
+    }
+
+    /// The turn-execution row is OP-scoped (two turns of one session never
+    /// alias) and STRICT: a corrupt/extended value is a loud decode error,
+    /// and the legacy shape (kind only) decodes with the empty attachment
+    /// set.
+    #[test]
+    fn turn_execution_row_is_op_scoped_and_strict() {
+        assert_ne!(turn_execution_row_key(1), turn_execution_row_key(2));
+        assert_eq!(turn_execution_row_key(0x2a), "turn-exec:000000000000002a");
+        let row = TurnExecution {
+            execution: ExecutionKind::Ask,
+            attachments: Vec::new(),
+        };
+        let encoded = row.encode().unwrap();
+        assert!(!encoded.contains("attachments"), "empty set is omitted");
+        assert_eq!(TurnExecution::decode(&encoded).unwrap(), row);
+        assert_eq!(
+            TurnExecution::decode(r#"{"execution":"task"}"#)
+                .unwrap()
+                .execution,
+            ExecutionKind::Task
+        );
+        assert!(
+            TurnExecution::decode(r#"{"execution":"implement"}"#).is_err(),
+            "an unknown kind is a loud typed refusal"
+        );
+        assert!(
+            TurnExecution::decode(r#"{"execution":"task","oops":1}"#).is_err(),
+            "an extended row is a loud typed refusal"
+        );
+        assert!(TurnExecution::decode("not json").is_err());
     }
 }

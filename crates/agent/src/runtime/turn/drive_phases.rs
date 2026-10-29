@@ -103,6 +103,17 @@ pub(crate) struct TurnDriveState<'a> {
     pub(crate) op_id: OpId,
     pub(crate) cancel: CancellationToken,
     pub(crate) task_id: TaskId,
+    /// The execution semantics of THIS turn (audit P0-ASK), read from the
+    /// durable turn-execution row at drive start (absent = `task`, the
+    /// legacy default). It selects the POLICY of the ONE shared runtime:
+    /// an `ask` keeps the engineering surfaces (goal init, task-row
+    /// restore/contract compile, verification, completion gate, mutating
+    /// tools) off, with no second agent implementation.
+    pub(crate) execution: faktor_protocol::ExecutionKind,
+    /// The TURN's accepted attachment ids (`Some` for an ask — an ask has
+    /// no task row, so the turn row owns its set; `None` for a task run,
+    /// which resolves the task row exactly as before).
+    pub(crate) turn_attachments: Option<Vec<faktor_core::attachment::AttachmentId>>,
     pub(crate) outcome: TurnOutcome,
     pub(crate) turn_summary: faktor_context::ledger::TurnSummary,
     pub(crate) detector: LoopDetector,
@@ -222,28 +233,71 @@ impl<'a> TurnDriveState<'a> {
         // escalation).
         let settled_calls: Vec<(SettledCallOutcome, u8)> = Vec::new();
         let drive_semantic_risk: u8 = 10;
-        // The durable task state starts from the user's own goal. The prompt
-        // is the authority; the title is only a label and is often generic
-        // ("task", "cli run"). A prompt carrying a credential is projected:
-        // every secret span is replaced by a fixed marker while the
-        // non-secret objective survives. When redaction leaves nothing
-        // meaningful the drive refuses typed
-        // (`goal_unavailable_after_redaction`) instead of silently adopting
-        // the title as the engineering goal.
-        initialize_durable_goal(handle, &mut ledger)?;
-        // Typed durable ledger (audits 27/71-72): heal the typed entry
-        // stream from the legacy blob/task rows when it predates them
-        // (goal/criteria first-seen seeding) and record instruction-epoch
-        // bumps. Idempotent: the materialized head is refreshed after any
-        // append, so nothing re-fires across restarts.
-        rt.typed_ledger_drive_start(handle, &ledger)?;
-        // Durable Task integration (audit 25): every drive — a fresh turn OR
-        // a crash-restarted one — restores the typed task row into the
-        // runtime's memory-fact set (task_state + criteria + goal facts,
-        // seeded only when absent or stale — never duplicated) and heals the
-        // row's spend from durable sources. A missing row is created from
-        // the goal so gates always have a row to update.
-        rt.restore_task_rows(handle, &mut ledger).await?;
+        // allowed-task-id-read: drive-start binding. The identity is captured
+        // ONCE here, before any turn work; the whole settlement tail uses this
+        // captured id and never re-reads the session's current identity. It is
+        // captured BEFORE the goal-projection lifecycle below so the
+        // projection is classified against THIS drive's admitted task.
+        let task_id = handle.task_id()?;
+        // Execution semantics of this turn (audit P0-ASK): the durable
+        // turn-execution row (absent = legacy `task`). An ask carries its
+        // accepted attachment ids on the row; a task run reads the task
+        // row's set exactly as before.
+        let (execution, turn_attachments) = match read_turn_execution(handle, op_id)? {
+            Some(row) if row.execution.is_ask() => {
+                (faktor_protocol::ExecutionKind::Ask, Some(row.attachments))
+            }
+            Some(_) | None => (faktor_protocol::ExecutionKind::Task, None),
+        };
+        if execution.is_task() {
+            // ---- ENGINEERING (task) turn: the goal projection lifecycle ----
+            //
+            // The durable task state starts from the user's own goal. The
+            // prompt is the authority; the title is only a label and is
+            // often generic ("task", "cli run"). A prompt carrying a
+            // credential is projected: every secret span is replaced by a
+            // fixed marker while the non-secret objective survives. When
+            // redaction leaves nothing meaningful the drive refuses typed
+            // (`goal_unavailable_after_redaction`) instead of silently
+            // adopting the title as the engineering goal.
+            //
+            // BEFORE any of that (audit P0-GOAL-BINDING): a projection
+            // bound to a DIFFERENT task is rebuilt from THIS task's own
+            // objective, and a rewound binding revision refuses typed —
+            // a new task never reads the old projection, and the rebuild
+            // lands before contract compile or request construction.
+            match classify_goal_projection_binding(handle, task_id)? {
+                GoalProjectionBinding::Keep => {}
+                GoalProjectionBinding::Rebuild { bound_task_id } => {
+                    rebuild_goal_projection(handle, &mut ledger, task_id, bound_task_id)?;
+                }
+            }
+            initialize_durable_goal(handle, &mut ledger)?;
+            // Typed durable ledger (audits 27/71-72): heal the typed entry
+            // stream from the legacy blob/task rows when it predates them
+            // (goal/criteria first-seen seeding) and record instruction-epoch
+            // bumps. Idempotent: the materialized head is refreshed after any
+            // append, so nothing re-fires across restarts. The goal seeding
+            // is BOUND to this drive's admitted task identity + revision.
+            rt.typed_ledger_drive_start(handle, &ledger, task_id)?;
+            // Durable Task integration (audit 25): every task drive — a
+            // fresh turn OR a crash-restarted one — restores the typed task
+            // row into the runtime's memory-fact set (task_state + criteria
+            // + goal facts, seeded only when absent or stale — never
+            // duplicated) and heals the row's spend from durable sources.
+            // A missing row is created from the goal so gates always have
+            // a row to update. THE engineering contract compiles here —
+            // never on an ask turn.
+            rt.restore_task_rows(handle, &mut ledger).await?;
+        }
+        // ASK (audit P0-ASK): a CONVERSATIONAL turn shares the runtime,
+        // permissions, cancellation, recovery and ownership machinery but
+        // runs NONE of the engineering projection lifecycle: no goal
+        // adoption/rotation (a greeting never becomes a goal), no typed
+        // goal seeding, no task-row restore and NO contract compile. The
+        // loaded ledger is read-only context for this turn; nothing in the
+        // ask path writes it back (the genuine end below refuses the
+        // engineering tail for `ask`).
         // Layered lifetimes (audit 26): this drive is ONE turn_budget_ms
         // slice. Wall-clock is measured from the drive's start; expiry is
         // evaluated at every iteration boundary so no single future spans
@@ -259,10 +313,6 @@ impl<'a> TurnDriveState<'a> {
         // and becomes the planning model of the next one; there is no
         // fallback: every routing failure is typed and terminal.
         let provider = rt.provider_for(handle)?;
-        // allowed-task-id-read: drive-start binding. The identity is captured
-        // ONCE here, before any turn work; the whole settlement tail uses this
-        // captured id and never re-reads the session's current identity.
-        let task_id = handle.task_id()?;
         let routed_decision: Option<RouteDecision> = None;
         let override_active = model_override.is_some();
         let model = match model_override {
@@ -323,6 +373,8 @@ impl<'a> TurnDriveState<'a> {
             op_id,
             cancel,
             task_id,
+            execution,
+            turn_attachments,
             outcome,
             turn_summary,
             detector,
@@ -484,6 +536,7 @@ impl AgentRuntime {
                 st.handle,
                 st.op_id,
                 st.task_id,
+                st.execution,
                 &mut st.outcome,
                 &mut st.ledger,
                 &st.turn_summary,
@@ -754,16 +807,19 @@ impl AgentRuntime {
         let (mut history, _history_head_seq) = self
             .history_messages_with_head(st.handle, &st.budget)
             .await?;
-        // Request construction (media): resolve the task's durable image
+        // Request construction (media): resolve the turn's durable image
         // attachments from the CAS into bounded in-memory parts BEFORE
         // the plan is measured, so their token cost is budgeted and a
         // vision-less model refuses here (typed) rather than after a
-        // paid call. Never persisted: the durable row keeps ids.
+        // paid call. Never persisted: the durable row keeps ids. An ask
+        // resolves its OWN turn-level set (audit P0-ATTACH); a task run
+        // keeps resolving the task row.
         self.inject_attachment_media(
             st.handle,
             &mut history,
             &st.effective_caps,
             st.provider.as_ref(),
+            st.turn_attachments.as_deref(),
         )?;
         // The wire-plan entry (P0-27): ONE selector. The planner picks
         // the conversation window and the evidence by utility per token
@@ -784,7 +840,33 @@ impl AgentRuntime {
         // no `/source` flag and no signal the set stays empty and this is
         // byte-identical to `bundle_for_phase` — zero schema tokens for
         // every ordinary prompt.
-        let tool_bundle = self.tools_bundle_for_turn(st.handle, &history, &st.effective_caps);
+        let mut tool_bundle = self.tools_bundle_for_turn(st.handle, &history, &st.effective_caps);
+        if st.execution.is_ask() {
+            // ASK tool policy (audit P0-ASK): EXPLICITLY read-permitted
+            // classes only. The bundle is the EXISTING authority — the
+            // membership guard in `run_tool_calls` refuses any name
+            // outside it with a typed, journaled denial, so a hostile
+            // model that guesses `write_file`/a shell gets the same
+            // refusal, and the permission hop still gates every tool that
+            // remains. Workspace mutation (DiskWrite), arbitrary shell
+            // (Terminal) and the write-capable Git/Mcp surfaces never
+            // ride a conversational ask.
+            tool_bundle.tools.retain(|spec| {
+                matches!(
+                    self.deps
+                        .tools
+                        .get(&spec.name)
+                        .map(|tool| tool.resource_class),
+                    Some(
+                        faktor_core::resource::ResourceClass::Model
+                            | faktor_core::resource::ResourceClass::DiskRead
+                            | faktor_core::resource::ResourceClass::Cpu
+                            | faktor_core::resource::ResourceClass::Network
+                            | faktor_core::resource::ResourceClass::Indexing
+                    )
+                )
+            });
+        }
         // Audit 68 production hook: the failure-aware prior is applied
         // ONLY when `failure_learning` is on AND a handle was installed
         // (`None` otherwise — the baseline planner path, byte parity).
@@ -894,6 +976,7 @@ impl AgentRuntime {
                     &mut st.history,
                     &st.effective_caps,
                     st.provider.as_ref(),
+                    st.turn_attachments.as_deref(),
                 )?;
                 wire_plan = plan_wire_turn_with_prior(
                     &self.deps.instructions,
@@ -1405,6 +1488,7 @@ impl AgentRuntime {
             st.handle,
             st.op_id,
             st.task_id,
+            st.execution,
             &mut st.outcome,
             &mut st.ledger,
             &st.turn_summary,

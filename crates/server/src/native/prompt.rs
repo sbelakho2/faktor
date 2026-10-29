@@ -37,6 +37,16 @@ use crate::api::AppState;
 pub struct PromptRequest {
     /// The prompt text (also the run goal).
     pub prompt: String,
+    /// The execution semantics of this prompt (protocol-level `ask` vs
+    /// `task`, audit P0-ASK). `Task` — the Default — is today's
+    /// engineering-task behavior for every older client (byte-compatible,
+    /// no silent change). `Ask` admits a CONVERSATIONAL turn through the
+    /// SAME executor/permissions/cancellation/recovery/ownership
+    /// infrastructure: no implementation work item, no shadow copy, no
+    /// engineering contract, no verification/completion gate, no
+    /// task-scoped budget/criteria seam (a cap on an ask is a typed
+    /// refusal, never a silent drop).
+    pub execution: faktor_protocol::ExecutionKind,
     /// The client's submission UUID when this prompt is a submission-keyed
     /// native task start (`POST /native/session/{id}/task-runs`): the
     /// executor admits the run durably under that key and replays the
@@ -245,6 +255,21 @@ impl PromptExecutionService {
         self.tasks.start_task_with_turn_cap(session, run, max_turns)
     }
 
+    /// Run ONE ordinary chat prompt as an in-session run through the
+    /// daemon's ONE executor entry.
+    ///
+    /// `execution == Task` (the default): the prompt becomes a single
+    /// MUTATING work item so the daemon's mutation policy (shadow by
+    /// default) gates every write the turn performs — byte-identical to
+    /// every pre-`execution` prompt.
+    ///
+    /// `execution == Ask` (audit P0-ASK): the SAME entry admits a
+    /// CONVERSATIONAL turn as one read-only work item — no implementation
+    /// work item, no shadow copy, no engineering task row, no contract, no
+    /// verification/completion gate, no task-scoped budget. The task seams
+    /// (caps, criteria) are TYPED refusals here: they bind to a durable
+    /// task row an ask never creates, and this service never drops them
+    /// silently.
     pub async fn prompt(
         &self,
         session: SessionId,
@@ -253,10 +278,34 @@ impl PromptExecutionService {
         if request.prompt.trim().is_empty() {
             return Err(ExecError::InvalidPlan("prompt is empty".into()));
         }
-        let item = WorkItem::new("main", request.prompt.clone(), WorkKind::Implementation);
+        let ask = request.execution.is_ask();
+        if ask
+            && (request.max_tokens.is_some()
+                || request.max_cost_micro.is_some()
+                || request.max_turns.is_some()
+                || !request.criteria.is_empty())
+        {
+            return Err(ExecError::InvalidPlan(
+                "an ask (conversational) prompt carries no task budget/turn/criteria seam (they bind to a durable task row an ask never creates); start a task run for budgeted work"
+                    .into(),
+            ));
+        }
+        let item = WorkItem::new(
+            "main",
+            request.prompt.clone(),
+            // The ITEM kind is the executor's isolation authority: an ask's
+            // read-only Analysis item is never shadowed, while a task's
+            // Implementation item keeps the isolated-candidate policy.
+            if ask {
+                WorkKind::Analysis
+            } else {
+                WorkKind::Implementation
+            },
+        );
         let run = TaskRunRequest {
             goal: request.prompt,
             work_items: vec![item],
+            execution: request.execution,
             submission_id: request.submission_id,
             reserved_op_id: request.reserved_op_id,
             admission_digest: request.admission_digest,

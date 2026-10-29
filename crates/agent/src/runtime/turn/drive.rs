@@ -672,6 +672,7 @@ impl AgentRuntime {
         handle: &faktor_session::SessionHandle,
         op_id: OpId,
         task_id: TaskId,
+        execution: faktor_protocol::ExecutionKind,
         outcome: &mut TurnOutcome,
         ledger: &mut TaskLedger,
         turn_summary: &faktor_context::ledger::TurnSummary,
@@ -701,6 +702,7 @@ impl AgentRuntime {
             handle,
             op_id,
             task_id,
+            execution,
             outcome,
             ledger,
             turn_summary,
@@ -726,6 +728,7 @@ impl AgentRuntime {
         handle: &faktor_session::SessionHandle,
         op_id: OpId,
         task_id: TaskId,
+        execution: faktor_protocol::ExecutionKind,
         outcome: &mut TurnOutcome,
         ledger: &mut TaskLedger,
         turn_summary: &faktor_context::ledger::TurnSummary,
@@ -734,6 +737,36 @@ impl AgentRuntime {
     ) -> faktor_core::Result<()> {
         // Bound at drive start; never re-read after TurnCompleted is visible.
         let settlement_task_id = task_id;
+        if execution.is_ask() {
+            // ASK (audit P0-ASK): the CONVERSATIONAL genuine end. Durable
+            // turn lifecycle ONLY — the turn lands its ONE TurnCompleted
+            // and the shared loop-signal machinery resets on real
+            // progress; NOTHING of the engineering tail runs: no ledger
+            // fold or persistence (this turn never mutates the working
+            // memory), no memory rows, NO verification, NO task-row sync,
+            // NO completion/budget/criteria gate, NO engineering
+            // typed-ledger tail and NO task-complete hook. Conversation
+            // history lives in the message stream and is untouched.
+            if turn_made_progress(turn_summary) {
+                self.guarded_reset_loop_signals(handle, DW_SITE_END_LOOP_SIGNALS)?;
+            }
+            if handle.state()? != AgentState::ReadyForNextTurn {
+                handle
+                    .append_journal_event(
+                        faktor_core::event::EventKind::TurnCompleted,
+                        AgentState::ReadyForNextTurn,
+                        Some(op_id),
+                        None,
+                    )
+                    .await?;
+            }
+            outcome.turns += 1;
+            outcome.final_state = AgentState::ReadyForNextTurn;
+            // Mirror the task path's no-gate branch: settled calls feed
+            // verified routing attribution ONLY behind a completion gate.
+            settled_calls.clear();
+            return Ok(());
+        }
         // P0-2 remainder: generic-shell changes are attributed through the
         // durable `shell_change` facts, so a crash-resumed turn (or a live
         // settlement that could not open a workspace) still feeds its ACTUAL
@@ -1230,9 +1263,24 @@ impl AgentRuntime {
         &self,
         handle: &faktor_session::SessionHandle,
         ledger: &TaskLedger,
+        task_id: TaskId,
     ) -> faktor_core::Result<()> {
         let view = handle.ledger_view()?;
         let mut appended = false;
+        // Binding revision of the ADMITTED task row (audit P0-GOAL-BINDING):
+        // a present row binds its identity + revision into every GoalSet
+        // this drive seeds; a direct-path drive whose row does not exist
+        // YET seeds UNBOUND exactly as before (`restore_task_rows` creates
+        // it moments later — the NEXT drive binds). A store failure is a
+        // typed refusal, never a guessed revision.
+        let binding_revision: Option<u64> = match handle.task_revision(task_id) {
+            Ok(revision) => Some(revision.raw()),
+            Err(faktor_session::task::TaskError::NotFound(_)) => None,
+            Err(e) => return Err(e.into()),
+        };
+        // Is the head's goal projection already bound to THIS admitted
+        // identity? A bound seed below flips this to true.
+        let mut head_bound = view.head.goal_task_id == Some(task_id.raw());
         // A legacy materialized head may predate the redacted projection and
         // still carry the session title (the old P1 fallback) or a raw
         // credential: append the redacted goal so the head (the read/export
@@ -1241,11 +1289,39 @@ impl AgentRuntime {
             view.head.goal.is_empty() || view.head.goal == handle.title().unwrap_or_default();
         if !ledger.goal.is_empty()
             && (head_is_label || crate::runtime::contains_secret(&view.head.goal))
-            && handle
-                .ledger_goal_set(&truncate(&ledger.goal, 4096))?
-                .is_some()
         {
-            appended = true;
+            let seeded = match binding_revision {
+                Some(revision) => {
+                    head_bound = true;
+                    handle.ledger_goal_set_bound(
+                        &truncate(&ledger.goal, 4096),
+                        task_id.raw(),
+                        revision,
+                    )?
+                }
+                None => handle.ledger_goal_set(&truncate(&ledger.goal, 4096))?,
+            };
+            if seeded.is_some() {
+                appended = true;
+            }
+        }
+        // Binding maintenance (audit P0-GOAL-BINDING): a goal projection
+        // whose head binding is ABSENT (legacy) or points at ANOTHER task
+        // gets a BOUND GoalSet for THIS admitted identity — even when the
+        // goal TEXT already equals the head — so the next task drive can
+        // prove the mismatch and rebuild instead of inheriting, and a
+        // mismatched head goal text is replaced by this task's objective
+        // in the same append. A continuation (already bound to this id)
+        // appends nothing — steering never rotates the recorded objective.
+        if !head_bound && !ledger.goal.is_empty() {
+            if let Some(revision) = binding_revision {
+                if handle
+                    .ledger_goal_set_bound(&truncate(&ledger.goal, 4096), task_id.raw(), revision)?
+                    .is_some()
+                {
+                    appended = true;
+                }
+            }
         }
         if view.head.criteria.is_empty() {
             if let Some(task) = self.session_task(handle)? {

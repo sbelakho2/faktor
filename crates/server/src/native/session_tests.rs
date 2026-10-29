@@ -2,6 +2,7 @@
 //!
 //! Kept out of `session.rs` so the production module stays under the
 //! repository source-size ceiling.
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 
 use super::*;
 use std::sync::Arc;
@@ -1450,7 +1451,7 @@ async fn prompt_replay_returns_the_stored_receipt_byte_for_byte_with_one_prompt_
     // The key carries exactly ONE completed admission storing the exact
     // response bytes (a claim for any other row would answer Fresh/
     // KeyReused, and the byte compare pins the stored receipt).
-    let digest = prompt_admission_digest(sid, "hi", &[]);
+    let digest = prompt_admission_digest(sid, "hi", &[], faktor_protocol::ExecutionKind::Task, &[]);
     assert_eq!(
         store
             .prompt_admission_claim(sid, PROMPT_KEY, &digest, "tx-replay-probe", 0)
@@ -1500,7 +1501,7 @@ async fn prompt_pending_key_with_the_same_body_is_an_in_flight_409_before_any_mu
     let (state, sid) = test_state(dir.path(), "prompt-in-flight");
     let handle = state.deps.session.get_session(sid).unwrap().unwrap();
     let store = state.deps.session.store();
-    let digest = prompt_admission_digest(sid, "hi", &[]);
+    let digest = prompt_admission_digest(sid, "hi", &[], faktor_protocol::ExecutionKind::Task, &[]);
     assert_eq!(
         store
             .prompt_admission_claim(
@@ -1733,7 +1734,8 @@ async fn prompt_crash_after_accepted_prompt_before_receipt_replays_from_facts() 
     let (state, sid) = test_state(dir.path(), "prompt-crash-accepted");
     let handle = state.deps.session.get_session(sid).unwrap().unwrap();
     let prompt = "crash matrix prompt";
-    let digest = prompt_admission_digest(sid, prompt, &[]);
+    let digest =
+        prompt_admission_digest(sid, prompt, &[], faktor_protocol::ExecutionKind::Task, &[]);
     let op = state.deps.session.try_next_op_id().unwrap();
     let reservation = format!("tx-{:016x}", op.raw());
     assert!(state
@@ -1807,7 +1809,13 @@ async fn prompt_crash_after_receipt_completion_replays_stored_bytes() {
     let (state, sid, body) =
         prompt_crash_and_reopen(&dir, "prompt_admission_complete_committed", 0).await;
     // The durable receipt is the answer the retry must return exactly.
-    let digest = prompt_admission_digest(sid, "crash matrix prompt", &[]);
+    let digest = prompt_admission_digest(
+        sid,
+        "crash matrix prompt",
+        &[],
+        faktor_protocol::ExecutionKind::Task,
+        &[],
+    );
     let stored = match state
         .deps
         .session
@@ -1836,7 +1844,13 @@ async fn prompt_unlinkable_pending_row_lands_typed_conflict_and_never_executes()
     let dir = tempfile::tempdir().unwrap();
     let (state, sid) = test_state(dir.path(), "prompt-legacy");
     let handle = state.deps.session.get_session(sid).unwrap().unwrap();
-    let digest = prompt_admission_digest(sid, "crash matrix prompt", &[]);
+    let digest = prompt_admission_digest(
+        sid,
+        "crash matrix prompt",
+        &[],
+        faktor_protocol::ExecutionKind::Task,
+        &[],
+    );
     assert!(state
         .deps
         .session
@@ -2134,5 +2148,516 @@ fn native_event_row_direct_serializer_is_byte_identical_and_cheaper() {
     assert!(
         new_elapsed < old_elapsed,
         "direct serialization must beat the Value round-trip: old {old_elapsed:?} new {new_elapsed:?}"
+    );
+}
+
+// ======================== P0-ASK / P0-ATTACH / P0-IDEMPOTENCY (prompt v27)
+
+/// The strict prompt DTO's additive fields (audits P0-ASK / P0-ATTACH):
+/// `execution` is ABSENT by default and decodes to `task` — the EXPLICIT
+/// legacy-compatible default, never a silent behavior change — while the
+/// two wire values decode shape-typed and everything else (unknown
+/// spellings, nulls, numbers, nested objects, camelCase typos, duplicate
+/// keys) is a typed parse refusal. `attachments` are typed session-owned
+/// ids with the SAME structural strictness as the task-start DTO.
+#[test]
+fn prompt_dto_execution_kind_defaults_to_task_and_is_strict() {
+    let base = serde_json::json!({
+        "session_id": "1",
+        "submission_id": PROMPT_KEY,
+        "prompt": "hi",
+    });
+    let parsed: NativePromptRequestBody =
+        serde_json::from_value(base.clone()).expect("a body without execution parses");
+    assert_eq!(
+        parsed.execution,
+        faktor_protocol::ExecutionKind::Task,
+        "absent execution = the explicit `task` default (older clients change nothing)"
+    );
+    assert_eq!(
+        parsed.attachments, None,
+        "absent attachments normalize to None"
+    );
+
+    for (value, expected) in [
+        (
+            serde_json::json!("task"),
+            faktor_protocol::ExecutionKind::Task,
+        ),
+        (
+            serde_json::json!("ask"),
+            faktor_protocol::ExecutionKind::Ask,
+        ),
+    ] {
+        let mut body = base.clone();
+        body["execution"] = value.clone();
+        let parsed: NativePromptRequestBody =
+            serde_json::from_value(body).unwrap_or_else(|e| panic!("{value} must decode: {e}"));
+        assert_eq!(parsed.execution, expected, "{value}");
+    }
+    for hostile in [
+        serde_json::json!("chat"),
+        serde_json::json!("implement"),
+        serde_json::json!("ASK"),
+        serde_json::json!("Task"),
+        serde_json::json!(""),
+        serde_json::json!(null),
+        serde_json::json!(7),
+        serde_json::json!(["ask"]),
+        serde_json::json!({"kind": "ask"}),
+    ] {
+        let mut body = base.clone();
+        body["execution"] = hostile.clone();
+        let err = serde_json::from_value::<NativePromptRequestBody>(body)
+            .expect_err("a hostile execution value must refuse at the wire");
+        let message = err.to_string();
+        assert!(
+            message.contains("unknown variant")
+                || message.contains("invalid type")
+                || message.contains("expected"),
+            "{hostile}: typed refusal, got: {message}"
+        );
+    }
+
+    // `attachments` are typed ids: structurally strict per element.
+    let mut body = base.clone();
+    body["attachments"] = serde_json::json!([{
+        "digest": "11".repeat(32),
+        "mime": "application/zip",
+        "filename": "bundle.zip",
+        "size": 4,
+    }]);
+    let parsed: NativePromptRequestBody =
+        serde_json::from_value(body).expect("a structurally valid attachment id parses");
+    let attachments = parsed.attachments.expect("attachments present");
+    assert_eq!(attachments.len(), 1);
+    assert_eq!(attachments[0].mime, "application/zip");
+
+    for (label, value) in [
+        (
+            "camelCase element field",
+            serde_json::json!([{"digest": "11".repeat(32), "mime": "image/png", "fileName": "a.png", "size": 3}]),
+        ),
+        (
+            "unknown element field",
+            serde_json::json!([{"digest": "11".repeat(32), "mime": "image/png", "filename": "a.png", "size": 3, "extra": 1}]),
+        ),
+        (
+            "numeric size",
+            serde_json::json!([{"digest": "11".repeat(32), "mime": "image/png", "filename": "a.png", "size": "3"}]),
+        ),
+        (
+            "string digest",
+            serde_json::json!([{"digest": 42, "mime": "image/png", "filename": "a.png", "size": 3}]),
+        ),
+        ("scalar instead of list", serde_json::json!("11".repeat(32))),
+    ] {
+        let mut body = base.clone();
+        body["attachments"] = value;
+        let err = serde_json::from_value::<NativePromptRequestBody>(body)
+            .expect_err("a hostile attachment shape must refuse");
+        let message = err.to_string();
+        assert!(
+            message.contains("unknown field")
+                || message.contains("invalid type")
+                || message.contains("expected"),
+            "{label}: typed refusal, got: {message}"
+        );
+    }
+}
+
+/// The engine of the route tests: poll until the detached prompt drive's
+/// turn record is terminal AND the machine is promptable again.
+async fn wait_prompt_settled(state: &AppState, sid: faktor_core::id::SessionId) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let handle = state.deps.session.get_session(sid).unwrap().unwrap();
+        let records = state.deps.session.store().turn_records_of(sid).unwrap();
+        let settled = !records.is_empty()
+            && records
+                .iter()
+                .all(|record| faktor_store::is_terminal_turn_record_status(&record.status))
+            && !turn_machine_busy(handle.state().unwrap());
+        if settled {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the prompt turn never settled: records={:?}",
+            records
+                .iter()
+                .map(|r| (r.turn_op_id, r.status.clone()))
+                .collect::<Vec<_>>()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// The ZERO witness at the ROUTE level (audit P0-ASK): an accepted ask
+/// leaves no engineering surface — no task row, no shadow, no contract
+/// row, no verification record/attempt, no working-ledger blob and no
+/// goal — before AND after its turn settles.
+async fn assert_route_left_no_engineering_rows(state: &AppState, sid: faktor_core::id::SessionId) {
+    let handle = state.deps.session.get_session(sid).unwrap().unwrap();
+    for id in 1..=4u64 {
+        let task_id = faktor_core::id::TaskId::new(id);
+        assert!(
+            handle.get_task(task_id).unwrap().is_none(),
+            "the ask must create no task row {id}"
+        );
+        assert!(
+            handle.completion_contract(task_id).unwrap().is_none(),
+            "the ask must leave no completion contract row for {id}"
+        );
+        let records = state
+            .deps
+            .session
+            .verification_records(sid, task_id)
+            .await
+            .unwrap();
+        assert!(
+            records.is_empty(),
+            "the ask must leave no verification records for {id}"
+        );
+    }
+    assert!(
+        state.deps.session.shadow_row(sid).unwrap().is_none(),
+        "the ask must never open a shadow copy"
+    );
+    let attempts = handle
+        .memory_facts_of_kinds(&["verification_attempt"], 32)
+        .unwrap()
+        .0;
+    assert!(
+        attempts.is_empty(),
+        "the ask must leave no verification attempt facts: {attempts:?}"
+    );
+    assert!(
+        handle.get_task_ledger().unwrap().is_none(),
+        "the ask must never write the engineering working-ledger blob"
+    );
+    let view = handle.ledger_view().unwrap();
+    assert!(
+        view.head.goal.is_empty(),
+        "a chat ask must never become a goal: {}",
+        view.head.goal
+    );
+    assert_eq!(
+        view.head.goal_task_id, None,
+        "an ask binds no engineering goal"
+    );
+}
+
+/// P0-ASK on the wire: a greeting prompt with `execution: "ask"` is
+/// admitted as ONE conversational turn — accepted receipt, its durable
+/// turn-execution row, exactly one turn record and one `PromptReceived`,
+/// and ZERO task/contract/shadow/verification rows before and after the
+/// drive settles.
+#[tokio::test]
+async fn greeting_ask_route_admits_one_turn_with_zero_engineering_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, sid) = test_state(dir.path(), "prompt-ask");
+    let handle = state.deps.session.get_session(sid).unwrap().unwrap();
+    let store = state.deps.session.store();
+
+    let mut body = prompt_body(sid, "aaaaaaaa-0000-4000-8000-0000000000a1", "hello there");
+    body["execution"] = serde_json::json!("ask");
+    let (status, text) = prompt_call(&state, sid, body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let receipt: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(receipt["accepted"], serde_json::json!(true), "{receipt}");
+    assert_route_left_no_engineering_rows(&state, sid).await;
+
+    // The turn-execution row IS the ask's durable identity.
+    let op_raw: u64 = receipt["op_id"]
+        .as_str()
+        .expect("receipt carries the op")
+        .parse()
+        .expect("decimal op id");
+    let row_value = handle
+        .memory_fact_get(
+            faktor_protocol::TURN_EXECUTION_ROW_KIND,
+            &faktor_protocol::turn_execution_row_key(op_raw),
+        )
+        .unwrap()
+        .expect("the ask's turn-execution row exists");
+    let turn_execution =
+        faktor_protocol::TurnExecution::decode(&row_value).expect("the row decodes typed");
+    assert_eq!(
+        turn_execution.execution,
+        faktor_protocol::ExecutionKind::Ask
+    );
+    assert!(turn_execution.attachments.is_empty());
+
+    wait_prompt_settled(&state, sid).await;
+    assert_route_left_no_engineering_rows(&state, sid).await;
+    assert_eq!(
+        store.turn_records_of(sid).unwrap().len(),
+        1,
+        "exactly ONE turn/execution for the ask"
+    );
+    assert_eq!(
+        prompt_received_count(&handle),
+        1,
+        "exactly one PromptReceived for the ask"
+    );
+    assert!(
+        handle.message_count().unwrap() >= 2,
+        "the greeting round-trips a user and an assistant message"
+    );
+}
+
+/// P0-ATTACH on the wire: the SAME resolution/admission the task path
+/// uses (ownership, byte-identical digest, media type, size, effective
+/// model capability), accepted ids persisted ON THE TURN (the run linkage
+/// row) and on the task row, and a replay with the attachments present
+/// stays byte-identical (the v2 admission domain covers the set).
+#[tokio::test]
+async fn prompt_attachments_are_admitted_with_the_task_path_rules_and_persisted_on_the_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, sid) = test_state(dir.path(), "prompt-attach");
+    let handle = state.deps.session.get_session(sid).unwrap().unwrap();
+    let zip = b"PK\x03\x04owned-by-this-session".to_vec();
+    let attachment = handle
+        .put_attachment("application/zip", Some("bundle.zip"), &zip)
+        .unwrap();
+
+    let mut body = prompt_body(
+        sid,
+        "aaaaaaaa-0000-4000-8000-0000000000b1",
+        "inspect the bundle",
+    );
+    body["attachments"] =
+        serde_json::json!([serde_json::to_value(&attachment).expect("attachment id json")]);
+    let (status, text) = prompt_call(&state, sid, body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let receipt: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(receipt["accepted"], serde_json::json!(true), "{receipt}");
+
+    // The accepted ids persist ON THE TURN: the run linkage row carries
+    // the exact id (digest, mime, filename, size).
+    let (run_rows, _) = handle
+        .memory_facts_of_kinds(
+            &[faktor_orchestrator::runtime::task_executor::TASK_RUN_ROW_KIND],
+            16,
+        )
+        .unwrap();
+    let run_row: faktor_orchestrator::runtime::task_executor::TaskRunRow = run_rows
+        .iter()
+        .find_map(|(_, _, value)| serde_json::from_str(value).ok())
+        .expect("the prompt's run linkage row exists");
+    assert_eq!(
+        run_row.attachments,
+        vec![attachment.clone()],
+        "the turn persists the accepted attachment ids exactly"
+    );
+    // And on the task row (the task path's durable seam).
+    let task_id = handle.task_id().unwrap();
+    let task = handle
+        .get_task(task_id)
+        .unwrap()
+        .expect("the task-kind prompt creates its row");
+    assert_eq!(task.attachments, vec![attachment.clone()]);
+
+    // A replay with the same body (attachments included) is byte-identical
+    // — the admission domain covers the accepted set.
+    let (replay_status, replay_text) = prompt_call(&state, sid, body).await;
+    assert_eq!(replay_status, StatusCode::OK, "{replay_text}");
+    assert_eq!(text, replay_text, "same body replays byte-for-byte");
+}
+
+/// P0-ATTACH typed refusals (never a silent text-only degradation, never
+/// a claimed key): an unknown/foreign digest, a mismatched identity and an
+/// image the effective model cannot take each refuse with a typed 4xx and
+/// leave NO admission claim behind — the same key then admits its
+/// corrected body as FRESH.
+#[tokio::test]
+async fn prompt_attachment_refusals_are_typed_and_never_claim_the_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, sid) = test_state(dir.path(), "prompt-attach-refuse");
+    let handle = state.deps.session.get_session(sid).unwrap().unwrap();
+    let store = state.deps.session.store();
+    let key = "aaaaaaaa-0000-4000-8000-0000000000c1";
+
+    let attempt = |attachments: serde_json::Value| {
+        let mut body = prompt_body(sid, key, "see the attachment");
+        body["attachments"] = attachments;
+        body
+    };
+    // 1) Unknown/foreign digest: never uploaded (or owned by another
+    // session) — typed refusal, key untouched.
+    let foreign = serde_json::json!({
+        "digest": "ab".repeat(32),
+        "mime": "application/zip",
+        "filename": "foreign.zip",
+        "size": 3,
+    });
+    let (status, text) = prompt_call(&state, sid, attempt(serde_json::json!([foreign]))).await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "foreign/unknown attachment refuses: {text}"
+    );
+    assert_eq!(prompt_received_count(&handle), 0, "no turn was admitted");
+
+    // 2) Mismatched identity: the row's digest with a WRONG declared size.
+    let real = handle
+        .put_attachment("application/zip", Some("real.zip"), b"real-bytes")
+        .unwrap();
+    let mut mismatched = serde_json::to_value(&real).unwrap();
+    mismatched["size"] = serde_json::json!(real.size + 7);
+    let (status, text) = prompt_call(&state, sid, attempt(serde_json::json!([mismatched]))).await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "a size-mismatched identity refuses: {text}"
+    );
+    assert_eq!(prompt_received_count(&handle), 0, "still no turn");
+
+    // 3) Unsupported media for the EFFECTIVE model: image/png against the
+    // session's vision-less model — typed refusal naming the capability.
+    let image = handle
+        .put_attachment("image/png", Some("a.png"), b"\x89PNG\x0d\x0a\x1a\x0a")
+        .unwrap();
+    let (status, text) = prompt_call(
+        &state,
+        sid,
+        attempt(serde_json::json!([serde_json::to_value(&image).unwrap()])),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "an image on a vision-less model refuses: {text}"
+    );
+    assert_eq!(prompt_received_count(&handle), 0, "still no turn");
+
+    // None of the refusals claimed the key: the CORRECTED body admits as
+    // FRESH (a stale claim would answer InFlight/KeyReused).
+    let (status, text) = prompt_call(&state, sid, prompt_body(sid, key, "plain text now")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the corrected body admits fresh after typed refusals: {text}"
+    );
+    assert_eq!(prompt_received_count(&handle), 1, "exactly one turn");
+    assert!(
+        store
+            .prompt_admission_claim(sid, key, "probe", "tx-attach-probe", 0)
+            .is_err()
+            || !matches!(
+                store.prompt_admission_claim(sid, key, "probe", "tx-attach-probe", 0),
+                Ok(PromptAdmissionClaim::Fresh)
+            ),
+        "the accepted key holds exactly its own completed row"
+    );
+}
+
+/// P0-ASK idempotency across kinds: the execution kind and the attachment
+/// set are BODY — the same submission id flipped to the other execution
+/// (or given a different attachment set) is a typed 409 KeyReused with
+/// zero mutation, never a receipt replay of the other semantics.
+#[tokio::test]
+async fn prompt_same_key_flipped_execution_or_attachments_is_typed_key_reuse() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, sid) = test_state(dir.path(), "prompt-key-flip");
+    let handle = state.deps.session.get_session(sid).unwrap().unwrap();
+    let store = state.deps.session.store();
+    let key = "aaaaaaaa-0000-4000-8000-0000000000d1";
+    let body = prompt_body(sid, key, "do the thing");
+
+    let (status, first_text) = prompt_call(&state, sid, body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{first_text}");
+    let messages = store.message_count(sid).unwrap();
+    let events = prompt_received_count(&handle);
+
+    // Same key, execution flipped to ask: different body -> typed 409.
+    let mut flipped = body.clone();
+    flipped["execution"] = serde_json::json!("ask");
+    let (status, text) = prompt_call(&state, sid, flipped).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{text}");
+    assert!(text.contains("already used for a different"), "{text}");
+    assert_eq!(store.message_count(sid).unwrap(), messages, "zero mutation");
+    assert_eq!(prompt_received_count(&handle), events, "no second turn");
+
+    // Same key, attachments added: the v2 admission domain refuses the
+    // changed set the same typed way.
+    let zip = handle
+        .put_attachment("application/zip", Some("x.zip"), b"PK")
+        .unwrap();
+    let mut with_attachment = body.clone();
+    with_attachment["attachments"] = serde_json::json!([serde_json::to_value(&zip).unwrap()]);
+    let (status, text) = prompt_call(&state, sid, with_attachment).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{text}");
+    assert!(text.contains("already used for a different"), "{text}");
+    assert_eq!(store.message_count(sid).unwrap(), messages, "zero mutation");
+
+    // The ORIGINAL body still replays its receipt byte-for-byte.
+    let (status, second_text) = prompt_call(&state, sid, body).await;
+    assert_eq!(status, StatusCode::OK, "{second_text}");
+    assert_eq!(first_text, second_text, "the original replay stays intact");
+}
+
+/// P0-IDEMPOTENCY (audit item 4): drop the response, replay the SAME
+/// submission id, and assert the durable economic truth — exactly ONE
+/// turn record, ONE provider-call (charge basis) and ONE `PromptReceived`
+/// ever exist; the replay adds nothing and returns the first bytes.
+#[tokio::test]
+async fn prompt_replay_drives_exactly_one_turn_execution_and_charge() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, sid) = test_state(dir.path(), "prompt-charge");
+    let handle = state.deps.session.get_session(sid).unwrap().unwrap();
+    let store = state.deps.session.store();
+    let body = prompt_body(sid, "aaaaaaaa-0000-4000-8000-0000000000e1", "charge once");
+
+    // The first response is DROPPED server-side (we keep the bytes only to
+    // compare the replay).
+    let (status, first_text) = prompt_call(&state, sid, body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{first_text}");
+    wait_prompt_settled(&state, sid).await;
+
+    let turns_after_drive = store.turn_records_of(sid).unwrap();
+    assert_eq!(
+        turns_after_drive.len(),
+        1,
+        "exactly ONE turn/execution ever exists: {:?}",
+        turns_after_drive
+            .iter()
+            .map(|r| (r.turn_op_id, r.status.clone()))
+            .collect::<Vec<_>>()
+    );
+    let charges_after_drive = store.provider_call_prefix_rows(sid).unwrap().len();
+    assert_eq!(
+        charges_after_drive, 1,
+        "exactly ONE provider call (the charge basis) settles for the turn"
+    );
+    let messages_after_drive = store.message_count(sid).unwrap();
+    let events_after_drive = prompt_received_count(&handle);
+
+    // Replay with the response dropped: byte-identical receipt, zero new
+    // durable economics.
+    let (status, second_text) = prompt_call(&state, sid, body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{second_text}");
+    assert_eq!(first_text, second_text, "byte-for-byte replay");
+    wait_prompt_settled(&state, sid).await;
+    assert_eq!(
+        store.turn_records_of(sid).unwrap().len(),
+        1,
+        "the replay must never create a second turn"
+    );
+    assert_eq!(
+        store.provider_call_prefix_rows(sid).unwrap().len(),
+        charges_after_drive,
+        "the replay must never add a charge"
+    );
+    assert_eq!(
+        store.message_count(sid).unwrap(),
+        messages_after_drive,
+        "the replay must add no message"
+    );
+    assert_eq!(
+        prompt_received_count(&handle),
+        events_after_drive,
+        "the replay must add no PromptReceived"
     );
 }

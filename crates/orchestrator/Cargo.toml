@@ -16,6 +16,10 @@ test-utils = []
 
 [dependencies]
 faktor-core.workspace = true
+# The protocol-level execution-kind vocabulary (`ask` vs `task`) rides the
+# run request and the durable turn-execution row: the DTO, the executor
+# admission and the agent's drive share ONE enum (audit P0-ASK).
+faktor-protocol.workspace = true
 faktor-session.workspace = true
 faktor-agent.workspace = true
 faktor-scheduler.workspace = true

@@ -1,4 +1,8 @@
-//! `runtime::goal_tests`: durable redacted goal projection (P1).
+//! `runtime::goal_tests`: durable redacted goal projection (P1), plus the
+//! P0-ASK turn-execution row and the P0-GOAL-BINDING projection
+//! classification/rebuild (adversarial: corrupt rows, foreign bindings,
+//! rewound revisions, secret-only objectives).
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 
 use super::*;
 use crate::runtime::tests::*;
@@ -624,4 +628,198 @@ async fn admission_seeded_title_goal_is_replaced_by_the_projected_objective() {
     assert_ne!(view.head.goal, handle.title().unwrap());
     assert!(view.head.goal.contains("zephyr"), "{}", view.head.goal);
     assert!(!view.head.goal.contains(&secret), "{}", view.head.goal);
+}
+
+// ====================================== P0-ASK turn-execution row (durable)
+
+/// The turn-execution row's read contract (audit P0-ASK): ABSENCE is the
+/// documented legacy `task` default; a PRESENT row decodes shape-typed —
+/// corrupt JSON, an unknown kind and an extended row are all LOUD typed
+/// refusals (never a silent fallback to either semantics), and a valid ask
+/// row round-trips with its accepted attachment set.
+#[test]
+fn turn_execution_absence_is_task_and_every_present_corrupt_row_is_typed() {
+    let (deps, _dir) = deps(scripted_provider(vec![]), vec![]);
+    let sid = new_session(&deps);
+    let handle = deps.session.get_session(sid).unwrap().unwrap();
+
+    let op = OpId::new(7);
+    assert!(
+        read_turn_execution(&handle, op).unwrap().is_none(),
+        "ABSENCE is the documented legacy default: an unkeyed/legacy turn is a task"
+    );
+
+    let key = faktor_protocol::turn_execution_row_key(op.raw());
+    for hostile in [
+        "not json",
+        r#"{"execution":"implement"}"#,
+        r#"{"execution":"task","extra":1}"#,
+        r#"{"execution":7}"#,
+    ] {
+        handle
+            .upsert_memory_fact(faktor_protocol::TURN_EXECUTION_ROW_KIND, &key, hostile)
+            .unwrap();
+        let err = read_turn_execution(&handle, op).expect_err("a corrupt row is a typed refusal");
+        assert!(
+            matches!(err.kind, ErrorKind::Malformed),
+            "{hostile:?} must refuse typed, got {err}"
+        );
+    }
+
+    let op_ask = OpId::new(8);
+    let row = faktor_protocol::TurnExecution {
+        execution: faktor_protocol::ExecutionKind::Ask,
+        attachments: Vec::new(),
+    };
+    handle
+        .upsert_memory_fact(
+            faktor_protocol::TURN_EXECUTION_ROW_KIND,
+            &faktor_protocol::turn_execution_row_key(op_ask.raw()),
+            &row.encode().unwrap(),
+        )
+        .unwrap();
+    let decoded = read_turn_execution(&handle, op_ask)
+        .unwrap()
+        .expect("a valid ask row decodes");
+    assert_eq!(decoded, row);
+    assert_eq!(decoded.execution, faktor_protocol::ExecutionKind::Ask);
+}
+
+// ================================= P0-GOAL-BINDING projection classification
+
+/// The binding verdicts, adversarially: an UNBOUND legacy head keeps
+/// (documented legacy, never a guessed identity); a bound head keeps only
+/// for the SAME admitted task; a FOREIGN binding is a typed `Rebuild`
+/// naming the old task; a REWOUND bound revision (the row sits below the
+/// binding the ledger recorded) refuses typed `Conflict` — a rolled-back
+/// task row is never driven under silently.
+#[test]
+fn goal_projection_binding_keeps_same_task_rebuilds_foreign_and_refuses_rewind() {
+    let (deps, _dir) = deps(scripted_provider(vec![]), vec![]);
+    let sid = new_session(&deps);
+    let handle = deps.session.get_session(sid).unwrap().unwrap();
+    let now = handle.now_ms();
+    let task_row = |id: u64, goal: String| faktor_session::Task {
+        task_id: TaskId::new(id),
+        session_id: sid,
+        goal,
+        acceptance_criteria: vec![],
+        plan: vec![],
+        attachments: Vec::new(),
+        contract: Default::default(),
+        budget: faktor_session::TaskBudget::default(),
+        state: faktor_core::state::TaskState::Pending,
+        created_ms: now,
+        updated_ms: now,
+    };
+    handle
+        .create_task(task_row(1, "restore the alpha parser".into()))
+        .unwrap();
+    handle
+        .create_task(task_row(2, "build the beta indexer".into()))
+        .unwrap();
+
+    assert!(
+        matches!(
+            classify_goal_projection_binding(&handle, TaskId::new(1)).unwrap(),
+            GoalProjectionBinding::Keep
+        ),
+        "an unbound legacy head keeps — absence is never a guessed binding"
+    );
+
+    let revision_one = handle.task_revision(TaskId::new(1)).unwrap().raw();
+    handle
+        .ledger_goal_set_bound("restore the alpha parser", 1, revision_one)
+        .unwrap();
+    assert!(
+        matches!(
+            classify_goal_projection_binding(&handle, TaskId::new(1)).unwrap(),
+            GoalProjectionBinding::Keep
+        ),
+        "the bound task's continuation keeps its projection"
+    );
+    match classify_goal_projection_binding(&handle, TaskId::new(2)).unwrap() {
+        GoalProjectionBinding::Rebuild { bound_task_id } => {
+            assert_eq!(bound_task_id, 1, "the mismatch names the OLD task")
+        }
+        GoalProjectionBinding::Keep => panic!("a foreign binding must rebuild"),
+    }
+
+    // Rewind: the binding records a revision the durable row never had.
+    handle
+        .ledger_goal_set_bound("restore the alpha parser", 1, revision_one + 9999)
+        .unwrap();
+    let err = classify_goal_projection_binding(&handle, TaskId::new(1))
+        .expect_err("a rewound binding revision must refuse typed");
+    assert!(matches!(err.kind, ErrorKind::Conflict), "{err}");
+
+    // The rebuild itself: task 2 never reads task 1's goal/plan/checks.
+    let mut ledger = TaskLedger {
+        goal: "restore the alpha parser".into(),
+        completed_steps: vec!["parsed the old grammar".into()],
+        open_steps: vec!["port the tests".into()],
+        decisions: vec!["keep the lexer table".into()],
+        known_failures: vec!["flaky reconnect".into()],
+        changed_files: vec!["src/alpha.rs".into()],
+        tests_run: vec!["alpha_test".into()],
+        user_preferences: vec!["concise answers".into()],
+        ..TaskLedger::default()
+    };
+    rebuild_goal_projection(&handle, &mut ledger, TaskId::new(2), 1).unwrap();
+    assert!(
+        ledger.goal.contains("beta"),
+        "the rebuilt goal is THIS task's objective: {}",
+        ledger.goal
+    );
+    assert!(!ledger.goal.contains("alpha"), "{}", ledger.goal);
+    assert!(
+        ledger.completed_steps.is_empty()
+            && ledger.open_steps.is_empty()
+            && ledger.decisions.is_empty()
+            && ledger.known_failures.is_empty()
+            && ledger.changed_files.is_empty()
+            && ledger.tests_run.is_empty(),
+        "a new task never reads the old projection's plan/checks/evidence"
+    );
+    assert_eq!(
+        ledger.user_preferences,
+        vec!["concise answers".to_string()],
+        "session knowledge survives a projection rebuild"
+    );
+    assert_eq!(
+        ledger.goal_projection_state,
+        Some(faktor_context::ledger::GoalProjectionState::Available)
+    );
+    assert!(
+        handle.get_task_ledger().unwrap().is_some(),
+        "the rebuilt projection persists"
+    );
+    // TYPED, not silent: the rebuild is durable ledger history naming the
+    // mismatch — never a quiet in-memory substitution.
+    assert!(
+        ledger_rows_json(&handle).contains("\"goal binding\""),
+        "the rebuild lands a typed ledger Decision"
+    );
+
+    // A task objective that redacts to nothing refuses with the SAME typed
+    // error a fresh projection gives — never the stale inherited goal.
+    let secret_only = ghp();
+    handle
+        .create_task(task_row(3, secret_only.clone()))
+        .unwrap();
+    let mut stale = TaskLedger {
+        goal: "restore the alpha parser".into(),
+        completed_steps: vec!["old work".into()],
+        ..TaskLedger::default()
+    };
+    let err = rebuild_goal_projection(&handle, &mut stale, TaskId::new(3), 1)
+        .expect_err("a secret-only objective must refuse typed");
+    assert!(
+        matches!(err.kind, ErrorKind::GoalUnavailableAfterRedaction { .. }),
+        "{err}"
+    );
+    assert!(
+        !stale.goal.contains("alpha"),
+        "the refused rebuild never leaves the stale objective in place"
+    );
 }
