@@ -35,7 +35,6 @@ import javax.swing.JScrollPane
 import javax.swing.KeyStroke
 import javax.swing.SwingUtilities
 import javax.swing.Timer
-import javax.swing.text.JTextComponent
 
 /** The production coalescing interval: 25 render passes/s at most. */
 internal const val UI_FLUSH_INTERVAL_MS = 40
@@ -363,112 +362,138 @@ internal class ScrollPinController(
 }
 
 /**
- * Batched transcript writes with a maintained budget. Callers append segments
- * (optionally keyed by a durable message seq) and flush once per EDT pass:
- * one `Document.insertString` for the whole batch. Trimming happens only when
- * a bound is crossed, never per delta, and clears stale offsets loudly.
+ * Batched transcript writes with a maintained budget over the COMPONENT
+ * transcript ([TranscriptView]). Callers queue unkeyed notice runs and
+ * keyed row ops, then flush once per EDT pass: the flush applies the queued
+ * ops in order, one render pass for the whole batch. Row upserts are keyed:
+ * an existing row's cell is replaced IN PLACE (its component identity —
+ * and any selection/focus inside it — survives), a new row inserts at its
+ * ordered anchor, and a row whose range dies to a trim is never re-inserted
+ * (content stays exactly-once inside the retained window; the loud
+ * "outside the retained window" notice owns the user message).
  *
- * Row-aware writes (the durable upsert path): keyed rows render through
- * [upsertRow]/[rekeyRow]/[removeRow] so an existing row's content can be
- * REPLACED in place and a new row can be INSERTED at its ordered anchor —
- * seq decides ordering, never whether an existing row may update. A row
- * whose range dies to a trim is never re-inserted (content stays exactly-once
- * inside the retained window; the loud "outside the retained window" notice
- * owns the user message).
+ * The budget counts each row's plain-text length and newline count; the
+ * trim drops the OLDEST cells (never the newest suffix), and lost keys are
+ * tombstoned so a later page can never duplicate trimmed content.
  */
 internal class TranscriptSink(
-    private val area: JTextComponent,
+    private val view: TranscriptView,
     private val scroll: ScrollPinController?,
     private val metrics: UiWorkMetrics,
     private val maxChars: Int,
     private val maxLines: Int
 ) {
-    private data class Segment(val text: String, val seq: Long?)
-
-    /** One queued write: an unkeyed segment or a keyed row op. */
+    /** One queued write: an unkeyed notice run or a keyed row op. */
     private sealed class PendingOp {
-        data class Raw(val segment: Segment) : PendingOp()
+        data class Raw(val text: String) : PendingOp()
 
-        data class RowUpsert(val key: String, val line: String, val beforeKey: String?) : PendingOp()
+        data class RowUpsert(
+            val key: String,
+            val payload: TranscriptRowPayload,
+            val beforeKey: String?
+        ) : PendingOp()
 
         data class RowRekey(
             val oldKey: String,
             val newKey: String,
-            val line: String,
+            val payload: TranscriptRowPayload,
             val beforeKey: String?
         ) : PendingOp()
     }
+
     private val pending = ArrayList<PendingOp>()
-    private val offsets = LinkedHashMap<Long, Pair<Int, Int>>()
 
-    /** Rendered keyed rows: key -> (start, end) document range. */
-    private val rowRanges = LinkedHashMap<String, Pair<Int, Int>>()
-
-    /** Rows whose ranges died to a trim: content is never re-inserted. */
+    /** Rows whose cells died to a trim: content is never re-inserted. */
     private val lostRows = HashSet<String>()
 
-    private var charCount = 0
-    private var lineCount = 0
-    private var initialized = false
+    private var sysCounter = 0L
+    private var partCounter = 0L
 
-    /** Durable message offsets, rebuilt only after a trim. */
-    val messageOffsets: Map<Long, Pair<Int, Int>>
-        get() = offsets
+    /** The maintained budget (plain-text lengths of every rendered row). */
+    var charCount = 0
+        private set
+
+    var lineCount = 0
+        private set
 
     val pendingChars: Int
         get() = pending.sumOf {
             when (it) {
-                is PendingOp.Raw -> it.segment.text.length
-                is PendingOp.RowUpsert -> it.line.length
-                is PendingOp.RowRekey -> it.line.length
+                is PendingOp.Raw -> it.text.length
+                is PendingOp.RowUpsert -> it.payload.text.length
+                is PendingOp.RowRekey -> it.payload.text.length
             }
         }
 
-    fun offsetOf(seq: Long): Pair<Int, Int>? = offsets[seq]
+    /** True while [key] has a live cell (not trimmed, not empty). */
+    fun locatedRow(key: String): Boolean = view.contains(key)
 
-    fun append(text: String, seq: Long? = null) {
+    fun append(text: String) {
         if (text.isEmpty()) return
-        pending.add(PendingOp.Raw(Segment(text, seq)))
+        pending.add(PendingOp.Raw(text))
     }
 
     fun appendMessage(role: String, text: String, seq: Long) {
-        append("$role: $text\n", seq)
+        val payload = TranscriptRowPayload(
+            kind = when (role) {
+                "assistant" -> TranscriptRowPayload.KIND_ASSISTANT
+                "user" -> TranscriptRowPayload.KIND_USER
+                else -> role
+            },
+            text = text,
+            seq = seq,
+            rowId = seq.toString(),
+            group = "g:m:$seq"
+        )
+        upsertRow("mm:$seq", payload, null)
     }
 
-    /** True while [key] has a live document range (not trimmed, not empty). */
-    fun locatedRow(key: String): Boolean = rowRanges.containsKey(key)
-
-    /** The document range of a rendered row, or null when not rendered. */
-    fun rowOffset(key: String): Pair<Int, Int>? = rowRanges[key]
-
     /**
-     * Queue a keyed row render: replace the row's range in place when it is
-     * located; otherwise insert [line] before [beforeKey]'s row (null = the
-     * document end). A row lost to a trim is never re-inserted.
+     * Queue one approval part of the current turn: it interleaves with the
+     * text/tool parts by ARRIVAL order and joins their turn group.
      */
-    fun upsertRow(key: String, line: String, beforeKey: String? = null) {
-        if (line.isEmpty()) return
-        pending.add(PendingOp.RowUpsert(key, line, beforeKey))
+    fun appendPart(payload: TranscriptRowPayload) {
+        if (payload.text.isEmpty()) return
+        pending.add(
+            PendingOp.RowUpsert(
+                "ap:${partCounter++}",
+                payload.copy(seq = partCounter - 1, rowId = "part-${partCounter - 1}"),
+                null
+            )
+        )
     }
 
     /**
-     * Queue a keyed row move/rename: the [oldKey] range is removed and
-     * [line] is rendered under [newKey] at the resolved anchor (the
+     * Queue a keyed row render: replace the row's cell in place when it is
+     * located; otherwise insert [payload] before [beforeKey]'s row (null =
+     * the document end). A row lost to a trim is never re-inserted.
+     */
+    fun upsertRow(key: String, payload: TranscriptRowPayload, beforeKey: String? = null) {
+        if (payload.text.isEmpty()) return
+        pending.add(PendingOp.RowUpsert(key, payload, beforeKey))
+    }
+
+    /**
+     * Queue a keyed row move/rename: the [oldKey] cell is removed and
+     * [payload] is rendered under [newKey] at the resolved anchor (the
      * provisional-to-durable reconciliation).
      */
-    fun rekeyRow(oldKey: String, newKey: String, line: String, beforeKey: String? = null) {
-        if (line.isEmpty()) return
-        pending.add(PendingOp.RowRekey(oldKey, newKey, line, beforeKey))
+    fun rekeyRow(
+        oldKey: String,
+        newKey: String,
+        payload: TranscriptRowPayload,
+        beforeKey: String? = null
+    ) {
+        if (payload.text.isEmpty()) return
+        pending.add(PendingOp.RowRekey(oldKey, newKey, payload, beforeKey))
     }
 
     /**
-     * Writes every pending op in queue order (consecutive unkeyed segments
-     * remain ONE document insert, positions resolve live), records
-     * message/row offsets, follows the viewport only while the user is
+     * Applies every pending op in queue order (consecutive unkeyed runs
+     * become ONE notice cell), follows the viewport only while the user is
      * pinned, then trims once if a bound was crossed.
      */
     fun flush(): Int {
-        initialize()
         if (pending.isEmpty()) return 0
         var workChars = 0
         var applied = 0
@@ -476,35 +501,31 @@ internal class TranscriptSink(
         while (index < pending.size) {
             val op = pending[index]
             if (op is PendingOp.Raw) {
-                // ONE document insert for the consecutive unkeyed run (the
-                // system-line/batched-append contract).
+                // ONE cell for the consecutive unkeyed run (the notice
+                // contract: milestones and refusals never interleave with
+                // themselves inside one flush).
                 val batch = StringBuilder()
-                val spans = ArrayList<Triple<Long?, Int, Int>>()
                 while (index < pending.size && pending[index] is PendingOp.Raw) {
-                    val segment = (pending[index] as PendingOp.Raw).segment
-                    spans.add(Triple(segment.seq, batch.length, segment.text.length))
-                    batch.append(segment.text)
+                    batch.append((pending[index] as PendingOp.Raw).text)
                     index++
                 }
-                val start = area.document.length
                 val text = batch.toString()
-                area.document.insertString(start, text, null)
-                for ((seq, offset, length) in spans) {
-                    if (seq != null) offsets[seq] = Pair(start + offset, start + offset + length)
-                }
+                view.appendRun(text)
                 charCount += text.length
-                lineCount += countLines(text)
+                lineCount += countNewlines(text)
                 workChars += text.length
                 applied++
                 continue
             }
             when (op) {
                 is PendingOp.RowUpsert -> {
-                    workChars += applyRowUpsert(op.key, op.line, op.beforeKey)
+                    workChars += applyRowUpsert(op.key, op.payload, op.beforeKey)
                     applied++
                 }
                 is PendingOp.RowRekey -> {
-                    workChars += applyRowRekey(op.oldKey, op.newKey, op.line, op.beforeKey)
+                    workChars += applyRowRekey(
+                        op.oldKey, op.newKey, op.payload, op.beforeKey
+                    )
                     applied++
                 }
                 is PendingOp.Raw -> Unit // handled above
@@ -517,150 +538,91 @@ internal class TranscriptSink(
         metrics.transcriptChars.addAndGet(workChars.toLong())
         scroll?.followAfterAppend()
         // ONE invalidation per flush, after the whole batch landed.
-        area.revalidate()
-        area.repaint()
+        view.revalidate()
+        view.repaint()
         trimIfNeeded()
         return workChars
     }
 
-    /** Replace a located row in place, or insert at the ordered anchor. */
-    private fun applyRowUpsert(key: String, line: String, beforeKey: String?): Int {
-        val range = rowRanges[key]
-        if (range != null) {
-            val oldLen = range.second - range.first
-            if (oldLen == line.length &&
-                area.document.getText(range.first, oldLen) == line
-            ) {
-                return 0
-            }
-            val oldNewlines = countRangeNewlines(range.first, oldLen)
-            area.document.remove(range.first, oldLen)
-            area.document.insertString(range.first, line, null)
-            val delta = line.length - oldLen
-            rowRanges[key] = Pair(range.first, range.first + line.length)
-            shiftRangesAfter(range.first, key, delta)
-            charCount += delta
-            lineCount += line.count { it == '\n' } - oldNewlines
-            return line.length
-        }
+    /** Replace a located row's cell in place, or insert at the anchor. */
+    private fun applyRowUpsert(
+        key: String,
+        payload: TranscriptRowPayload,
+        beforeKey: String?
+    ): Int {
         if (key in lostRows) {
             // The row died to a bounded trim: its content lives outside the
             // retained window and must never be re-inserted (exactly-once).
             return 0
         }
-        return insertRowRange(key, line, beforeKey)
+        val current = view.payloadOf(key)
+        if (current != null) {
+            if (current == payload) return 0
+            view.upsert(key, payload, beforeKey)
+            charCount += payload.text.length - current.text.length
+            lineCount += countNewlines(payload.text) - countNewlines(current.text)
+            return payload.text.length
+        }
+        view.upsert(key, payload, beforeKey)
+        charCount += payload.text.length
+        lineCount += countNewlines(payload.text)
+        return payload.text.length
     }
 
-    /** Remove the old key's range and render [newKey] at its anchor. */
-    private fun applyRowRekey(oldKey: String, newKey: String, line: String, beforeKey: String?): Int {
-        var chars = 0
-        val oldRange = rowRanges.remove(oldKey)
+    /** Remove the old key's cell and render [newKey] at its anchor. */
+    private fun applyRowRekey(
+        oldKey: String,
+        newKey: String,
+        payload: TranscriptRowPayload,
+        beforeKey: String?
+    ): Int {
+        val oldPayload = view.payloadOf(oldKey)
+        if (oldPayload != null) {
+            charCount -= oldPayload.text.length
+            lineCount -= countNewlines(oldPayload.text)
+        }
         lostRows.remove(oldKey)
-        if (oldRange != null) {
-            val oldLen = oldRange.second - oldRange.first
-            area.document.remove(oldRange.first, oldLen)
-            shiftRangesAfter(oldRange.first, null, -oldLen)
-            charCount -= oldLen
-        }
-        if (line.isEmpty()) return chars
-        if (newKey in lostRows) return chars
-        // The removal already shifted the anchor candidates; insert fresh.
-        chars += insertRowRange(newKey, line, beforeKey)
-        return chars
-    }
-
-    private fun insertRowRange(key: String, line: String, beforeKey: String?): Int {
-        val at = anchorOffset(beforeKey)
-        area.document.insertString(at, line, null)
-        shiftRangesAfter(at, null, line.length)
-        rowRanges[key] = Pair(at, at + line.length)
-        charCount += line.length
-        lineCount += line.count { it == '\n' }
-        return line.length
-    }
-
-    /** The insertion offset of an ordered anchor (null = document end). */
-    private fun anchorOffset(beforeKey: String?): Int {
-        if (beforeKey == null) return area.document.length
-        return rowRanges[beforeKey]?.first ?: area.document.length
-    }
-
-    /** Shifts every range at/after [position]; [exceptKey] stays put. */
-    private fun shiftRangesAfter(position: Int, exceptKey: String?, delta: Int) {
-        if (delta == 0) return
-        for (key in rowRanges.keys.toList()) {
-            if (key == exceptKey) continue
-            val range = rowRanges[key] ?: continue
-            if (range.first >= position) {
-                rowRanges[key] = Pair(range.first + delta, range.second + delta)
-            }
-        }
-        for (seq in offsets.keys.toList()) {
-            val range = offsets[seq] ?: continue
-            if (range.first >= position) {
-                offsets[seq] = Pair(range.first + delta, range.second + delta)
-            }
-        }
-    }
-
-    /** Newlines inside a replaced range (for the maintained line budget). */
-    private fun countRangeNewlines(start: Int, length: Int): Int {
-        if (length <= 0) return 0
-        val text = try {
-            area.document.getText(start, length)
-        } catch (e: Exception) {
-            return 0
-        }
-        return text.count { it == '\n' }
+        view.rekey(oldKey, newKey, payload, beforeKey)
+        if (newKey in lostRows) return 0
+        charCount += payload.text.length
+        lineCount += countNewlines(payload.text)
+        return payload.text.length
     }
 
     fun reset() {
         pending.clear()
-        offsets.clear()
-        rowRanges.clear()
         lostRows.clear()
         charCount = 0
         lineCount = 0
-        initialized = true
-        area.text = ""
+        view.clear()
         scroll?.reset()
     }
 
+    /** Trim from the OLDEST cell until the budget holds again. */
     fun trimIfNeeded() {
-        initialize()
         if (charCount <= maxChars && lineCount <= maxLines) return
-        val text = area.text
-        val lines = text.split('\n')
-        val keptLines = if (lines.size > maxLines) lines.takeLast(maxLines) else lines
-        var kept = keptLines.joinToString("\n")
-        if (kept.length > maxChars) kept = safeTakeLast(kept, maxChars)
-        area.text = kept
-        charCount = kept.length
-        lineCount = kept.count { it == '\n' }
-        // Offsets and row ranges no longer map onto the rebuilt text; the
-        // rows become "lost" (never re-inserted, so no duplicates) and
-        // message navigation falls back to the loud "outside the retained
-        // window" notice.
-        lostRows.addAll(rowRanges.keys)
-        rowRanges.clear()
-        offsets.clear()
-        metrics.transcriptTrims.incrementAndGet()
-        metrics.transcriptInserts.incrementAndGet()
-        scroll?.followAfterAppend()
-        area.revalidate()
-        area.repaint()
+        var trimmed = 0
+        while (charCount > maxChars || lineCount > maxLines) {
+            val removed = view.removeOldest() ?: break
+            charCount -= removed.payload.text.length
+            lineCount -= countNewlines(removed.payload.text)
+            lostRows.add(removed.key)
+            trimmed++
+        }
+        if (trimmed > 0) {
+            charCount = charCount.coerceAtLeast(0)
+            lineCount = lineCount.coerceAtLeast(0)
+            metrics.transcriptTrims.incrementAndGet()
+            metrics.transcriptInserts.incrementAndGet()
+            scroll?.followAfterAppend()
+            view.revalidate()
+            view.repaint()
+        }
     }
 
-    private fun initialize() {
-        if (initialized) return
-        initialized = true
-        charCount = area.document.length
-        lineCount = area.text.count { it == '\n' }
-    }
-
-    private fun countLines(batch: CharSequence): Int {
+    private fun countNewlines(text: String): Int {
         var count = 0
-        for (i in 0 until batch.length) if (batch[i] == '\n') count++
+        for (index in text.indices) if (text[index] == '\n') count++
         return count
     }
 }

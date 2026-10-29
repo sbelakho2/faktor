@@ -323,6 +323,8 @@ $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/AgentsPanel.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/OverviewPanel.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/VerificationPanel.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/TranscriptModel.kt
+$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/RichMarkdown.kt
+$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/TranscriptRender.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/ToolWindowAutoStart.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/UiWork.kt"
 

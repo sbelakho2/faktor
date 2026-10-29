@@ -226,16 +226,22 @@ class FaktorChatPanel(
      */
     internal var taskStartObserver: ((String, String) -> Unit)? = null
 
-    private val transcript = JTextArea()
+    /**
+     * The component transcript: stable You/Faktor identities, real styled
+     * Markdown blocks (headings/lists/emphasis/code/links/tables), a Copy
+     * action on every code block, and turn-grouped assistant parts. Row
+     * cells keep their Swing component identity across updates.
+     */
+    private val transcriptView = TranscriptView()
 
     /** The transcript viewport + the follow/detach scroll policy. */
-    private val transcriptScroll = insetScroll(transcript)
+    private val transcriptScroll = insetScroll(transcriptView)
 
     private val transcriptPin = ScrollPinController(transcriptScroll)
 
-    /** One batched document insert per flush; offsets survive incrementally. */
+    /** One batched render pass per flush; keyed rows update in place. */
     private val transcriptSink = TranscriptSink(
-        transcript,
+        transcriptView,
         transcriptPin,
         uiMetrics,
         MAX_TRANSCRIPT_CHARS,
@@ -712,7 +718,7 @@ class FaktorChatPanel(
     override fun updateUI() {
         super.updateUI()
         if (!uiInitialized) return
-        transcript.font = uiPanelFont().deriveFont(13f)
+        transcriptView.applyFont(uiPanelFont().deriveFont(13f))
         input.font = uiPanelFont()
         runSummaryArea.font = uiPanelFont()
         transcriptSink.trimIfNeeded()
@@ -840,14 +846,7 @@ class FaktorChatPanel(
 
 
     private fun buildLayout() {
-        transcript.isEditable = false
-        transcript.lineWrap = true
-        transcript.wrapStyleWord = true
-        transcript.font = uiPanelFont().deriveFont(13f)
-        transcript.a11y(
-            "Conversation transcript",
-            "Live conversation. Routine stream chunks are coalesced; durable milestones appear here."
-        )
+        transcriptView.applyFont(uiPanelFont().deriveFont(13f))
 
         input.lineWrap = true
         input.wrapStyleWord = true
@@ -3688,10 +3687,10 @@ class FaktorChatPanel(
             for (op in ops) {
                 when (op) {
                     is TranscriptRowOp.Upsert -> transcriptSink.upsertRow(
-                        op.key.render(), op.line + "\n", op.beforeKey?.render()
+                        op.key.render(), op.payload, op.beforeKey?.render()
                     )
                     is TranscriptRowOp.Rekey -> transcriptSink.rekeyRow(
-                        op.key.render(), op.newKey.render(), op.line + "\n", op.beforeKey?.render()
+                        op.key.render(), op.newKey.render(), op.payload, op.beforeKey?.render()
                     )
                 }
             }
@@ -4554,19 +4553,15 @@ class FaktorChatPanel(
 
     private fun jumpToTranscript(seq: Long) {
         val key = transcriptModel.keyForSeq(seq)
-        val range = key?.let { transcriptSink.rowOffset(it.render()) }
-        if (range == null) {
+        if (key == null || !transcriptSink.locatedRow(key.render())) {
             appendSystem("message #$seq is outside the retained transcript window")
             return
         }
         try {
-            transcript.requestFocusInWindow()
+            transcriptView.requestFocusInWindow()
             // An explicit jump is user intent to follow again.
             transcriptPin.pin.onJump()
-            transcript.select(range.first, range.second)
-            transcript.caretPosition = range.second
-            val view = transcript.modelToView(range.first)
-            if (view != null) transcript.scrollRectToVisible(view)
+            transcriptView.scrollTo(key.render())
         } catch (e: Exception) {
             appendSystem("message #$seq cannot be focused: ${e.message}")
         }
@@ -4716,7 +4711,22 @@ class FaktorChatPanel(
         if (accepted == 0) return
         for (delta in notable.takeLast(MAX_NOTABLE_EVENTS_PER_FLUSH)) {
             val copy = milestoneCopy(delta.event.event)
-            transcriptSink.append(copy + "\n")
+            if (delta.event.event.startsWith("permission_")) {
+                // An approval decision is a TURN PART: it interleaves with
+                // the text/tool parts by arrival order and joins the current
+                // Faktor turn group (never its own anonymous line).
+                transcriptSink.appendPart(
+                    TranscriptRowPayload(
+                        kind = TranscriptRowPayload.KIND_APPROVAL,
+                        text = copy,
+                        seq = delta.event.id,
+                        rowId = "evt-${delta.event.id}",
+                        group = transcriptModel.currentAssistantGroup() ?: ""
+                    )
+                )
+            } else {
+                transcriptSink.append(copy + "\n")
+            }
             // The raw wire kind + journal id stay reachable in the details
             // surface, never in the ordinary transcript copy.
             onEdt {
@@ -4845,17 +4855,17 @@ class FaktorChatPanel(
         if (touched) applyLiveOverlayOps()
     }
 
-    /** Render exactly the rows whose merged text moved (one flush). */
+    /** Render exactly the rows whose merged payload moved (one flush). */
     private fun applyLiveOverlayOps() {
         val ops = transcriptModel.liveOps()
         if (ops.isEmpty()) return
         for (op in ops) {
             when (op) {
                 is TranscriptRowOp.Upsert -> transcriptSink.upsertRow(
-                    op.key.render(), op.line + "\n", op.beforeKey?.render()
+                    op.key.render(), op.payload, op.beforeKey?.render()
                 )
                 is TranscriptRowOp.Rekey -> transcriptSink.rekeyRow(
-                    op.key.render(), op.newKey.render(), op.line + "\n", op.beforeKey?.render()
+                    op.key.render(), op.newKey.render(), op.payload, op.beforeKey?.render()
                 )
             }
         }
@@ -4973,12 +4983,14 @@ class FaktorChatPanel(
     internal fun hostLifecycleStarted(version: String, adopted: Boolean) {
         onEdt {
             setControlsEnabled(true)
-            diagnosticsPanel.setReadiness("ready", "version $version")
+            // The transcript line lands BEFORE the readiness flip: a poller
+            // that observes "ready" must never race an unwritten line.
             if (adopted) {
                 appendSystem("Connected to the running Faktor service (version $version)")
             } else {
                 appendSystem("daemon ready: version $version")
             }
+            diagnosticsPanel.setReadiness("ready", "version $version")
             ensureEdition5SessionPanelsLoaded()
         }
     }
@@ -4990,8 +5002,9 @@ class FaktorChatPanel(
      */
     internal fun hostLifecycleRefused(kind: String, detail: String) {
         onEdt {
-            diagnosticsPanel.setReadiness("auto-start refused", "$kind · $detail")
+            // Transcript line first, readiness second (see hostLifecycleStarted).
             appendSystem(autoStartRefusalCopy(kind, detail))
+            diagnosticsPanel.setReadiness("auto-start refused", "$kind · $detail")
         }
     }
 
@@ -5389,7 +5402,7 @@ class FaktorChatPanel(
     internal fun triggerAgentControlForTest(label: String): Boolean = agentsPanel.clickControl(label)
 
     /** The rendered transcript (smoke assertions on typed refusals). */
-    internal fun transcriptTextForTest(): String = transcript.text
+    internal fun transcriptTextForTest(): String = transcriptView.plainText()
 
     internal fun newSessionForTest() {
         newSessionFromControls(selectedProviderOrDefault(), selectedModelOrDefault())
@@ -5749,7 +5762,9 @@ class FaktorChatPanel(
         onEdt {
             transcriptModel.addProvisional(submissionId, text)?.let { op ->
                 if (op is TranscriptRowOp.Upsert) {
-                    transcriptSink.upsertRow(op.key.render(), op.line + "\n", op.beforeKey?.render())
+                    transcriptSink.upsertRow(
+                        op.key.render(), op.payload, op.beforeKey?.render()
+                    )
                 }
             }
             transcriptSink.flush()

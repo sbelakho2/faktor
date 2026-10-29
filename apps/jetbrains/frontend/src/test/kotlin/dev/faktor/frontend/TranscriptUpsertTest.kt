@@ -61,11 +61,11 @@ class TranscriptUpsertTest {
 
             val text = panel.transcriptTextForTest()
             assertEquals(
-                "assistant: Part one. Part two. Part three.\n",
+                "Faktor: Part one. Part two. Part three.\n",
                 text,
                 "the final row must carry the full content exactly once"
             )
-            assertEquals(1, countOccurrences(text, "assistant: "), "exactly one assistant row")
+            assertEquals(1, countOccurrences(text, "Faktor: "), "exactly one Faktor turn header")
             assertEquals(0L, panel.transcriptRevisionGuardHitsForTest(), "growth is never guarded")
         }
     }
@@ -89,7 +89,7 @@ class TranscriptUpsertTest {
             panel.submitAskForTest()
             await("the durable twin reconciles into ONE row") {
                 val text = panel.transcriptTextForTest()
-                text.contains("user: hello durable twin") &&
+                text.contains("You: hello durable twin") &&
                     !text.contains("you: hello durable twin")
             }
             val text = panel.transcriptTextForTest()
@@ -121,7 +121,7 @@ class TranscriptUpsertTest {
             panel.refreshMessagesForTest()
             var text = panel.transcriptTextForTest()
             assertTrue(
-                text.indexOf("assistant: first") < text.indexOf("assistant: second"),
+                text.indexOf("first") < text.indexOf("second"),
                 "the lower-seq row must render first, got: $text"
             )
 
@@ -134,8 +134,8 @@ class TranscriptUpsertTest {
             )
             panel.refreshMessagesForTest()
             text = panel.transcriptTextForTest()
-            assertTrue(text.contains("assistant: second and more"), text)
-            assertEquals(1, countOccurrences(text, "assistant: second"), text)
+            assertTrue(text.contains("second and more"), text)
+            assertEquals(1, countOccurrences(text, "second and more"), text)
 
             // A STALE page (seq 5 regressed to the shorter text) arrives
             // late: the revision guard refuses the downgrade.
@@ -148,7 +148,7 @@ class TranscriptUpsertTest {
             panel.refreshMessagesForTest()
             text = panel.transcriptTextForTest()
             assertTrue(
-                text.contains("assistant: second and more"),
+                text.contains("second and more"),
                 "a stale shorter snapshot must never regress the row: $text"
             )
             assertEquals(1L, panel.transcriptRevisionGuardHitsForTest())

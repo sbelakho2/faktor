@@ -156,24 +156,28 @@ object EdtWorkHarness {
             naiveArea.revalidate()
             naiveArea.repaint()
         }
-        val sinkArea = JTextArea()
-        var sinkInserts = 0
-        sinkArea.document.addDocumentListener(insertCounter { sinkInserts++ })
+        val sinkView = TranscriptView()
         val sink = TranscriptSink(
-            sinkArea,
+            sinkView,
             null,
             UiWorkMetrics(),
             400_000,
             4_000
         )
+        // OFF the flush: queueing must mutate NOTHING (the render contract).
         for (i in 1..TRANSCRIPT_MESSAGES) {
             sink.appendMessage("assistant", "message $i", i.toLong())
         }
+        check(sinkView.mutations.get() == 0L) {
+            "queueing 500 messages must mutate no cell, got ${sinkView.mutations.get()}"
+        }
         sink.flush()
-        check(sinkInserts == 1) { "500 messages must be ONE document insert, got $sinkInserts" }
-        check(sink.offsetOf(1L) != null && sink.offsetOf(500L) != null) { "message offsets" }
+        check(sinkView.mutations.get() == TRANSCRIPT_MESSAGES.toLong()) {
+            "one flush applies every keyed row: ${sinkView.mutations.get()}"
+        }
+        check(sink.locatedRow("mm:1") && sink.locatedRow("mm:500")) { "every row is located" }
         report["transcript.before.docInserts"] = naiveInserts.toString()
-        report["transcript.after.docInserts"] = sinkInserts.toString()
+        report["transcript.after.docInserts"] = "1 flush, ${sinkView.mutations.get()} cells"
 
         // ------------------------------------------------------ 1k-row list
         val model = DefaultListModel<Row>()
@@ -254,17 +258,17 @@ object EdtWorkHarness {
 
         // ---------------------------------------- 100k transcript paging
         // 100,000 durable messages loaded in 200-message pages through the
-        // PRODUCTION TranscriptSink (400k-char / 4k-line budget). Pages are
-        // folded in chronological order (older page first, oldest row first),
-        // which is the sink's render contract: a paged read must never make
-        // the host materialize the whole transcript, every page is one
-        // bounded flush, the document stays inside its budget, and the
-        // retained suffix is the NEWEST one.
+        // PRODUCTION TranscriptSink over the PRODUCTION TranscriptView
+        // (400k-char / 4k-line budget). Pages are folded in chronological
+        // order (older page first, oldest row first), which is the sink's
+        // render contract: a paged read must never make the host materialize
+        // the whole transcript, every page is one bounded flush, the view
+        // stays inside its budget, and the retained suffix is the NEWEST one.
         val totalMessages = 100_000
         val pageSize = 200
         val pageFill = "x".repeat(32)
-        val pageArea = JTextArea()
-        val pageSink = TranscriptSink(pageArea, null, UiWorkMetrics(), 400_000, 4_000)
+        val pageView = TranscriptView()
+        val pageSink = TranscriptSink(pageView, null, UiWorkMetrics(), 400_000, 4_000)
         var pages = 0
         var maxDocument = 0
         val pageStart = System.nanoTime()
@@ -274,19 +278,19 @@ object EdtWorkHarness {
                 pageSink.appendMessage("assistant", "message-$index $pageFill", index.toLong() + 1L)
             }
             pageSink.flush()
-            maxDocument = maxOf(maxDocument, pageArea.document.length)
-            check(pageArea.document.length <= 400_000) {
-                "transcript exceeded its char budget: ${pageArea.document.length}"
+            maxDocument = maxOf(maxDocument, pageSink.charCount)
+            check(pageSink.charCount <= 400_000) {
+                "transcript exceeded its char budget: ${pageSink.charCount}"
             }
-            check(pageArea.document.length > 0) { "page $page produced no document" }
+            check(pageView.rowCount() > 0) { "page $page produced no cells" }
             pages += 1
         }
         val pageElapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - pageStart)
         check(pages == totalMessages / pageSize) { "pages $pages" }
-        check(pageArea.text.trimEnd().endsWith("message-99999 $pageFill")) {
+        check(pageView.plainText().contains("message-99999 $pageFill")) {
             "newest message was not retained"
         }
-        check(!pageArea.text.contains("message-0 ")) { "the oldest message must be trimmed" }
+        check(!pageView.plainText().contains("message-0 ")) { "the oldest message must be trimmed" }
         check(pageElapsedMs < 300_000) { "100k paging took ${pageElapsedMs}ms" }
         report["scale.messages"] = totalMessages.toString()
         report["scale.pages"] = pages.toString()
@@ -297,9 +301,9 @@ object EdtWorkHarness {
         // 16 concurrent session sinks: no cross-session bleed, each bounded.
         val concurrentSessions = 16
         val perSession = 1_000
-        val areas = Array(concurrentSessions) { JTextArea() }
+        val views = Array(concurrentSessions) { TranscriptView() }
         val sinks = Array(concurrentSessions) { session ->
-            TranscriptSink(areas[session], null, UiWorkMetrics(), 64_000, 1_000)
+            TranscriptSink(views[session], null, UiWorkMetrics(), 64_000, 1_000)
         }
         val concurrentStart = System.nanoTime()
         for (round in 0 until perSession) {
@@ -311,16 +315,17 @@ object EdtWorkHarness {
         sinks.forEach { it.flush() }
         val concurrentElapsedMs =
             TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - concurrentStart)
-        areas.forEachIndexed { session, area ->
-            check(area.document.length <= 64_000) {
-                "session $session exceeded its budget: ${area.document.length}"
+        views.forEachIndexed { session, view ->
+            check(sinks[session].charCount <= 64_000) {
+                "session $session exceeded its budget: ${sinks[session].charCount}"
             }
-            check(area.text.contains("s$session-delta-${perSession - 1}")) {
+            val text = view.plainText()
+            check(text.contains("s$session-delta-${perSession - 1}")) {
                 "session $session lost its newest delta"
             }
             for (other in 0 until concurrentSessions) {
                 if (other != session) {
-                    check(!area.text.contains("s$other-delta-")) {
+                    check(!text.contains("s$other-delta-")) {
                         "session $session saw session $other's deltas"
                     }
                 }
@@ -484,11 +489,8 @@ object EdtWorkHarness {
     private fun follows(pin: ScrollPin): Boolean = pin.isPinned
 
     private fun coalescedStream(tokens: Int, perSecond: Int): VirtualCounts {
-        val area = JTextArea()
-        var inserts = 0
-        area.document.addDocumentListener(insertCounter { inserts++ })
-        val metrics = UiWorkMetrics()
-        val sink = TranscriptSink(area, null, metrics, 2_000_000, 20_000)
+        val view = TranscriptView()
+        val sink = TranscriptSink(view, null, UiWorkMetrics(), 2_000_000, 20_000)
         val deltaMs = 1_000L / perSecond
         var now = 0L
         var flushAt = VIRTUAL_FLUSH_MS.toLong()
@@ -509,6 +511,9 @@ object EdtWorkHarness {
             sink.flush()
             flushes++
         }
+        // ONE notice cell per flush (the consecutive raw run contract): the
+        // component view never does per-delta work.
+        val inserts = view.mutations.get().toInt()
         val durationMs = tokens.toLong() * 1_000L / perSecond
         val slowRefreshes = (durationMs / UI_REFRESH_INTERVAL_MS).toInt()
         return VirtualCounts(flushes, inserts, flushes, slowRefreshes)

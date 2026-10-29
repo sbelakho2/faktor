@@ -45,7 +45,6 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
-import javax.swing.JTextArea
 
 object NativeLiveStreamSmoke {
     private const val INSTANCE_A = "aaaaaaaaaaaaaaaa"
@@ -160,7 +159,7 @@ object NativeLiveStreamSmoke {
             )
             panel.flushLiveForTest()
             val text = panel.transcriptTextForTest()
-            check(text.contains("assistant: First token"), "live text before durable flush: $text")
+            check(text.contains("Faktor: First token"), "live text before durable flush: $text")
         }
     }
 
@@ -187,14 +186,14 @@ object NativeLiveStreamSmoke {
                 LiveOutputMessage.Chunk(frame(42, "text", 2, 2, 5, " wo"))
             )
             panel.flushLiveForTest()
-            check(panel.transcriptTextForTest().contains("assistant: Hello wo"))
+            check(panel.transcriptTextForTest().contains("Faktor: Hello wo"))
 
             // A reordered stale frame (old revision): dropped.
             panel.onLiveMessageForTest(
                 LiveOutputMessage.Chunk(frame(42, "text", 3, 1, 0, "Hello"))
             )
             panel.flushLiveForTest()
-            check(panel.transcriptTextForTest().contains("assistant: Hello wo"))
+            check(panel.transcriptTextForTest().contains("Faktor: Hello wo"))
 
             // OMITTED range: revision jumps 2 → 5 and the offset jumps.
             panel.onLiveMessageForTest(
@@ -202,12 +201,12 @@ object NativeLiveStreamSmoke {
             )
             panel.flushLiveForTest()
             check(panel.liveGapSignalsForTest() >= 1, "an offset/revision gap requests resync")
-            check(panel.transcriptTextForTest().contains("assistant: Hello wo"))
+            check(panel.transcriptTextForTest().contains("Faktor: Hello wo"))
             check(!panel.transcriptTextForTest().contains("lost"), "a gap never fabricates text")
 
             // The authoritative snapshot (fetched by the panel resync) lands.
             await("resync snapshot reconciles") {
-                panel.transcriptTextForTest().contains("assistant: Hello world from")
+                panel.transcriptTextForTest().contains("Faktor: Hello world from")
             }
             check(!panel.transcriptTextForTest().contains("Hello woHello"), "no duplicate text")
 
@@ -217,7 +216,7 @@ object NativeLiveStreamSmoke {
             )
             panel.flushLiveForTest()
             check(
-                panel.transcriptTextForTest().contains("assistant: Hello world from the server"),
+                panel.transcriptTextForTest().contains("Faktor: Hello world from the server"),
                 panel.transcriptTextForTest()
             )
             check(panel.liveDuplicatesDroppedForTest() >= 2, "duplicate/replay frames were dropped")
@@ -238,7 +237,7 @@ object NativeLiveStreamSmoke {
             )
             panel.flushLiveForTest()
             check(panel.liveForeignDroppedForTest() == 1L, "foreign-instance frame dropped")
-            check(panel.transcriptTextForTest().contains("assistant: base"))
+            check(panel.transcriptTextForTest().contains("Faktor: base"))
             check(!panel.transcriptTextForTest().contains("from-an-old-daemon"))
 
             // The restarted daemon is adopted through ITS snapshot.
@@ -249,7 +248,7 @@ object NativeLiveStreamSmoke {
                 LiveOutputMessage.Chunk(frame(42, "text", 1, 1, 4, " after-restart", INSTANCE_B))
             )
             panel.flushLiveForTest()
-            check(panel.transcriptTextForTest().contains("assistant: base after-restart"))
+            check(panel.transcriptTextForTest().contains("Faktor: base after-restart"))
         }
     }
 
@@ -292,13 +291,13 @@ object NativeLiveStreamSmoke {
                 )
             )
             panel.flushLiveForTest()
-            check(panel.transcriptTextForTest().contains("assistant: Hello world"))
+            check(panel.transcriptTextForTest().contains("Faktor: Hello world"))
             check(!panel.transcriptTextForTest().contains("HelloHello"))
             panel.onLiveMessageForTest(
                 LiveOutputMessage.Chunk(frame(42, "text", 61, 6, 11, "!"))
             )
             panel.flushLiveForTest()
-            check(panel.transcriptTextForTest().contains("assistant: Hello world!"))
+            check(panel.transcriptTextForTest().contains("Faktor: Hello world!"))
         }
     }
 
@@ -311,7 +310,7 @@ object NativeLiveStreamSmoke {
                 LiveOutputMessage.Chunk(frame(42, "text", 1, 1, 0, "partial reply"))
             )
             panel.flushLiveForTest()
-            check(panel.transcriptTextForTest().contains("assistant: partial reply"))
+            check(panel.transcriptTextForTest().contains("Faktor: partial reply"))
             panel.dispatchTurnForTest(TurnEvent.Submit(TurnSource.ASK))
             panel.dispatchTurnForTest(TurnEvent.Receipt("op-1", null, queued = false))
             panel.dispatchTurnForTest(TurnEvent.Machine("streaming", "op-1"))
@@ -325,7 +324,7 @@ object NativeLiveStreamSmoke {
             }
             check(panel.workStateChipTextForTest() == "Stopped")
             check(
-                panel.transcriptTextForTest().contains("assistant: partial reply"),
+                panel.transcriptTextForTest().contains("Faktor: partial reply"),
                 "partial text is kept after Stop, never silently deleted"
             )
             check(!daemon.abortBodies.any { it.contains("op-2") })
@@ -352,8 +351,8 @@ object NativeLiveStreamSmoke {
     // ----------------------------------------------------- ordered tool parts
 
     fun orderedToolRowSitsBetweenTextRows() {
-        val area = JTextArea()
-        val sink = TranscriptSink(area, null, UiWorkMetrics(), 100_000, 2_000)
+        val view = TranscriptView()
+        val sink = TranscriptSink(view, null, UiWorkMetrics(), 100_000, 2_000)
         val model = TranscriptModel()
         applyModelOps(model.upsertDurable(listOf(message(1, 1, "user", "go")), { false }), sink)
         applyModelOps(model.upsertDurable(listOf(message(2, 2, "assistant", "")), { false }), sink)
@@ -364,13 +363,13 @@ object NativeLiveStreamSmoke {
         // A later durable message must land AFTER the tool row (the tool sits
         // between the two text rows, in stream order).
         applyModelOps(
-            model.upsertDurable(listOf(message(3, 3, "assistant", "next")), { sink.locatedRow(it.render()) }),
+            model.upsertDurable(listOf(message(3, 3, "assistant", "next"))) { sink.locatedRow(it.render()) },
             sink
         )
         sink.flush()
-        val text = area.text
+        val text = view.plainText()
         val toolAt = text.indexOf("[tool]")
-        val nextAt = text.indexOf("assistant: next")
+        val nextAt = text.indexOf("next")
         check(toolAt >= 0, "tool row rendered: $text")
         check(nextAt > toolAt, "tool row sits between text rows: $text")
     }
@@ -378,15 +377,45 @@ object NativeLiveStreamSmoke {
     // -------------------------------------------------------------- markdown
 
     fun assistantMarkdownStaysPlainStructuralText() {
-        val formatted = AssistantMarkdown.format("# Title\n- one\n> quote\n```kotlin\nval x = 1\n```\n**bold** and `code`")
-        check(formatted.startsWith("▸ Title"), formatted)
-        check(formatted.contains("• one"), formatted)
-        check(formatted.contains("│ quote"), formatted)
-        check(formatted.contains("┌─ code (kotlin)"), formatted)
-        check(formatted.contains("│ val x = 1"), formatted)
-        check(!formatted.contains("<"), "no HTML is ever produced: $formatted")
-        check(!formatted.contains("**"), "emphasis markers are stripped: $formatted")
-        check(formatted.contains("bold and code"), formatted)
+        // The rich parser: structure is first-class, hostile text is only
+        // ever characters, and unsafe link schemes can never become links.
+        val blocks = RichMarkdown.parse(
+            "# Title\n- one\n> quote\n```kotlin\nval x = 1\n```\n**bold** and `code`"
+        )
+        val kinds = blocks.map { it::class.java.simpleName }
+        check(
+            kinds == listOf("Heading", "BulletList", "Quote", "Code", "Paragraph"),
+            "block sequence: $kinds"
+        )
+        val paragraph = blocks.last() as MarkdownBlock.Paragraph
+        check(paragraph.plainText() == "bold and code", paragraph.plainText())
+        check(
+            paragraph.spans.any { it is InlineSpan.Strong } &&
+                paragraph.spans.any { it is InlineSpan.CodeSpan },
+            "inline styles survive the parse: ${paragraph.spans}"
+        )
+        val code = blocks[3] as MarkdownBlock.Code
+        check(code.language == "kotlin" && code.code == "val x = 1", "$code")
+        val allText = blocks.joinToString("\n") { it.plainText() }
+        check(!allText.contains("<html"), "no HTML is ever produced: $allText")
+
+        // Unsafe schemes NEVER become links (nothing clickable, URL visible).
+        val hostile = RichMarkdown.parse(
+            "[run](javascript:alert(1)) [x](ide://command) [f](file:///etc/passwd)"
+        )
+        val links = hostile.flatMap { block ->
+            when (block) {
+                is MarkdownBlock.Paragraph -> block.spans.filterIsInstance<InlineSpan.Link>()
+                else -> emptyList()
+            }
+        }
+        check(links.isEmpty(), "unsafe schemes must never become links: $links")
+        check(RichMarkdown.safeUrl("https://example.com") != null)
+        check(RichMarkdown.safeUrl("mailto:dev@example.com") != null)
+        check(RichMarkdown.safeUrl("javascript:alert(1)") == null)
+        check(RichMarkdown.safeUrl("file:///etc/passwd") == null)
+        check(RichMarkdown.safeUrl("ide://run-command") == null)
+        check(RichMarkdown.safeUrl("data:text/html,<script>") == null)
     }
 
     // --------------------------------------------------------- live client
@@ -601,10 +630,10 @@ object NativeLiveStreamSmoke {
         for (op in ops) {
             when (op) {
                 is TranscriptRowOp.Upsert -> sink.upsertRow(
-                    op.key.render(), op.line + "\n", op.beforeKey?.render()
+                    op.key.render(), op.payload, op.beforeKey?.render()
                 )
                 is TranscriptRowOp.Rekey -> sink.rekeyRow(
-                    op.key.render(), op.newKey.render(), op.line + "\n", op.beforeKey?.render()
+                    op.key.render(), op.newKey.render(), op.payload, op.beforeKey?.render()
                 )
             }
         }

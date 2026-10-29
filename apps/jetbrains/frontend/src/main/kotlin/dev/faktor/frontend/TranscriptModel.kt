@@ -22,6 +22,17 @@
 //    IDENTITY (same role + same text), never by duplication: the provisional
 //    row MOVES to the durable row's ordered position under the durable key.
 //
+// Turn grouping (one Faktor turn presentation per logical turn):
+//  - the live projection carries a `turn` (op) id on every frame/snapshot
+//    part; a run of consecutive assistant rows SHARES one group, and a
+//    known turn id SUBDIVIDES the run (rows of turn op-1 vs op-2 are two
+//    turns even without an intervening user row);
+//  - the durable projection (NativeMessage) carries NO turn field, so the
+//    documented FALLBACK is role-run grouping: a maximal run of consecutive
+//    assistant rows (ordered by seq, live overlay merged) is ONE turn; any
+//    intervening user row starts a new turn. Group ids derive from the
+//    first row of the run, so an unchanged topology never churns payloads.
+//
 // Rendering is the sink's job (TranscriptSink row ops); this model only
 // computes the ordered rows and the minimal diff ops. EDT-only: the panel
 // mutates it from EDT apply blocks.
@@ -54,7 +65,8 @@ internal fun liveUtf8Length(text: String): Long {
 /**
  * One live part lineage. [bytes] is the running UTF-8 length of [text] —
  * offsets are NEVER UTF-16 indices; [attempt] pins the snapshot lineage and
- * [revision] is the per-part publish counter.
+ * [revision] is the per-part publish counter. [turn] is the live op id the
+ * part belongs to (grouping authority while the stream is hot).
  */
 internal data class LivePartState(
     val messageId: Long,
@@ -63,7 +75,8 @@ internal data class LivePartState(
     val bytes: Long,
     val attempt: Int?,
     val revision: Long,
-    val sequence: Long
+    val sequence: Long,
+    val turn: String? = null
 )
 
 /** One ordered discrete (tool) part row rendered between text rows. */
@@ -71,7 +84,8 @@ internal data class LiveToolSegment(
     val messageId: Long,
     val kind: String,
     val sequence: Long,
-    val content: String
+    val content: String,
+    val turn: String? = null
 )
 
 /** The stable identity of one transcript row. */
@@ -98,24 +112,19 @@ internal data class TranscriptRow(
      * durable row and never take part in seq ordering. */
     val seq: Long,
     /** The durable role ("user"/"assistant"/...); provisional rows render
-     * as the optimistic "you:" line. */
+     * as the optimistic "You" line. */
     val role: String,
     val text: String,
-    val revision: Long
+    val revision: Long,
+    /** The live turn (op) id when the row was observed through the stream. */
+    val turn: String? = null
 ) {
-    /** The exact rendered line (without the trailing newline). */
-    val line: String
-        get() = if (key.kind == TranscriptRowKey.KIND_PROVISIONAL) {
-            "you: $text"
-        } else {
-            // Assistant prose gets lightweight, host-appropriate structure
-            // (headings/lists/code blocks) in plain text — never HTML.
-            val shown = if (role == "assistant") AssistantMarkdown.format(text) else text
-            "$role: $shown"
-        }
-
     companion object {
         const val PROVISIONAL_ROLE = "you"
+
+        /** The effective speaker role (the provisional row is a user line). */
+        fun speakerOf(role: String): String =
+            if (role == PROVISIONAL_ROLE) "user" else role
     }
 }
 
@@ -129,11 +138,11 @@ internal fun contentRevision(text: String): Long = text.length.toLong()
 
 /**
  * One render instruction for the sink:
- *  - [Upsert]: render [line] for [key] — replace in place when the row is
- *    currently rendered, insert before [beforeKey] (null = document end)
+ *  - [Upsert]: render [payload] for [key] — replace in place when the row
+ *    is currently rendered, insert before [beforeKey] (null = document end)
  *    when it is not (a new row, or a row whose text just became non-empty);
  *  - [Rekey]: the provisional row [key] becomes the durable row [newKey]
- *    with [line], repositioned to the durable ordered position (the sink
+ *    with [payload], repositioned to the durable ordered position (the sink
  *    removes the old range and inserts at the resolved anchor).
  */
 internal sealed class TranscriptRowOp {
@@ -141,14 +150,14 @@ internal sealed class TranscriptRowOp {
 
     data class Upsert(
         override val key: TranscriptRowKey,
-        val line: String,
+        val payload: TranscriptRowPayload,
         val beforeKey: TranscriptRowKey?
     ) : TranscriptRowOp()
 
     data class Rekey(
         override val key: TranscriptRowKey,
         val newKey: TranscriptRowKey,
-        val line: String,
+        val payload: TranscriptRowPayload,
         val beforeKey: TranscriptRowKey?
     ) : TranscriptRowOp()
 }
@@ -165,6 +174,9 @@ internal class TranscriptModel {
 
     /** Ordered row keys: durable rows by (seq, id), provisional last. */
     private val order = ArrayList<TranscriptRowKey>()
+
+    /** The last payload emitted per key (the minimal-diff baseline). */
+    private val emitted = HashMap<TranscriptRowKey, TranscriptRowPayload>()
 
     /** Stale-snapshot refusals (the revision guard), for smoke observability. */
     var revisionGuardHits: Long = 0
@@ -198,6 +210,9 @@ internal class TranscriptModel {
     var liveGapSignals: Long = 0
         private set
 
+    /** The turn group of the newest observed assistant part (approval parts). */
+    private var lastAssistantGroup: String? = null
+
     /** The explicit resync signal: the caller fetches the authoritative snapshot. */
     var liveGapListener: ((String) -> Unit)? = null
         private set
@@ -209,7 +224,9 @@ internal class TranscriptModel {
     fun reset() {
         rows.clear()
         order.clear()
+        emitted.clear()
         revisionGuardHits = 0
+        lastAssistantGroup = null
         resetLive()
     }
 
@@ -261,7 +278,7 @@ internal class TranscriptModel {
             // Discrete kinds (tool payloads) render as their own ordered row.
             val toolKey = liveKey(frame.messageId, "$kind@${frame.sequence}")
             liveTools[toolKey] = LiveToolSegment(
-                frame.messageId, kind, frame.sequence, frame.content
+                frame.messageId, kind, frame.sequence, frame.content, frame.turn
             )
             // Bounded: a hostile tool-frame flood evicts the oldest rows.
             while (liveTools.size > MAX_LIVE_TOOL_ROWS) {
@@ -283,7 +300,8 @@ internal class TranscriptModel {
                 bytes = liveUtf8Length(base),
                 attempt = null,
                 revision = -1,
-                sequence = frame.sequence
+                sequence = frame.sequence,
+                turn = frame.turn
             )
             liveParts[key] = part
             boundLiveParts()
@@ -295,25 +313,29 @@ internal class TranscriptModel {
             requestGap(key)
             return false
         }
-        if (part.attempt == null) part = part.copy(attempt = frame.attempt)
-        if (frame.revision <= part.revision) {
+        var accepted = part
+        if (part.attempt == null) accepted = accepted.copy(attempt = frame.attempt)
+        if (accepted.turn == null && frame.turn != null) {
+            accepted = accepted.copy(turn = frame.turn)
+        }
+        if (frame.revision <= accepted.revision) {
             // Duplicate/replayed frame: dropped before any visible work.
             liveDuplicatesDropped += 1
             return false
         }
-        if (part.revision >= 0 && frame.revision > part.revision + 1) {
+        if (accepted.revision >= 0 && frame.revision > accepted.revision + 1) {
             requestGap(key)
             return false
         }
         val contentBytes = liveUtf8Length(frame.content)
-        if (frame.offset > part.bytes) {
+        if (frame.offset > accepted.bytes) {
             requestGap(key)
             return false
         }
-        if (frame.offset < part.bytes) {
-            if (frame.offset + contentBytes <= part.bytes) {
+        if (frame.offset < accepted.bytes) {
+            if (frame.offset + contentBytes <= accepted.bytes) {
                 // Fully held already (the duplicate covers only known bytes).
-                liveParts[key] = part.copy(revision = frame.revision)
+                liveParts[key] = accepted.copy(revision = frame.revision)
                 liveDuplicatesDropped += 1
                 return false
             }
@@ -322,13 +344,12 @@ internal class TranscriptModel {
         }
         // Whole code points: append the content string and advance the BYTE
         // counter by that content's UTF-8 length (never a UTF-16 index).
-        val advanced = part.copy(
-            text = part.text + frame.content,
-            bytes = part.bytes + contentBytes,
+        liveParts[key] = accepted.copy(
+            text = accepted.text + frame.content,
+            bytes = accepted.bytes + contentBytes,
             revision = frame.revision,
             sequence = frame.sequence
         )
-        liveParts[key] = advanced
         return true
     }
 
@@ -359,7 +380,7 @@ internal class TranscriptModel {
                 if (snapBytes > 0) {
                     liveParts[key] = LivePartState(
                         part.messageId, kind, snapText, snapBytes,
-                        part.attempt, part.revision, snapshot.sequence
+                        part.attempt, part.revision, snapshot.sequence, part.turn
                     )
                     boundLiveParts()
                 }
@@ -372,7 +393,8 @@ internal class TranscriptModel {
                         text = snapText,
                         bytes = snapBytes,
                         attempt = part.attempt,
-                        sequence = snapshot.sequence
+                        sequence = snapshot.sequence,
+                        turn = part.turn ?: held.turn
                     )
                 }
                 held.text.startsWith(snapText) -> {
@@ -386,7 +408,8 @@ internal class TranscriptModel {
                         text = snapText,
                         bytes = snapBytes,
                         attempt = null,
-                        sequence = snapshot.sequence
+                        sequence = snapshot.sequence,
+                        turn = part.turn ?: held.turn
                     )
                 }
             }
@@ -433,8 +456,11 @@ internal class TranscriptModel {
                 if (row.text != part.text) {
                     out[index] = row.copy(
                         text = part.text,
-                        revision = maxOf(row.revision, contentRevision(part.text))
+                        revision = maxOf(row.revision, contentRevision(part.text)),
+                        turn = part.turn ?: row.turn
                     )
+                } else if (part.turn != null && row.turn == null) {
+                    out[index] = row.copy(turn = part.turn)
                 }
             } else {
                 out.add(
@@ -443,7 +469,8 @@ internal class TranscriptModel {
                         LIVE_ROW_SEQ_BASE + part.messageId,
                         "assistant",
                         part.text,
-                        contentRevision(part.text)
+                        contentRevision(part.text),
+                        part.turn
                     )
                 )
             }
@@ -453,46 +480,211 @@ internal class TranscriptModel {
 
     /**
      * Render ops for the live overlay: one in-place update per row whose
-     * visible text advanced, plus the ordered discrete (tool) rows. The sink
-     * no-ops an unchanged line, so a quiet flush performs no DOM work.
+     * merged payload moved (text OR turn group), plus the ordered discrete
+     * (tool) rows. The sink no-ops an unchanged payload, so a quiet flush
+     * performs no DOM work.
      */
-    fun liveOps(): List<TranscriptRowOp> {
-        reconcileLiveWithDurable()
-        val base = rows().associateBy { it.key }
-        val merged = rowsWithLive()
-        val ops = ArrayList<TranscriptRowOp>()
-        for (row in merged) {
-            val previous = base[row.key]
-            if (previous == null || previous.line != row.line) {
-                ops.add(TranscriptRowOp.Upsert(row.key, row.line, null))
+    fun liveOps(): List<TranscriptRowOp> = emitChanged({ emitted.containsKey(it) })
+
+    /**
+     * Fold one durable message page into the model. Rows are processed in
+     * seq order; for each message:
+     *  - an EXISTING id updates its content when the incoming revision is
+     *    not lower (seq never gates the update — that was the P0 defect);
+     *  - a user message first reconciles any matching optimistic row by
+     *    identity (same text), rekeying it to the durable id instead of a
+     *    duplicate row;
+     *  - a NEW id inserts at its seq-ordered position (out-of-order arrivals
+     *    converge to the same order).
+     * [located] reports whether a row key is currently rendered in the
+     * document, so insertion anchors skip not-yet-rendered rows.
+     */
+    fun upsertDurable(
+        messages: List<NativeMessage>,
+        located: (TranscriptRowKey) -> Boolean
+    ): List<TranscriptRowOp> {
+        val rekeys = ArrayList<Pair<TranscriptRowKey, TranscriptRowKey>>()
+        val sorted = messages.sortedWith(compareBy({ it.seq }, { it.id }))
+        for (message in sorted) {
+            val key = TranscriptRowKey.durable(message.id)
+            val revision = contentRevision(message.text)
+            val existing = rows[key]
+            if (existing != null) {
+                if (revision < existing.revision) {
+                    revisionGuardHits += 1
+                    continue
+                }
+                if (existing.text == message.text && existing.role == message.role) continue
+                rows[key] = existing.copy(
+                    seq = message.seq,
+                    role = message.role,
+                    text = message.text,
+                    revision = revision
+                )
+                continue
             }
+            // Reconcile the optimistic user line by identity BEFORE inserting
+            // a durable twin: one row, never two.
+            val provisionalKey = if (message.role == "user") {
+                order.firstOrNull { candidate ->
+                    val row = rows[candidate] ?: return@firstOrNull false
+                    row.key.kind == TranscriptRowKey.KIND_PROVISIONAL &&
+                        row.text.trim() == message.text.trim()
+                }
+            } else {
+                null
+            }
+            val row = TranscriptRow(key, message.seq, message.role, message.text, revision)
+            val insertAt = orderedInsertIndex(row)
+            if (provisionalKey != null) {
+                // The provisional slot is at or after insertAt (provisional
+                // rows sort last), so removing it first keeps insertAt valid.
+                rows.remove(provisionalKey)
+                order.remove(provisionalKey)
+                emitted.remove(provisionalKey)
+                rows[key] = row
+                order.add(insertAt, key)
+                rekeys.add(provisionalKey to key)
+                continue
+            }
+            rows[key] = row
+            order.add(insertAt, key)
         }
-        for (tool in liveTools.values.sortedBy { it.sequence }) {
-            val key = TranscriptRowKey(LIVE_TOOL_KIND, "${tool.messageId}:${tool.kind}@${tool.sequence}")
+        return emitChanged(located, rekeys)
+    }
+
+    /**
+     * The minimal op set for the CURRENT visible state: every row whose
+     * payload (text, role, or turn group) differs from the last emitted one,
+     * plus the recorded provisional rekeys. Group ids are computed over the
+     * merged durable+live order in ONE pass, so a run split by an arriving
+     * user row or a turn change re-emits exactly the affected rows.
+     */
+    private fun emitChanged(
+        located: (TranscriptRowKey) -> Boolean,
+        rekeys: List<Pair<TranscriptRowKey, TranscriptRowKey>> = emptyList()
+    ): List<TranscriptRowOp> {
+        val visible = rowsWithLive()
+        val groups = computeGroups(visible)
+        lastAssistantGroup = visible.lastOrNull {
+            TranscriptRow.speakerOf(it.role) == "assistant"
+        }?.let { groups[it.key] }
+        val ops = ArrayList<TranscriptRowOp>()
+        val rekeyed = HashSet<TranscriptRowKey>()
+        for ((oldKey, newKey) in rekeys) {
+            emitted.remove(oldKey)
+            val index = visible.indexOfFirst { it.key == newKey }
+            if (index < 0) continue
+            val row = visible[index]
+            if (row.text.isEmpty()) continue
+            val payload = payloadOf(row, groups[newKey] ?: fallbackGroup(newKey))
+            emitted[newKey] = payload
+            rekeyed.add(newKey)
             ops.add(
-                TranscriptRowOp.Upsert(
-                    key,
-                    "[" + tool.kind + "] " + tool.content,
-                    null
+                TranscriptRowOp.Rekey(
+                    oldKey, newKey, payload,
+                    nextLocatedKey(visible, index, located)
                 )
             )
+        }
+        for ((index, row) in visible.withIndex()) {
+            if (row.key in rekeyed || row.text.isEmpty()) continue
+            val payload = payloadOf(row, groups[row.key] ?: fallbackGroup(row.key))
+            if (emitted[row.key] == payload) continue
+            emitted[row.key] = payload
+            ops.add(
+                TranscriptRowOp.Upsert(row.key, payload, nextLocatedKey(visible, index, located))
+            )
+        }
+        for (tool in liveTools.values.sortedBy { it.sequence }) {
+            val key = TranscriptRowKey(
+                LIVE_TOOL_KIND, "${tool.messageId}:${tool.kind}@${tool.sequence}"
+            )
+            val payload = TranscriptRowPayload(
+                kind = TranscriptRowPayload.KIND_TOOL,
+                text = tool.content,
+                seq = tool.sequence,
+                rowId = tool.messageId.toString(),
+                group = groups[TranscriptRowKey.durable(tool.messageId)] ?: "",
+                label = tool.kind
+            )
+            if (emitted[key] == payload) continue
+            emitted[key] = payload
+            ops.add(TranscriptRowOp.Upsert(key, payload, null))
         }
         return ops
     }
 
+    /** The render payload of one row inside its turn group. */
+    private fun payloadOf(row: TranscriptRow, group: String): TranscriptRowPayload =
+        when (TranscriptRow.speakerOf(row.role)) {
+            "assistant" -> TranscriptRowPayload(
+                TranscriptRowPayload.KIND_ASSISTANT, row.text, row.seq, row.key.id, group
+            )
+            "user" -> TranscriptRowPayload(
+                TranscriptRowPayload.KIND_USER, row.text,
+                if (row.key.kind == TranscriptRowKey.KIND_PROVISIONAL) -1 else row.seq,
+                row.key.id, group
+            )
+            else -> TranscriptRowPayload(
+                row.role, row.text, row.seq, row.key.id, group
+            )
+        }
+
+    private fun fallbackGroup(key: TranscriptRowKey): String = "g:${key.kind}:${key.id}"
+
+    /**
+     * Turn groups over the merged visible order (documented fallback when
+     * the projection carries no turn id — see the file header):
+     *  - non-assistant rows always start their own group;
+     *  - consecutive assistant rows continue the current run unless BOTH
+     *    the current and the previous row carry KNOWN, DIFFERENT turn ids;
+     *  - a group id derives from the FIRST row of its run, so an unchanged
+     *    topology produces byte-identical payloads (no render churn).
+     */
+    private fun computeGroups(visible: List<TranscriptRow>): Map<TranscriptRowKey, String> {
+        val groups = HashMap<TranscriptRowKey, String>(visible.size)
+        var currentGroup: String? = null
+        var currentAssistant = false
+        var currentTurn: String? = null
+        for (row in visible) {
+            val isAssistant = TranscriptRow.speakerOf(row.role) == "assistant"
+            val continues = isAssistant && currentAssistant &&
+                (row.turn == null || currentTurn == null || row.turn == currentTurn)
+            if (!continues) {
+                currentGroup = fallbackGroup(row.key)
+                currentTurn = null
+            }
+            if (isAssistant && row.turn != null) currentTurn = row.turn
+            currentAssistant = isAssistant
+            groups[row.key] = currentGroup!!
+        }
+        return groups
+    }
+
+    /**
+     * The nearest RENDERED row key after [fromIndex] (the insertion anchor);
+     * null means "append at the document end". Rows with empty text (reserved
+     * but not rendered) and rows lost to the transcript trim are skipped, so
+     * an insert always lands at a real document position.
+     */
+    private fun nextLocatedKey(
+        visible: List<TranscriptRow>,
+        fromIndex: Int,
+        located: (TranscriptRowKey) -> Boolean
+    ): TranscriptRowKey? {
+        for (index in (fromIndex + 1) until visible.size) {
+            if (visible[index].text.isEmpty()) continue
+            if (located(visible[index].key)) return visible[index].key
+        }
+        return null
+    }
+
+    /** The turn group of the newest observed assistant part (null = none). */
+    fun currentAssistantGroup(): String? = lastAssistantGroup
+
     /** Bounded live-overlay diagnostics for the smoke/tests. */
     fun livePartsForTest(): Map<String, LivePartState> = LinkedHashMap(liveParts)
-
-    companion object {
-        /** Synthetic live rows sort after durable rows (by message id). */
-        private const val LIVE_ROW_SEQ_BASE = Long.MAX_VALUE / 2
-
-        const val LIVE_TOOL_KIND = "lt"
-
-        /** Hard bounds of the part-keyed live overlay (bounded everything). */
-        const val MAX_LIVE_PARTS = 512
-        const val MAX_LIVE_TOOL_ROWS = 256
-    }
 
     /** The ordered rows (durable first by seq, provisional last). */
     fun rows(): List<TranscriptRow> = order.mapNotNull { rows[it] }
@@ -518,97 +710,15 @@ internal class TranscriptModel {
             }
             if (existing.text == text) return null
             rows[key] = existing.copy(text = text, revision = revision)
-            return TranscriptRowOp.Upsert(key, "you: $text", null)
+        } else {
+            rows[key] = TranscriptRow(
+                key, Long.MAX_VALUE, TranscriptRow.PROVISIONAL_ROLE, text, revision
+            )
+            order.add(key)
         }
-        rows[key] = TranscriptRow(key, Long.MAX_VALUE, TranscriptRow.PROVISIONAL_ROLE, text, revision)
-        order.add(key)
-        return TranscriptRowOp.Upsert(key, "you: $text", null)
-    }
-
-    /**
-     * Fold one durable message page into the model. Rows are processed in
-     * seq order; for each message:
-     *  - an EXISTING id updates its content when the incoming revision is
-     *    not lower (seq never gates the update — that was the P0 defect);
-     *  - a user message first reconciles any matching optimistic row by
-     *    identity (same text), rekeying it to the durable id instead of a
-     *    duplicate row;
-     *  - a NEW id inserts at its seq-ordered position (out-of-order arrivals
-     *    converge to the same order).
-     * [located] reports whether a row key is currently rendered in the
-     * document, so insertion anchors skip not-yet-rendered rows.
-     */
-    fun upsertDurable(
-        messages: List<NativeMessage>,
-        located: (TranscriptRowKey) -> Boolean
-    ): List<TranscriptRowOp> {
-        val ops = ArrayList<TranscriptRowOp>()
-        val sorted = messages.sortedWith(compareBy({ it.seq }, { it.id }))
-        for (message in sorted) {
-            val key = TranscriptRowKey.durable(message.id)
-            val revision = contentRevision(message.text)
-            val existing = rows[key]
-            if (existing != null) {
-                if (revision < existing.revision) {
-                    revisionGuardHits += 1
-                    continue
-                }
-                if (existing.text == message.text && existing.role == message.role) continue
-                val updated = existing.copy(
-                    seq = message.seq,
-                    role = message.role,
-                    text = message.text,
-                    revision = revision
-                )
-                rows[key] = updated
-                if (updated.text.isEmpty()) continue
-                ops.add(
-                    TranscriptRowOp.Upsert(
-                        key, updated.line,
-                        nextLocatedKey(order.indexOf(key), located)
-                    )
-                )
-                continue
-            }
-            // Reconcile the optimistic user line by identity BEFORE inserting
-            // a durable twin: one row, never two.
-            val provisionalKey = if (message.role == "user") {
-                order.firstOrNull { candidate ->
-                    val row = rows[candidate] ?: return@firstOrNull false
-                    row.key.kind == TranscriptRowKey.KIND_PROVISIONAL &&
-                        row.text.trim() == message.text.trim()
-                }
-            } else {
-                null
-            }
-            val row = TranscriptRow(key, message.seq, message.role, message.text, revision)
-            val insertAt = orderedInsertIndex(row)
-            if (provisionalKey != null) {
-                // The provisional slot is at or after insertAt (provisional
-                // rows sort last), so removing it first keeps insertAt valid.
-                rows.remove(provisionalKey)
-                order.remove(provisionalKey)
-                rows[key] = row
-                order.add(insertAt, key)
-                if (row.text.isNotEmpty()) {
-                    ops.add(
-                        TranscriptRowOp.Rekey(
-                            provisionalKey, key, row.line,
-                            nextLocatedKey(order.indexOf(key), located)
-                        )
-                    )
-                }
-                continue
-            }
-            rows[key] = row
-            order.add(insertAt, key)
-            if (row.text.isNotEmpty()) {
-                ops.add(
-                    TranscriptRowOp.Upsert(key, row.line, nextLocatedKey(insertAt, located))
-                )
-            }
-        }
-        return ops
+        val payload = payloadOf(rows[key]!!, fallbackGroup(key))
+        emitted[key] = payload
+        return TranscriptRowOp.Upsert(key, payload, null)
     }
 
     /** The sorted insertion index of a new durable row. */
@@ -623,20 +733,14 @@ internal class TranscriptModel {
         return order.size
     }
 
-    /**
-     * The nearest row key after [fromIndex] that is currently RENDERED in
-     * the document (the insertion anchor); null means "append at the
-     * document end". Rows with empty text (reserved but not rendered) and
-     * rows lost to the transcript trim are skipped, so an insert always
-     * lands at a real document position.
-     */
-    private fun nextLocatedKey(
-        fromIndex: Int,
-        located: (TranscriptRowKey) -> Boolean
-    ): TranscriptRowKey? {
-        for (index in (fromIndex + 1) until order.size) {
-            if (located(order[index])) return order[index]
-        }
-        return null
+    companion object {
+        /** Synthetic live rows sort after durable rows (by message id). */
+        private const val LIVE_ROW_SEQ_BASE = Long.MAX_VALUE / 2
+
+        const val LIVE_TOOL_KIND = "lt"
+
+        /** Hard bounds of the part-keyed live overlay (bounded everything). */
+        const val MAX_LIVE_PARTS = 512
+        const val MAX_LIVE_TOOL_ROWS = 256
     }
 }
