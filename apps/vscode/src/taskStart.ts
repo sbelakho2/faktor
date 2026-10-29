@@ -866,6 +866,13 @@ export interface StartTaskSettings {
    * non-canonical value is never forwarded.
    */
   readonly submissionId?: string | null;
+  /**
+   * The operator's explicit per-run model override (audit item 13): a
+   * `provider/model` string the daemon validates against its catalog; a
+   * missing/unserved model is a typed start refusal, never a silent
+   * fallback.
+   */
+  readonly model?: string | null;
 }
 
 /** The typed classification of a refused task start. */
@@ -941,9 +948,11 @@ export function startTaskRequest(goal: string, settings: StartTaskSettings): Sta
     ? (settings.contractRows as StartTaskContractRows)
     : null;
   const submissionId = canonicalSubmissionId(settings.submissionId ?? null);
+  const model = typeof settings.model === 'string' && settings.model.length > 0 ? settings.model : null;
   const request: StartTaskRunRequest = {
     goal,
     ...(submissionId !== null ? { submission_id: submissionId } : {}),
+    ...(model !== null ? { model } : {}),
     ...(settings.maxTokens > 0 ? { max_tokens: settings.maxTokens } : {}),
     ...(settings.maxCostMicro > 0n
       ? { max_cost_micro: microWireValue(settings.maxCostMicro) }

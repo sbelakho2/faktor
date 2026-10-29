@@ -1632,6 +1632,7 @@ dependencies = [
  "faktor-fs",
  "faktor-git",
  "faktor-instructions",
+ "faktor-protocol",
  "faktor-provider",
  "faktor-scheduler",
  "faktor-scm",

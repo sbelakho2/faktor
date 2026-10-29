@@ -97,10 +97,44 @@ export async function pickModel(deps: Edition8PanelDeps): Promise<void> {
     void vscode.window.showErrorMessage(`Model was not saved: ${result.message}`);
     return;
   }
-  const outcome =
-    deps.newConversation === undefined
-      ? 'It applies to new conversations.'
-      : await deps.newConversation(pick.provider, pick.model);
+  // Item 13: a model change offers TWO explicit operations — future runs
+  // of THIS conversation (the daemon's typed per-run model override) or a
+  // NEW conversation — instead of always creating a session.
+  const operation = await vscode.window.showQuickPick(
+    [
+      {
+        label: 'Future runs in this conversation',
+        description: 'subsequent Task runs of this conversation use the picked model',
+        key: 'this' as const,
+      },
+      {
+        label: 'Start a new conversation',
+        description: 'a fresh conversation is created and opened with the picked model',
+        key: 'new' as const,
+      },
+    ],
+    {
+      title: 'Faktor: apply the model',
+      placeHolder: 'Choose where the picked model applies.',
+      ignoreFocusOut: true,
+    },
+  );
+  if (operation === undefined) {
+    void vscode.window.showInformationMessage(`Default model: ${pick.label}. ${result.message}`);
+    return;
+  }
+  let outcome: string;
+  if (operation.key === 'new') {
+    outcome =
+      deps.newConversation === undefined
+        ? 'It applies to new conversations.'
+        : await deps.newConversation(pick.provider, pick.model);
+  } else {
+    outcome =
+      deps.futureModel === undefined
+        ? 'This host cannot set a per-conversation model override.'
+        : await deps.futureModel(pick.provider, pick.model);
+  }
   void vscode.window.showInformationMessage(`Default model: ${pick.label}. ${result.message} ${outcome}`);
 }
 

@@ -507,6 +507,8 @@ const SCRIPT_ALLOWLIST = new Map(
       'nightly scale-probe lane (1,000 turns/100k messages/2k sessions with stored curves); too large for the offline dogfood suite.',
     'scripts/vscode-e2e/edition8-host-smoke.cjs':
       'invoked by the Extension Host e2e lane (scripts/vscode-e2e.sh / apps/vscode package scripts), not by the offline dogfood plan.',
+    'scripts/package-vsix.mjs':
+      'the ONE reproducible VSIX packaging flow (audit item 17): operator-invoked release step that compiles, stamps build-info.json with the build commit + asset hashes and packages through the lockfile-pinned @vscode/vsce; verified by running it directly (produces apps/vscode/out/faktor-<version>.vsix) and consumed through `npm run package:vsix`, not by the offline dogfood suite.',
     'scripts/programme/hil.mjs':
       'hardware-in-the-loop release lane driver: requires FAKTOR_HIL=1 and a rig command, so it is a typed refusal outside the release rig.',
     'scripts/woodpecker/verify-boundary.sh':
@@ -1105,7 +1107,7 @@ const UIUX_CONTRACT = [
       ['apps/vscode/media/chat.js', "label: 'Starting the run'"],
       ['apps/vscode/media/chat.js', "copy: 'Your captured draft is being admitted once.'"],
       ['apps/vscode/media/chat.js', 'spec = COMPOSER_STATES.starting;'],
-      ['apps/vscode/media/chat.js', 'var submitting = false;'],
+      ['apps/vscode/media/chat.js', 'function composerLocked()'],
     ],
     tests: { vscode: ['T07 starting strip renders during the single-flight admission and never twice'] },
   },

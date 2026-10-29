@@ -39,7 +39,6 @@ export type AttentionKind =
 
 export type UxActionKey =
   | 'openProviderSettings'
-  | 'retryProvider'
   | 'reconnect'
   | 'resumeRun'
   | 'retryStart'

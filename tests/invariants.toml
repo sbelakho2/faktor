@@ -370,11 +370,11 @@ platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
 id = "INV-VSCODE-KEYBOARD-SUBMISSION"
-statement = "The VS Code composer is fully keyboard-operable: Enter inserts a newline, Ctrl/Cmd+Enter starts, Escape dismisses, and focus returns after success."
+statement = "The VS Code composer is fully keyboard-operable: Enter sends, Shift+Enter inserts a newline, Ctrl/Cmd+Enter keeps sending (IME composition never submits), Escape dismisses, and focus returns after success."
 owner = "apps/vscode webview"
 authority = "apps/vscode/media/chat.js key handling"
-script_check = "Enter is a newline, Ctrl/Cmd+Enter starts, Escape dismisses, focus returns"
-mutation_witness = "Enter is a newline, Ctrl/Cmd+Enter starts, Escape dismisses, focus returns"
+script_check = "Enter sends, Shift+Enter is a newline, Ctrl/Cmd+Enter keeps sending, focus returns"
+mutation_witness = "Enter sends, Shift+Enter is a newline, Ctrl/Cmd+Enter keeps sending, focus returns"
 mutation_command = "node scripts/mutation-run.mjs INV-VSCODE-KEYBOARD-SUBMISSION"
 mutation_debt = ""
 release_critical = true

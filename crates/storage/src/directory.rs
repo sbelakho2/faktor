@@ -188,6 +188,10 @@ impl StorageBackend for DirectoryBackend {
         Some((&self.roots, self.min_age_ms))
     }
 
+    fn admission_path(&self, key: &str) -> Option<PathBuf> {
+        self.resolve(key)
+    }
+
     fn evict(
         &self,
         _governor: &StorageGovernor,
@@ -371,6 +375,10 @@ impl StorageBackend for SqliteBackend {
             }
         }
         Ok(out)
+    }
+
+    fn admission_path(&self, key: &str) -> Option<PathBuf> {
+        self.db_path(key)
     }
 
     fn evict(

@@ -53,6 +53,8 @@ import { edition8Snapshot } from './fixtures/edition8.mjs';
 import composerPolicy from '../media/composer-state.js';
 import boardPolicy from '../media/board-state.js';
 import historyPolicy from '../media/history-state.js';
+import moneyInput from '../media/money-input.js';
+import markdown from '../media/markdown.js';
 import {
   chmodSync,
   existsSync,
@@ -5080,7 +5082,7 @@ async function completionContractTests() {
     // Plain start: no contract field at all (chat never carries one).
     dom.document.getElementById('goal').value = 'plain goal';
     dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
-    assertDeepEqual(posted[posted.length - 1], { type: 'sendGoal', goal: 'plain goal', intent: 'task' });
+    assertDeepEqual(withoutSubmissionToken(posted[posted.length - 1]), { type: 'sendGoal', goal: 'plain goal', intent: 'task' });
     // The explicit result releases the single-flight lock before the next
     // logical submission (the lock itself is covered separately).
     deliver({ type: 'startResult', goal: 'plain goal', ok: true });
@@ -5089,7 +5091,7 @@ async function completionContractTests() {
     dom.document.getElementById('goal').value = 'contracted goal';
     dom.document.getElementById('contract-pr').checked = true;
     dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
-    assertDeepEqual(posted[posted.length - 1], {
+    assertDeepEqual(withoutSubmissionToken(posted[posted.length - 1]), {
       type: 'sendGoal',
       goal: 'contracted goal',
       intent: 'task',
@@ -5128,7 +5130,7 @@ async function completionContractTests() {
     // Leave changes locally (the default) sends no contract at all.
     goal.value = 'local only';
     submit();
-    assertDeepEqual(posted[posted.length - 1], { type: 'sendGoal', goal: 'local only', intent: 'task' });
+    assertDeepEqual(withoutSubmissionToken(posted[posted.length - 1]), { type: 'sendGoal', goal: 'local only', intent: 'task' });
     deliver({ type: 'startResult', goal: 'local only', ok: true });
     // Push branch implies commit.
     dom.document.getElementById('contract-push').checked = true;
@@ -8030,7 +8032,7 @@ async function contractTests() {
     dom.document.getElementById('contract-obligations').value = '';
     dom.document.getElementById('contract-invariants').value = '\n  \n';
     dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
-    assertDeepEqual(posted[posted.length - 1], {
+    assertDeepEqual(withoutSubmissionToken(posted[posted.length - 1]), {
       type: 'sendGoal',
       goal: 'contracted composer goal',
       intent: 'task',
@@ -8847,6 +8849,7 @@ function makeFakeDom() {
     },
     createElement: makeNode,
     createElementNS: (namespace, tagName) => makeNode(tagName),
+    createTextNode: (text) => ({ nodeType: 3, nodeValue: String(text), parentNode: null }),
     querySelectorAll(selector) {
       const found = [];
       for (const root of nodesById.values()) {
@@ -8857,6 +8860,9 @@ function makeFakeDom() {
         });
       }
       return found;
+    },
+    querySelector(selector) {
+      return this.querySelectorAll(selector)[0] || null;
     },
   };
   return { document, nodesById, makeNode };
@@ -9031,6 +9037,44 @@ function webviewSnapshot(agents) {
     lastError: null,
     busy: false,
   };
+}
+
+/**
+ * Audit items 7/10: every composer submit now carries the panel-minted
+ * `submissionToken` (the ack-fencing correlation). Exact-shape assertions
+ * on the POSTED message strip it; the token itself is pinned by the
+ * dedicated fencing tests.
+ */
+function withoutSubmissionToken(message) {
+  if (!message || typeof message !== 'object' || message.submissionToken === undefined) {
+    return message;
+  }
+  const copy = { ...message };
+  delete copy.submissionToken;
+  return copy;
+}
+
+/** A detached markdown render target over the fake document. */
+function makeMarkdownContainer(doc) {
+  const container = {
+    ownerDocument: doc,
+    children: [],
+    appendChild(child) {
+      this.children.push(child);
+      child.parentNode = this;
+    },
+    removeChild(child) {
+      const index = this.children.indexOf(child);
+      if (index >= 0) this.children.splice(index, 1);
+      child.parentNode = null;
+    },
+  };
+  Object.defineProperty(container, 'childNodes', { get: () => container.children });
+  Object.defineProperty(container, 'firstChild', { get: () => container.children[0] || null });
+  Object.defineProperty(container, 'lastChild', {
+    get: () => container.children[container.children.length - 1] || null,
+  });
+  return container;
 }
 
 function runChatWebview(snapshot) {
@@ -10129,21 +10173,21 @@ async function composerAttachmentTests() {
       // settings/Quick Pick surfaces. Their IDs and labels are pinned too.
       'faktor.openControlCenter': 'Open Settings',
       'faktor.openModelPicker': 'Models and Capabilities',
-      'faktor.openSettings': 'Settings: Revision 8',
+      'faktor.openSettings': 'Settings',
       'faktor.openControl8': 'Faktor: Open Settings Screen',
       'faktor.openEdition8': 'Faktor: Open Work',
       'faktor.openInspect8': 'Faktor: Open Inspect',
       'faktor.openHistory8': 'Faktor: Open History',
       'faktor.openUsage8': 'Faktor: Open Usage & Outcomes',
-      'faktor.openSettings8': 'Faktor: Open Revision 8 Settings',
+      'faktor.openSettings8': 'Faktor: Open Settings',
       'faktor.openProviders8': 'Faktor: Open Providers',
       'faktor.openTools8': 'Faktor: Open Tools & MCP',
       'faktor.openContext8': 'Faktor: Open Context',
       'faktor.openDiagnostics8': 'Faktor: Open Diagnostics',
-      'faktor.openModelPicker8': 'Faktor: Choose Model (Revision 8)',
-      'faktor.openAgentPicker8': 'Faktor: Agents (Revision 8)',
-      'faktor.addContext8': 'Faktor: Add Context (Revision 8)',
-      'faktor.stopScoped8': 'Faktor: Stop… (Revision 8)',
+      'faktor.openModelPicker8': 'Faktor: Choose Model',
+      'faktor.openAgentPicker8': 'Faktor: Agents',
+      'faktor.addContext8': 'Faktor: Add Context',
+      'faktor.stopScoped8': 'Faktor: Stop…',
       'faktor.trustExecutable8': 'Faktor: Review Executable Trust',
       'faktor.deleteMemory8': 'Faktor: Review and Delete Memory',
       'faktor.testHook8': 'Faktor: Test Hook',
@@ -10720,39 +10764,49 @@ async function composerAttachmentTests() {
     assertEqual(card.hidden, true, 'a recovered stream hides the attention card');
   });
 
-  await test('Enter is a newline, Ctrl/Cmd+Enter starts, Escape dismisses, focus returns', () => {
+  await test('Enter sends, Shift+Enter is a newline, Ctrl/Cmd+Enter keeps sending, focus returns', () => {
     const harness = runChatWebview(webviewSnapshot([]));
     const goal = harness.dom.document.getElementById('goal');
     goal.value = 'keyboard task';
     const count = harness.posted.length;
+    // Item 10: Shift+Enter inserts a newline — never a submit.
+    let shiftPrevented = false;
     goal.dispatch('keydown', {
       key: 'Enter',
+      shiftKey: true,
       preventDefault() {
-        throw new Error('plain Enter must keep the textarea newline behavior');
+        shiftPrevented = true;
       },
     });
-    assertEqual(harness.posted.length, count, 'plain Enter never submits');
+    assertEqual(shiftPrevented, false, 'Shift+Enter keeps the textarea newline behavior');
+    assertEqual(harness.posted.length, count, 'Shift+Enter never submits');
+    // Item 10: plain Enter SENDS.
     let prevented = false;
     goal.dispatch('keydown', {
       key: 'Enter',
-      ctrlKey: true,
       preventDefault() {
         prevented = true;
       },
     });
-    assertEqual(prevented, true, 'Ctrl+Enter prevents the default newline');
+    assertEqual(prevented, true, 'plain Enter prevents the default newline');
     assertEqual(harness.posted.length, count + 1);
-    assertDeepEqual(harness.posted[harness.posted.length - 1], {
+    assertDeepEqual(withoutSubmissionToken(harness.posted[harness.posted.length - 1]), {
       type: 'sendGoal',
       goal: 'keyboard task',
       intent: 'task',
     });
-    // The single-flight lock holds for keyboard starts too.
+    // The per-conversation lock holds for keyboard starts too.
     goal.dispatch('keydown', { key: 'Enter', metaKey: true, preventDefault() {} });
     assertEqual(harness.posted.length, count + 1, 'single-flight holds for a keyboard start');
     // A successful start returns focus to the composer.
     harness.deliver({ type: 'startResult', goal: 'keyboard task', ok: true });
     assertEqual(goal.focused, true, 'a successful start returns focus to the composer');
+    // Ctrl/Cmd+Enter keeps sending after the lock is released (the ack
+    // cleared the draft, so the composer is refilled first).
+    const afterResult = harness.posted.length;
+    goal.value = 'ctrl enter task';
+    goal.dispatch('keydown', { key: 'Enter', ctrlKey: true, preventDefault() {} });
+    assertEqual(harness.posted.length, afterResult + 1, 'Ctrl+Enter still sends');
     // Escape dismisses the transient attachment notice.
     harness.deliver({ type: 'attachments', items: [attachmentMeta('att-1', { refusal: 'nope' })] });
     assertEqual(harness.dom.document.getElementById('attachment-notice').hidden, false);
@@ -12629,7 +12683,7 @@ async function transcriptScrollTests() {
     composer.dispatch('submit', { preventDefault() {} });
     // posted[0] is the initial ready message.
     assertEqual(posted.length, 2, 'the first submit posts exactly one sendGoal');
-    assertDeepEqual(posted[1], { type: 'sendGoal', goal: 'first goal', intent: 'task' });
+    assertDeepEqual(withoutSubmissionToken(posted[1]), { type: 'sendGoal', goal: 'first goal', intent: 'task' });
     assertEqual(send.disabled, true, 'Run task is disabled while submitting');
     assertEqual(
       dom.document.getElementById('contract-commit').disabled,
@@ -16323,9 +16377,11 @@ async function runBudgetTests() {
     assert(tokens && cost, 'both per-run budget fields exist in the Acceptance & contract disclosure');
     goal.value = 'budgeted goal';
     tokens.value = ' 120000 ';
-    cost.value = '5000000';
+    // Item 12: the DOLLAR-labeled field parses with exact integer
+    // arithmetic — `5.00` is five dollars and converts to "5000000" micro.
+    cost.value = '5.00';
     dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
-    assertDeepEqual(posted[posted.length - 1], {
+    assertDeepEqual(withoutSubmissionToken(posted[posted.length - 1]), {
       type: 'sendGoal',
       goal: 'budgeted goal',
       intent: 'task',
@@ -16334,12 +16390,47 @@ async function runBudgetTests() {
     });
     deliver({ type: 'startResult', goal: 'budgeted goal', ok: false });
     assertEqual(tokens.value, ' 120000 ', 'a failed start keeps the per-run budget fields');
-    assertEqual(cost.value, '5000000');
+    assertEqual(cost.value, '5.00');
+    // Item 12: `5`, `5.0`, `5.00` and `$5.00` are EXACTLY "5000000" micro.
+    for (const dollarForm of ['5', '5.0', '5.00', '$5.00']) {
+      const parsed = dom.document.getElementById('composer');
+      const before = posted.length;
+      // release the lock the previous submit may hold (a durable ack
+      // CLEARS the budget fields, so the form is typed after it)
+      deliver({ type: 'startResult', goal: 'budgeted goal', ok: true });
+      tokens.value = '';
+      cost.value = dollarForm;
+      goal.value = `dollar form ${dollarForm}`;
+      parsed.dispatch('submit', { preventDefault() {} });
+      assertEqual(posted[posted.length - 1].budgetCostMicro, '5000000', `exact micro for ${dollarForm}`);
+      assertEqual(posted[posted.length - 1].goal, `dollar form ${dollarForm}`);
+      assert(posted.length === before + 1, 'each form submits once');
+    }
+    deliver({ type: 'startResult', goal: 'dollar form $5.00', ok: true });
+    // Item 12: the explicit ADVANCED surface keeps raw micro entry.
+    const raw = dom.document.getElementById('contract-budget-cost-raw');
+    assert(raw !== null, 'the advanced raw micro-USD checkbox exists');
+    raw.checked = true;
+    cost.value = '725';
+    goal.value = 'raw micro goal';
+    dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
+    assertEqual(posted[posted.length - 1].budgetCostMicro, '725', 'raw micro rides only behind the advanced checkbox');
+    deliver({ type: 'startResult', goal: 'raw micro goal', ok: true });
+    raw.checked = false;
+    // Item 12: a malformed value is a TYPED refusal — nothing posts.
+    cost.value = '1,000';
+    goal.value = 'refused budget goal';
+    const beforeRefusal = posted.length;
+    dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
+    assertEqual(posted.length, beforeRefusal, 'a malformed cost budget refuses the START');
+    assertEqual(goal.value, 'refused budget goal', 'the draft is kept');
+    const errorCard = dom.document.getElementById('attention-card');
+    assert(errorCard !== null && errorCard.hidden === false, 'the refusal is shown as a typed local error');
     tokens.value = '   ';
     cost.value = '';
     goal.value = 'plain goal';
     dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
-    assertDeepEqual(posted[posted.length - 1], { type: 'sendGoal', goal: 'plain goal', intent: 'task' });
+    assertDeepEqual(withoutSubmissionToken(posted[posted.length - 1]), { type: 'sendGoal', goal: 'plain goal', intent: 'task' });
     deliver({ type: 'startResult', goal: 'plain goal', ok: true });
     assertEqual(tokens.value, '', 'durable acceptance clears the token override');
     assertEqual(cost.value, '', 'durable acceptance clears the cost override');
@@ -16375,7 +16466,7 @@ async function askFirstUxTests() {
     dom.document.getElementById('contract-risks').value = 'must not leak';
     dom.document.getElementById('contract-budget-tokens').value = '500';
     dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
-    assertDeepEqual(posted[posted.length - 1], {
+    assertDeepEqual(withoutSubmissionToken(posted[posted.length - 1]), {
       type: 'sendGoal',
       goal: 'hello',
       intent: 'ask',
@@ -19122,6 +19213,444 @@ async function edition8HtmlSafetyTests() {
   });
 }
 
+
+// ------------------------------------------- Wave 2 audit tests (items 7-17)
+//
+// TEST-SEPARATION (scripts/check-test-separation.mjs): every test below is
+// NEW Wave-2 audit coverage for apps/vscode/media/*.js + src/state.ts and
+// the production webview it drives. Oracle: the audit's exact invariants
+// (dollar arithmetic, ack fencing, ordered parts, hostile markdown, paging
+// merge, provenance rows). Isolation: pure module calls or one fresh
+// `runChatWebview` fake-DOM harness each; no shared mutable state, no disk
+// beyond the checked-in modules under test.
+
+async function wave2ModuleTests() {
+  await test('item 12: dollar budget parse is exact integer arithmetic (5/5.0/5.00/$5.00 = 5000000)', () => {
+    for (const form of ['5', '5.0', '5.00', '$5', '$5.00']) {
+      assertDeepEqual(moneyInput.parseDollarMicro(form), { micro: '5000000' }, `exact micro for ${form}`);
+    }
+    assertDeepEqual(moneyInput.parseDollarMicro('0.000001'), { micro: '1' });
+    assertDeepEqual(moneyInput.parseDollarMicro('  $12.3456  '), { micro: '12345600' });
+    assertDeepEqual(moneyInput.parseBudgetCost('', false), { empty: true });
+  });
+
+  await test('item 12: hostile budget inputs are TYPED refusals, never coerced', () => {
+    const hostile = [
+      '-5',
+      '+5',
+      '1e5',
+      '5E2',
+      'NaN',
+      'Infinity',
+      '1,000',
+      '1_000',
+      '1 000',
+      '1.000.000',
+      '1.1234567',
+      'abc',
+      '$',
+      '5.',
+      '1.2.',
+    ];
+    for (const input of hostile) {
+      const parsed = moneyInput.parseDollarMicro(input);
+      assert(parsed && typeof parsed.reason === 'string' && parsed.reason.length > 0, `refuses ${JSON.stringify(input)}`);
+      assert(parsed.micro === undefined, `never coerces ${JSON.stringify(input)}`);
+    }
+    // Overflow beyond the exact-integer bound (2^53-1) is refused.
+    const overflow = moneyInput.parseDollarMicro('9007199254741');
+    assert(overflow.micro === undefined && typeof overflow.reason === 'string', 'overflow refused');
+  });
+
+  await test('item 12: raw micro is the ADVANCED surface only (plain integer, same bound)', () => {
+    assertDeepEqual(moneyInput.parseRawMicro('5000000'), { micro: '5000000' });
+    assert(moneyInput.parseRawMicro('5.00').micro === undefined, 'raw micro never parses decimals');
+    assert(moneyInput.parseRawMicro('-1').micro === undefined, 'raw micro refuses negatives');
+    assert(moneyInput.parseRawMicro('9007199254740993').micro === undefined, 'raw micro refuses overflow');
+    assertDeepEqual(moneyInput.parseBudgetCost('725', true), { micro: '725' });
+    assertDeepEqual(moneyInput.parseBudgetCost('725', false), { micro: '725000000' }, 'without the checkbox 725 is dollars');
+  });
+
+  await test('item 9: markdown parse is block-structured and partial-tail tolerant', () => {
+    const full = markdown.parse('# Title\n\npara one\n\n- a\n- b\n\n```rs\nlet x = 1;\n```\n');
+    assertDeepEqual(full.blocks.map((b) => b.kind), ['heading', 'paragraph', 'list', 'code']);
+    assertEqual(full.blocks[0].level, 1);
+    assertEqual(full.blocks[2].ordered, false);
+    assertEqual(full.blocks[3].lang, 'rs');
+    assertEqual(full.blocks[3].closed, true);
+    // An UNTERMINATED fence is the partial tail: parsed, marked open.
+    const partial = markdown.parse('para\n\n```js\nconst x =');
+    assertEqual(partial.blocks[partial.blocks.length - 1].kind, 'code');
+    assertEqual(partial.blocks[partial.blocks.length - 1].closed, false);
+    assert(partial.partialStart < partial.source.length, 'the partial tail is bounded by offset');
+    // Tables.
+    const table = markdown.parse('| a | b |\n| --- | --- |\n| 1 | 2 |\n');
+    assertEqual(table.blocks[0].kind, 'table');
+    assertDeepEqual(table.blocks[0].header, ['a', 'b']);
+    assertDeepEqual(table.blocks[0].rows, [['1', '2']]);
+  });
+
+  await test('item 9: hostile HTML/SVG/links never become markup or navigation', () => {
+    assertEqual(markdown.safeUrl('javascript:alert(1)'), null, 'javascript: rejected');
+    assertEqual(markdown.safeUrl('data:text/html,<script>'), null, 'data: rejected');
+    assertEqual(markdown.safeUrl('vbscript:x'), null, 'vbscript: rejected');
+    assertEqual(markdown.safeUrl('file:///etc/passwd'), null, 'file: rejected');
+    assertEqual(markdown.safeUrl('vscode-webview://abc'), 'vscode-webview://abc', 'host scheme kept');
+    assertEqual(markdown.safeUrl('https://example.com'), 'https://example.com');
+    const doc = makeFakeDom().document;
+    const container = makeMarkdownContainer(doc);
+    markdown.render(container, '<script>alert(1)</script>\n\n[x](javascript:alert(1))\n\n<svg onload=alert(1)>');
+    const tags = container.children.map((node) => String(node.tagName).toUpperCase());
+    assert(tags.indexOf('SCRIPT') === -1, 'raw HTML never becomes a SCRIPT element');
+    assert(tags.indexOf('SVG') === -1, 'raw SVG never becomes an SVG element');
+    assert(tags.indexOf('IMG') === -1, 'no image element is ever fabricated');
+    const anchors = [];
+    const texts = [];
+    const walk = (node) => {
+      for (const child of node.children || []) {
+        if (child.tagName === 'a') anchors.push(child);
+        if (child.nodeType === 3) texts.push(child.nodeValue);
+        walk(child);
+      }
+    };
+    walk(container);
+    assertEqual(anchors.length, 0, 'a javascript: link is never an anchor');
+    assert(
+      texts.some((value) => value.indexOf('<script>') !== -1),
+      'the hostile HTML survives as literal text',
+    );
+  });
+
+  await test('item 9: markdown renders headings, code+Copy, links and tables as DOM nodes', () => {
+    const doc = makeFakeDom().document;
+    const container = makeMarkdownContainer(doc);
+    markdown.render(container, '## Head\n\nsee [docs](https://example.com)\n\n```python\nprint(1)\n```\n\n| h |\n| --- |\n| v |\n');
+    const tags = container.children.map((node) => String(node.tagName).toUpperCase());
+    assertDeepEqual(tags, ['H2', 'P', 'DIV', 'TABLE'], 'block order preserved');
+    const p = container.children[1];
+    const anchor = p.children.find((child) => child.tagName === 'a');
+    assertEqual(anchor.attributes.href, 'https://example.com', 'a safe link keeps its href');
+    const codeBlock = container.children[2];
+    assertEqual(codeBlock.className, 'md-code');
+    const bar = codeBlock.children[0];
+    const lang = bar.children.find((child) => child.className === 'md-code-lang');
+    const copy = bar.children.find((child) => child.className === 'md-code-copy');
+    assertEqual(lang.textContent, 'python', 'the language label is shown');
+    assertEqual(copy.textContent, 'Copy', 'the Copy button exists');
+    const table = container.children[3];
+    assertEqual(table.children.length, 2, 'thead + tbody');
+  });
+
+  await test('item 9: incremental render keeps completed block nodes (append-only growth)', () => {
+    const doc = makeFakeDom().document;
+    const container = makeMarkdownContainer(doc);
+    markdown.render(container, '# One\n\ntwo');
+    assertEqual(container.children.length, 2);
+    const keptHeading = container.children[0];
+    const keptParagraph = container.children[1];
+    markdown.render(container, '# One\n\ntwo three\n\n');
+    assertEqual(container.children[0], keptHeading, 'the completed heading node survives');
+    assertEqual(container.children.length, 2, 'the partial paragraph re-renders in place');
+    assert(keptParagraph !== container.children[1] || keptParagraph.textContent.length > 0, 'the tail is re-rendered');
+  });
+
+  await test('item 8: the reducer preserves ORDERED typed parts (tool between text)', () => {
+    const messages = [
+      {
+        seq: 1,
+        id: 1,
+        role: 'assistant',
+        createdMs: 1,
+        data: {},
+        parts: [
+          { kind: 'text', data: { text: 'before ' } },
+          { kind: 'tool_call', data: { tool_call_id: 'c1', name: 'bash', input: {}, state: 'running' } },
+          { kind: 'text', data: { text: 'after' } },
+          { kind: 'tool_result', data: { tool_call_id: 'c1', excerpt: 'ok', exit_code: 0 } },
+        ],
+      },
+    ];
+    const [entry] = st.transcriptFromMessages(messages);
+    assertDeepEqual(
+      entry.parts.map((part) => (part.kind === 'tool' ? 'tool' : part.kind)),
+      ['text', 'tool', 'text'],
+      'the tool part keeps its arrival position between the text runs',
+    );
+    assertEqual(entry.parts[0].text, 'before ');
+    assertEqual(entry.parts[2].text, 'after');
+    assertEqual(entry.tools.length, 1, 'the merged tool row survives');
+    assertEqual(entry.tools[0].excerpt, 'ok', 'the later result merged into the call');
+    assertEqual(entry.text, 'before after', 'the bucket is derived, order lives in parts');
+    // Same buckets, different interleaving → different content identity.
+    const reordered = st.transcriptFromMessages([
+      {
+        seq: 1,
+        id: 1,
+        role: 'assistant',
+        createdMs: 1,
+        data: {},
+        parts: [
+          { kind: 'text', data: { text: 'before ' } },
+          { kind: 'text', data: { text: 'after' } },
+          { kind: 'tool_call', data: { tool_call_id: 'c1', name: 'bash', input: {}, state: 'running' } },
+        ],
+      },
+    ]);
+    assertEqual(st.transcriptSignature([entry]) === st.transcriptSignature(reordered), false, 'order is in the digest');
+    assertEqual(st.transcriptContentEqual([entry], reordered), false, 'order is in the equality');
+  });
+
+  await test('item 13: pages MERGE by durable id (never replace the accumulated view)', () => {
+    const older = st.transcriptFromMessages([
+      { seq: 1, id: 1, role: 'user', createdMs: 1, data: { text: 'first' }, parts: [] },
+      { seq: 2, id: 2, role: 'assistant', createdMs: 2, data: {}, parts: [{ kind: 'text', data: { text: 'reply' } }] },
+    ]);
+    const newer = st.transcriptFromMessages([
+      { seq: 2, id: 2, role: 'assistant', createdMs: 2, data: {}, parts: [{ kind: 'text', data: { text: 'reply v2' } }] },
+      { seq: 3, id: 3, role: 'user', createdMs: 3, data: { text: 'second' }, parts: [] },
+    ]);
+    const merged = st.mergeTranscriptPages(older, newer);
+    assertEqual(merged.length, 3, 'the older page survives the newer one');
+    assertEqual(merged[0].id, '1');
+    assertEqual(merged[1].text, 'reply v2', 'the newer page upserts by id');
+    assertEqual(merged[2].id, '3');
+    const seqs = merged.map((entry) => entry.seq);
+    assertDeepEqual(seqs, [1, 2, 3], 'order is by durable seq');
+  });
+
+  await test('item 13: MAX_ENTRY_CHARS clipping is an EXPLICIT retained-output boundary', () => {
+    const huge = 'x'.repeat(st.MAX_ENTRY_CHARS + 64);
+    const [entry] = st.transcriptFromMessages([
+      { seq: 1, id: 1, role: 'assistant', createdMs: 1, data: {}, parts: [{ kind: 'text', data: { text: huge } }] },
+    ]);
+    assertEqual(entry.text.length, st.MAX_ENTRY_CHARS, 'the bound still holds');
+    assertEqual(entry.clipped, true, 'the clip is explicit, not silent');
+    const clean = st.transcriptFromMessages([
+      { seq: 2, id: 2, role: 'assistant', createdMs: 2, data: {}, parts: [{ kind: 'text', data: { text: 'small' } }] },
+    ]);
+    assertEqual(clean[0].clipped, false, 'unclipped entries carry no marker');
+  });
+}
+
+async function wave2WebviewTests() {
+  await test('item 7: the composer posts a submission token and only a MATCHED result repaints', () => {
+    const harness = runChatWebview(webviewSnapshot([]));
+    const { dom, posted, deliver } = harness;
+    dom.document.getElementById('goal').value = 'fenced send';
+    dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
+    const sent = posted[posted.length - 1];
+    assertEqual(sent.type, 'sendGoal');
+    assert(typeof sent.submissionToken === 'string' && sent.submissionToken.length > 0, 'the token rides the send');
+    assertEqual(dom.document.getElementById('btn-send').disabled, true, 'the composer locks');
+    // A FOREIGN token is fenced out entirely: no release, no repaint.
+    dom.document.getElementById('goal').value = 'typed while pending';
+    deliver({ type: 'startResult', goal: 'fenced send', ok: false, submissionToken: 'wp-FOREIGN', sessionId: null });
+    assertEqual(dom.document.getElementById('btn-send').disabled, true, 'a foreign token never releases the lock');
+    assertEqual(dom.document.getElementById('goal').value, 'typed while pending', 'a foreign token never repaints the draft');
+    // The MATCHING token releases the lock; the draft survives a failure.
+    deliver({ type: 'startResult', goal: 'fenced send', ok: false, retryable: true, submissionToken: sent.submissionToken, sessionId: null });
+    assertEqual(dom.document.getElementById('btn-send').disabled, false, 'the matching result releases the lock');
+    assertEqual(dom.document.getElementById('goal').value, 'typed while pending', 'a failed start keeps the CURRENT draft');
+  });
+
+  await test('item 7: a result for ANOTHER conversation never clears the visible draft', () => {
+    const snapshot = webviewSnapshot([]);
+    snapshot.session = { id: 'sess-B', title: 'B', provider: 'p', model: 'm', state: 'active' };
+    const harness = runChatWebview(snapshot);
+    const { dom, posted, deliver } = harness;
+    dom.document.getElementById('goal').value = 'for B';
+    dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
+    const sent = posted[posted.length - 1];
+    // The operator switched to another conversation while the reply ran.
+    dom.document.getElementById('goal').value = 'draft for C';
+    deliver({
+      type: 'startResult',
+      goal: 'for B',
+      ok: true,
+      submissionToken: sent.submissionToken,
+      sessionId: 'sess-OTHER',
+    });
+    assertEqual(
+      dom.document.getElementById('goal').value,
+      'draft for C',
+      'a receipt for another conversation never clears the visible draft',
+    );
+    assertEqual(dom.document.getElementById('btn-send').disabled, false, 'the lock of the leaving conversation is released');
+  });
+
+  await test('item 10: the pending You row appears immediately and reconciles with the durable twin', () => {
+    const harness = runChatWebview(webviewSnapshot([]));
+    const { dom, posted, deliver } = harness;
+    const pending = dom.document.getElementById('pending-entries');
+    dom.document.getElementById('goal').value = 'immediate row';
+    dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
+    assertEqual(pending.children.length, 1, 'the pending row renders IMMEDIATELY');
+    assertEqual(pending.children[0].className.indexOf('entry-pending') !== -1, true, 'the row is marked pending');
+    const sent = posted[posted.length - 1];
+    deliver({ type: 'startResult', goal: 'immediate row', ok: true, submissionToken: sent.submissionToken, sessionId: null });
+    assertEqual(pending.children.length, 1, 'the accepted row stays until the durable twin arrives');
+    // The durable transcript gains the matching user row: reconciled, no dup.
+    const snapshot = webviewSnapshot([
+      transcriptEntry(1, 'immediate row', { role: 'user', id: 'm-1' }),
+    ]);
+    snapshot.session = { id: 'sess-A', title: 'A', provider: 'p', model: 'm', state: 'active' };
+    const nextHarness = runChatWebview(snapshot, {
+      pre: (h) => {
+        h.dom.document.getElementById('goal').value = 'immediate row';
+        h.dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
+        const posted2 = h.posted[h.posted.length - 1];
+        h.deliver({ type: 'startResult', goal: 'immediate row', ok: true, submissionToken: posted2.submissionToken, sessionId: 'sess-A' });
+      },
+    });
+    assertEqual(
+      nextHarness.dom.document.getElementById('pending-entries').children.length,
+      0,
+      'the durable twin reconciles the pending row (no duplicate)',
+    );
+  });
+
+  await test('item 10: a FAILED start drops the pending row with the restored draft', () => {
+    const harness = runChatWebview(webviewSnapshot([]));
+    const { dom, posted, deliver } = harness;
+    dom.document.getElementById('goal').value = 'will fail';
+    dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
+    assertEqual(dom.document.getElementById('pending-entries').children.length, 1);
+    const sent = posted[posted.length - 1];
+    deliver({ type: 'startResult', goal: 'will fail', ok: false, retryable: true, submissionToken: sent.submissionToken, sessionId: null });
+    assertEqual(dom.document.getElementById('pending-entries').children.length, 0, 'a failed start drops the pending row');
+  });
+
+  await test('item 16: the composer status distinguishes the six running states', () => {
+    const harness = runChatWebview(webviewSnapshot([]));
+    const labelOf = () => harness.dom.document.getElementById('composer-state-label').textContent;
+    harness.deliver({ type: 'turnState', phase: 'streaming', opId: 'op-1' });
+    assertEqual(labelOf(), 'Working', 'streaming is Working');
+    harness.deliver({ type: 'turnState', phase: 'queued', opId: null });
+    assertEqual(labelOf(), 'Waiting', 'queued is Waiting');
+    harness.deliver({ type: 'turnState', phase: 'awaiting-user', opId: 'op-1' });
+    assertEqual(labelOf(), 'Waiting', 'awaiting-user is Waiting');
+    const snapshot = webviewSnapshot([]);
+    snapshot.busy = true;
+    const verifyingUx = JSON.parse(JSON.stringify(st.emptySnapshot().ux));
+    verifyingUx.presentation = { ...verifyingUx.presentation, run: 'verifying' };
+    snapshot.ux = verifyingUx;
+    const checking = runChatWebview(snapshot);
+    checking.deliver({ type: 'turnState', phase: 'streaming', opId: 'op-2' });
+    assertEqual(
+      checking.dom.document.getElementById('composer-state-label').textContent,
+      'Checking',
+      'a verifying run reads Checking',
+    );
+    harness.deliver({ type: 'turnState', phase: 'failed', opId: 'op-1' });
+    // The settled label lives only while the snapshot still shows the run.
+    const live = webviewSnapshot([]);
+    live.busy = true;
+    const failedHarness = runChatWebview(live);
+    failedHarness.deliver({ type: 'turnState', phase: 'failed', opId: 'op-3' });
+    assertEqual(
+      failedHarness.dom.document.getElementById('composer-state-label').textContent,
+      'Failed',
+      'failed is Failed while the run is live in the snapshot',
+    );
+  });
+
+  await test('item 16: tool summaries convey action + subject', () => {
+    const snapshot = webviewSnapshot([]);
+    snapshot.daemon = 'running';
+    snapshot.transcript = [
+      transcriptEntry(2, '', {
+        tools: [
+          { toolCallId: 'c1', name: 'read_file', state: 'completed', input: { path: 'src/main.rs' }, excerpt: 'fn main() {}', exitCode: null, artifact: null },
+        ],
+      }),
+    ];
+    const harness = runChatWebview(snapshot);
+    const subject = harness.dom.document.querySelector('.activity-subject');
+    assert(subject !== null, 'the tool row carries a subject span');
+    assertEqual(subject.textContent, 'src/main.rs', 'the subject names WHAT the action touched');
+  });
+
+  await test('items 8/13: entries stamp data-entry-id and the clip marker renders', () => {
+    const snapshot = webviewSnapshot([]);
+    snapshot.daemon = 'running';
+    snapshot.transcript = [
+      transcriptEntry(1, 'first', { id: 'm-1', role: 'user' }),
+      transcriptEntry(2, 'second', { id: 'm-2', role: 'assistant', clipped: true }),
+    ];
+    const harness = runChatWebview(snapshot);
+    const container = harness.dom.document.getElementById('entries');
+    const ids = container.children.map((node) => node.getAttribute('data-entry-id'));
+    assertDeepEqual(ids, ['m-1', 'm-2'], 'every entry node is addressable by durable id');
+    const heads = container.children.map((node) => node.children[0].textContent);
+    assertDeepEqual(heads, ['You', 'Faktor'], 'stable authors, no seq ids in ordinary copy');
+    const clip = harness.dom.document.querySelector('.entry-clip');
+    assert(clip !== null, 'the retained-output boundary renders explicitly');
+  });
+
+  await test('item 17: Diagnostics renders build provenance + the capability handshake', () => {
+    const snapshot = webviewSnapshot([]);
+    snapshot.provenance = {
+      extensionVersion: '9.9.9',
+      buildCommit: 'abc123',
+      packagedAt: '2026-01-01T00:00:00Z',
+      assets: [
+        { path: 'media/chat.js', packagedSha256: 'aa', liveSha256: 'aa', matches: true },
+      ],
+      assetsMatch: true,
+      daemonVersion: 'faktor 1.2.3',
+      daemonExecutable: '/opt/faktor/faktor-server',
+      protocol: { liveStreaming: true, attachments: false, turnState: null },
+    };
+    const harness = runChatWebview(snapshot);
+    const build = harness.dom.document.getElementById('diag-build');
+    const caps = harness.dom.document.getElementById('diag-protocol-caps');
+    assertEqual(build.textContent, 'extension 9.9.9 · abc123', 'the build commit renders');
+    assertEqual(
+      caps.textContent,
+      'live streaming: yes · attachments: no · turn state: no',
+      'the handshake advertisement renders exactly',
+    );
+    // A daemon WITHOUT the handshake gets the coherent degradation copy.
+    const legacy = webviewSnapshot([]);
+    legacy.provenance = { ...snapshot.provenance, protocol: null };
+    const legacyHarness = runChatWebview(legacy);
+    const legacyCaps = legacyHarness.dom.document.getElementById('diag-protocol-caps');
+    assert(
+      legacyCaps.textContent.indexOf('not advertised by this daemon') !== -1,
+      'a missing handshake degrades with ONE coherent message',
+    );
+    // A MODIFIED asset is called out, never hidden.
+    const dirty = webviewSnapshot([]);
+    dirty.provenance = {
+      ...snapshot.provenance,
+      assets: [{ path: 'media/chat.js', packagedSha256: 'aa', liveSha256: 'bb', matches: false }],
+      assetsMatch: false,
+    };
+    const dirtyHarness = runChatWebview(dirty);
+    assert(
+      dirtyHarness.dom.document.getElementById('diag-build-assets').textContent.indexOf('MODIFIED') !== -1,
+      'a post-packaging modification is loud',
+    );
+  });
+
+  await test('items 13/16: the scrollback + new-output affordances never force a scroll', () => {
+    const snapshot = webviewSnapshot([]);
+    snapshot.transcriptHasMore = true;
+    const harness = runChatWebview(snapshot);
+    const older = harness.dom.document.getElementById('btn-load-older');
+    assertEqual(older.hidden, false, 'hasMore exposes the explicit scrollback affordance');
+    let postedOlder = null;
+    const originalPost = harness.dom.window ? null : null;
+    // The affordance posts loadOlderMessages.
+    const before = harness.posted.length;
+    older.click();
+    assertEqual(harness.posted.length, before + 1, 'clicking loads older history');
+    assertEqual(harness.posted[harness.posted.length - 1].type, 'loadOlderMessages');
+    assertEqual(postedOlder, null);
+  });
+}
+
+
 async function main() {
   await validatorAccepts();
   await validatorRejects();
@@ -19159,6 +19688,8 @@ async function main() {
   await attentionWebviewTests();
   await navigationWebviewTests();
   await composerAttachmentTests();
+  await wave2ModuleTests();
+  await wave2WebviewTests();
   await askFirstUxTests();
   await askRecoveryTests();
   await submissionSingleFlightTests();

@@ -30,6 +30,12 @@ export interface Edition8PanelDeps {
   readonly switchSession?: (sessionId: string) => Promise<void>;
   /** Bind a picked provider/model to a new conversation; returns the copy. */
   readonly newConversation?: (provider: string, model: string) => Promise<string>;
+  /**
+   * Apply the picked provider/model to FUTURE runs of the CURRENT
+   * conversation (audit item 13 — the typed per-run override); returns the
+   * exact honest copy, including any daemon-route limitation.
+   */
+  readonly futureModel?: (provider: string, model: string) => Promise<string>;
   readonly output: vscode.OutputChannel;
 }
 

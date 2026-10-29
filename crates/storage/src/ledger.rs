@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS reservation (
     key TEXT NOT NULL,
     bytes INTEGER NOT NULL,
     owner TEXT NOT NULL DEFAULT '',
+    volume TEXT NOT NULL DEFAULT '',
     created_ms INTEGER NOT NULL,
     lease_expires_ms INTEGER NOT NULL
 );
@@ -138,7 +139,8 @@ pub struct BudgetSnapshot {
 }
 
 /// The result of one atomic admission attempt. A reservation id is present
-/// only when the class quota AND the aggregate budget could hold the bytes.
+/// only when the class quota AND the aggregate budget could hold the bytes
+/// AND every destination volume could preserve its own free-space reserve.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdmitRow {
     pub reservation_id: Option<String>,
@@ -147,6 +149,56 @@ pub struct AdmitRow {
     pub total_used: u64,
     pub class_deficit: u64,
     pub total_deficit: u64,
+    /// Set when the destination-volume free-space rule denied the write
+    /// (reserve breach or unmeasurable volume), regardless of the quota and
+    /// aggregate outcomes.
+    pub volume_denial: Option<VolumeDenial>,
+    /// The single destination volume resolved inside the transaction, stored
+    /// on the reservation row so later admissions charge this write against
+    /// exactly that volume. `None` = ambiguous destination (charged
+    /// conservatively to every volume through the empty-volume rule).
+    pub volume: Option<u64>,
+}
+
+/// Why the destination-volume free-space rule denied one admission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VolumeDenial {
+    /// A candidate destination path could not be measured: the volume's free
+    /// space and reserve are unknown, so the write is refused typed until a
+    /// probe succeeds.
+    Unmeasured { detail: String },
+    /// The volume's own reserve could not be preserved once unmaterialized
+    /// reservations and the new write bound are charged to it.
+    Reserve {
+        volume_id: u64,
+        deficit: u64,
+        /// Free bytes above this volume's reserve at check time.
+        available: u64,
+        detail: String,
+    },
+}
+
+/// The destination-volume free-space rule evaluated INSIDE the admission
+/// transaction: free space is re-measured after the write lock is taken and
+/// pending reservations are read from the same snapshot that inserts, so two
+/// synchronized writers can never both pass on one stale free-space reading.
+pub struct VolumeRule<'a> {
+    pub probe: &'a dyn crate::capacity::CapacityProbe,
+    /// Candidate destination paths of the pending write. All candidates are
+    /// measured and every distinct resulting volume must hold its reserve;
+    /// when they collapse to exactly one volume, that id is recorded on the
+    /// reservation row.
+    pub paths: Vec<PathBuf>,
+    /// Payload plus bounded metadata/WAL/temp growth of the pending write.
+    pub write_bound: u64,
+    /// Filesystem id of the governor ledger's own volume (SQLite/WAL growth
+    /// lives there), if measurable.
+    pub ledger_volume_id: Option<u64>,
+    /// Admitted-but-not-yet-materialized WAL debt on that volume; subtracted
+    /// only when the volume under check IS the ledger volume, so materialized
+    /// bytes (already in measured free space) are never double-charged.
+    pub unsettled_inflight: u64,
+    pub config: &'a StorageGovernorConfig,
 }
 
 pub struct Ledger {
@@ -223,6 +275,14 @@ impl Ledger {
         );
         let _ = conn.execute(
             "ALTER TABLE reservation ADD COLUMN owner TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        // Destination volume of the pending write (filesystem id as decimal
+        // text; '' = unknown/legacy row, conservatively charged to EVERY
+        // volume's unmaterialized sum). Existing rows keep '' for the rest
+        // of their lease, which only over-subtracts free space (safe).
+        let _ = conn.execute(
+            "ALTER TABLE reservation ADD COLUMN volume TEXT NOT NULL DEFAULT ''",
             [],
         );
         conn.execute_batch(
@@ -398,6 +458,12 @@ impl Ledger {
     /// process; this transaction is what makes the hard budget hold across
     /// concurrent governor instances, CAS roots and processes sharing one
     /// data directory.
+    ///
+    /// The destination-volume free-space rule is evaluated in the SAME
+    /// transaction: free space is re-measured after the write lock is taken
+    /// and pending rows are read from the snapshot that inserts, so two
+    /// synchronized writers can never both pass on one stale free reading
+    /// (free(v) − unmaterialized(v) − write_bound ≥ reserve(v)).
     #[allow(clippy::too_many_arguments)]
     pub fn try_reserve_atomic(
         &mut self,
@@ -408,6 +474,7 @@ impl Ledger {
         expires_ms: i64,
         quota: u64,
         total: u64,
+        volume_rule: VolumeRule<'_>,
     ) -> GovernorResult<AdmitRow> {
         let tx = self
             .conn
@@ -417,26 +484,109 @@ impl Ledger {
             params![now_ms],
         )?;
         let snapshot = budget_snapshot_on(&tx, class, now_ms)?;
+        // Destination-volume rule, measured under the write lock: every
+        // distinct candidate volume must keep its own reserve once
+        // unmaterialized reservations (and, on the ledger volume, unsettled
+        // WAL debt) are charged. A single resolved volume id is recorded on
+        // the row so later admissions charge this write to exactly it.
+        let mut volume_id: Option<u64> = None;
+        let mut volume_denial: Option<VolumeDenial> = None;
+        let mut spaces: BTreeMap<u64, crate::capacity::FilesystemSpace> = BTreeMap::new();
+        for path in &volume_rule.paths {
+            match volume_rule.probe.space(path) {
+                Some(space) => {
+                    spaces
+                        .entry(space.filesystem_id)
+                        .and_modify(|current| {
+                            current.capacity_bytes =
+                                current.capacity_bytes.max(space.capacity_bytes);
+                            current.available_bytes =
+                                current.available_bytes.min(space.available_bytes);
+                        })
+                        .or_insert(space);
+                }
+                None => {
+                    volume_denial = Some(VolumeDenial::Unmeasured {
+                        detail: format!(
+                            "capacity measurement failed for destination {}; new material \
+                             storage is refused until the destination volume can be measured",
+                            path.display()
+                        ),
+                    });
+                    break;
+                }
+            }
+        }
+        if volume_denial.is_none() && spaces.len() == 1 {
+            volume_id = spaces.keys().next().copied();
+        }
+        for (id, space) in &spaces {
+            if volume_denial.is_some() {
+                break;
+            }
+            let reserve_bytes =
+                crate::capacity::volume_reserve_bytes(volume_rule.config, space.capacity_bytes);
+            let pending: u64 = tx.query_row(
+                "SELECT COALESCE(SUM(bytes), 0) FROM reservation
+                 WHERE lease_expires_ms >= ?1 AND (volume = ?2 OR volume = '')",
+                params![now_ms, id.to_string()],
+                |row| Ok(from_i64(row.get(0)?)),
+            )?;
+            let inflight = if volume_rule.ledger_volume_id == Some(*id) {
+                volume_rule.unsettled_inflight
+            } else {
+                0
+            };
+            let deficit = crate::capacity::volume_admission_deficit(
+                space.available_bytes,
+                reserve_bytes,
+                pending.saturating_add(inflight),
+                volume_rule.write_bound,
+            );
+            if deficit > 0 {
+                volume_denial = Some(VolumeDenial::Reserve {
+                    volume_id: *id,
+                    deficit,
+                    available: space.available_bytes.saturating_sub(reserve_bytes),
+                    detail: format!(
+                        "destination volume {id}: {} bytes free, {reserve_bytes} byte reserve, \
+                         {pending} bytes of unmaterialized reservations, {inflight} bytes of \
+                         in-flight SQLite growth, {} byte write bound; {deficit} bytes short of \
+                         preserving the reserve",
+                        space.available_bytes, volume_rule.write_bound
+                    ),
+                });
+            }
+        }
         let class_used = snapshot.class_bytes.saturating_add(snapshot.class_pending);
         let total_used = snapshot.total_bytes.saturating_add(snapshot.total_pending);
         let class_deficit = class_used.saturating_add(bytes).saturating_sub(quota);
         let total_deficit = total_used.saturating_add(bytes).saturating_sub(total);
         let reservation_id = if class_deficit == 0 && total_deficit == 0 && bytes <= total {
-            let id = uuid::Uuid::new_v4().simple().to_string();
-            tx.execute(
-                "INSERT INTO reservation(id, class, key, bytes, owner, created_ms, lease_expires_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    id,
-                    class.as_str(),
-                    key,
-                    to_i64(bytes),
-                    process_boot_id(),
-                    now_ms,
-                    expires_ms
-                ],
-            )?;
-            Some(id)
+            if volume_denial.is_none() {
+                let id = uuid::Uuid::new_v4().simple().to_string();
+                let volume = match volume_id {
+                    Some(volume) => volume.to_string(),
+                    None => String::new(),
+                };
+                tx.execute(
+                    "INSERT INTO reservation(id, class, key, bytes, owner, volume, created_ms, lease_expires_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        id,
+                        class.as_str(),
+                        key,
+                        to_i64(bytes),
+                        process_boot_id(),
+                        volume,
+                        now_ms,
+                        expires_ms
+                    ],
+                )?;
+                Some(id)
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -448,7 +598,21 @@ impl Ledger {
             total_used,
             class_deficit,
             total_deficit,
+            volume_denial,
+            volume: volume_id,
         })
+    }
+
+    /// Live (unexpired) reservation bytes charged to ONE destination volume.
+    /// Legacy/unknown-volume rows (`volume = ''`) count toward every volume —
+    /// conservative by construction.
+    pub fn pending_on_volume(&self, volume_id: u64, now_ms: i64) -> GovernorResult<u64> {
+        Ok(from_i64(self.conn.query_row(
+            "SELECT COALESCE(SUM(bytes), 0) FROM reservation
+             WHERE lease_expires_ms >= ?1 AND (volume = ?2 OR volume = '')",
+            params![now_ms, volume_id.to_string()],
+            |row| row.get(0),
+        )?))
     }
 
     pub fn reservation(&self, id: &str) -> GovernorResult<Option<ReservationRow>> {

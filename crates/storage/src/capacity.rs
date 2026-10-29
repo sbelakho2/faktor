@@ -6,6 +6,23 @@
 //! with an always-preserved free-space reserve. Capacity and free space are
 //! measured per backing filesystem and deduplicated by filesystem identity,
 //! so several governed roots on one volume are counted once.
+//!
+//! Admission policy on top of this snapshot (governor-side, audit item 18):
+//!
+//! 1. **Measurement failure refuses typed.** When no volume can be measured
+//!    the snapshot reports `measured = false`; the governor refuses every
+//!    new material-storage admission with
+//!    [`crate::RefusalReason::CapacityUnmeasured`] and degrades health to
+//!    `capacity_unmeasured` until a probe succeeds. The configured operator
+//!    cap never silently becomes an unbounded admission budget.
+//! 2. **Volumes are never pooled for admission.** The aggregate fields below
+//!    are a metrics/health view; admission resolves the DESTINATION volume of
+//!    the pending write and enforces that volume's own reserve via
+//!    [`volume_reserve_bytes`] plus the aggregate budget.
+//! 3. **Unmaterialized reservations are subtracted.** For destination volume
+//!    `v`: `free(v) − unmaterialized(v) − new_write_bound(v) ≥ reserve(v)`,
+//!    computed with [`volume_admission_deficit`] inside the admission
+//!    transaction so synchronized writers cannot both pass one reading.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -53,16 +70,58 @@ impl CapacityProbe for SystemCapacityProbe {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FilesystemCapacity {
+    /// Stable identity of this volume (same value a reservation records as
+    /// its destination), so per-volume admission and metrics name one volume.
+    #[serde(default)]
+    pub filesystem_id: u64,
     pub capacity_bytes: u64,
     pub available_bytes: u64,
+    /// This volume's own always-preserved reserve:
+    /// `max(reserve_bytes, reserve_permille * capacity / 1000)`.
+    #[serde(default)]
+    pub reserve_bytes: u64,
+}
+
+/// The free-space reserve that must stay untouched on ONE volume:
+/// `max(config.reserve_bytes, config.reserve_permille * volume_capacity)`.
+///
+/// Identical to the aggregate reserve formula but applied to the
+/// destination volume alone, so a nearly-full destination cannot borrow
+/// headroom from free space on a different filesystem.
+pub fn volume_reserve_bytes(config: &StorageGovernorConfig, volume_capacity: u64) -> u64 {
+    config
+        .reserve_bytes
+        .max(volume_capacity.saturating_mul(config.reserve_permille as u64) / 1000)
+}
+
+/// The admission deficit of ONE destination volume.
+///
+/// `unmaterialized_bytes` are reservations granted on this volume whose
+/// bytes are not yet (or not fully) reflected in measured free space;
+/// `write_bound` is the payload plus bounded metadata/WAL/temp growth of the
+/// pending write. Zero means the write fits while the volume's own reserve
+/// stays whole. This is the single formula used both outside and inside the
+/// admission transaction.
+pub fn volume_admission_deficit(
+    available_bytes: u64,
+    reserve_bytes: u64,
+    unmaterialized_bytes: u64,
+    write_bound: u64,
+) -> u64 {
+    unmaterialized_bytes
+        .saturating_add(write_bound)
+        .saturating_add(reserve_bytes)
+        .saturating_sub(available_bytes)
 }
 
 /// The effective capacity-aware budget at one instant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CapacitySnapshot {
-    /// False when no backing path could be measured; the configured user cap
-    /// then remains the only limit (no fabricated capacity number).
+    /// False when no backing path could be measured. Admission then refuses
+    /// new material storage typed (`capacity_unmeasured`) and health degrades
+    /// until a probe succeeds; the configured operator cap alone still bounds
+    /// ledger accounting (no fabricated capacity number).
     pub measured: bool,
     pub capacity_bytes: u64,
     pub available_bytes: u64,
@@ -94,9 +153,14 @@ impl Default for CapacitySnapshot {
 impl CapacitySnapshot {
     /// Combine measured filesystems with the configured policy.
     ///
-    /// `reserve = max(reserve_bytes, reserve_permille * capacity)`;
-    /// `capacity_cap = max(capacity_permille * capacity, min_install_allowance)`;
-    /// `effective = min(user_cap, capacity_cap, capacity - reserve)`.
+    /// Aggregate view (metrics/health): `reserve = max(reserve_bytes,
+    /// reserve_permille * capacity)`; `capacity_cap = max(capacity_permille *
+    /// capacity, min_install_allowance)`; `effective = min(user_cap,
+    /// capacity_cap, capacity - reserve)`. Each entry additionally carries its
+    /// own id and per-volume reserve — admission uses those, never the pooled
+    /// numbers, to judge a specific destination write. `measured = false`
+    /// when no volume could be probed: admission then refuses typed instead
+    /// of falling back to the (potentially unbounded) operator cap.
     pub fn evaluate(
         config: &StorageGovernorConfig,
         spaces: impl IntoIterator<Item = FilesystemSpace>,
@@ -112,8 +176,10 @@ impl CapacitySnapshot {
                     entry.available_bytes = entry.available_bytes.min(space.available_bytes);
                 })
                 .or_insert(FilesystemCapacity {
+                    filesystem_id: space.filesystem_id,
                     capacity_bytes: space.capacity_bytes,
                     available_bytes: space.available_bytes,
+                    reserve_bytes: 0,
                 });
         }
         if by_id.is_empty() {
@@ -124,7 +190,13 @@ impl CapacitySnapshot {
                 ..Self::default()
             };
         }
-        let filesystems: Vec<FilesystemCapacity> = by_id.into_values().collect();
+        let filesystems: Vec<FilesystemCapacity> = by_id
+            .into_values()
+            .map(|mut fs| {
+                fs.reserve_bytes = volume_reserve_bytes(config, fs.capacity_bytes);
+                fs
+            })
+            .collect();
         let capacity_bytes = filesystems
             .iter()
             .fold(0u64, |sum, fs| sum.saturating_add(fs.capacity_bytes));
@@ -152,7 +224,12 @@ impl CapacitySnapshot {
     }
 
     /// Bytes that must be reclaimed before `incoming_bytes` may be admitted
-    /// without eating into the reserve.
+    /// without eating into the reserve, computed over the POOLED volumes.
+    ///
+    /// Metrics/legacy view only: admission never uses this (pooling can mask
+    /// a nearly-full destination volume in both directions). The governor
+    /// checks the resolved destination volume with
+    /// [`volume_admission_deficit`] instead.
     pub fn admission_deficit(&self, incoming_bytes: u64) -> u64 {
         if !self.measured {
             return 0;
@@ -162,12 +239,28 @@ impl CapacitySnapshot {
             .saturating_sub(self.available_bytes)
     }
 
-    /// Bytes currently missing from the always-preserved reserve.
+    /// Bytes currently missing from the always-preserved reserve, as the
+    /// WORST single volume: free space on one volume can never stand in for
+    /// the reserve of a different, nearly-full volume. Zero when unmeasured
+    /// (there is no capacity truth to defend; health reports the separate
+    /// `capacity_unmeasured` degradation instead).
     pub fn reserve_deficit(&self) -> u64 {
         if !self.measured {
             return 0;
         }
-        self.reserve_bytes.saturating_sub(self.available_bytes)
+        self.filesystems
+            .iter()
+            .map(|fs| fs.reserve_bytes.saturating_sub(fs.available_bytes))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The snapshot entry for one volume id (used by admission/health to
+    /// name the volume under pressure).
+    pub fn volume(&self, filesystem_id: u64) -> Option<&FilesystemCapacity> {
+        self.filesystems
+            .iter()
+            .find(|fs| fs.filesystem_id == filesystem_id)
     }
 }
 
@@ -191,13 +284,13 @@ fn filesystem_id(path: &Path) -> Option<u64> {
 #[cfg(windows)]
 fn filesystem_id(path: &Path) -> Option<u64> {
     use std::os::windows::fs::MetadataExt;
-    Some(
-        std::fs::metadata(path)
-            .ok()?
-            .volume_serial_number()
-            .map(u64::from)
-            .unwrap_or(0),
-    )
+    // An unknown volume serial is a FAILED measurement (None), never a
+    // fabricated id 0: two distinct volumes collapsing onto one id would
+    // pool them again and let one volume's headroom mask another's reserve.
+    std::fs::metadata(path)
+        .ok()?
+        .volume_serial_number()
+        .map(u64::from)
 }
 
 #[cfg(not(any(unix, windows)))]

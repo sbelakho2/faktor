@@ -80,4 +80,14 @@ pub trait StorageBackend: Send + Sync {
     fn directory_roots(&self) -> Option<(&[std::path::PathBuf], i64)> {
         None
     }
+
+    /// The exact path where publishing `key` will land, when the backend can
+    /// derive it. Admission resolves the DESTINATION VOLUME of the pending
+    /// write from it and enforces that volume's own free-space reserve.
+    /// `None` falls back to the class's directory roots, then to the
+    /// conservative candidate set (data dir + every registered capacity
+    /// root), where every candidate volume must hold its reserve.
+    fn admission_path(&self, _key: &str) -> Option<std::path::PathBuf> {
+        None
+    }
 }

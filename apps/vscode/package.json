@@ -132,7 +132,7 @@
       },
       {
         "command": "faktor.openSettings",
-        "title": "Settings: Revision 8",
+        "title": "Settings",
         "category": "Faktor"
       },
       {
@@ -157,7 +157,7 @@
       },
       {
         "command": "faktor.openSettings8",
-        "title": "Faktor: Open Revision 8 Settings",
+        "title": "Faktor: Open Settings",
         "category": "Faktor"
       },
       {
@@ -182,22 +182,22 @@
       },
       {
         "command": "faktor.openModelPicker8",
-        "title": "Faktor: Choose Model (Revision 8)",
+        "title": "Faktor: Choose Model",
         "category": "Faktor"
       },
       {
         "command": "faktor.openAgentPicker8",
-        "title": "Faktor: Agents (Revision 8)",
+        "title": "Faktor: Agents",
         "category": "Faktor"
       },
       {
         "command": "faktor.addContext8",
-        "title": "Faktor: Add Context (Revision 8)",
+        "title": "Faktor: Add Context",
         "category": "Faktor"
       },
       {
         "command": "faktor.stopScoped8",
-        "title": "Faktor: Stop\u2026 (Revision 8)",
+        "title": "Faktor: Stop\u2026",
         "category": "Faktor"
       },
       {
@@ -406,7 +406,7 @@
     "selftest": "node scripts/selftest.mjs",
     "render:check": "node scripts/settings-surface-check.mjs && node scripts/window-architecture-check.mjs && node scripts/render-webview.mjs --check && node scripts/render-edition5.mjs --check",
     "render:screenshots": "node scripts/render-webview.mjs --screenshots --prefix render",
-    "package:vsix": "npx --no-install vsce package",
+    "package:vsix": "node scripts/package-vsix.mjs",
     "render:edition5": "node scripts/render-edition5.mjs --write",
     "exercise:edition5": "node scripts/exercise-edition5.mjs",
     "acceptance:edition5": "node scripts/acceptance-edition5.mjs",

@@ -327,10 +327,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    * classification: only a lost/unavailable start response reuses the SAME
    * logical submission on retry (T08 `Start response unavailable`); a typed
    * local refusal ends the submission and keeps only the draft.
+   *
+   * Ack fencing (audit item 7): `sessionId` names the conversation the
+   * submission was admitted on and `submissionToken` the panel's own
+   * in-flight token. The panel repaints/clears the composer ONLY when both
+   * match what it currently shows — a receipt that lands after the operator
+   * switched conversations can never touch the visible draft.
    */
-  postStartResult(goal: string, ok: boolean, retryable = false): void {
+  postStartResult(
+    goal: string,
+    ok: boolean,
+    retryable = false,
+    correlation?: { readonly sessionId?: string | null; readonly submissionToken?: string | null },
+  ): void {
+    const base = ok
+      ? { type: 'startResult', goal, ok: true }
+      : { type: 'startResult', goal, ok: false, retryable };
+    const sessionId = correlation?.sessionId ?? null;
+    const submissionToken = correlation?.submissionToken ?? null;
     this.post(
-      ok ? { type: 'startResult', goal, ok: true } : { type: 'startResult', goal, ok: false, retryable },
+      sessionId === null && submissionToken === null
+        ? base
+        : { ...base, sessionId, submissionToken },
     );
   }
 
@@ -346,9 +364,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     pending: { readonly text: string },
     error: string,
     retryable: boolean,
+    correlation?: { readonly sessionId?: string | null; readonly submissionToken?: string | null },
   ): void {
     console.error(`[faktor-chat] task start failed; the draft was kept: ${error}`);
-    this.post({ type: 'startResult', goal: pending.text, ok: false, retryable });
+    this.postStartResult(pending.text, false, retryable, correlation);
   }
 
   /**
@@ -446,6 +465,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     );
     const historyUri = webview.asWebviewUri(
       vscode.Uri.joinPath(this.extensionUri, 'media', 'history-state.js'),
+    );
+    const moneyUri = webview.asWebviewUri(
+      vscode.Uri.joinPath(this.extensionUri, 'media', 'money-input.js'),
+    );
+    const markdownUri = webview.asWebviewUri(
+      vscode.Uri.joinPath(this.extensionUri, 'media', 'markdown.js'),
     );
     const styleUri = webview.asWebviewUri(
       vscode.Uri.joinPath(this.extensionUri, 'media', 'chat.css'),
@@ -550,6 +575,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       <div class="meta-row"><span class="meta-key">Stream state</span><span id="diag-stream-state">stopped</span></div>
       <div class="meta-row"><span class="meta-key">Service state</span><span id="diag-daemon-state">stopped</span></div>
       <div class="meta-row"><span class="meta-key">Last error</span><span id="diag-last-error">—</span></div>
+      <div class="meta-row"><span class="meta-key">Extension build</span><span id="diag-build">—</span></div>
+      <div class="meta-row"><span class="meta-key">Build assets</span><span id="diag-build-assets">—</span></div>
+      <div class="meta-row"><span class="meta-key">Daemon build</span><span id="diag-daemon-build">—</span></div>
+      <div class="meta-row"><span class="meta-key">Protocol capabilities</span><span id="diag-protocol-caps">—</span></div>
     </section>
     <div id="stream-cursor" class="muted" hidden></div>
     <section id="sandbox-setup" class="setup-card" aria-labelledby="sandbox-setup-title">
@@ -588,7 +617,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   </section>
   <section id="transcript-card" class="card transcript-card">
     <p id="welcome" class="welcome-line muted">Ask Faktor to start a conversation.</p>
+    <div class="transcript-affordances">
+      <button type="button" id="btn-load-older" class="transcript-affordance" hidden>Load earlier messages</button>
+    </div>
     <div id="entries" role="log" aria-live="polite" aria-relevant="additions" aria-label="Conversation transcript" tabindex="-1"></div>
+    <div class="transcript-affordances transcript-affordances-bottom">
+      <button type="button" id="btn-new-output" class="transcript-affordance" hidden>New output ↓</button>
+    </div>
+    <div id="pending-entries" class="pending-entries" aria-label="Messages awaiting durable confirmation"></div>
   </section>
   <form id="composer" data-intent="ask">
     <textarea id="goal" rows="1" aria-label="Ask Faktor" placeholder="Ask anything…"></textarea>
@@ -630,8 +666,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       <p class="muted">Optional budget for this task run only. Empty uses the Faktor setting; an invalid value keeps the draft.</p>
       <label for="contract-budget-tokens" class="composer-label">Per-run token budget — non-negative integer, empty uses the setting</label>
       <input id="contract-budget-tokens" class="contract-budget" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" placeholder="e.g. 200000" />
-      <label for="contract-budget-cost" class="composer-label">Per-run cost budget — dollars, empty uses the setting</label>
+      <label for="contract-budget-cost" class="composer-label">Per-run cost budget — dollars (e.g. $5.00), empty uses the setting</label>
       <input id="contract-budget-cost" class="contract-budget" type="text" inputmode="decimal" autocomplete="off" spellcheck="false" placeholder="e.g. $5.00" />
+      <label class="composer-label budget-raw-label" for="contract-budget-cost-raw"><input id="contract-budget-cost-raw" type="checkbox" /> Advanced: cost budget is raw micro-USD (5000000 = $5.00)</label>
     </details>
     <div id="composer-state" class="state-strip composer-state" role="status" hidden>
       <span id="composer-state-glyph" class="state-strip-glyph" aria-hidden="true"></span>
@@ -814,6 +851,8 @@ ${settingsMarkup}
 <script nonce="${nonce}" src="${settingsScriptUri}?v=${assetVersion()}"></script>
 <script nonce="${nonce}" src="${boardUri}?v=${assetVersion()}"></script>
 <script nonce="${nonce}" src="${historyUri}?v=${assetVersion()}"></script>
+<script nonce="${nonce}" src="${moneyUri}?v=${assetVersion()}"></script>
+<script nonce="${nonce}" src="${markdownUri}?v=${assetVersion()}"></script>
 <script nonce="${nonce}" src="${composerUri}?v=${assetVersion()}"></script>
 <script nonce="${nonce}" src="${scriptUri}?v=${assetVersion()}"></script>
 </body>

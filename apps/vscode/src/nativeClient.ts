@@ -489,9 +489,24 @@ function looseAliasString(object: JsonObject, keys: readonly string[]): string |
 
 // -------------------------------------------------------------- result types
 
+/**
+ * The daemon's ADDITIVE protocol-capability advertisement (audit item 17).
+ * Absent on older daemons (the extension treats that as NOT advertised and
+ * degrades by observed route presence); present = the exact feature truth.
+ * Every member is optional; a malformed present member is a loud protocol
+ * failure, never a silent default.
+ */
+export interface NativeProtocolCapabilities {
+  readonly liveStreaming: boolean | null;
+  readonly attachments: boolean | null;
+  readonly turnState: boolean | null;
+}
+
 export interface NativeHealth {
   readonly ok: boolean;
   readonly version: string;
+  /** Null when the serving daemon predates the capability handshake. */
+  readonly protocol: NativeProtocolCapabilities | null;
 }
 
 export interface NativeReady {
@@ -1705,7 +1720,30 @@ export function validateHealth(json: Json): NativeHealth {
   const path = 'GET /native/health';
   const object = asObject(json, path);
   checkResponseKeys(object, path, ['ok', 'version']);
-  return { ok: fBool(object, 'ok', path), version: fString(object, 'version', path) };
+  let protocol: NativeProtocolCapabilities | null = null;
+  if (Object.prototype.hasOwnProperty.call(object, 'protocol')) {
+    const proto = asObject(object.protocol, `${path}.protocol`);
+    const flag = (key: 'liveStreaming' | 'attachments' | 'turnState'): boolean | null => {
+      if (!Object.prototype.hasOwnProperty.call(proto, key)) {
+        return null;
+      }
+      const value = proto[key];
+      if (typeof value !== 'boolean') {
+        fail(`${path}.protocol.${key}`, `expected a boolean, got ${describe(value)}`);
+      }
+      return value;
+    };
+    protocol = {
+      liveStreaming: flag('liveStreaming'),
+      attachments: flag('attachments'),
+      turnState: flag('turnState'),
+    };
+  }
+  return {
+    ok: fBool(object, 'ok', path),
+    version: fString(object, 'version', path),
+    protocol,
+  };
 }
 
 export function validateReady(json: Json): NativeReady {

@@ -7,13 +7,18 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use serde::{Deserialize, Serialize};
 
-use crate::capacity::{CapacityProbe, CapacitySnapshot, SystemCapacityProbe};
+use crate::capacity::{
+    volume_admission_deficit, volume_reserve_bytes, CapacityProbe, CapacitySnapshot,
+    SystemCapacityProbe,
+};
 use crate::class::StorageClass;
 use crate::config::StorageGovernorConfig;
 use crate::directory::{object_row, DirectoryBackend, SqliteBackend};
 use crate::error::{GovernorError, GovernorResult, RefusalReason, StorageRefusal};
 use crate::health::{ClassUsage, DegradedHealth, StorageMetrics};
-use crate::ledger::{now_ms, Counters, DirectoryRootsMeta, Ledger, ObjectRow, UsageRow};
+use crate::ledger::{
+    now_ms, Counters, DirectoryRootsMeta, Ledger, ObjectRow, UsageRow, VolumeDenial, VolumeRule,
+};
 use crate::object::{EvictionOutcome, StorageBackend, StorageObject};
 
 /// The governor's own durable directory name (never part of any budgeted
@@ -33,6 +38,28 @@ const WATERMARK_HYSTERESIS_PERMILLE: u64 = 50;
 /// budget true even when the caller's estimate is optimistic.
 fn sqlite_growth_bound(incoming_bytes: u64) -> u64 {
     incoming_bytes.saturating_mul(2).saturating_add(16 * 1024)
+}
+
+/// Bounded metadata/temp growth charged to the destination volume's
+/// free-space check for ONE non-SQLite write: the reservation insert and the
+/// commit upsert travel through the governor ledger's SQLite WAL (a frame per
+/// statement plus row bytes), and directory publishes carry dirent/page
+/// overhead while their temp file is staged. 16 KiB — four default SQLite
+/// frames — is comfortably above the measured per-admission ledger growth and
+/// stays negligible next to any payload worth admitting. SQLite/WAL class
+/// appends use [`sqlite_growth_bound`] instead (the payload itself can land
+/// twice on disk: WAL + database).
+pub const RESERVATION_METADATA_ALLOWANCE_BYTES: u64 = 16 * 1024;
+
+/// The free-space write bound for one admitted write of `bytes` on `class`:
+/// payload plus bounded metadata/WAL/temp growth. This is what a destination
+/// volume must still hold above its reserve before the write may start.
+fn free_space_write_bound(class: StorageClass, bytes: u64) -> u64 {
+    if class == StorageClass::SqliteWal {
+        sqlite_growth_bound(bytes)
+    } else {
+        bytes.saturating_add(RESERVATION_METADATA_ALLOWANCE_BYTES)
+    }
 }
 
 /// Resolved roots for the classes that are plain directories.
@@ -635,15 +662,48 @@ impl StorageGovernor {
 
     /// Reserve `bytes` BEFORE publishing. The admission checks the
     /// capacity-aware hard budget (operator cap vs measured capacity),
-    /// per-class quota, and actual disk headroom (free space above the
-    /// always-preserved reserve). When headroom is short, noncritical classes
-    /// are evicted; if the reserve still cannot be preserved the admission is
-    /// refused typed and health degrades — the disk is never filled.
+    /// per-class quota, and the DESTINATION volume's own free-space reserve
+    /// against measured free space minus unmaterialized reservations. When
+    /// headroom is short, noncritical classes are evicted; if the reserve
+    /// still cannot be preserved the admission is refused typed and health
+    /// degrades — the disk is never filled. When no volume can be measured
+    /// the admission is refused typed `capacity_unmeasured` (never an
+    /// unbounded fallback to the operator cap).
+    ///
+    /// The destination volume is resolved from the class/key (see
+    /// [`Self::destination_paths`]); writers that know their exact target
+    /// path should use [`Self::reserve_into`] instead.
     pub fn reserve(
         &self,
         class: StorageClass,
         key: &str,
         bytes: u64,
+    ) -> GovernorResult<Reservation> {
+        self.reserve_inner(class, key, bytes, None)
+    }
+
+    /// Reserve `bytes` for a write that will land at `destination` (an
+    /// absolute/relative path the writer owns). Admission enforces exactly
+    /// THAT path's volume — its own reserve plus the aggregate budget — so a
+    /// nearly-full destination can never borrow headroom from another
+    /// filesystem, and a write targeting a healthy volume is never refused
+    /// because a different volume is full.
+    pub fn reserve_into(
+        &self,
+        class: StorageClass,
+        key: &str,
+        bytes: u64,
+        destination: impl AsRef<Path>,
+    ) -> GovernorResult<Reservation> {
+        self.reserve_inner(class, key, bytes, Some(destination.as_ref()))
+    }
+
+    fn reserve_inner(
+        &self,
+        class: StorageClass,
+        key: &str,
+        bytes: u64,
+        destination: Option<&Path>,
     ) -> GovernorResult<Reservation> {
         if key.is_empty() {
             return Err(GovernorError::Malformed(
@@ -655,13 +715,35 @@ impl StorageGovernor {
         // bounded cadence. Non-blocking when another thread is already
         // maintaining.
         let _ = self.maintain_if_due(300_000, 30_000);
+        let destinations = self.destination_paths(class, key, destination);
+        let write_bound = free_space_write_bound(class, bytes);
         let mut last_available = 0u64;
         let mut last_reason = RefusalReason::NoEvictableObjects;
+        let mut last_detail: Option<String> = None;
         // At most four admission rounds: each round either admits, or makes
-        // one bounded eviction pass. Capacity headroom is re-measured every
-        // round, so eviction only counts when the filesystem really freed it.
+        // one bounded eviction pass. The destination volume's free space is
+        // re-measured every round (inside the admission transaction), so
+        // eviction only counts when the filesystem really freed it.
         for _attempt in 0..4 {
             let capacity = self.capacity_snapshot();
+            if !capacity.measured {
+                // Counterexample 1: measurement failure must never widen the
+                // budget to the (possibly u64::MAX) operator cap. No volume
+                // means no verified headroom: refuse typed until a probe
+                // succeeds; health degrades `capacity_unmeasured`.
+                return self.refuse(
+                    class,
+                    key,
+                    bytes,
+                    0,
+                    RefusalReason::CapacityUnmeasured,
+                    format!(
+                        "no backing volume could be measured ({} registered capacity paths); \
+                         new material storage is refused until capacity measurement succeeds",
+                        self.capacity_path_count()
+                    ),
+                );
+            }
             let total = capacity.effective_budget_bytes;
             let quota = self.inner.config.quota_for(class, total);
             if bytes > quota {
@@ -684,25 +766,28 @@ impl StorageGovernor {
                     format!("object alone exceeds the {total} byte effective aggregate budget"),
                 );
             }
-            let capacity_deficit = capacity.admission_deficit(bytes);
-            if capacity_deficit > 0 {
-                last_available = capacity.headroom_bytes;
-                last_reason = RefusalReason::FreeSpaceReserve;
-                let freed = self.evict_global_for(capacity_deficit)?;
-                if freed == 0 {
-                    break;
-                }
-                continue;
-            }
-            match self.try_reserve(class, key, bytes, quota, total)? {
+            match self.try_reserve(class, key, bytes, quota, total, &destinations, write_bound)? {
                 Admit::Reserved(reservation) => {
                     self.maintain_watermark()?;
                     self.clear_degraded_if_healthy()?;
                     return Ok(reservation);
                 }
                 Admit::Need(need) => {
+                    if let Some(detail) = need.volume_unmeasured.clone() {
+                        // No eviction can restore measurement: refuse typed
+                        // with the exact degraded state surfaced.
+                        return self.refuse(
+                            class,
+                            key,
+                            bytes,
+                            0,
+                            RefusalReason::CapacityUnmeasured,
+                            detail,
+                        );
+                    }
                     last_available = need.available;
                     last_reason = need.reason();
+                    last_detail = need.volume_detail.clone();
                     let mut freed = 0u64;
                     if need.class_deficit > 0 {
                         // Class pressure is satisfied ONLY from that class:
@@ -712,6 +797,8 @@ impl StorageGovernor {
                     }
                     if need.class_deficit == 0 || freed >= need.class_deficit {
                         let remaining = need.total_deficit.saturating_sub(freed);
+                        let volume_remaining = need.volume_deficit.saturating_sub(freed);
+                        let remaining = remaining.max(volume_remaining);
                         if remaining > 0 {
                             freed = freed.saturating_add(self.evict_global_for(remaining)?);
                         }
@@ -728,11 +815,63 @@ impl StorageGovernor {
             bytes,
             last_available,
             last_reason,
-            "eviction could not free enough bytes; the hard budget or free-space reserve is not met"
-                .into(),
+            last_detail.unwrap_or_else(|| {
+                "eviction could not free enough bytes; the hard budget or free-space reserve \
+                 is not met"
+                    .into()
+            }),
         )
     }
 
+    /// How many registered paths a capacity probe would visit (degraded-state
+    /// detail; never used to fabricate a measurement).
+    fn capacity_path_count(&self) -> usize {
+        let mut paths: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+        paths.insert(self.inner.data_dir.clone());
+        paths.insert(self.inner.root.clone());
+        paths.extend(self.inner.capacity_roots.read().unwrap().iter().cloned());
+        for backend in self.inner.backends.read().unwrap().values() {
+            if let Some((roots, _)) = backend.directory_roots() {
+                paths.extend(roots.iter().cloned());
+            }
+        }
+        paths.len()
+    }
+
+    /// Candidate destination paths for a pending write under `class`/`key`,
+    /// in resolution order:
+    ///
+    /// 1. the explicit destination passed by the writer (authoritative),
+    /// 2. the backend's derived path for the key ([`StorageBackend::admission_path`]),
+    /// 3. every directory root of the class when the key names no single root,
+    /// 4. otherwise the conservative candidate set: the data directory plus
+    ///    every registered capacity root. When the true destination cannot be
+    ///    narrowed to one path, EVERY distinct candidate volume must keep its
+    ///    own reserve — the check can then never under-admit the real target,
+    ///    only (deliberately) over-refuse.
+    fn destination_paths(
+        &self,
+        class: StorageClass,
+        key: &str,
+        explicit: Option<&Path>,
+    ) -> Vec<PathBuf> {
+        if let Some(destination) = explicit {
+            return vec![destination.to_path_buf()];
+        }
+        if let Some(backend) = self.backend(class) {
+            if let Some(path) = backend.admission_path(key) {
+                return vec![path];
+            }
+            if let Some((roots, _)) = backend.directory_roots() {
+                return roots.to_vec();
+            }
+        }
+        let mut candidates = vec![self.inner.data_dir.clone()];
+        candidates.extend(self.inner.capacity_roots.read().unwrap().iter().cloned());
+        candidates
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn try_reserve(
         &self,
         class: StorageClass,
@@ -740,9 +879,28 @@ impl StorageGovernor {
         bytes: u64,
         quota: u64,
         total: u64,
+        destinations: &[PathBuf],
+        write_bound: u64,
     ) -> GovernorResult<Admit> {
         let now = now_ms();
         let lease = self.inner.config.reservation_lease_ms.max(1);
+        // The ledger volume (its SQLite/WAL lives under the data dir) is
+        // identified before the transaction; filesystem ids are stable, while
+        // the destination volumes themselves are re-measured INSIDE the
+        // transaction together with the pending rows.
+        let ledger_volume_id = self
+            .inner
+            .capacity_probe
+            .space(&self.inner.data_dir)
+            .map(|space| space.filesystem_id);
+        let rule = VolumeRule {
+            probe: self.inner.capacity_probe.as_ref(),
+            paths: destinations.to_vec(),
+            write_bound,
+            ledger_volume_id,
+            unsettled_inflight: self.inner.wal_debt.inflight.load(Ordering::Acquire),
+            config: &self.inner.config,
+        };
         let row = {
             let mut ledger = self.inner.ledger.lock().unwrap();
             ledger.try_reserve_atomic(
@@ -753,15 +911,34 @@ impl StorageGovernor {
                 now.saturating_add(lease),
                 quota,
                 total,
+                rule,
             )?
         };
         let Some(id) = row.reservation_id else {
-            let available = quota
+            let room = quota
                 .saturating_sub(row.class_used)
                 .min(total.saturating_sub(row.total_used));
+            let available = match &row.volume_denial {
+                // The volume's headroom is the honest "available" when the
+                // destination reserve is what refused the write.
+                Some(VolumeDenial::Reserve { available, .. }) => room.min(*available),
+                _ => room,
+            };
             return Ok(Admit::Need(Need {
                 class_deficit: row.class_deficit,
                 total_deficit: row.total_deficit,
+                volume_deficit: match &row.volume_denial {
+                    Some(VolumeDenial::Reserve { deficit, .. }) => *deficit,
+                    _ => 0,
+                },
+                volume_unmeasured: match &row.volume_denial {
+                    Some(VolumeDenial::Unmeasured { detail }) => Some(detail.clone()),
+                    _ => None,
+                },
+                volume_detail: match &row.volume_denial {
+                    Some(VolumeDenial::Reserve { detail, .. }) => Some(detail.clone()),
+                    _ => None,
+                },
                 available,
                 class_pinned: row.snapshot.class_pinned,
                 total_pinned: row.snapshot.total_pinned,
@@ -1333,22 +1510,50 @@ impl StorageGovernor {
         };
         let capacity = self.capacity_snapshot();
         let effective_budget = capacity.effective_budget_bytes;
+        // Counterexample 1, surfaced state: no measurable volume degrades
+        // health FIRST (above every capacity-relative judgement), naming the
+        // exact state instead of silently trusting the operator cap.
+        let measurement = (!capacity.measured).then(|| DegradedHealth {
+            code: "capacity_unmeasured".into(),
+            detail: format!(
+                "no backing volume could be measured ({} registered capacity paths); the \
+                 capacity-relative budget, the free-space reserve and new-material-storage \
+                 admission are unavailable until a probe succeeds",
+                self.capacity_path_count()
+            ),
+            total_bytes: total,
+            total_budget_bytes: effective_budget,
+            required_bytes: pinned,
+            class: None,
+            at_ms: now_ms(),
+        });
+        // Counterexample 2 on the maintenance side: the reserve must be whole
+        // on EVERY volume; pooled free space can no longer mask one nearly-full
+        // volume behind another's emptiness.
         let reserve_pressure = capacity.measured.then(|| {
-            let deficit = capacity.reserve_deficit();
-            (deficit > 0).then(|| DegradedHealth {
-                code: "free_space_reserve_unmet".into(),
-                detail: format!(
-                    "{} bytes of free space remain but the {} byte reserve must be preserved; no evictable noncritical object remains",
-                    capacity.available_bytes, capacity.reserve_bytes
-                ),
-                total_bytes: total,
-                total_budget_bytes: effective_budget,
-                required_bytes: pinned.saturating_add(deficit),
-                class: None,
-                at_ms: now_ms(),
+            let worst = capacity
+                .filesystems
+                .iter()
+                .max_by_key(|fs| fs.reserve_bytes.saturating_sub(fs.available_bytes));
+            worst.and_then(|fs| {
+                let deficit = fs.reserve_bytes.saturating_sub(fs.available_bytes);
+                (deficit > 0).then(|| DegradedHealth {
+                    code: "free_space_reserve_unmet".into(),
+                    detail: format!(
+                        "volume {}: {} bytes free but its {} byte reserve must be preserved; no evictable noncritical object remains",
+                        fs.filesystem_id, fs.available_bytes, fs.reserve_bytes
+                    ),
+                    total_bytes: total,
+                    total_budget_bytes: effective_budget,
+                    required_bytes: pinned.saturating_add(deficit),
+                    class: None,
+                    at_ms: now_ms(),
+                })
             })
         });
-        let structural = reserve_pressure.flatten().or_else(|| {
+        let structural = measurement
+            .or(reserve_pressure.flatten())
+            .or_else(|| {
             if total > effective_budget {
                 Some(DegradedHealth {
                     code: "aggregate_budget_exceeded".into(),
@@ -1444,7 +1649,10 @@ impl StorageGovernor {
         drop(ledger);
         let capacity = self.capacity_snapshot();
         let effective_budget = capacity.effective_budget_bytes;
-        if total <= effective_budget
+        // An unmeasured governor is NEVER "healthy again": the
+        // `capacity_unmeasured` degradation stands until a probe succeeds.
+        if capacity.measured
+            && total <= effective_budget
             && usage.iter().all(|(class, row)| {
                 row.bytes <= self.inner.config.quota_for(*class, effective_budget)
             })
@@ -1594,20 +1802,18 @@ impl StorageGovernor {
 
     /// Attempt one SQLite growth admission against durable usage, pending
     /// reservations and the bytes admitted since the last inventory scan.
+    /// Takes the already-held ledger lock so the budget room, the destination
+    /// volume rule and the debt increment can be checked atomically.
     fn sqlite_room(
         &self,
+        ledger: &Ledger,
         incoming_bytes: u64,
         quota: u64,
         total: u64,
     ) -> GovernorResult<Option<(u64, u64, u64)>> {
         let bound = sqlite_growth_bound(incoming_bytes);
         let now = now_ms();
-        let snapshot = self
-            .inner
-            .ledger
-            .lock()
-            .unwrap()
-            .budget_snapshot(StorageClass::SqliteWal, now)?;
+        let snapshot = ledger.budget_snapshot(StorageClass::SqliteWal, now)?;
         let debt = self.inner.wal_debt.admitted.load(Ordering::Acquire);
         let class_used = snapshot
             .class_bytes
@@ -1623,6 +1829,47 @@ impl StorageGovernor {
         Ok(None)
     }
 
+    /// The destination-volume room for one SQLite/WAL growth admission: the
+    /// data directory's volume must keep its own reserve after live
+    /// reservations on that volume (including unknown-volume rows) and the
+    /// unsettled in-flight WAL debt are charged against measured free space.
+    /// Evaluated under the held ledger lock together with the budget room, so
+    /// synchronized admissions cannot both pass one free-space reading.
+    fn sqlite_volume_room(&self, ledger: &Ledger, bound: u64) -> GovernorResult<SqliteVolumeRoom> {
+        let Some(space) = self.inner.capacity_probe.space(&self.inner.data_dir) else {
+            return Ok(SqliteVolumeRoom::Unmeasured {
+                detail: format!(
+                    "capacity measurement failed for the SQLite data directory {}; SQLite/WAL \
+                     growth is refused until that volume can be measured",
+                    self.inner.data_dir.display()
+                ),
+            });
+        };
+        let reserve_bytes = volume_reserve_bytes(&self.inner.config, space.capacity_bytes);
+        let pending = ledger.pending_on_volume(space.filesystem_id, now_ms())?;
+        let inflight = self.inner.wal_debt.inflight.load(Ordering::Acquire);
+        let deficit = volume_admission_deficit(
+            space.available_bytes,
+            reserve_bytes,
+            pending.saturating_add(inflight),
+            bound,
+        );
+        if deficit > 0 {
+            return Ok(SqliteVolumeRoom::Reserve {
+                deficit,
+                available: space.available_bytes.saturating_sub(reserve_bytes),
+                detail: format!(
+                    "data-dir volume {}: {} bytes free, {reserve_bytes} byte reserve, {pending} \
+                     bytes of unmaterialized reservations, {inflight} bytes of in-flight SQLite \
+                     growth, {bound} byte write bound; {deficit} bytes short of preserving the \
+                     reserve",
+                    space.filesystem_id, space.available_bytes
+                ),
+            });
+        }
+        Ok(SqliteVolumeRoom::Ok)
+    }
+
     fn charge_sqlite_growth(
         &self,
         incoming_bytes: u64,
@@ -1630,44 +1877,68 @@ impl StorageGovernor {
     ) -> GovernorResult<Option<SqliteAdmission>> {
         let bound = sqlite_growth_bound(incoming_bytes);
         let capacity = self.capacity_snapshot();
-        if capacity.measured && bound > capacity.headroom_bytes {
+        if !capacity.measured {
+            // Measurement failure never admits growth: the caller's refusal
+            // path reports the typed `capacity_unmeasured` state.
             return Ok(None);
         }
         let total = capacity.effective_budget_bytes;
         let quota = self.inner.config.quota_for(StorageClass::SqliteWal, total);
         loop {
-            if self.sqlite_room(incoming_bytes, quota, total)?.is_none() {
-                break;
-            }
-            let debt = self.inner.wal_debt.admitted.load(Ordering::Acquire);
-            // Mark in-flight BEFORE the admitted CAS: a scan that snaps
-            // between the two must not treat this admission as completed.
-            if tracked {
-                self.inner
-                    .wal_debt
-                    .inflight
-                    .fetch_add(bound, Ordering::AcqRel);
-            }
-            if self
-                .inner
-                .wal_debt
-                .admitted
-                .compare_exchange(
-                    debt,
-                    debt.saturating_add(bound),
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
+            let mut stop = false;
+            let mut admitted: Option<SqliteAdmission> = None;
             {
-                return Ok(Some(SqliteAdmission {
-                    governor: self.clone(),
-                    charged: if tracked { bound } else { 0 },
-                    active: tracked,
-                }));
+                // One ledger lock spans the budget room, the destination
+                // volume's free-space rule and the debt increment: a
+                // concurrent admission can never slip between check and
+                // charge on one stale free-space reading.
+                let ledger = self.inner.ledger.lock().unwrap();
+                let room = self.sqlite_room(&ledger, incoming_bytes, quota, total)?;
+                let volume_ok = matches!(
+                    self.sqlite_volume_room(&ledger, bound)?,
+                    SqliteVolumeRoom::Ok
+                );
+                if room.is_none() || !volume_ok {
+                    // Budget room spent, or the destination volume cannot
+                    // keep its reserve: the caller evicts or refuses.
+                    stop = true;
+                } else {
+                    let debt = self.inner.wal_debt.admitted.load(Ordering::Acquire);
+                    // Mark in-flight BEFORE the admitted CAS: a scan that snaps
+                    // between the two must not treat this admission as completed.
+                    if tracked {
+                        self.inner
+                            .wal_debt
+                            .inflight
+                            .fetch_add(bound, Ordering::AcqRel);
+                    }
+                    if self
+                        .inner
+                        .wal_debt
+                        .admitted
+                        .compare_exchange(
+                            debt,
+                            debt.saturating_add(bound),
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        admitted = Some(SqliteAdmission {
+                            governor: self.clone(),
+                            charged: if tracked { bound } else { 0 },
+                            active: tracked,
+                        });
+                    } else if tracked {
+                        settle_inflight(&self.inner.wal_debt.inflight, bound);
+                    }
+                }
             }
-            if tracked {
-                settle_inflight(&self.inner.wal_debt.inflight, bound);
+            if let Some(admission) = admitted {
+                return Ok(Some(admission));
+            }
+            if stop {
+                break;
             }
         }
         Ok(None)
@@ -1738,12 +2009,17 @@ impl StorageGovernor {
                 return Ok(Some(admission));
             }
         }
-        // Actual disk headroom: reclaim noncritical classes before refusing
-        // an append that would consume the free-space reserve.
-        let capacity = self.capacity_snapshot();
-        let headroom_deficit = capacity.admission_deficit(sqlite_growth_bound(incoming_bytes));
-        if headroom_deficit > 0 {
-            let _ = self.evict_global_for(headroom_deficit);
+        // Destination volume: reclaim noncritical classes before refusing an
+        // append that would consume that volume's free-space reserve.
+        let volume_deficit = {
+            let ledger = self.inner.ledger.lock().unwrap();
+            match self.sqlite_volume_room(&ledger, sqlite_growth_bound(incoming_bytes))? {
+                SqliteVolumeRoom::Reserve { deficit, .. } => deficit,
+                _ => 0,
+            }
+        };
+        if volume_deficit > 0 {
+            let _ = self.evict_global_for(volume_deficit);
             if let Some(admission) = self.charge_sqlite_growth(incoming_bytes, tracked)? {
                 return Ok(Some(admission));
             }
@@ -1769,17 +2045,37 @@ impl StorageGovernor {
             .saturating_add(debt);
         let pinned = snapshot.total_pinned;
         let bound = sqlite_growth_bound(incoming_bytes);
-        let reason = if capacity.measured && bound > capacity.headroom_bytes {
-            RefusalReason::FreeSpaceReserve
-        } else if class_used.saturating_add(bound) > quota {
-            RefusalReason::ClassQuota
-        } else {
-            RefusalReason::AggregateBudget
+        let volume_room = {
+            let ledger = self.inner.ledger.lock().unwrap();
+            self.sqlite_volume_room(&ledger, bound)?
+        };
+        let volume_headroom = match &volume_room {
+            SqliteVolumeRoom::Reserve { available, .. } => *available,
+            SqliteVolumeRoom::Ok => capacity.headroom_bytes,
+            SqliteVolumeRoom::Unmeasured { .. } => 0,
+        };
+        // Counterexample 1 on the SQLite path: measurement failure must
+        // refuse typed, never fall back to the operator cap as if headroom
+        // were known.
+        let reason =
+            if !capacity.measured || matches!(volume_room, SqliteVolumeRoom::Unmeasured { .. }) {
+                RefusalReason::CapacityUnmeasured
+            } else if matches!(volume_room, SqliteVolumeRoom::Reserve { .. }) {
+                RefusalReason::FreeSpaceReserve
+            } else if class_used.saturating_add(bound) > quota {
+                RefusalReason::ClassQuota
+            } else {
+                RefusalReason::AggregateBudget
+            };
+        let detail = match &volume_room {
+            SqliteVolumeRoom::Unmeasured { detail } => detail.clone(),
+            SqliteVolumeRoom::Reserve { detail, .. } => detail.clone(),
+            SqliteVolumeRoom::Ok => "SQLite/WAL growth refused before the append".to_string(),
         };
         let available = quota
             .saturating_sub(class_used)
             .min(total.saturating_sub(total_used))
-            .min(capacity.headroom_bytes);
+            .min(volume_headroom);
         {
             let mut ledger = self.inner.ledger.lock().unwrap();
             ledger.record_refusal(
@@ -1787,14 +2083,14 @@ impl StorageGovernor {
                 incoming_bytes,
                 available,
                 reason.as_str(),
-                "SQLite/WAL growth refused before the append",
+                &detail,
             )?;
         }
         let health = DegradedHealth {
             code: format!("storage_{}", reason.as_str()),
             detail: format!(
-                "SQLite growth of {incoming_bytes} bytes refused ({} used of {} quota, pinned {pinned})",
-                class_used, quota
+                "SQLite growth of {incoming_bytes} bytes refused ({detail}; {class_used} used of \
+                 {quota} quota, pinned {pinned})"
             ),
             total_bytes: total_used,
             total_budget_bytes: total,
@@ -1808,7 +2104,7 @@ impl StorageGovernor {
             requested_bytes: incoming_bytes,
             available_bytes: available,
             reason,
-            detail: "SQLite/WAL growth refused before the append".into(),
+            detail,
         }))
     }
 
@@ -1863,9 +2159,33 @@ enum Admit {
     Need(Need),
 }
 
+/// Outcome of one destination-volume room check on the SQLite path.
+enum SqliteVolumeRoom {
+    /// The volume keeps its reserve after unmaterialized charges.
+    Ok,
+    /// The volume's reserve could not be preserved.
+    Reserve {
+        deficit: u64,
+        available: u64,
+        detail: String,
+    },
+    /// The volume could not be measured at all.
+    Unmeasured { detail: String },
+}
+
 struct Need {
     class_deficit: u64,
     total_deficit: u64,
+    /// Bytes the destination volume is short of preserving its own reserve,
+    /// once unmaterialized reservations and the write bound are charged.
+    volume_deficit: u64,
+    /// Set when a destination volume could not be measured (typed refusal;
+    /// eviction cannot help, the governor must stop and report the degraded
+    /// state).
+    volume_unmeasured: Option<String>,
+    /// Human-readable destination-volume denial carried into the final
+    /// refusal detail.
+    volume_detail: Option<String>,
     available: u64,
     class_pinned: u64,
     total_pinned: u64,
@@ -1877,6 +2197,9 @@ struct Need {
 
 impl Need {
     fn reason(&self) -> RefusalReason {
+        if self.volume_unmeasured.is_some() {
+            return RefusalReason::CapacityUnmeasured;
+        }
         if self.class_deficit > 0 && self.class_pinned.saturating_add(self.class_bytes) > self.quota
         {
             return RefusalReason::RequiredBytes;
@@ -1884,6 +2207,9 @@ impl Need {
         if self.total_deficit > 0 && self.total_pinned.saturating_add(self.class_bytes) > self.total
         {
             return RefusalReason::RequiredBytes;
+        }
+        if self.volume_deficit > 0 {
+            return RefusalReason::FreeSpaceReserve;
         }
         if self.class_deficit > 0 && !self.has_backend {
             return RefusalReason::NoBackend;

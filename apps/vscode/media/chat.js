@@ -60,6 +60,35 @@
       return 'history unavailable (policy missing)';
     },
   };
+  // Cost-budget input policy comes from media/money-input.js (loaded
+  // first). The fallback keeps the dollar semantics (audit item 12): exact
+  // integer arithmetic, typed refusals, raw micro only behind the explicit
+  // advanced checkbox — never a silent coercion.
+  var moneyInputPolicy =
+    (typeof FaktorMoneyInput !== 'undefined' && FaktorMoneyInput) || {
+      parseBudgetCost: function (value, raw) {
+        var text = String(value == null ? '' : value).trim();
+        if (text.length === 0) {
+          return { empty: true };
+        }
+        if (raw === true) {
+          if (!/^[0-9]+$/.test(text)) {
+            return { reason: 'raw micro-USD is a plain non-negative integer' };
+          }
+          return { micro: text };
+        }
+        var match = /^\$?([0-9]+)(?:\.([0-9]{1,6}))?$/.exec(text);
+        if (match === null) {
+          return { reason: 'write the cost budget as a dollar amount such as $5.00' };
+        }
+        var fraction = (match[2] || '').padEnd(6, '0');
+        var micro = BigInt(match[1]) * 1000000n + BigInt(fraction || '0');
+        if (micro > 9007199254740991n) {
+          return { reason: 'the cost budget exceeds the exact integer range (max 2^53-1 micro-USD)' };
+        }
+        return { micro: micro.toString() };
+      },
+    };
   // The T27/T28 recovery presentation (I06e). The mode is chosen from the
   // host's stream status + the explicit recovery message; the copy is frozen
   // and the actions are exactly Wait/Refresh and Reconnect/Refresh from
@@ -143,10 +172,18 @@
     label: 'composer-state-label',
     copy: 'composer-state-copy',
   };
-  // One logical submission at a time. The flag gates the composer BEFORE the
-  // post, so a double click / Enter+click race can never emit a second
-  // sendGoal; it is released ONLY by an explicit host result.
-  var submitting = false;
+  // ONE logical submission per CONVERSATION (audit items 7/10). The lock
+  // gates the composer BEFORE the post, so a double click / Enter+click
+  // race can never emit a second sendGoal for the same conversation; a
+  // different conversation is never blocked by it. Each in-flight entry is
+  // keyed by the panel-minted submission token the host echoes back in
+  // `startResult`, so a receipt that lands after a switch can neither
+  // release a newer lock nor repaint the visible composer. The lock is
+  // released ONLY by an explicit host result for that token.
+  var composerSubmitSeq = 0;
+  var inFlightSubmissions = {};
+  var pendingUserRows = [];
+  var MAX_PENDING_USER_ROWS = 4;
   /** The ONE composer's explicit intent. Ask is the product default. */
   var composerIntent = 'ask';
   /**
@@ -2308,16 +2345,55 @@
    * READY row renders only from the served ready preflight with no active
    * run. Nothing renders when no served condition holds.
    */
+  // Item 16: the running status beside the composer distinguishes these
+  // six explicit states (the settled ones retire with their snapshot).
+  var TURN_SIX_STATE = {
+    submitting: { label: 'Working', glyph: '\u25b6' },
+    starting: { label: 'Working', glyph: '\u25b6' },
+    streaming: { label: 'Working', glyph: '\u25b6' },
+    'tool-running': { label: 'Working', glyph: '\u25b6' },
+    queued: { label: 'Waiting', glyph: '\u23f8' },
+    'awaiting-user': { label: 'Waiting', glyph: '\u23f8' },
+    completed: { label: 'Done', glyph: '\u2713' },
+    interrupted: { label: 'Stopped', glyph: '\u2298' },
+    failed: { label: 'Failed', glyph: '\u2717' },
+  };
+
   function renderComposerState() {
     var spec = null;
-    if (submitting) {
+    if (composerLocked()) {
       spec = COMPOSER_STATES.starting;
-    } else if (startFailed) {
-      spec = COMPOSER_STATES.startUnavailable;
-    } else if (machineStateValue === 'needs_user_input') {
-      spec = COMPOSER_STATES.needsInput;
-    } else if (lastPreflight && lastPreflight.state === 'ready' && !runActive) {
-      spec = COMPOSER_STATES.ready;
+    } else if (turnStatePhase !== 'idle' && TURN_SIX_STATE[turnStatePhase]) {
+      var six = TURN_SIX_STATE[turnStatePhase];
+      var settled =
+        turnStatePhase === 'completed' ||
+        turnStatePhase === 'interrupted' ||
+        turnStatePhase === 'failed';
+      // A SETTLED label lives exactly as long as the run it describes
+      // (the snapshot's busy/activeRunId); a live label follows the turn.
+      if (settled && !runActive) {
+        spec = null;
+      } else {
+        var verifying =
+          lastSnapshotForHeader !== null &&
+          lastSnapshotForHeader.ux &&
+          lastSnapshotForHeader.ux.presentation &&
+          lastSnapshotForHeader.ux.presentation.run === 'verifying';
+        spec = {
+          glyph: six.glyph,
+          label: verifying && six.label === 'Working' ? 'Checking' : six.label,
+          copy: turnPhaseCopy(turnStatePhase),
+        };
+      }
+    }
+    if (spec === null) {
+      if (startFailed) {
+        spec = COMPOSER_STATES.startUnavailable;
+      } else if (machineStateValue === 'needs_user_input') {
+        spec = COMPOSER_STATES.needsInput;
+      } else if (lastPreflight && lastPreflight.state === 'ready' && !runActive) {
+        spec = COMPOSER_STATES.ready;
+      }
     }
     writeStateStrip(COMPOSER_STATE_IDS, spec);
   }
@@ -3108,6 +3184,8 @@
       hash128(entry.reasoning) +
       ':' +
       hash128(entry.summary) +
+      ':' +
+      entryPartsKey(entry) +
       ':';
     for (var t = 0; t < tools.length; t++) {
       out +=
@@ -3241,6 +3319,8 @@
       String(entry.reasoning == null ? '' : entry.reasoning).length +
       ':' +
       String(entry.summary == null ? '' : entry.summary).length +
+      ':' +
+      entryPartsKey(entry) +
       ':';
     for (var t = 0; t < tools.length; t++) {
       out +=
@@ -3454,7 +3534,13 @@
         hi = mid - 1;
       }
     }
-    return { index: lo, offset: Math.max(0, scrollTop - prefix[lo]) };
+    var anchoredId =
+      typeof transcriptEntries === 'object' &&
+      transcriptEntries !== null &&
+      transcriptEntries[lo]
+        ? String(transcriptEntries[lo].id)
+        : null;
+    return { index: lo, offset: Math.max(0, scrollTop - prefix[lo]), entryId: anchoredId };
   }
 
   /** The first visible entry of the short (non-windowed) list. */
@@ -3480,12 +3566,25 @@
   /** Restore the anchor pixel position of `anchor.index` after a rebuild. */
   function scrollToTranscriptAnchor(container, anchor) {
     var children = container.children || [];
-    if (children.length === 0) {
+    if (children.length === 0 || !anchor) {
       return;
     }
     var index = Math.min(Math.max(0, anchor.index), children.length - 1);
+    // Item 13: an ID-based anchor (captured before a scrollback PREPEND)
+    // locates the same entry at its NEW index, so loading older history
+    // never shifts the reader off the passage being read.
+    if (anchor.entryId != null && anchor.entryId !== '') {
+      var want = String(anchor.entryId);
+      for (var c = 0; c < children.length; c += 1) {
+        var child = children[c];
+        if (child && child.getAttribute && child.getAttribute('data-entry-id') === want) {
+          index = c;
+          break;
+        }
+      }
+    }
     var node = children[index];
-    var top = typeof node.offsetTop === 'number' ? node.offsetTop : 0;
+    var top = node && typeof node.offsetTop === 'number' ? node.offsetTop : 0;
     setTranscriptScroll(container, top + anchor.offset);
   }
 
@@ -3702,6 +3801,13 @@
       return;
     }
     var next = value == null ? '' : String(value);
+    // Markdown hosts (assistant prose) re-render through the incremental
+    // parser (item 9): completed blocks keep their DOM identity, so
+    // selection/focus in them survives a growing reply.
+    if (part.__faktorMarkdownHost) {
+      updateTextPart(part, next);
+      return;
+    }
     var first = part.firstChild;
     if (
       first &&
@@ -3720,6 +3826,113 @@
     if (part.textContent !== next) {
       part.textContent = next;
     }
+  }
+
+  /** Update ONE text part node with the exact current text. */
+  function updateTextPart(part, value) {
+    if (!part) {
+      return;
+    }
+    var next = value == null ? '' : String(value);
+    if (part.__faktorMarkdownHost) {
+      if (typeof FaktorMarkdown !== 'undefined' && FaktorMarkdown) {
+        FaktorMarkdown.render(part, next);
+        return;
+      }
+      part.__faktorMarkdownHost = false;
+    }
+    setPartText(part, next);
+  }
+
+  /**
+   * The ordered-part structure key (item 8): the sequence of part kinds
+   * (tools as T) plus the clip marker. A changed key is a REBUILD (new
+   * nodes); an unchanged key is patchable in place.
+   */
+  function entryPartsKey(entry) {
+    var parts = Array.isArray(entry.parts) && entry.parts.length > 0 ? entry.parts : null;
+    var out = '';
+    if (parts !== null) {
+      for (var i = 0; i < parts.length; i += 1) {
+        out += parts[i].kind === 'tool' ? 'T' : parts[i].kind.charAt(0);
+      }
+    } else {
+      if (entry.text) out += 't';
+      if (entry.reasoning) out += 'r';
+      if (entry.summary) out += 's';
+      var tools = entry.tools || [];
+      for (var t = 0; t < tools.length; t += 1) out += 'T';
+    }
+    return out + (entry.clipped ? ':c' : '');
+  }
+
+  /** The ordered parts of an entry, synthesized from buckets when absent. */
+  function entryPartsOf(entry) {
+    if (Array.isArray(entry.parts) && entry.parts.length > 0) {
+      return entry.parts;
+    }
+    var synthesized = [];
+    if (entry.reasoning) synthesized.push({ kind: 'reasoning', text: entry.reasoning });
+    if (entry.summary) synthesized.push({ kind: 'summary', text: entry.summary });
+    if (entry.text) synthesized.push({ kind: 'text', text: entry.text });
+    var tools = entry.tools || [];
+    for (var t = 0; t < tools.length; t += 1) {
+      synthesized.push({ kind: 'tool', toolCallId: tools[t].toolCallId });
+    }
+    return synthesized;
+  }
+
+  /**
+   * Rebuild the ordered parts after the live overlay replaced a bucket
+   * (item 8): an append extends the LAST part of that kind (or opens a new
+   * one); a divergence replaces that kind's parts in place, keeping tool
+   * positions.
+   */
+  function rebuildPartsForOverlay(entry, kind, oldText, newText) {
+    var parts = Array.isArray(entry.parts) ? entry.parts.slice() : [];
+    var oldStr = oldText == null ? '' : String(oldText);
+    var nextStr = newText == null ? '' : String(newText);
+    var hadKind = false;
+    for (var k = 0; k < parts.length; k += 1) {
+      if (parts[k].kind === kind) {
+        hadKind = true;
+        break;
+      }
+    }
+    if (!hadKind) {
+      // A legacy/fixture entry without ordered parts: the overlay bucket IS
+      // the full text — the part must carry it whole, never the delta alone.
+      if (nextStr.length > 0) {
+        parts.push({ kind: kind, text: nextStr });
+      }
+      return parts;
+    }
+    if (nextStr.lastIndexOf(oldStr, 0) === 0 && nextStr.length > oldStr.length) {
+      var delta = nextStr.slice(oldStr.length);
+      var last = parts.length > 0 ? parts[parts.length - 1] : null;
+      if (last !== null && last.kind === kind) {
+        parts[parts.length - 1] = { kind: kind, text: last.text + delta };
+      } else {
+        parts.push({ kind: kind, text: delta });
+      }
+      return parts;
+    }
+    var out = [];
+    var replaced = false;
+    for (var i = 0; i < parts.length; i += 1) {
+      if (parts[i].kind === kind) {
+        if (!replaced && nextStr.length > 0) {
+          out.push({ kind: kind, text: nextStr });
+          replaced = true;
+        }
+        continue;
+      }
+      out.push(parts[i]);
+    }
+    if (!replaced && nextStr.length > 0) {
+      out.push({ kind: kind, text: nextStr });
+    }
+    return out;
   }
 
   function toolContentSame(left, right) {
@@ -3747,7 +3960,17 @@
   function patchEntryNode(node, entry) {
     var old = node ? node.__faktorEntry : null;
     var parts = node ? node.__faktorParts : null;
-    if (!old || !parts || old.seq !== entry.seq || old.role !== entry.role) {
+    if (!old || !parts) {
+      return false;
+    }
+    // Item 8: the ordered part structure (kinds sequence + clip marker) is
+    // the patch fence — a changed structure is a rebuild (new nodes); an
+    // unchanged one patches text parts and tool rows in place, preserving
+    // selection, focus and expanded disclosures.
+    if (entryPartsKey(old) !== entryPartsKey(entry)) {
+      return false;
+    }
+    if (old.seq !== entry.seq || old.role !== entry.role) {
       return false;
     }
     var oldTools = old.tools || [];
@@ -3755,14 +3978,30 @@
     if (oldTools.length !== newTools.length) {
       return false;
     }
-    if (!!entry.text !== !!(parts.text && parts.text.__faktorPresent)) {
-      return false;
-    }
-    if (!!entry.reasoning !== !!(parts.reasoning && parts.reasoning.__faktorPresent)) {
-      return false;
-    }
-    if (!!entry.summary !== !!(parts.summary && parts.summary.__faktorPresent)) {
-      return false;
+    var newOrdered = entryPartsOf(entry);
+    var textNodes = parts.textNodes || [];
+    var reasoningNodes = parts.reasoningNodes || [];
+    var summaryNodes = parts.summaryNodes || [];
+    var textCursor = 0;
+    var reasoningCursor = 0;
+    var summaryCursor = 0;
+    for (var pi = 0; pi < newOrdered.length; pi += 1) {
+      var part = newOrdered[pi];
+      if (part.kind === 'tool') {
+        continue;
+      }
+      if (part.kind === 'reasoning') {
+        setPartText(reasoningNodes[reasoningCursor], part.text);
+        reasoningCursor += 1;
+        continue;
+      }
+      if (part.kind === 'summary') {
+        setPartText(summaryNodes[summaryCursor], part.text);
+        summaryCursor += 1;
+        continue;
+      }
+      setPartText(textNodes[textCursor], part.text);
+      textCursor += 1;
     }
     var focusInside =
       typeof document !== 'undefined' &&
@@ -3770,9 +4009,6 @@
       node.contains &&
       node.contains(document.activeElement);
     var preserved = focusInside ? captureEntryState(node) : null;
-    setPartText(parts.text, entry.text);
-    setPartText(parts.reasoning, entry.reasoning);
-    setPartText(parts.summary, entry.summary);
     var toolNodes = node.__faktorToolNodes || [];
     for (var t = 0; t < newTools.length; t += 1) {
       var oldTool = oldTools[t];
@@ -3828,26 +4064,30 @@
         continue;
       }
       // Preserve the OLD row's open disclosure / delivered evidence even when
-      // focus has left it (the reader may have opened a tool card and then
-      // clicked into the composer). The capture is scoped to this row, so a
-      // per-token text patch never clones the whole entry.
+      // focus has left it. The capture is scoped to this row.
       var rowState = existingRow ? captureEntryState(existingRow) : null;
       var fresh = renderToolNode(newTool);
+      fresh.__faktorTool = newTool;
       if (existingRow && existingRow.parentNode && (!node.contains || node.contains(existingRow))) {
         existingRow.parentNode.replaceChild(fresh, existingRow);
       } else {
-        var host = node.__faktorToolGroup
-          ? node.querySelector('.activity-group-body')
-          : node;
-        if (host) host.appendChild(fresh);
+        var host = node.querySelector ? node.querySelector('.activity-group-body') : null;
+        if (host) {
+          host.appendChild(fresh);
+        } else if (node.appendChild) {
+          node.appendChild(fresh);
+        }
       }
       if (rowState) {
         restoreEntryState(fresh, rowState);
       }
       toolNodes[t] = fresh;
     }
-    if (node.__faktorToolGroup) {
-      updateToolGroupSummary(node.__faktorToolGroup, newTools);
+    var groups = node.__faktorToolGroups || [];
+    for (var g = 0; g < groups.length; g += 1) {
+      var runStart = groups[g].__faktorRunStart || 0;
+      var runLength = groups[g].__faktorRunLength || 0;
+      updateToolGroupSummary(groups[g], newTools.slice(runStart, runStart + runLength));
     }
     node.__faktorToolNodes = toolNodes;
     node.__faktorEntry = entry;
@@ -3871,8 +4111,9 @@
     renderProbe(patched ? 'transcript-patch' : 'transcript-patch-fallback');
     if (!patched) {
       var preserved = captureEntryState(node);
-      var fresh = renderEntry(entry);
+      var fresh = renderEntry(entry, index > 0 ? entries[index - 1] : null);
       fresh.setAttribute('data-entry-index', String(index));
+      fresh.setAttribute('data-entry-id', String(entry.id));
       container.replaceChild(fresh, node);
       restoreEntryState(fresh, preserved);
       node = fresh;
@@ -3980,8 +4221,9 @@
         target.appendChild(transcriptSpacer('transcript-spacer-top', transcriptPrefix[start] - TRANSCRIPT_ENTRY_GAP_PX));
       }
       for (var i = start; i < end; i += 1) {
-        var node = renderEntry(entries[i]);
+        var node = renderEntry(entries[i], i > 0 ? entries[i - 1] : null);
         node.setAttribute('data-entry-index', String(i));
+        node.setAttribute('data-entry-id', String(entries[i].id));
         target.appendChild(node);
       }
       if (end < total) {
@@ -4088,6 +4330,7 @@
   }
 
   function noteTranscriptUserScroll() {
+    updateTranscriptAffordances();
     transcriptUserScrollUntil = Date.now() + 300;
   }
 
@@ -4211,8 +4454,9 @@
     if (appended) {
       renderProbe('transcript-append');
       for (var a = container.children.length; a < entries.length; a++) {
-        var appendedNode = renderEntry(entries[a]);
+        var appendedNode = renderEntry(entries[a], a > 0 ? entries[a - 1] : null);
         appendedNode.setAttribute('data-entry-index', String(a));
+        appendedNode.setAttribute('data-entry-id', String(entries[a].id));
         container.appendChild(appendedNode);
       }
     } else {
@@ -4224,8 +4468,9 @@
           return;
         }
         for (var i = 0; i < entries.length; i++) {
-          var node = renderEntry(entries[i]);
+          var node = renderEntry(entries[i], i > 0 ? entries[i - 1] : null);
           node.setAttribute('data-entry-index', String(i));
+          node.setAttribute('data-entry-id', String(entries[i].id));
           container.appendChild(node);
         }
       });
@@ -4470,7 +4715,28 @@
     return { tone: outcome.tone, label: outcome.label };
   }
 
-  function renderToolNode(tool) {
+  /**
+   * Item 16: the SUBJECT of one tool run (what the action acted on): the
+   * first bounded path/command/url the daemon's input carries — never a
+   * fabricated value, empty when the input names none.
+   */
+  function toolSubject(tool) {
+    var input = tool && tool.input;
+    if (!input || typeof input !== 'object') {
+      return '';
+    }
+    var keys = ['path', 'file_path', 'filePath', 'command', 'url', 'notebook_path', 'target'];
+    for (var i = 0; i < keys.length; i += 1) {
+      var value = input[keys[i]];
+      if (typeof value === 'string' && value.trim().length > 0) {
+        var text = value.trim();
+        return text.length > 80 ? text.slice(0, 77) + '…' : text;
+      }
+    }
+    return '';
+  }
+
+function renderToolNode(tool) {
     var name = String(tool.name == null ? '' : tool.name);
     var kind = classifyTool(name);
     var outcome = toolOutcome(tool);
@@ -4493,6 +4759,11 @@
     summary.className = 'activity-summary';
     summary.appendChild(toolGlyph(kind));
     span(summary, name.length > 0 ? name : '(unnamed tool)', 'activity-name');
+    // Item 16: the summary conveys ACTION + SUBJECT.
+    var subject = toolSubject(tool);
+    if (subject.length > 0) {
+      span(summary, subject, 'activity-subject');
+    }
     var diffAdd = null;
     var diffDel = null;
     if (chip.tone === 'diff') {
@@ -4545,78 +4816,169 @@
     return row;
   }
 
-  function textPart(wrapper, className, value) {
+  function textPart(wrapper, className, value, markdown) {
     var node = document.createElement('div');
     node.className = className;
-    node.textContent = value;
-    node.__faktorPresent = value !== null && value !== undefined && value !== '';
+    var present = value !== null && value !== undefined && value !== '';
+    // Item 9: assistant prose renders as safe incremental Markdown; user
+    // rows and summaries stay plain text (user content is DATA).
+    if (markdown === true && present && typeof FaktorMarkdown !== 'undefined' && FaktorMarkdown) {
+      node.__faktorMarkdownHost = true;
+      FaktorMarkdown.render(node, String(value));
+    } else {
+      node.textContent = value == null ? '' : String(value);
+    }
+    node.__faktorPresent = present;
     wrapper.appendChild(node);
     return node;
   }
 
-  function renderEntry(entry) {
+  function renderEntry(entry, previousEntry) {
     var wrapper = document.createElement('article');
     wrapper.className = 'entry entry-' + (entry.role === 'user' ? 'user' : 'assistant');
 
+    // Item 8: stable authors — "You"/"Faktor" instead of `role #seq`; the
+    // seq/id live on the head as diagnostics (tooltip), never in ordinary
+    // copy. Assistant iterations of one turn group under ONE Faktor
+    // identity: the author head renders only where the role run starts
+    // (a user turn always starts a new run).
     var head = document.createElement('div');
     head.className = 'entry-head';
-    head.textContent = entry.role + ' #' + entry.seq;
+    var sameRoleRun =
+      previousEntry != null &&
+      typeof previousEntry === 'object' &&
+      previousEntry.role === entry.role;
+    head.textContent = sameRoleRun ? '' : entry.role === 'user' ? 'You' : 'Faktor';
+    head.setAttribute('title', 'message ' + entry.id + ' (seq ' + entry.seq + ')');
     wrapper.appendChild(head);
 
-    var parts = { text: null, reasoning: null, summary: null };
-    if (entry.text) {
-      parts.text = textPart(wrapper, 'entry-text', entry.text);
+    // `text` stays the FIRST text node (the live-overlay/test contract);
+    // `textNodes`/`reasoningNodes`/`summaryNodes` carry the ordered parts.
+    var parts = {
+      text: null,
+      reasoning: null,
+      summary: null,
+      textNodes: [],
+      reasoningNodes: [],
+      summaryNodes: [],
+      toolNodes: [],
+      toolGroups: [],
+    };
+    var ordered = entryPartsOf(entry);
+    var toolRun = [];
+    var toolRunStart = 0;
+    var flushToolRun = function () {
+      if (toolRun.length === 0) {
+        return;
+      }
+      var runTools = toolRun;
+      var runStart = toolRunStart;
+      toolRun = [];
+      var nodes = [];
+      var group = null;
+      var host = wrapper;
+      if (runTools.length > 1) {
+        group = document.createElement('details');
+        group.className = 'activity-group';
+        var groupSummary = document.createElement('summary');
+        groupSummary.className = 'activity-group-summary';
+        group.appendChild(groupSummary);
+        host = document.createElement('div');
+        host.className = 'activity-group-body';
+        group.appendChild(host);
+        // Only LIVE work auto-opens. A settled batch stays collapsed.
+        group.open = runTools.some(function (tool) {
+          return toolOutcome(tool).tone === 'run';
+        });
+        wrapper.appendChild(group);
+      }
+      for (var t = 0; t < runTools.length; t += 1) {
+        var toolNode = renderToolNode(runTools[t]);
+        host.appendChild(toolNode);
+        nodes.push(toolNode);
+        parts.toolNodes.push(toolNode);
+      }
+      if (group !== null) {
+        updateToolGroupSummary(group, runTools);
+        group.__faktorRunStart = runStart;
+        group.__faktorRunLength = runTools.length;
+        parts.toolGroups.push(group);
+      }
+      var toolById = {};
+      var entryTools = entry.tools || [];
+      for (var e = 0; e < entryTools.length; e += 1) {
+        toolById[String(entryTools[e].toolCallId)] = entryTools[e];
+      }
+      for (var n = 0; n < nodes.length; n += 1) {
+        nodes[n].__faktorTool = toolById[String(runTools[n].toolCallId)];
+      }
+    };
+    var toolsById = {};
+    var allTools = entry.tools || [];
+    for (var ti = 0; ti < allTools.length; ti += 1) {
+      toolsById[String(allTools[ti].toolCallId)] = allTools[ti];
     }
-    if (entry.reasoning) {
-      var details = document.createElement('details');
-      details.className = 'reasoning-details';
-      var summary = document.createElement('summary');
-      summary.textContent = 'Reasoning';
-      details.appendChild(summary);
-      var reasoning = document.createElement('pre');
-      reasoning.className = 'reasoning';
-      reasoning.textContent = entry.reasoning;
-      reasoning.__faktorPresent = true;
-      details.appendChild(reasoning);
-      wrapper.appendChild(details);
-      parts.reasoning = reasoning;
+    for (var pi = 0; pi < ordered.length; pi += 1) {
+      var part = ordered[pi];
+      if (part.kind === 'tool') {
+        var tool = toolsById[String(part.toolCallId)];
+        if (tool) {
+          if (toolRun.length === 0) {
+            toolRunStart = parts.toolNodes.length;
+          }
+          toolRun.push(tool);
+        }
+        continue;
+      }
+      flushToolRun();
+      if (part.kind === 'reasoning') {
+        var details = document.createElement('details');
+        details.className = 'reasoning-details';
+        var summaryNode = document.createElement('summary');
+        summaryNode.textContent = 'Reasoning';
+        details.appendChild(summaryNode);
+        var reasoning = document.createElement('pre');
+        reasoning.className = 'reasoning';
+        reasoning.textContent = part.text;
+        reasoning.__faktorPresent = part.text !== '';
+        details.appendChild(reasoning);
+        wrapper.appendChild(details);
+        parts.reasoningNodes.push(reasoning);
+        if (parts.reasoning === null) {
+          parts.reasoning = reasoning;
+        }
+        continue;
+      }
+      if (part.kind === 'summary') {
+        var summaryNode = textPart(wrapper, 'entry-summary', part.text, false);
+        parts.summaryNodes.push(summaryNode);
+        if (parts.summary === null) {
+          parts.summary = summaryNode;
+        }
+        continue;
+      }
+      var proseNode = textPart(wrapper, 'entry-text', part.text, entry.role !== 'user');
+      parts.textNodes.push(proseNode);
+      if (parts.text === null) {
+        parts.text = proseNode;
+      }
     }
-    if (entry.summary) {
-      parts.summary = textPart(wrapper, 'entry-summary', entry.summary);
-    }
-    var tools = Array.isArray(entry.tools) ? entry.tools : [];
-    var toolNodes = [];
-    var toolHost = wrapper;
-    var toolGroup = null;
-    if (tools.length > 1) {
-      toolGroup = document.createElement('details');
-      toolGroup.className = 'activity-group';
-      var groupSummary = document.createElement('summary');
-      groupSummary.className = 'activity-group-summary';
-      toolGroup.appendChild(groupSummary);
-      toolHost = document.createElement('div');
-      toolHost.className = 'activity-group-body';
-      toolGroup.appendChild(toolHost);
-      // Only LIVE work auto-opens. A settled batch — including a batch of
-      // failures from a dead/interrupted run — stays collapsed behind its
-      // one-line summary so it never blocks the conversation surface.
-      toolGroup.open = tools.some(function (tool) {
-        return toolOutcome(tool).tone === 'run';
-      });
-      wrapper.appendChild(toolGroup);
-    }
-    for (var i = 0; i < tools.length; i++) {
-      var toolNode = renderToolNode(tools[i]);
-      toolHost.appendChild(toolNode);
-      toolNodes.push(toolNode);
-    }
-    if (toolGroup !== null) {
-      updateToolGroupSummary(toolGroup, tools);
+    flushToolRun();
+    // Item 13: the retained-output boundary is explicit, never a silent
+    // truncation.
+    if (entry.clipped) {
+      var clip = document.createElement('div');
+      clip.className = 'entry-clip muted';
+      clip.textContent =
+        'Retained output ends here — this entry reached the ' +
+        '256 KB transcript bound.';
+      wrapper.appendChild(clip);
     }
     wrapper.__faktorEntry = entry;
     wrapper.__faktorParts = parts;
-    wrapper.__faktorToolNodes = toolNodes;
-    wrapper.__faktorToolGroup = toolGroup;
+    wrapper.__faktorToolNodes = parts.toolNodes;
+    wrapper.__faktorToolGroups = parts.toolGroups;
+    wrapper.__faktorToolGroup = null;
     return wrapper;
   }
 
@@ -4655,6 +5017,17 @@
       parts = [tools.length + (tools.length === 1 ? ' tool call' : ' tool calls')];
       if (failed > 0) parts.push(failed + ' failed');
       if (running > 0) parts.push(running + ' running');
+      // Item 16: the batch summary names the SUBJECTS (bounded, deduped).
+      var subjects = [];
+      for (var s = 0; s < tools.length && subjects.length < 3; s += 1) {
+        var subjectText = toolSubject(tools[s]);
+        if (subjectText.length > 0 && subjects.indexOf(subjectText) === -1) {
+          subjects.push(subjectText);
+        }
+      }
+      if (subjects.length > 0) {
+        parts.push(subjects.join(', '));
+      }
     }
     summary.textContent = parts.join(' · ');
     summary.setAttribute('aria-label', 'Tool activity: ' + parts.join(', '));
@@ -4808,9 +5181,9 @@
         remove.className = 'attachment-remove';
         remove.textContent = 'Remove';
         remove.setAttribute('aria-label', 'Remove attachment ' + (item.filename || item.mime));
-        remove.disabled = submitting;
+        remove.disabled = composerLocked();
         remove.addEventListener('click', function () {
-          if (submitting) {
+          if (composerLocked()) {
             return;
           }
           vscode.postMessage({ type: 'removeAttachment', id: item.id });
@@ -4820,7 +5193,7 @@
       })(attachments[i]);
     }
     clearButton.hidden = attachments.length === 0;
-    clearButton.disabled = submitting;
+    clearButton.disabled = composerLocked();
     if (notice) {
       notice.hidden = firstRefusal === null;
       notice.textContent = firstRefusal === null ? '' : 'Attachment refused: ' + firstRefusal;
@@ -4873,7 +5246,7 @@
   }
 
   function ingestFiles(fileList) {
-    if (submitting || !fileList || fileList.length === 0) {
+    if (composerLocked() || !fileList || fileList.length === 0) {
       return;
     }
     var room = WEBVIEW_MAX_ATTACHMENTS - attachments.length;
@@ -5741,6 +6114,10 @@
       liveParts = {};
       lastDurableTranscript = null;
       lastDurableRevision = null;
+      // Pending user rows are per conversation (item 10): none survives a
+      // switch into a different conversation.
+      pendingUserRows = [];
+      renderPendingUserRows();
     }
     currentSessionId = sessionId;
     lastSnapshotForHeader = snapshot;
@@ -5788,6 +6165,11 @@
     lastDurableTranscript = snapshot.transcript;
     lastDurableRevision = snapshot.transcriptRevision;
     renderTranscript(withLiveOverlay(snapshot.transcript), snapshot.transcriptRevision);
+    // Item 10: an accepted pending row is reconciled with its durable twin
+    // here (exact-text baseline match), so the pair never renders twice.
+    reconcilePendingUserRows(snapshot.transcript);
+    renderPendingUserRows();
+    updateTranscriptAffordances();
     // The raw last error lives in Diagnostics; the structured projection
     // reached the panel through `userError`. A last error with no posted
     // projection (e.g. a cockpit projection failure) still surfaces ONCE
@@ -5838,6 +6220,58 @@
     setText('diag-stream-state', snapshot ? snapshot.streamStatus : null);
     setText('diag-daemon-state', snapshot ? snapshot.daemon : null);
     setText('diag-last-error', snapshot ? snapshot.lastError : null);
+    // Item 17: the provenance + capability-handshake rows. Everything here
+    // is served state — nothing is fabricated when the stamp or handshake
+    // is absent.
+    var provenance = snapshot ? snapshot.provenance : null;
+    if (provenance) {
+      var commit = provenance.buildCommit == null ? 'uncommitted build' : provenance.buildCommit;
+      setText(
+        'diag-build',
+        'extension ' + provenance.extensionVersion + ' · ' + commit,
+      );
+      var assetNote =
+        provenance.assets.length === 0
+          ? 'no packaged stamp'
+          : provenance.assetsMatch
+            ? 'all ' + provenance.assets.length + ' assets match the packaged build'
+            : 'MODIFIED since packaging: ' +
+              provenance.assets
+                .filter(function (asset) {
+                  return !asset.matches;
+                })
+                .map(function (asset) {
+                  return asset.path;
+                })
+                .slice(0, 6)
+                .join(', ');
+      setText('diag-build-assets', assetNote);
+      var daemonNote = provenance.daemonVersion == null ? '—' : provenance.daemonVersion;
+      if (provenance.daemonExecutable) {
+        daemonNote += ' · ' + provenance.daemonExecutable;
+      }
+      setText('diag-daemon-build', daemonNote);
+      var caps = provenance.protocol;
+      if (caps === null || caps === undefined) {
+        setText(
+          'diag-protocol-caps',
+          'not advertised by this daemon — live output, attachments and turn-state ' +
+            'degrade by observed route presence (the daemon can add the additive ' +
+            '`protocol` member on GET /native/health)',
+        );
+      } else {
+        var capNote = [];
+        capNote.push('live streaming: ' + (caps.liveStreaming === true ? 'yes' : 'no'));
+        capNote.push('attachments: ' + (caps.attachments === true ? 'yes' : 'no'));
+        capNote.push('turn state: ' + (caps.turnState === true ? 'yes' : 'no'));
+        setText('diag-protocol-caps', capNote.join(' · '));
+      }
+    } else {
+      setText('diag-build', null);
+      setText('diag-build-assets', null);
+      setText('diag-daemon-build', null);
+      setText('diag-protocol-caps', null);
+    }
   }
 
   /** The composer's model chip: session identity, quiet and non-interactive. */
@@ -5984,8 +6418,31 @@
    * can never join the pending request. Every outcome (success, typed
    * refusal, transport failure) re-enables.
    */
-  function setSubmitting(value) {
-    submitting = value;
+  function conversationKeyOf(sessionId) {
+    return sessionId === null || sessionId === undefined ? '' : String(sessionId);
+  }
+
+  function currentConversationKey() {
+    return conversationKeyOf(currentSessionId);
+  }
+
+  /** TRUE while a logical submission of THIS conversation awaits its result. */
+  function composerLocked() {
+    var conversation = currentConversationKey();
+    for (var token in inFlightSubmissions) {
+      if (
+        Object.prototype.hasOwnProperty.call(inFlightSubmissions, token) &&
+        inFlightSubmissions[token].conversationId === conversation
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** Recompute the disabled state of every submission-gated control. */
+  function renderComposerAvailability() {
+    var locked = composerLocked();
     var ids = [
       'btn-send',
       'btn-intent-ask',
@@ -6000,11 +6457,74 @@
     for (var i = 0; i < ids.length; i++) {
       var node = byId(ids[i]);
       if (node) {
-        node.disabled = value;
+        node.disabled = locked;
       }
     }
     renderAttachments();
     renderComposerState();
+  }
+
+  // --------------------------------------------- pending user rows (item 10)
+  //
+  // The sent message is visible IMMEDIATELY as a pending "You" row keyed by
+  // the submission token; the durable twin (the daemon's user message) is
+  // reconciled by exact text against a per-row baseline count, so a repeated
+  // phrase never duplicates and a failed start drops the row with the draft
+  // restored. Rows are per conversation and bounded.
+
+  function countDurableUserText(transcript, text) {
+    var count = 0;
+    var entries = Array.isArray(transcript) ? transcript : [];
+    for (var i = 0; i < entries.length; i++) {
+      var entry = entries[i];
+      if (entry && entry.role === 'user' && String(entry.text == null ? '' : entry.text) === text) {
+        count += 1;
+      }
+    }
+    return count;
+  }
+
+  function reconcilePendingUserRows(transcript) {
+    var kept = [];
+    for (var i = 0; i < pendingUserRows.length; i++) {
+      var row = pendingUserRows[i];
+      if (row.status === 'accepted' && countDurableUserText(transcript, row.text) > row.baseline) {
+        continue;
+      }
+      kept.push(row);
+    }
+    pendingUserRows = kept;
+  }
+
+  function renderPendingUserRows() {
+    var container = byId('pending-entries');
+    if (!container) {
+      return;
+    }
+    clear(container);
+    var conversation = currentConversationKey();
+    for (var i = 0; i < pendingUserRows.length; i++) {
+      var row = pendingUserRows[i];
+      if (row.conversationId !== conversation) {
+        continue;
+      }
+      var wrapper = document.createElement('article');
+      wrapper.className = 'entry entry-user entry-pending';
+      wrapper.setAttribute('data-pending-token', row.token);
+      var head = document.createElement('div');
+      head.className = 'entry-head';
+      head.textContent = 'You';
+      wrapper.appendChild(head);
+      var body = document.createElement('div');
+      body.className = 'entry-text';
+      body.textContent = row.text;
+      wrapper.appendChild(body);
+      var state = document.createElement('div');
+      state.className = 'entry-pending-state muted';
+      state.textContent = row.status === 'accepted' ? 'Sent' : 'Sending\u2026';
+      wrapper.appendChild(state);
+      container.appendChild(wrapper);
+    }
   }
 
   // ------------------------------------------------------- message coalescing
@@ -6358,6 +6878,20 @@
           merged[field] = entry[field];
         }
       }
+      // Item 8: the ordered parts stay the authority — the overlay extends
+      // them exactly like the durable reducer (append to the last part of
+      // that kind; divergence replaces that kind in place).
+      if (text !== entry.text) {
+        merged.parts = rebuildPartsForOverlay(merged, 'text', entry.text, text);
+      }
+      if (reasoning !== entry.reasoning) {
+        merged.parts = rebuildPartsForOverlay(
+          merged.parts === undefined ? merged : { ...merged, parts: merged.parts },
+          'reasoning',
+          entry.reasoning,
+          reasoning,
+        );
+      }
       merged.text = text;
       merged.reasoning = reasoning;
       out[i] = merged;
@@ -6514,6 +7048,9 @@
     // Turn-state rendering: the header status carries the exact phase (and
     // the settled outcome); Stop is visible while ANY turn is live, even
     // before the busy snapshot lands (receipt and snapshot are separate).
+    // The composer strip (item 16) follows the SAME single live-status
+    // channel — never a reread of a growing reply.
+    renderComposerState();
     if (lastSnapshotForHeader !== null) {
       setText('daemon-text', headerStatusText(lastSnapshotForHeader));
     }
@@ -6604,15 +7141,80 @@
         forgetPermissionRefusal(resultId);
       }
     } else if (message.type === 'startResult') {
-      // The explicit result releases the submitting lock on EVERY outcome.
-      // A failed start kept the draft: T08 `Start response unavailable`
-      // renders ONLY when the host classified the failure retryable (a lost
-      // response reuses the SAME logical submission); a typed refusal keeps
-      // the draft but ends that submission. The retry itself is always the
-      // OPERATOR's next Run task.
+      // Ack fencing (audit item 7): the result repaints/clears the
+      // composer ONLY when it matches the in-flight submission of the
+      // conversation being viewed. A token the panel no longer holds (an
+      // already-settled or foreign receipt) is fenced out entirely; a
+      // conversation mismatch releases that conversation's lock but never
+      // touches the visible draft. The explicit result releases the lock on
+      // EVERY matched outcome. A failed start kept the draft: T08 `Start
+      // response unavailable` renders ONLY when the host classified the
+      // failure retryable; a typed refusal keeps the draft but ends that
+      // submission. The retry itself is always the OPERATOR's next Run task.
       var ok = message.ok === true;
+      var resultToken =
+        typeof message.submissionToken === 'string' && message.submissionToken.length > 0
+          ? message.submissionToken
+          : null;
+      var matchedEntry = null;
+      if (resultToken !== null) {
+        if (!Object.prototype.hasOwnProperty.call(inFlightSubmissions, resultToken)) {
+          // Stale/foreign receipt: it neither releases a newer lock nor
+          // repaints the visible composer.
+          return;
+        }
+        matchedEntry = inFlightSubmissions[resultToken];
+        delete inFlightSubmissions[resultToken];
+      } else {
+        // Legacy host result (no token): release the current conversation's
+        // lock if one is held.
+        var legacyConversation = currentConversationKey();
+        for (var held in inFlightSubmissions) {
+          if (
+            Object.prototype.hasOwnProperty.call(inFlightSubmissions, held) &&
+            inFlightSubmissions[held].conversationId === legacyConversation
+          ) {
+            matchedEntry = inFlightSubmissions[held];
+            delete inFlightSubmissions[held];
+            break;
+          }
+        }
+      }
+      var resultSession =
+        typeof message.sessionId === 'string' && message.sessionId.length > 0
+          ? message.sessionId
+          : null;
+      var visible =
+        resultSession === null ||
+        currentSessionId === null ||
+        resultSession === String(currentSessionId);
+      // Reconcile the pending user row: accepted rows await their durable
+      // twin; a failed start drops the row with the restored draft.
+      for (var rowIndex = 0; rowIndex < pendingUserRows.length; rowIndex += 1) {
+        var pendingRow = pendingUserRows[rowIndex];
+        var tokenMatch =
+          resultToken !== null
+            ? pendingRow.token === resultToken
+            : matchedEntry !== null && pendingRow.conversationId === legacyConversation;
+        if (!tokenMatch) {
+          continue;
+        }
+        if (ok) {
+          pendingRow.status = 'accepted';
+        } else {
+          pendingUserRows.splice(rowIndex, 1);
+          rowIndex -= 1;
+        }
+      }
+      renderPendingUserRows();
+      if (!visible) {
+        // The receipt belongs to a conversation the operator left: the
+        // visible composer is never repainted or cleared.
+        renderComposerAvailability();
+        return;
+      }
       startFailed = !ok && message.retryable === true;
-      setSubmitting(false);
+      renderComposerAvailability();
       var goalNode = byId('goal');
       if (goalNode) {
         goalNode.value = composerPolicy.afterStart(goalNode.value, message.goal, ok);
@@ -6623,7 +7225,7 @@
         // the visible set and the submission identity, and focus returns to
         // the composer for the next task.
         attachments = [];
-          renderAttachments();
+        renderAttachments();
         // The completion contract is per task start: a successful ack
         // resets the finish-level radio group; a failure keeps it for the
         // retry.
@@ -6775,6 +7377,7 @@
   function runBudgetFromControls() {
     var tokensNode = byId('contract-budget-tokens');
     var costNode = byId('contract-budget-cost');
+    var rawNode = byId('contract-budget-cost-raw');
     var tokens = tokensNode && typeof tokensNode.value === 'string' ? tokensNode.value.trim() : '';
     var cost = costNode && typeof costNode.value === 'string' ? costNode.value.trim() : '';
     var budget = {};
@@ -6782,17 +7385,17 @@
       budget.tokens = tokens;
     }
     if (cost.length > 0) {
-      // Human money in the composer, exact micro on the wire. `$5.00` and
-      // `5.00` mean five dollars; an explicit `5000000µ$` (or a bare
-      // integer) stays exact micro for compatibility.
-      var dollars = /^\$?([0-9]+)(?:\.([0-9]{1,6}))?$/.exec(cost);
-      if (dollars && (cost.charAt(0) === '$' || cost.indexOf('.') !== -1)) {
-        var whole = BigInt(dollars[1]);
-        var fraction = (dollars[2] || '').padEnd(6, '0');
-        budget.cost = (whole * 1000000n + BigInt(fraction || '0')).toString();
-      } else {
-        budget.cost = cost;
+      // Human dollars in the composer, exact micro on the wire (audit item
+      // 12): `5`, `5.0`, `5.00` and `$5.00` all convert to exactly
+      // "5000000" through integer arithmetic. Raw micro-USD is the EXPLICIT
+      // advanced surface (the "raw micro-USD" checkbox), never the default
+      // reading of a dollar-labeled field. A malformed value is a typed
+      // refusal — the caller refuses the START and keeps the draft.
+      var parsed = moneyInputPolicy.parseBudgetCost(cost, rawNode && rawNode.checked === true);
+      if (parsed.reason !== undefined) {
+        return { costRefusal: parsed.reason };
       }
+      budget.cost = parsed.micro;
     }
     return budget;
   }
@@ -6806,6 +7409,11 @@
         node.value = '';
       }
     }
+    // The explicit advanced surface resets with the field it belongs to.
+    var raw = byId('contract-budget-cost-raw');
+    if (raw) {
+      raw.checked = false;
+    }
   }
 
   /**
@@ -6817,7 +7425,7 @@
    * (minted from the complete parsed snapshot, never from a webview key).
    */
   function requestStart() {
-    if (submitting) {
+    if (composerLocked()) {
       return;
     }
     var goal = byId('goal').value.trim();
@@ -6841,6 +7449,20 @@
       var contract = completionContractFromControls();
       var contractRows = contractRowsFromControls();
       var budget = runBudgetFromControls();
+      if (budget.costRefusal !== undefined) {
+        // Audit item 12: a malformed cost budget is a TYPED local refusal —
+        // the START is refused loudly, the draft (and every field) is kept,
+        // and nothing is posted.
+        showUserError(
+          localUserError(
+            'That cost budget is not an exact amount',
+            budget.costRefusal + '. The draft was kept.',
+            budget.costRefusal,
+            { key: 'focusComposer', label: 'Fix the budget' },
+          ),
+        );
+        return;
+      }
       if (contract) {
         message.completionContract = contract;
       }
@@ -6854,12 +7476,32 @@
         message.budgetCostMicro = budget.cost;
       }
     }
+    // Items 7/10: the submission is fenced by a panel-minted token bound to
+    // the conversation being viewed; the pending "You" row renders
+    // IMMEDIATELY and is reconciled with the durable twin on arrival.
+    composerSubmitSeq += 1;
+    var token = 'wp-' + composerSubmitSeq;
+    message.submissionToken = token;
+    var conversation = currentConversationKey();
+    inFlightSubmissions[token] = { conversationId: conversation, intent: composerIntent };
+    var baseline = countDurableUserText(lastDurableTranscript, goal);
+    pendingUserRows.push({
+      token: token,
+      conversationId: conversation,
+      text: goal,
+      status: 'sending',
+      baseline: baseline,
+    });
+    while (pendingUserRows.length > MAX_PENDING_USER_ROWS) {
+      pendingUserRows.shift();
+    }
     transcriptPinRequested = true;
     transcriptPinned = true;
     transcriptAnchor = null;
     // A new submission supersedes a kept failed start (T08 -> T07).
     startFailed = false;
-    setSubmitting(true);
+    renderComposerAvailability();
+    renderPendingUserRows();
     // Run task becomes disabled while the submission is pending; keep
     // keyboard focus in the composer instead of dropping it to the body.
     var goalNode = byId('goal');
@@ -6868,6 +7510,7 @@
     }
     vscode.postMessage(message);
   }
+
 
   function setComposerIntent(intent) {
     composerIntent = intent === 'task' ? 'task' : 'ask';
@@ -6889,6 +7532,48 @@
   });
   setComposerIntent('ask');
   autoGrowGoal();
+
+  // Item 13: explicit scrollback affordance — fetches the OLDER history
+  // page by the host's `nextBefore` cursor. The id-based anchor keeps the
+  // reading position stable across the prepend.
+  byId('btn-load-older').addEventListener('click', function () {
+    var container = byId('entries');
+    if (container) {
+      transcriptPinned = false;
+      transcriptPinRequested = false;
+      transcriptAnchor = transcriptAnchorOf(container);
+    }
+    vscode.postMessage({ type: 'loadOlderMessages' });
+  });
+  // Item 16: scroll-up never yanks — while unpinned, new output is offered
+  // through an explicit affordance instead of a forced scroll.
+  byId('btn-new-output').addEventListener('click', function () {
+    transcriptPinned = true;
+    transcriptPinRequested = true;
+    transcriptAnchor = null;
+    var container = byId('entries');
+    if (container) {
+      setTranscriptScroll(container, container.scrollHeight);
+    }
+    updateTranscriptAffordances();
+  });
+
+  function updateTranscriptAffordances() {
+    var older = byId('btn-load-older');
+    if (older) {
+      var hasMore =
+        lastSnapshotForHeader !== null && lastSnapshotForHeader.transcriptHasMore === true;
+      older.hidden = !hasMore;
+    }
+    var newer = byId('btn-new-output');
+    if (newer) {
+      var container = byId('entries');
+      var atBottom =
+        !container ||
+        container.scrollTop + container.clientHeight >= container.scrollHeight - 24;
+      newer.hidden = transcriptPinned || atBottom;
+    }
+  }
 
   byId('composer').addEventListener('submit', function (event) {
     event.preventDefault();
@@ -6932,7 +7617,8 @@
   byId('board-subject').addEventListener('input', updateBoardPostEnabled);
   byId('board-body').addEventListener('input', updateBoardPostEnabled);
 
-  // Keyboard: Enter inserts a newline; Ctrl/Cmd+Enter starts the task.
+  // Keyboard: Enter sends, Shift+Enter inserts a newline (item 10);
+  // Ctrl/Cmd+Enter keeps sending. IME composition is never a submit.
   if (typeof document.addEventListener === 'function') {
     document.addEventListener('compositionstart', function () {
       composing = true;
@@ -6954,12 +7640,26 @@
       // IME composition confirm: never start the task from a composing chord.
       return;
     }
-    if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+    if (event.key !== 'Enter') {
+      return;
+    }
+    // Item 10: Enter sends; Shift+Enter inserts a newline; Ctrl/Cmd+Enter
+    // keeps sending. An Alt chord never sends on plain-Enter semantics.
+    if (event.ctrlKey || event.metaKey) {
       if (event.preventDefault) {
         event.preventDefault();
       }
       requestStart();
+      return;
     }
+    if (event.shiftKey || event.altKey) {
+      // Shift+Enter falls through to the browser's newline insert.
+      return;
+    }
+    if (event.preventDefault) {
+      event.preventDefault();
+    }
+    requestStart();
   });
 
   // Paste image affordance: bounded bytes transit once; the host validates,
@@ -7032,7 +7732,7 @@
   });
 
   byId('btn-attach').addEventListener('click', function () {
-    if (submitting) {
+    if (composerLocked()) {
       return;
     }
     // The HOST opens the native picker and reads the files: no file bytes
@@ -7040,7 +7740,7 @@
     vscode.postMessage({ type: 'attachPick' });
   });
   byId('btn-clear-attachments').addEventListener('click', function () {
-    if (submitting) {
+    if (composerLocked()) {
       return;
     }
     vscode.postMessage({ type: 'clearAttachments' });

@@ -50,6 +50,17 @@ export interface TranscriptTool {
   readonly artifact: string | null;
 }
 
+/**
+ * One ordered transcript part (audit item 8): the reducer preserves the
+ * ARRIVAL ORDER of text/reasoning/summary segments and tool runs instead of
+ * collapsing them into text-then-tools buckets, so a tool result renders
+ * between the text before it and the text after it. Tool parts reference
+ * the merged tool by id (single source of truth, no duplicated state).
+ */
+export type TranscriptPart =
+  | { readonly kind: 'text' | 'reasoning' | 'summary'; readonly text: string }
+  | { readonly kind: 'tool'; readonly toolCallId: string };
+
 export interface TranscriptEntry {
   readonly id: string;
   readonly role: string;
@@ -59,6 +70,52 @@ export interface TranscriptEntry {
   readonly reasoning: string;
   readonly summary: string;
   readonly tools: readonly TranscriptTool[];
+  /**
+   * The ordered typed parts (audit item 8). Entries built by the reducer
+   * always carry it; a legacy entry literal (tests/fixtures) may omit it
+   * and the renderer falls back to the derived buckets.
+   */
+  readonly parts?: readonly TranscriptPart[];
+  /**
+   * TRUE when this entry's text hit the `MAX_ENTRY_CHARS` retained-output
+   * boundary (audit item 13): the transcript shows an explicit clip marker
+   * instead of a silent truncation.
+   */
+  readonly clipped: boolean;
+}
+
+/**
+ * One shipped asset's build provenance (audit item 17): the packaged
+ * sha256 from `build-info.json` and whether the INSTALLED bytes still
+ * hash to it. A mismatch means the tree was modified after packaging —
+ * Diagnostics says so instead of trusting the label.
+ */
+export interface ProvenanceAsset {
+  readonly path: string;
+  readonly packagedSha256: string;
+  readonly liveSha256: string;
+  readonly matches: boolean;
+}
+
+export interface ProvenanceView {
+  readonly extensionVersion: string;
+  /** The git commit the VSIX was packaged from; null when uncommitted. */
+  readonly buildCommit: string | null;
+  readonly packagedAt: string | null;
+  readonly assets: readonly ProvenanceAsset[];
+  /** TRUE when every live asset hash still matches the packaged stamp. */
+  readonly assetsMatch: boolean;
+  readonly daemonVersion: string | null;
+  readonly daemonExecutable: string | null;
+  /**
+   * The daemon's protocol-capability handshake (item 17); null when the
+   * serving daemon does not advertise it (degraded by observed routes).
+   */
+  readonly protocol: {
+    readonly liveStreaming: boolean | null;
+    readonly attachments: boolean | null;
+    readonly turnState: boolean | null;
+  } | null;
 }
 
 export interface RunSummary {
@@ -562,6 +619,14 @@ export interface FaktorSnapshot {
   readonly indexCoverage: NativeIndexCoverageSnapshot | null;
   readonly transcript: readonly TranscriptEntry[];
   /**
+   * TRUE when the daemon serves OLDER history than the accumulated
+   * transcript (audit item 13): the panel offers an explicit scrollback
+   * load whose prepend keeps a stable anchor on the entry being read.
+   */
+  readonly transcriptHasMore: boolean;
+  /** The build provenance + protocol handshake of the running pair. */
+  readonly provenance: ProvenanceView | null;
+  /**
    * Content digest of `transcript` (host-computed, bounded refresh cadence).
    * The webview skips transcript key work and DOM mutation entirely while it
    * is unchanged; a changed digest with identical lengths still re-keys the
@@ -590,6 +655,14 @@ export interface FaktorSnapshot {
    */
   readonly preflight: PreflightView | null;
   readonly lastError: string | null;
+  /**
+   * The kind of the failure `lastError` carries (audit item 11): a SERVICE
+   * recovery (reconnect, restart) may clear a service/stream-class error but
+   * NEVER a turn-scoped one (`run_failure`, `conversation_missing`) — the
+   * turn's own outcome must stay visible until its surface retires it.
+   * Null when no error is recorded.
+   */
+  readonly lastErrorKind: string | null;
   readonly busy: boolean;
   /** Explicit Account/Usage surface state; never read by a run refresh. */
   readonly accountStatus: 'not_read' | 'not_connected' | 'read' | 'unavailable';
@@ -626,12 +699,15 @@ export function emptySnapshot(): FaktorSnapshot {
     permissions: [],
     transcript: [],
     transcriptRevision: '',
+    transcriptHasMore: false,
+    provenance: null,
     streamStatus: 'stopped',
     connectionNotice: null,
     serviceAuthority: null,
     service: null,
     preflight: null,
     lastError: null,
+    lastErrorKind: null,
     busy: false,
     accountStatus: 'not_read',
     ux: emptyUx(),
@@ -717,7 +793,7 @@ function clampText(existing: string, addition: string): string {
 }
 
 function emptyEntry(id: string, role: string, seq: number, createdMs: number): TranscriptEntry {
-  return { id, role, seq, createdMs, text: '', reasoning: '', summary: '', tools: [] };
+  return { id, role, seq, createdMs, text: '', reasoning: '', summary: '', tools: [], parts: [], clipped: false };
 }
 
 function asObject(value: Json | undefined): Record<string, Json> | null {
@@ -823,18 +899,80 @@ function mergeTool(
   return tools.map((tool) => (tool.toolCallId === id ? merged : tool));
 }
 
+/**
+ * Re-derive the compatibility buckets (`text`/`reasoning`/`summary`/
+ * `tools`) from the ordered parts — the parts stay the authority for
+ * content and order, the buckets feed the keys/live overlay/legacy
+ * consumers.
+ */
+function withDerivedBuckets(entry: TranscriptEntry): TranscriptEntry {
+  const parts = entry.parts ?? [];
+  let text = '';
+  let reasoning = '';
+  let summary = '';
+  const tools: TranscriptTool[] = [];
+  // The merged tool rows ride in (applyToolUpdate passes the merged
+  // array); the derivation only re-orders them to match the parts.
+  const toolsById = new Map<string, TranscriptTool>(
+    entry.tools.map((tool) => [tool.toolCallId, tool]),
+  );
+  for (const part of parts) {
+    if (part.kind === 'tool') {
+      const tool = toolsById.get(part.toolCallId);
+      if (tool !== undefined) {
+        tools.push(tool);
+      }
+      continue;
+    }
+    if (part.kind === 'reasoning') {
+      reasoning += part.text;
+    } else if (part.kind === 'summary') {
+      summary += part.text;
+    } else {
+      text += part.text;
+    }
+  }
+  return { ...entry, text, reasoning, summary, tools };
+}
+
+/**
+ * Append ONE text-kind segment to the ordered parts (audit item 8).
+ * Consecutive segments of the same kind merge into the last part so the
+ * streaming path grows one part per kind run; a different kind (or any tool
+ * part between) starts a NEW part — the interleaving survives.
+ */
+function appendTextPartToParts(
+  parts: readonly TranscriptPart[],
+  kind: 'text' | 'reasoning' | 'summary',
+  text: string,
+): TranscriptPart[] {
+  const last = parts.length > 0 ? parts[parts.length - 1] : undefined;
+  if (last !== undefined && last.kind === kind) {
+    return [...parts.slice(0, -1), { kind, text: last.text + text }];
+  }
+  return [...parts, { kind, text }];
+}
+
 function applyTextPart(
   entry: TranscriptEntry,
   kind: string,
   text: string,
 ): TranscriptEntry {
-  if (kind === 'reasoning') {
-    return { ...entry, reasoning: clampText(entry.reasoning, text) };
+  const partKind: 'text' | 'reasoning' | 'summary' =
+    kind === 'reasoning' ? 'reasoning' : kind === 'summary' ? 'summary' : 'text';
+  const bucket =
+    partKind === 'reasoning' ? entry.reasoning : partKind === 'summary' ? entry.summary : entry.text;
+  // The retained-output boundary (item 13): a bucket grows to
+  // MAX_ENTRY_CHARS exactly as before, and the clip becomes EXPLICIT — the
+  // entry carries the marker instead of a silent truncation.
+  const clamped = clampText(bucket, text);
+  const added = clamped.slice(bucket.length);
+  const clipped = entry.clipped || added.length < text.length;
+  if (added.length === 0) {
+    return entry.clipped === clipped ? entry : { ...entry, clipped };
   }
-  if (kind === 'summary') {
-    return { ...entry, summary: clampText(entry.summary, text) };
-  }
-  return { ...entry, text: clampText(entry.text, text) };
+  const parts = appendTextPartToParts(entry.parts ?? [], partKind, added);
+  return withDerivedBuckets({ ...entry, parts, clipped });
 }
 
 function entryFromMessage(id: string, message: Record<string, Json>): TranscriptEntry {
@@ -871,13 +1009,34 @@ function entryFromMessage(id: string, message: Record<string, Json>): Transcript
         ? toolFromSsePart(part)
         : toolFromDurablePart(type ?? '', payload ?? part);
     if (update) {
-      entry = { ...entry, tools: mergeTool(entry.tools, update) };
+      entry = applyToolUpdate(entry, update);
     }
   }
   if (entry.text.length === 0 && dataText !== null && dataText.length > 0) {
-    entry = { ...entry, text: clampText(entry.text, dataText) };
+    entry = applyTextPart(entry, 'text', dataText);
   }
   return entry;
+}
+
+/**
+ * Merge ONE tool update (call or result) into the entry: the tool row
+ * merges by `toolCallId` AND keeps its ORDERED PART POSITION — a result
+ * that arrives after later text still renders at the call's position (the
+ * interleaved order the audit requires), never re-appended at the end.
+ */
+function applyToolUpdate(
+  entry: TranscriptEntry,
+  update: Partial<TranscriptTool>,
+): TranscriptEntry {
+  const tools = mergeTool(entry.tools, update);
+  const parts = entry.parts ?? [];
+  const id = update.toolCallId ?? '';
+  const existingPart = parts.find((part) => part.kind === 'tool' && part.toolCallId === id);
+  const nextParts =
+    existingPart !== undefined
+      ? parts
+      : [...parts, { kind: 'tool' as const, toolCallId: id }];
+  return withDerivedBuckets({ ...entry, tools, parts: nextParts });
 }
 
 function boundTranscript(entries: TranscriptEntry[]): TranscriptEntry[] {
@@ -953,7 +1112,18 @@ function mergeCrossMessageToolResults(entries: readonly TranscriptEntry[]): Tran
       drop.add(entryIndex);
     }
   }
-  return out.filter((_, index) => !drop.has(index));
+  const kept = out.filter((_, index) => !drop.has(index));
+  // Keep the ordered tool PARTS in sync with the merged tool rows (their
+  // position is the call's position; only the row content changed).
+  return kept.map((entry) => {
+    const toolsById = new Map(entry.tools.map((tool) => [tool.toolCallId, tool]));
+    const parts = (entry.parts ?? []).map((part) =>
+      part.kind === 'tool' && toolsById.has(part.toolCallId)
+        ? { kind: 'tool' as const, toolCallId: part.toolCallId }
+        : part,
+    );
+    return { ...entry, parts };
+  });
 }
 
 /**
@@ -999,6 +1169,10 @@ export function transcriptSignature(entries: readonly TranscriptEntry[]): string
     mix(entry.text, 3);
     mix(entry.reasoning, 4);
     mix(entry.summary, 5);
+    mix(entry.clipped ? 'clipped' : '', 11);
+    // The ORDERED part sequence (item 8): two transcripts with identical
+    // buckets but a different interleaving must never share a digest.
+    mix((entry.parts ?? []).map((part) => (part.kind === 'tool' ? `t:${part.toolCallId}` : part.kind)).join('\u0001'), 12);
     for (const tool of entry.tools) {
       mix(tool.state, 6);
       mix(tool.name, 7);
@@ -1037,9 +1211,31 @@ export function transcriptContentEqual(
       a.role !== b.role ||
       a.text !== b.text ||
       a.reasoning !== b.reasoning ||
-      a.summary !== b.summary
+      a.summary !== b.summary ||
+      a.clipped !== b.clipped
     ) {
       return false;
+    }
+    const aParts = a.parts ?? [];
+    const bParts = b.parts ?? [];
+    if (aParts.length !== bParts.length) {
+      return false;
+    }
+    for (let part = 0; part < aParts.length; part += 1) {
+      const leftPart = aParts[part];
+      const rightPart = bParts[part];
+      if (leftPart.kind !== rightPart.kind) {
+        return false;
+      }
+      if (leftPart.kind === 'tool' && rightPart.kind === 'tool') {
+        if (leftPart.toolCallId !== rightPart.toolCallId) {
+          return false;
+        }
+      } else if (leftPart.kind !== 'tool' && rightPart.kind !== 'tool') {
+        if (leftPart.text !== rightPart.text) {
+          return false;
+        }
+      }
     }
     if (a.tools.length !== b.tools.length) {
       return false;
@@ -1059,6 +1255,28 @@ export function transcriptContentEqual(
     }
   }
   return true;
+}
+
+/**
+ * Merge ONE fetched history page into the accumulated transcript (audit
+ * item 13): entries upsert BY DURABLE MESSAGE ID, order by `seq`, and the
+ * accumulated list is never replaced by the newest page alone — scrolling
+ * back keeps older entries while a refresh reconciles newer ones. The
+ * result stays bounded by MAX_TRANSCRIPT_ENTRIES (the retained tail).
+ */
+export function mergeTranscriptPages(
+  existing: readonly TranscriptEntry[],
+  incoming: readonly TranscriptEntry[],
+): TranscriptEntry[] {
+  const byId = new Map<string, TranscriptEntry>();
+  for (const entry of existing) {
+    byId.set(entry.id, entry);
+  }
+  for (const entry of incoming) {
+    byId.set(entry.id, entry);
+  }
+  const merged = Array.from(byId.values()).sort((a, b) => a.seq - b.seq);
+  return boundTranscript(merged);
 }
 
 /** Recursively bound a JSON value (depth, array/keys, string lengths). */

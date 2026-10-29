@@ -21,6 +21,11 @@ pub enum RefusalReason {
     /// Admitting the bytes would consume the always-preserved free-space
     /// reserve (measured free space, not only the nominal quota).
     FreeSpaceReserve,
+    /// No backing volume (or no measurable destination volume) could be
+    /// probed: free space and the reserve cannot be verified, so new
+    /// material storage is refused until capacity measurement succeeds and
+    /// health is degraded `capacity_unmeasured`.
+    CapacityUnmeasured,
     /// A backend refused the eviction (integrity failure, active file, ...).
     BackendRefused,
     /// The request itself is malformed (zero length, invalid key, ...).
@@ -36,6 +41,7 @@ impl RefusalReason {
             RefusalReason::RequiredBytes => "required_bytes",
             RefusalReason::NoBackend => "no_backend",
             RefusalReason::FreeSpaceReserve => "free_space_reserve",
+            RefusalReason::CapacityUnmeasured => "capacity_unmeasured",
             RefusalReason::BackendRefused => "backend_refused",
             RefusalReason::InvalidRequest => "invalid_request",
         }

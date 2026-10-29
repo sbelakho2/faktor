@@ -1383,6 +1383,16 @@ impl SimProbe {
             .fetch_add(bytes, std::sync::atomic::Ordering::AcqRel);
     }
 
+    /// Simulate bytes MATERIALIZING on the volume (a publish): measured free
+    /// space drops exactly like a real write, unlike `release` (eviction).
+    fn consume(&self, fs: &SimFs, bytes: u64) {
+        let _ = fs.available_bytes.fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |current| Some(current.saturating_sub(bytes)),
+        );
+    }
+
     fn available(&self, fs: &SimFs) -> u64 {
         fs.available_bytes
             .load(std::sync::atomic::Ordering::Acquire)
@@ -1727,4 +1737,513 @@ fn capacity_configuration_is_clamped_to_safe_bounds() {
         high.min_install_allowance_bytes,
         MAX_INSTALL_ALLOWANCE_BYTES
     );
+}
+
+// ---------------------------------------------------------------------------
+// Audit item 18: capacity-governor counterexamples (adversarial acceptance).
+// ---------------------------------------------------------------------------
+
+/// Probe seam for acceptance test (a): fails every measurement on demand so
+/// the "no volume can be measured" state is reproducible, and recovers to a
+/// fixed healthy volume so admission-recovery can be asserted.
+struct ToggleProbe {
+    fail: std::sync::atomic::AtomicBool,
+}
+
+impl ToggleProbe {
+    fn failing() -> Self {
+        Self {
+            fail: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+}
+
+impl crate::capacity::CapacityProbe for ToggleProbe {
+    fn space(&self, _path: &Path) -> Option<crate::capacity::FilesystemSpace> {
+        if self.fail.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        Some(crate::capacity::FilesystemSpace {
+            filesystem_id: 7,
+            capacity_bytes: 64 * GIB,
+            available_bytes: 40 * GIB,
+        })
+    }
+}
+
+/// Counterexample 1 — a failed capacity probe must NEVER widen the effective
+/// admission budget to the configured operator cap (default u64::MAX). New
+/// material storage is refused typed `capacity_unmeasured`, the exact
+/// degraded state is visible on every health surface, and admission resumes
+/// only when a probe succeeds again.
+#[test]
+fn failed_capacity_probe_refuses_new_storage_typed_until_measurement_recovers() {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = Arc::new(ToggleProbe::failing());
+    let governor = StorageGovernor::open_with_capacity_probe(
+        dir.path(),
+        capacity_config(u64::MAX),
+        probe.clone(),
+    )
+    .unwrap();
+
+    // (a) reservation path: typed refusal, not an unbounded admission.
+    let refusal = governor
+        .reserve(StorageClass::MainCas, "unmeasured", 1_000)
+        .expect_err("no measurement, no new material storage")
+        .refusal()
+        .cloned()
+        .expect("typed refusal");
+    assert_eq!(refusal.reason, RefusalReason::CapacityUnmeasured);
+    assert_eq!(refusal.requested_bytes, 1_000);
+    assert_eq!(governor.pending_reservations().unwrap(), 0);
+    assert_eq!(governor.counters().unwrap().refusals, 1);
+
+    // SQLite growth path: the same typed refusal before any append.
+    let growth = governor
+        .admit_sqlite_growth(4_096)
+        .expect_err("unmeasured volume refuses WAL growth too")
+        .refusal()
+        .cloned()
+        .expect("typed refusal");
+    assert_eq!(growth.reason, RefusalReason::CapacityUnmeasured);
+    assert!(governor.counters().unwrap().refusals >= 2);
+
+    // The exact degraded state is surfaced, not a silent fallback.
+    let health = governor
+        .health()
+        .unwrap()
+        .expect("measurement failure is a visible degraded state");
+    assert_eq!(health.code, "capacity_unmeasured", "{}", health.code);
+    let metrics = governor.metrics().unwrap();
+    assert!(!metrics.capacity_measured);
+    assert!(
+        metrics
+            .degraded
+            .as_ref()
+            .is_some_and(|degraded| degraded.code == "capacity_unmeasured"),
+        "{:?}",
+        metrics.degraded
+    );
+
+    // Recovery: one successful probe reopens admission and clears health.
+    probe
+        .fail
+        .store(false, std::sync::atomic::Ordering::Release);
+    governor
+        .reserve(StorageClass::MainCas, "recovered", 1_000)
+        .expect("admission resumes when measurement succeeds")
+        .abort();
+    assert!(
+        governor.health().unwrap().is_none(),
+        "measurement recovery must clear the capacity_unmeasured degradation"
+    );
+    assert!(governor.metrics().unwrap().capacity_measured);
+}
+
+/// Counterexample 2 — free bytes from DISTINCT filesystems are pooled by the
+/// aggregate snapshot; a nearly-full destination volume A must keep its own
+/// reserve even when an empty, larger volume B pools into the totals. The
+/// write is targeted at A explicitly (and, through conservative candidate
+/// resolution, through plain `reserve` as well).
+#[test]
+fn nearly_full_destination_volume_is_not_masked_by_an_empty_other_volume() {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = Arc::new(SimProbe::new());
+    let reserve_a = 64 * GIB * 50 / 1000; // 5% of A, above the 2 GiB floor
+    let a_free = reserve_a + GIB / 4;
+    let fs_a = probe.mount(dir.path(), 21, 64 * GIB, a_free);
+    let other = dir.path().join("other-volume");
+    std::fs::create_dir_all(&other).unwrap();
+    let fs_b = probe.mount(&other, 22, 500 * GIB, 400 * GIB);
+    let governor = StorageGovernor::open_with_capacity_probe(
+        dir.path(),
+        capacity_config(u64::MAX),
+        probe.clone(),
+    )
+    .unwrap();
+    // A CAS-style second volume joins the measured snapshot (the pooling
+    // surface the audit flagged).
+    governor.register_capacity_root(&other);
+
+    // Mutation witness: the pooled aggregate would happily admit 10 GiB.
+    let capacity = governor.capacity_snapshot();
+    assert!(capacity.measured);
+    assert_eq!(capacity.filesystems.len(), 2, "two distinct volumes pooled");
+    assert!(
+        capacity.headroom_bytes > 10 * GIB,
+        "aggregate headroom {} would mask A's shortfall",
+        capacity.headroom_bytes
+    );
+
+    // Write TARGETING A: A's own reserve wins over the pooled headroom.
+    let target_a = dir.path().join("target-a");
+    let refusal = governor
+        .reserve_into(StorageClass::MainCas, "target-a", GIB, &target_a)
+        .expect_err("A's reserve must be preserved despite B's emptiness")
+        .refusal()
+        .cloned()
+        .expect("typed refusal");
+    assert_eq!(refusal.reason, RefusalReason::FreeSpaceReserve);
+    assert_eq!(
+        refusal.available_bytes,
+        GIB / 4,
+        "available must be A's own headroom, never B's"
+    );
+    assert_eq!(
+        probe.available(&fs_a),
+        a_free,
+        "no eviction may touch A while refusing; its free space is unchanged"
+    );
+
+    // Plain `reserve` (conservative candidates A+B) refuses on A as well.
+    let plain = governor
+        .reserve(StorageClass::MainCas, "candidates", GIB)
+        .expect_err("every candidate volume must keep its reserve")
+        .refusal()
+        .cloned()
+        .expect("typed refusal");
+    assert_eq!(plain.reason, RefusalReason::FreeSpaceReserve);
+    assert_eq!(plain.available_bytes, GIB / 4);
+
+    // The SAME size targeting healthy volume B is admitted (no over-refusal
+    // from A's pressure).
+    governor
+        .reserve_into(StorageClass::MainCas, "target-b", GIB, other.join("blob"))
+        .expect("volume B has room for its own reserve and the write")
+        .abort();
+    assert_eq!(probe.available(&fs_b), 400 * GIB);
+}
+
+/// Counterexample 3 (sequential) — reservations granted but not yet
+/// materialized are subtracted from the destination volume: the second of
+/// two pending writes refuses even though the AGGREGATE budget and class
+/// quota happily fit both (their combined reservations fit the quota; only
+/// the volume cannot hold them).
+#[test]
+fn unmaterialized_reservations_block_a_second_write_on_the_destination_volume() {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = Arc::new(SimProbe::new());
+    let reserve = 64 * GIB * 50 / 1000;
+    let write = GIB;
+    // The volume holds its reserve plus 1.5 writes: exactly ONE write fits.
+    probe.mount(dir.path(), 11, 64 * GIB, reserve + write + write / 2);
+    let governor = StorageGovernor::open_with_capacity_probe(
+        dir.path(),
+        capacity_config(100 * GIB),
+        probe.clone(),
+    )
+    .unwrap();
+
+    let first = governor
+        .reserve(StorageClass::MainCas, "first", write)
+        .expect("the first write fits above the reserve");
+    assert_eq!(governor.pending_reservations().unwrap(), 1);
+
+    // Aggregate room still exists (quota 3.2 GiB+ sees 1 of 100 GiB used);
+    // the refusal must come from the destination volume's charge.
+    let refusal = governor
+        .reserve(StorageClass::MainCas, "second", write)
+        .expect_err("the unmaterialized first write already spent the room")
+        .refusal()
+        .cloned()
+        .expect("typed refusal");
+    assert_eq!(refusal.reason, RefusalReason::FreeSpaceReserve);
+    assert_eq!(
+        refusal.available_bytes,
+        write + write / 2,
+        "available is the volume headroom above its reserve"
+    );
+    assert_eq!(
+        governor.pending_reservations().unwrap(),
+        1,
+        "only the first reservation exists"
+    );
+
+    // Releasing the unmaterialized write returns exactly its bytes.
+    drop(first);
+    assert_eq!(governor.pending_reservations().unwrap(), 0);
+    governor
+        .reserve(StorageClass::MainCas, "third", write)
+        .expect("a released reservation restores the volume room")
+        .abort();
+}
+
+/// Counterexample 3 (concurrent) — two synchronized writers race for the
+/// same destination volume before either materializes. The free-space rule
+/// is evaluated INSIDE the admission transaction, so the second writer
+/// cannot pass on the first's stale free reading: exactly one admits, and
+/// the total reservation fits the volume.
+#[test]
+fn two_synchronized_reservations_cannot_both_pass_one_free_space_reading() {
+    use std::sync::Barrier;
+
+    let dir = tempfile::tempdir().unwrap();
+    let probe = Arc::new(SimProbe::new());
+    let reserve = 64 * GIB * 50 / 1000;
+    let write = GIB;
+    // Room for the reserve plus 1.5 writes: two reservations cannot fit.
+    probe.mount(dir.path(), 12, 64 * GIB, reserve + write + write / 2);
+    let barrier = Arc::new(Barrier::new(2));
+    let handles: Vec<_> = (0..2)
+        .map(|index| {
+            let path = dir.path().to_path_buf();
+            let config = capacity_config(100 * GIB);
+            let probe = probe.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let governor =
+                    StorageGovernor::open_with_capacity_probe(path, config, probe).unwrap();
+                barrier.wait();
+                match governor.reserve(StorageClass::MainCas, &format!("race-{index}"), write) {
+                    Ok(reservation) => {
+                        let bytes = reservation.bytes();
+                        std::mem::forget(reservation);
+                        bytes
+                    }
+                    Err(GovernorError::Refused(refusal)) => {
+                        assert_eq!(refusal.reason, RefusalReason::FreeSpaceReserve);
+                        0
+                    }
+                    Err(error) => panic!("unexpected admission failure: {error}"),
+                }
+            })
+        })
+        .collect();
+    let admitted: u64 = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .sum();
+    assert_eq!(
+        admitted, write,
+        "exactly one of two synchronized writers may admit (admitted {admitted})"
+    );
+    assert_eq!(
+        probe.available(&fs_of(&probe)),
+        reserve + write + write / 2,
+        "neither writer materialized: measured free space must be untouched"
+    );
+}
+
+/// Helper for the concurrent volume test: the single mounted SimFs.
+/// (SimProbe only ever mounts one volume in that test.)
+fn fs_of(probe: &SimProbe) -> std::sync::Arc<SimFs> {
+    let roots = probe.roots.lock().unwrap();
+    roots[0].1.clone()
+}
+
+/// Counterexample 3 + crash reconciliation — boundary states of one write:
+/// crash at RESERVE (row, no bytes), at PUBLISH (row + materialized bytes,
+/// no commit), and at COMMIT (atomic tx: row gone, bytes indexed). Across
+/// every boundary the accounting must stay conservative (never over-admit)
+/// and materialized bytes must be counted EXACTLY ONCE — never in both
+/// measured free space and a live reservation/usage double charge.
+#[test]
+fn crash_at_reserve_publish_or_commit_reconciles_conservatively_without_double_charging() {
+    let write = GIB;
+    let reserve = 64 * GIB * 50 / 1000;
+    let dead = "dead-process"; // pid parse fails -> treated as a dead owner
+
+    // ---- boundary 1: crash between reserve and publish -----------------
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = Arc::new(SimProbe::new());
+        // Room for the reserve plus 1.5 writes; nothing was ever written.
+        probe.mount(dir.path(), 31, 64 * GIB, reserve + write + write / 2);
+        let governor = StorageGovernor::open_with_capacity_probe(
+            dir.path(),
+            capacity_config(100 * GIB),
+            probe.clone(),
+        )
+        .unwrap();
+        // The dead process's durable reservation row (no volume attribution:
+        // legacy rows charge every volume conservatively).
+        {
+            let mut ledger =
+                crate::ledger::Ledger::open(&StorageGovernor::database_path(dir.path())).unwrap();
+            let now = crate::ledger::now_ms();
+            ledger
+                .insert_reservation(
+                    "crashed-reserve",
+                    StorageClass::MainCas,
+                    "crashed",
+                    write,
+                    dead,
+                    now,
+                    now + 60_000,
+                )
+                .unwrap();
+        }
+        // While the row is live its bytes are charged: never over-admit.
+        let refusal = governor
+            .reserve_into(
+                StorageClass::MainCas,
+                "over-crash",
+                write,
+                dir.path().join("w"),
+            )
+            .expect_err("the crashed reservation still holds its bytes")
+            .refusal()
+            .cloned()
+            .expect("typed refusal");
+        assert_eq!(refusal.reason, RefusalReason::FreeSpaceReserve);
+        assert_eq!(
+            probe.available(&fs_of(&probe)),
+            reserve + write + write / 2,
+            "refusal must not evict or fabricate free space"
+        );
+
+        // Restart sweeps the dead owner (crash seam): the row's bytes never
+        // existed on disk, so admission room returns exactly once.
+        let governor = StorageGovernor::open_with_capacity_probe(
+            dir.path(),
+            capacity_config(100 * GIB),
+            probe.clone(),
+        )
+        .unwrap();
+        assert_eq!(governor.pending_reservations().unwrap(), 0);
+        governor
+            .reserve_into(
+                StorageClass::MainCas,
+                "after-sweep",
+                write,
+                dir.path().join("w"),
+            )
+            .expect("the swept reservation restores room exactly once")
+            .abort();
+        // ...but the volume still holds only ONE write: never over-admit.
+        governor
+            .reserve_into(
+                StorageClass::MainCas,
+                "still-bounded",
+                write + write,
+                dir.path().join("w2"),
+            )
+            .expect_err("recovery must not widen the volume beyond its room");
+    }
+
+    // ---- boundary 2: crash between publish and commit ------------------
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = Arc::new(SimProbe::new());
+        // Room for the reserve plus 2.5 writes.
+        probe.mount(dir.path(), 32, 64 * GIB, reserve + 2 * write + write / 2);
+        let governor = StorageGovernor::open_with_capacity_probe(
+            dir.path(),
+            capacity_config(100 * GIB),
+            probe.clone(),
+        )
+        .unwrap();
+        {
+            let mut ledger =
+                crate::ledger::Ledger::open(&StorageGovernor::database_path(dir.path())).unwrap();
+            let now = crate::ledger::now_ms();
+            ledger
+                .insert_reservation(
+                    "crashed-publish",
+                    StorageClass::MainCas,
+                    "published",
+                    write,
+                    dead,
+                    now,
+                    now + 60_000,
+                )
+                .unwrap();
+        }
+        // The bytes materialized before the crash: measured free dropped.
+        std::fs::write(dir.path().join("published-blob"), b"partial").unwrap();
+        probe.consume(&fs_of(&probe), write);
+
+        // Pre-sweep the row AND the consumed bytes are charged — conservative
+        // over-subtraction, never over-admission.
+        governor
+            .reserve_into(
+                StorageClass::MainCas,
+                "pre-sweep",
+                write,
+                dir.path().join("w"),
+            )
+            .expect_err("live row + materialized bytes must not admit a third charge");
+
+        // Restart sweeps the dead row: the materialized bytes are then
+        // counted exactly ONCE — through measured free space, not twice.
+        let governor = StorageGovernor::open_with_capacity_probe(
+            dir.path(),
+            capacity_config(100 * GIB),
+            probe.clone(),
+        )
+        .unwrap();
+        assert_eq!(governor.pending_reservations().unwrap(), 0);
+        governor
+            .reserve_into(
+                StorageClass::MainCas,
+                "one-more",
+                write,
+                dir.path().join("w"),
+            )
+            .expect(
+                "no double charge: one write fits once the crashed row is swept (free space \
+                 still carries the materialized bytes)",
+            )
+            .abort();
+        governor
+            .reserve_into(
+                StorageClass::MainCas,
+                "two-more",
+                write + write,
+                dir.path().join("w2"),
+            )
+            .expect_err("never over-admit past the volume's remaining room");
+    }
+
+    // ---- boundary 3: commit (atomic tx: row deleted + bytes indexed) ---
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = Arc::new(SimProbe::new());
+        probe.mount(dir.path(), 33, 64 * GIB, reserve + 2 * write + write / 2);
+        let governor = StorageGovernor::open_with_capacity_probe(
+            dir.path(),
+            capacity_config(100 * GIB),
+            probe.clone(),
+        )
+        .unwrap();
+        // A commit crash can only land on one side of one transaction: the
+        // row is deleted and the object indexed atomically. Reproduce the
+        // committed side of that transaction with the same disk state as
+        // boundary 2's post-sweep state.
+        let reservation = governor
+            .reserve_into(
+                StorageClass::MainCas,
+                "committing",
+                write,
+                dir.path().join("c"),
+            )
+            .unwrap();
+        std::fs::write(dir.path().join("committed-blob"), b"done").unwrap();
+        probe.consume(&fs_of(&probe), write);
+        reservation.commit(write, None).unwrap();
+        assert_eq!(governor.pending_reservations().unwrap(), 0);
+        assert_eq!(governor.metrics().unwrap().total_bytes, write);
+
+        // Byte-identical admission outcomes to boundary 2's post-sweep
+        // state: usage accounting (quota side) adds no second charge against
+        // measured free space.
+        governor
+            .reserve_into(
+                StorageClass::MainCas,
+                "one-more",
+                write,
+                dir.path().join("w"),
+            )
+            .expect("committed bytes are charged once — through free space")
+            .abort();
+        governor
+            .reserve_into(
+                StorageClass::MainCas,
+                "two-more",
+                write + write,
+                dir.path().join("w2"),
+            )
+            .expect_err("never over-admit past the volume's remaining room");
+    }
 }

@@ -196,9 +196,26 @@ The create-session contract validates BOTH the provider and the model against th
   wall-clock presentation metadata only, so a same-millisecond update can
   never move a conversation across a page cursor.
 - `POST /native/session/{id}/prompt` — run ONE ordinary prompt through the
-  daemon's single executor entry: `{session_id, submission_id, prompt,
-  files?}` (the body id must match the path) → `{op_id, run_id, accepted,
-  queued}`. `submission_id` is REQUIRED: the client submission UUID of this
+  daemon's single executor entry: strict body `{session_id, submission_id,
+  prompt, files?, execution?, attachments?}` (the body id must match the
+  path; unknown fields refused) → `{op_id, run_id, accepted, queued}`.
+  Two ADDITIVE fields:
+  - `execution` — `"ask"` | `"task"` (absent = `task`, the explicit
+    legacy-compatible default; anything else is a typed 400). An admitted
+    `ask` is a durable CONVERSATIONAL turn: no shadow worktree copy, no
+    task-row create/advance/re-goal, no contract/budget seed, no
+    verification/completion gate, no remote placement; its tool bundle
+    keeps only Model/DiskRead/Cpu/Network/Indexing.
+  - `attachments` — typed SESSION-OWNED `AttachmentId` references
+    (`{digest, mime}` rows uploaded through the attachment routes),
+    admitted through the SAME ownership/digest/MIME/size/model-capability
+    resolution as the task path BEFORE any admission claim; accepted ids
+    persist on the turn. Never workspace paths. The admission digest is
+    domain-separated by this split: `faktor.native-prompt-admission/v1`
+    (task, attachment-free — byte-identical to the legacy domain),
+    `/v2` (task + attachments), `/ask/v1` (any ask). Flipping `execution`
+    under the same `submission_id` is a different body → typed 409, never
+    the other semantics' receipt. `submission_id` is REQUIRED: the client submission UUID of this
   logical prompt, 1..=64 ASCII `[0-9a-f-]` (UUID-shaped, lowercase hex; the
   SAME contract as the task-start field); any other shape is a typed 400.
   It is the durable idempotency key (finding 1): the handler claims a
@@ -304,6 +321,27 @@ The create-session contract validates BOTH the provider and the model against th
   non-delta event flushes immediately. An append wakes the stream through
   the session's journal generation (250 ms fallback poll); heartbeats are
   emitted once after the tail drains and then at most every 5 s.
+- `GET /native/session/{id}/turns` — the durable TURN records of the
+  session (one per admitted logical turn), newest first, bounded: each row
+  is `{opId, status, provider, model, variant, toolMode, startedAt,
+  updatedMs, queueSeq, promptMessageId}`. A turn record is the durable
+  completion authority of its logical turn; a page refresh never claims a
+  verdict of its own.
+- `GET /native/session/{id}/live/output` — authenticated SSE of LIVE model
+  output for ONE session (never the prompt text; never a durable row). The
+  handshake is snapshot-first: the first frame is a `snapshot` event
+  `{instance, session, hubSequence, durableWatermark, activeTurn, parts:
+  [{messageId, kind, partId, turn, attempt, revision, byteOffset, text}]}`
+  establishing the server-instance lineage and the per-part watermarks;
+  then `live` frames `{messageId, kind, partId, turn, attempt, revision,
+  byteOffset, text}` carry whole-codepoint deltas, and `turn` frames
+  `{turn, opId, status}` are the ONLY completion authority. A daemon
+  restart constructs a NEW hub with a NEW `instance` id; clients drop
+  foreign-instance and replay frames and resync by reopening the stream.
+  Bounded hub lag answers `resync` instead of a silent gap.
+- `GET /native/session/{id}/live/snapshot` — the authoritative live-parts
+  snapshot WITHOUT streaming: the same `parts` shape as the SSE handshake,
+  for resync/reconciliation.
 - `GET /native/usage` — cross-session aggregate with two documented
   layers. The legacy view keeps its frozen shape over the memory facts of
   kind `usage` (keys `budget`/`spent`): `{sessions, totals: {budget,

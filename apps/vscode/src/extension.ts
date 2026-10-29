@@ -13,9 +13,9 @@
 // response.
 
 import * as vscode from 'vscode';
-import { writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { basename, resolve } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 /** The attachment-envelope correlation id: the host mints one when the
  *  webview did not supply an id, so the webview is never an id authority. */
@@ -109,6 +109,8 @@ import {
   turnStopOpId,
 } from './turnState';
 import {
+  type ProvenanceView,
+  mergeTranscriptPages,
   BoardStateSummary,
   FaktorStore,
   Json,
@@ -254,6 +256,27 @@ let lastControlPlaneNotice: string | null = null;
 /** The last workspace-scope refusal, deduped like the control-plane notice. */
 let lastMachineSettingNotice: string | null = null;
 
+/**
+ * One in-flight Ask submission of ONE conversation (audit item 7). The
+ * receipt/error that eventually lands is correlated by all three fields:
+ * the lifecycle generation captured at send time, the conversation the
+ * prompt was admitted on, and the logical submission id (mirrored by the
+ * panel's own submission token in `startResult`).
+ */
+interface AskInFlightEntry {
+  readonly generation: number;
+  /** The visible-conversation epoch captured at send time. */
+  readonly viewEpoch: number;
+  /** The conversation key this submission belongs to. */
+  readonly conversationKey: string;
+  /** The resolved session id while still on the same binding (null = unresolved). */
+  sessionId: string | null;
+  readonly submissionId: string;
+  /** The panel's submission token echoed back in `startResult`. */
+  readonly panelToken: string | null;
+  readonly goal: string;
+}
+
 interface ActiveSession {
   daemon: DaemonHandle | null;
   client: NativeClient | null;
@@ -266,8 +289,42 @@ interface ActiveSession {
    * conversations: stream-driven refreshes stay conversational and never
    * read task/proof/billing state. */
   askOnly: boolean;
-  /** One plain prompt at a time (Ask single-flight). */
-  conversationInFlight: boolean;
+  /**
+   * Ask single-flight PER CONVERSATION (audit item 7): one plain prompt at
+   * a time per conversation key (the bound session id, or `workspace`
+   * before the first resolve). Each entry captures the view generation,
+   * the resolved conversation and the submission id/panel token the
+   * eventual receipt is routed back with — a reply that finishes after the
+   * operator switched conversations can never retarget the visible one.
+   */
+  askInFlight: Map<string, AskInFlightEntry>;
+  /**
+   * Paged history (audit item 13): which session the accumulated
+   * transcript belongs to, whether the daemon serves OLDER history, and
+   * the `before` cursor for the next scrollback page. A switch resets all
+   * three so one conversation's accumulation never leaks into another.
+   */
+  transcriptSessionId: string | null;
+  transcriptHasMore: boolean;
+  transcriptNextBefore: number | null;
+  loadingOlder: boolean;
+  /**
+   * The operator's explicit per-conversation model choice (audit item 13):
+   * applied to subsequent Task runs of THIS conversation through the
+   * daemon's per-run `model` override; a switch drops it (it is never a
+   * silent global default).
+   */
+  futureModelOverride: string | null;
+  /**
+   * The daemon's protocol-capability handshake (audit item 17): null when
+   * the serving daemon does not advertise it (the Diagnostics surface then
+   * reports the coherent degradation instead of claiming the features).
+   */
+  protocolCapabilities: {
+    readonly liveStreaming: boolean | null;
+    readonly attachments: boolean | null;
+    readonly turnState: boolean | null;
+  } | null;
   refreshing: boolean;
   refreshTimer: NodeJS.Timeout | null;
   /** Reuse the last task-verification read while its authority key is
@@ -308,7 +365,13 @@ const active: ActiveSession = {
   sessionId: null,
   activeRunId: null,
   askOnly: false,
-  conversationInFlight: false,
+  askInFlight: new Map(),
+  transcriptSessionId: null,
+  transcriptHasMore: false,
+  transcriptNextBefore: null,
+  loadingOlder: false,
+  futureModelOverride: null,
+  protocolCapabilities: null,
   refreshing: false,
   refreshTimer: null,
   taskVerificationCache: new EvidenceAuthorityCache<NativeTaskVerification>(),
@@ -413,6 +476,15 @@ interface HostServiceConnection extends ServiceConnection {
 let serviceLifecycle: ServiceLifecycle<HostServiceConnection> | null = null;
 /** Journal position to resume after a crash; never reset by a manual stop. */
 let resumeCursor = 0;
+/**
+ * The VISIBLE-conversation epoch (audit item 7): bumped only by an
+ * explicit conversation switch (the one operation that retargets the
+ * panel's conversation). An Ask flight captures it at send time; its
+ * receipt/error is treated as stale the moment the operator switches —
+ * while a daemon-side session rebind inside the SAME conversation never
+ * moves it.
+ */
+let conversationViewEpoch = 0;
 /** Dedupe authority notices: the same cause interrupts once, not per tick. */
 let lastServiceAuthorityKey: string | null = null;
 
@@ -661,13 +733,19 @@ async function launchService(
     active.daemon = daemon;
     active.client = client;
     bumpLifecycle();
+    // Item 17: the additive protocol-capability handshake is stored on
+    // connect; null (older daemon) is reported as NOT advertised.
+    active.protocolCapabilities = health.protocol;
     store.patch({
       daemon: 'running',
       daemonDetail: health.version,
       baseUrl: daemon.baseUrl,
-      lastError: null,
       streamStatus: 'connecting',
     });
+    // A service (re)connect clears ONLY a service/stream-scoped error; a
+    // turn failure recorded earlier stays on its own surface (item 11).
+    clearServiceScopedError();
+    refreshProvenance(context, health.version);
     return {
       daemon,
       client,
@@ -912,7 +990,7 @@ function errorCodeOf(error: unknown): string | null {
  * chrome and only surface inside the panel.
  */
 function recordError(projection: UserErrorProjection, toast = false): void {
-  store.patch({ lastError: projection.technical });
+  store.patch({ lastError: projection.technical, lastErrorKind: projection.kind });
   chatProvider?.postUserError(projection);
   if (toast) {
     void vscode.window.showErrorMessage(`Faktor: ${projection.summary}`);
@@ -937,6 +1015,115 @@ function projectOf(error: unknown, kind: UserErrorKind = 'unexpected'): UserErro
 /** A background read failure: panel-visible, no IDE toast (no user gesture). */
 function recordBackgroundError(error: unknown, kind: UserErrorKind = 'unexpected'): void {
   recordError(projectOf(error, kind));
+}
+
+/**
+ * Service/stream-scoped error kinds (audit item 11): a SERVICE recovery
+ * (reconnect, restart, adoption) may clear exactly these. A turn-scoped
+ * failure (`run_failure`, `conversation_missing`) and a webview-local
+ * refusal (`attachment_refused`, `permission_expired`, `unexpected`) are
+ * NEVER cleared by service recovery — they belong to their own surface.
+ */
+const SERVICE_SCOPED_ERROR_KINDS: ReadonlySet<string> = new Set([
+  'daemon_down',
+  'daemon_unreachable',
+  'daemon_start_failed',
+  'service_not_ready',
+  'service_binary_missing',
+  'service_trust_changed',
+  'service_trust_unverified',
+  'service_budget_exhausted',
+  'service_configuration_invalid',
+  'service_untrusted_install',
+  'stream_gap',
+]);
+
+/** One bounded provenance asset hash (item 17); null = unreadable file. */
+function provenanceHash(root: string, relPath: string): string | null {
+  try {
+    const bytes = readFileSync(resolve(root, relPath));
+    if (bytes.length > 8 * 1024 * 1024) {
+      return null;
+    }
+    return createHash('sha256').update(bytes).digest('hex');
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The Diagnostics provenance surface (audit item 17): the packaged build
+ * commit + asset content hashes (from `build-info.json`, written by
+ * scripts/package-vsix.mjs) compared against the LIVE installed bytes, plus
+ * the daemon's version/executable and the protocol handshake. Missing or
+ * unreadable stamps report honestly ("uncommitted build" / per-asset
+ * mismatch) — never a fabricated match.
+ */
+function refreshProvenance(
+  context: vscode.ExtensionContext,
+  daemonVersion: string | null = null,
+): void {
+  try {
+    const root = context.extensionUri.fsPath;
+    const manifest = JSON.parse(
+      readFileSync(resolve(root, 'package.json'), 'utf8'),
+    ) as { version?: unknown };
+    let stamp: {
+      commit?: unknown;
+      packagedAt?: unknown;
+      assets?: Record<string, unknown>;
+    } | null = null;
+    try {
+      stamp = JSON.parse(readFileSync(resolve(root, 'build-info.json'), 'utf8'));
+    } catch {
+      stamp = null;
+    }
+    const packaged = stamp !== null && typeof stamp.assets === 'object' && stamp.assets !== null
+      ? (stamp.assets as Record<string, unknown>)
+      : {};
+    const assets: Array<{
+      path: string;
+      packagedSha256: string;
+      liveSha256: string;
+      matches: boolean;
+    }> = [];
+    const keys = Object.keys(packaged).sort().slice(0, 40);
+    for (const rel of keys) {
+      const want = typeof packaged[rel] === 'string' ? (packaged[rel] as string) : '';
+      const live = provenanceHash(root, rel);
+      assets.push({
+        path: rel,
+        packagedSha256: want,
+        liveSha256: live ?? '',
+        matches: live !== null && live === want,
+      });
+    }
+    const service = store.snapshot().service;
+    const view: ProvenanceView = {
+      extensionVersion: typeof manifest.version === 'string' ? manifest.version : 'unknown',
+      buildCommit: typeof stamp?.commit === 'string' ? (stamp.commit as string) : null,
+      packagedAt: typeof stamp?.packagedAt === 'string' ? (stamp.packagedAt as string) : null,
+      assets,
+      assetsMatch: assets.length > 0 && assets.every((asset) => asset.matches),
+      daemonVersion: daemonVersion ?? (store.snapshot().daemonDetail || null),
+      daemonExecutable: service?.executable ?? null,
+      protocol: active.protocolCapabilities,
+    };
+    store.patch({ provenance: view });
+  } catch (error) {
+    recordBackgroundError(error);
+  }
+}
+
+/**
+ * Clear `lastError` ONLY while it carries a service/stream-scoped kind (or
+ * no recorded kind at all). A service recovery never clears a turn failure.
+ */
+function clearServiceScopedError(): void {
+  const kind = store.snapshot().lastErrorKind;
+  if (kind === null || SERVICE_SCOPED_ERROR_KINDS.has(kind)) {
+    store.patch({ lastError: null, lastErrorKind: null });
+  }
 }
 
 function reportError(error: unknown, kind: UserErrorKind = 'unexpected'): void {
@@ -1384,7 +1571,7 @@ async function startServer(
   // serve.lock adoption) reaches here without it, and without this clear
   // the ONE actionable card outlives its own condition forever.
   if (active.client && store.snapshot().lastError !== null) {
-    store.patch({ lastError: null });
+    clearServiceScopedError();
   }
 }
 
@@ -1558,6 +1745,7 @@ function resetHostState(context: vscode.ExtensionContext | null = activeContext)
     serviceAuthority: null,
     service: null,
     lastError: null,
+    lastErrorKind: null,
     busy: false,
   });
   publishPreflight(context);
@@ -1730,6 +1918,13 @@ async function switchSession(
   }
   active.sessionId = decision.sessionId;
   bumpLifecycle();
+  conversationViewEpoch += 1;
+  // Item 13: the accumulated transcript, its scrollback cursor and the
+  // per-conversation model override belong to ONE conversation.
+  active.transcriptSessionId = null;
+  active.transcriptHasMore = false;
+  active.transcriptNextBefore = null;
+  active.futureModelOverride = null;
   streamRefresh?.reset();
   if (active.refreshTimer !== null) {
     clearTimeout(active.refreshTimer);
@@ -1782,6 +1977,7 @@ async function switchSession(
     transcriptRevision: '',
     streamStatus: 'stopped',
     lastError: null,
+    lastErrorKind: null,
   });
   try {
     const page = await client.messages(decision.sessionId, { limit: HISTORY_PAGE_LIMIT });
@@ -2145,7 +2341,7 @@ function startStream(cursor = 0): void {
             : null;
         if (typeof message === 'string' && message.length > 0) {
           const projection = projectOf(new Error(message), 'run_failure');
-          store.patch({ lastError: projection.technical });
+          store.patch({ lastError: projection.technical, lastErrorKind: projection.kind });
           chatProvider?.postUserError(projection);
         }
       }
@@ -2176,7 +2372,7 @@ function startStream(cursor = 0): void {
         // automatic reconnect loop replays the offending frame.
         const reason = detail ?? 'the durable event stream is blocked';
         const projection = projectOf(new Error(reason), 'stream_gap');
-        store.patch({ streamStatus: status, lastError: projection.technical });
+        store.patch({ streamStatus: status, lastError: projection.technical, lastErrorKind: projection.kind });
         chatProvider?.postUserError(projection);
         chatProvider?.postStreamRecovery(false);
         chatProvider?.postStreamBlocked(reason, active.stream?.blocked?.cursor ?? null);
@@ -2473,19 +2669,31 @@ async function refreshConversation(): Promise<void> {
     if (!current()) {
       return;
     }
-    const transcript = transcriptOf(read.messages);
-    const transcriptRevision = transcriptSignature(transcript);
+    const pageEntries = transcriptOf(read.messages);
+    // Item 13: pages MERGE by durable message id — the newest page never
+    // replaces the accumulated transcript, so a scrollback that loaded
+    // older history survives every later refresh. A different session
+    // (first load after a switch) starts a fresh accumulation.
     const previous = store.snapshot();
+    const accumulated =
+      active.transcriptSessionId === sessionId
+        ? mergeTranscriptPages(previous.transcript, pageEntries)
+        : pageEntries;
+    active.transcriptSessionId = sessionId;
+    active.transcriptHasMore = read.messages.hasMore === true;
+    active.transcriptNextBefore = read.messages.nextBefore;
+    const transcriptRevision = transcriptSignature(accumulated);
     store.patch({
       sessions: read.sessions,
       sessionsUnavailable: null,
+      transcriptHasMore: active.transcriptHasMore,
       permissions:
         read.permissions === null
           ? previous.permissions
           : permissionSummaries(read.permissions as NativePermissionEntry[]),
       ...(transcriptRevision !== previous.transcriptRevision ||
-      !transcriptContentEqual(transcript, previous.transcript)
-        ? { transcript, transcriptRevision }
+      !transcriptContentEqual(accumulated, previous.transcript)
+        ? { transcript: accumulated, transcriptRevision }
         : {}),
     });
   } catch (error) {
@@ -2687,21 +2895,56 @@ async function handleUxAction(raw: unknown): Promise<void> {
     return;
   }
   if (action === 'reconnect') {
+    // Item 11: Reconnect ACTUALLY reconnects — a blocked stream recovers
+    // from its paused cursor; otherwise the service connection itself is
+    // re-established (never a silent refresh masquerading as a reconnect).
     if (active.stream?.blocked != null) {
       recoverEventStream();
-    } else {
-      await refreshFromUserGesture();
+      return;
     }
+    if (serviceLifecycle !== null) {
+      await serviceLifecycle.reconnectNow();
+    }
+    await refreshFromUserGesture();
     return;
   }
   if (action === 'resumeRun') {
-    // A durable run is resumed from its checkpoint; it is NEVER re-sent.
+    // Item 11: Resume is a REAL typed dispatch. A paused CHILD agent
+    // resumes through the daemon's agent-control route; a blocked stream
+    // recovers first so the resumed turn is observable. The serving
+    // daemon exposes NO session-level run-resume route (only cancel), so
+    // a paused conversation-level run gets an honest refusal naming the
+    // missing route contract — never a fake "resumed" notice.
     if (active.stream?.blocked != null) {
       recoverEventStream();
-    } else {
-      chatProvider?.postNotice('info', 'resuming the saved run from its durable checkpoint');
-      await refreshFromUserGesture();
     }
+    const client = active.client;
+    const sessionId = active.sessionId;
+    if (!client || !sessionId) {
+      chatProvider?.postNotice('error', 'the Faktor service is not connected; nothing was resumed');
+      return;
+    }
+    const pausedChild = store
+      .snapshot()
+      .agents.find((agent) => agent.kind === 'child' && agent.state === 'paused');
+    if (pausedChild !== undefined) {
+      try {
+        await client.resumeAgent(pausedChild.agentId);
+        chatProvider?.postNotice('info', `resumed the paused agent ${pausedChild.agentId}`);
+        scheduleRefresh(0);
+      } catch (error) {
+        reportError(error);
+      }
+      return;
+    }
+    chatProvider?.postNotice(
+      'error',
+      'this serving daemon has no resume route for a paused conversation run ' +
+        '(POST /native/session/{id}/task-runs/{run_id}/resume is not served); ' +
+        'the run remains saved — nothing was re-sent',
+    );
+    await refreshFromUserGesture();
+    return;
   }
 }
 
@@ -3171,7 +3414,10 @@ function recoverEventStream(): void {
   // kept and the formerly offending frame is replayed, never skipped.
   chatProvider?.postStreamRecovery(true);
   stream.recover();
-  store.patch({ streamStatus: 'connecting', lastError: null });
+  store.patch({ streamStatus: 'connecting' });
+  // The stream recovery retires its OWN paused-stream error; a turn failure
+  // recorded earlier is never cleared by a service recovery (item 11).
+  clearServiceScopedError();
   chatProvider?.postStreamBlocked(null);
   chatProvider?.postNotice(
     'info',
@@ -3257,9 +3503,24 @@ async function sendAskTurnFromComposer(
   goal: string,
   context: vscode.ExtensionContext,
 ): Promise<void> {
-  if (active.conversationInFlight) {
-    return;
+  // Ack fencing (audit item 7): the submission is bound to ONE conversation
+  // key (the bound session, or `workspace` before the first resolve). A
+  // second send to the SAME conversation while one is in flight is ignored;
+  // a send to a DIFFERENT conversation is admitted (its own key is free).
+  // The lifecycle generation, the conversation and the logical submission
+  // id are captured HERE: every receipt/error below is routed back through
+  // them, so switching conversations while a reply runs never retargets the
+  // visible one.
+  const conversationKey = active.sessionId ?? 'workspace';
+  for (const [, entry] of active.askInFlight) {
+    if (entry.conversationKey === conversationKey && entry.viewEpoch === conversationViewEpoch) {
+      return;
+    }
   }
+  const panelToken =
+    typeof message.submissionToken === 'string' && message.submissionToken.length <= 64
+      ? message.submissionToken
+      : null;
   const { files, refused } = boundedWebviewFiles(message.files);
   if (refused.length > 0) {
     const reasons = refused.map((entry) => `#${entry.index}: ${entry.reason}`);
@@ -3270,10 +3531,33 @@ async function sendAskTurnFromComposer(
       }),
     );
   }
-  active.conversationInFlight = true;
+  const generation = lifecycle.current();
+  const viewEpoch = conversationViewEpoch;
+  const submissionId = randomUUID();
+  const flight: AskInFlightEntry = {
+    generation,
+    viewEpoch,
+    conversationKey,
+    sessionId: active.sessionId,
+    submissionId,
+    panelToken,
+    goal,
+  };
+  active.askInFlight.set(submissionId, flight);
   // ONE turn reducer: idle → submitting. Busy follows the reducer from
   // here on (never the HTTP status line).
   dispatchTurn({ type: 'submit', source: 'ask' });
+  const correlation = (): { sessionId: string | null; submissionToken: string | null } => ({
+    sessionId: flight.sessionId,
+    submissionToken: panelToken,
+  });
+  /**
+   * TRUE while the operator still views the conversation this send bound.
+   * Only an explicit conversation switch moves the view epoch; a daemon
+   * session rebind inside the SAME conversation (stale-session recovery)
+   * never does, so it cannot fake a stale receipt.
+   */
+  const stillVisible = (): boolean => conversationViewEpoch === viewEpoch;
   try {
     // Subscribe-before-submit: the live-output handshake must be open
     // BEFORE the prompt POST so a fast reply cannot outrun the listener.
@@ -3296,9 +3580,18 @@ async function sendAskTurnFromComposer(
         files,
         // Stable across the one retry: the daemon's prompt admission replays
         // an accepted receipt byte-for-byte instead of duplicating the turn.
-        submissionId: randomUUID(),
+        submissionId,
       },
     );
+    flight.sessionId = outcome.connection.sessionId;
+    if (!stillVisible()) {
+      // The operator switched away while this reply ran: the receipt lands
+      // on ITS OWN conversation only. The visible conversation's turn
+      // lifecycle, busy flag and transcript are never retargeted; the panel
+      // receives the correlated result and fences its composer by token.
+      chatProvider?.postStartResult(goal, true, false, correlation());
+      return;
+    }
     active.sessionId = outcome.connection.sessionId;
     // Ask owns the conversation from here: subsequent stream-driven
     // refreshes read conversation state only until an explicit Task start.
@@ -3319,30 +3612,42 @@ async function sendAskTurnFromComposer(
       activeRunId: null,
       busy: turnLifecycleIsLive(turns) || active.activeRunId !== null,
       lastError: null,
+      lastErrorKind: null,
     });
-    chatProvider?.postStartResult(goal, true);
+    chatProvider?.postStartResult(goal, true, false, correlation());
     await refreshConversation();
   } catch (error) {
     const retryable = error instanceof NativeApiError ? error.retryable : true;
     const reason = messageOf(error);
-    // The submission never landed (or its response was lost): the tracked
-    // entry ends with its exact outcome — busy must not stick on a turn
-    // the daemon never admitted. A retry starts a fresh entry.
-    dispatchTurn({ type: 'turnStatus', opId: null, status: 'failed' });
-    store.patch({ lastError: reason });
-    reportError(error, askErrorKind(error));
-    chatProvider?.postStartResult(goal, false, retryable);
+    if (stillVisible()) {
+      // The submission never landed (or its response was lost): the tracked
+      // entry ends with its exact outcome — busy must not stick on a turn
+      // the daemon never admitted. A retry starts a fresh entry.
+      dispatchTurn({ type: 'turnStatus', opId: null, status: 'failed' });
+      store.patch({ lastError: reason, lastErrorKind: 'run_failure' });
+      reportError(error, askErrorKind(error));
+    }
+    // The correlated result is posted on EVERY path (including a stale
+    // conversation) so the panel can release exactly its own token lock;
+    // the visible conversation is only touched when still current.
+    chatProvider?.postStartResult(goal, false, retryable, correlation());
   } finally {
-    active.conversationInFlight = false;
+    active.askInFlight.delete(submissionId);
   }
 }
 
 async function startTask(
   snapshot: StartSubmissionSnapshot,
   context: vscode.ExtensionContext,
+  correlation?: { readonly sessionId: string | null; readonly submissionToken: string | null },
 ): Promise<void> {
   const { submissionId, pending, files, contract, contractRows } = snapshot;
   const goal = pending.text;
+  // Ack fencing (audit item 7): the start is bound to the conversation the
+  // operator was viewing when it was admitted; a switch mid-start never
+  // retargets the visible conversation's run state or composer.
+  const viewEpoch = conversationViewEpoch;
+  const stillVisible = (): boolean => conversationViewEpoch === viewEpoch;
   // An explicit Task start leaves the conversational-only refresh mode.
   active.askOnly = false;
   const restore = (failure: AdmitFailure, enriched: PendingSubmission): void => {
@@ -3362,13 +3667,13 @@ async function startTask(
     // retryable classification rides along so the composer shows T08
     // `Start response unavailable` only when the retry is the SAME logical
     // submission.
-    chatProvider?.postSendMessageFailed(enriched, failure.message, retryable);
+    chatProvider?.postSendMessageFailed(enriched, failure.message, retryable, correlation);
   };
   const refuse = (message: string, enriched: PendingSubmission): void => {
     pendingSubmissionRetainer.retain(enriched);
     reportError(new Error(message), 'run_failure');
     taskStartGate.settle(submissionId, 'refused');
-    chatProvider?.postSendMessageFailed(enriched, message, false);
+    chatProvider?.postSendMessageFailed(enriched, message, false, correlation);
   };
   try {
     if (!active.client || !active.sessionId) {
@@ -3439,6 +3744,9 @@ async function startTask(
       completionContract: contract,
       contractRows,
       submissionId,
+      // Item 13: the operator's explicit per-conversation model choice
+      // rides the daemon's typed per-run `model` override.
+      model: active.futureModelOverride,
     };
     const outcome = await admitPendingSubmission({
       client,
@@ -3447,9 +3755,12 @@ async function startTask(
       settings,
       attachmentLimits,
       onStarted: (started) => {
+        if (!stillVisible()) {
+          return;
+        }
         active.activeRunId = started.run_id;
         active.completionContract = contract;
-        store.patch({ activeRunId: started.run_id, busy: true, lastError: null });
+        store.patch({ activeRunId: started.run_id, busy: true, lastError: null, lastErrorKind: null });
         const attached = files.length + pending.attachments.length;
         const attachments = attached > 0 ? ` with ${attached} attachment${attached === 1 ? '' : 's'}` : '';
         const steps = contract !== null ? ' + completion contract' : '';
@@ -3484,15 +3795,18 @@ async function startTask(
         // cleared.
         chatProvider?.postAttachmentsCleared();
       }
-      chatProvider?.postStartResult(goal, true);
+      chatProvider?.postStartResult(goal, true, false, correlation);
     }
   } catch (error) {
-    reportError(error);
+    if (stillVisible()) {
+      reportError(error);
+    }
     taskStartGate.settle(submissionId, 'transport');
     chatProvider?.postSendMessageFailed(
       pending,
       error instanceof Error ? error.message : String(error),
       true,
+      correlation,
     );
   }
 }
@@ -4618,6 +4932,52 @@ async function handleWebviewMessage(
       await replyPermissionEntry(sessionId, permissionId, decision);
       return;
     }
+    case 'loadOlderMessages': {
+      // Item 13: explicit scrollback — fetch the OLDER page by the
+      // accumulated cursor and MERGE it (never replace); the webview's
+      // id-based anchor keeps the reading position stable across the
+      // prepend.
+      const olderClient = active.client;
+      const olderSession = active.sessionId;
+      if (
+        !olderClient ||
+        !olderSession ||
+        active.transcriptNextBefore === null ||
+        !active.transcriptHasMore ||
+        active.loadingOlder
+      ) {
+        return;
+      }
+      active.loadingOlder = true;
+      const olderGeneration = lifecycle.current();
+      try {
+        const page = await olderClient.messages(olderSession, {
+          before: active.transcriptNextBefore,
+          limit: HISTORY_PAGE_LIMIT,
+        });
+        if (!lifecycle.isCurrent(olderGeneration) || active.sessionId !== olderSession) {
+          return;
+        }
+        const older = transcriptOf(page);
+        const previous = store.snapshot();
+        const merged = mergeTranscriptPages(previous.transcript, older);
+        active.transcriptHasMore = page.hasMore === true;
+        active.transcriptNextBefore = page.nextBefore;
+        const mergedRevision = transcriptSignature(merged);
+        store.patch({
+          transcript: merged,
+          transcriptRevision: mergedRevision,
+          transcriptHasMore: active.transcriptHasMore,
+        });
+      } catch (error) {
+        recordBackgroundError(error);
+      } finally {
+        if (lifecycle.isCurrent(olderGeneration)) {
+          active.loadingOlder = false;
+        }
+      }
+      return;
+    }
     case 'sendGoal': {
       const goal = typeof message.goal === 'string' ? message.goal.trim() : '';
       if (goal.length === 0) {
@@ -4787,7 +5147,13 @@ async function handleWebviewMessage(
             pending: pendingSubmissionRetainer.restore(decision.snapshot.pending),
           }
         : decision.snapshot;
-      await startTask(snapshot, context);
+      await startTask(snapshot, context, {
+        sessionId: active.sessionId,
+        submissionToken:
+          typeof message.submissionToken === 'string' && message.submissionToken.length <= 64
+            ? message.submissionToken
+            : null,
+      });
       return;
     }
     case 'cancelRun':
@@ -4964,7 +5330,7 @@ function edition8Deps(context: vscode.ExtensionContext): Edition8PanelDeps {
           return 'Theme, zoom and density are host-owned; Faktor never overrides them.';
         case 'D-10':
           await vscode.commands.executeCommand('workbench.action.openSettings', 'faktor.send');
-          return 'Send behavior is a host keybinding; Ctrl/Cmd+Enter remains the default.';
+          return 'Enter sends; Shift+Enter inserts a newline; Ctrl/Cmd+Enter also sends.';
         case 'D-11':
           await vscode.commands.executeCommand('workbench.action.showCommands');
           return 'Faktor commands are registered under Faktor in the native palette.';
@@ -4981,6 +5347,17 @@ function edition8Deps(context: vscode.ExtensionContext): Edition8PanelDeps {
     switchSession: (sessionId: string) => switchSession(sessionId, context),
     newConversation: (provider: string, model: string) =>
       newConversationWith(provider, model, context),
+    futureModel: async (provider: string, model: string) => {
+      if (active.sessionId === null) {
+        return 'No conversation is open; open one first, then choose again.';
+      }
+      active.futureModelOverride = `${provider}/${model}`;
+      return (
+        `Future Task runs of this conversation use ${provider}/${model} ` +
+        '(per-run override on the next start). Ask turns keep the daemon\u2019s ' +
+        'routing model until the native prompt route accepts a per-turn model.'
+      );
+    },
     output,
   };
 }
@@ -5046,6 +5423,7 @@ export function activate(context: vscode.ExtensionContext): void {
       session: () => active.sessionId,
       workspaceRoot: () => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? null,
     }),
+
     vscode.window.registerWebviewViewProvider(ChatViewProvider.viewType, chatProvider, {
       webviewOptions: { retainContextWhenHidden: true },
     }),
@@ -5151,6 +5529,9 @@ export function activate(context: vscode.ExtensionContext): void {
   // waits for the short connecting threshold before showing anything, and an
   // explicit Diagnostics stop keeps auto-start off until Start is pressed.
   void ensureServiceLifecycle(context).open();
+  // Item 17: the provenance surface is available even before the daemon
+  // connects (extension assets + the packaged stamp; daemon rows fill in).
+  refreshProvenance(context);
 }
 
 export async function deactivate(): Promise<void> {
