@@ -103,6 +103,8 @@ impl<'de> serde::Deserialize<'de> for Config {
             #[serde(default = "default_instructions")]
             instructions: String,
             #[serde(default)]
+            ask_instructions: String,
+            #[serde(default)]
             provider_env_file: Option<String>,
             #[serde(default)]
             providers: Vec<ProviderCfg>,
@@ -160,6 +162,7 @@ impl<'de> serde::Deserialize<'de> for Config {
             compaction_min_reduction: file.compaction_min_reduction,
             compact_at_usage: file.compact_at_usage,
             instructions: file.instructions,
+            ask_instructions: file.ask_instructions,
             provider_env_file: file.provider_env_file,
             providers: file.providers,
             routing_mode: file.routing_mode,

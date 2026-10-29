@@ -1,8 +1,8 @@
 {
   "schema": "faktor-test-programme-registry/v1",
-  "generated_at": "2026-10-29T14:35:19.512Z",
-  "commit": "687cb88d48b55f0a9391db465e49381323512d44",
-  "tree": "0ffe351c3683c847363f104e3b9e88e9a82ed8da",
+  "generated_at": "2026-10-29T16:10:46.472Z",
+  "commit": "e30f8e2555b61c24cb15c34e3281754feaafcd18",
+  "tree": "1eb2a9d3321396a8b5e0405505c704a701f19b66",
   "layers": [
     "structural",
     "unit",
@@ -1252,7 +1252,7 @@
       ],
       "evidence": {
         "passed": false,
-        "reason": "Error: route probe daemon did not start: \u001b[2m2026-10-29T14:35:18.753611Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mfaktor_cli::daemon::serve\u001b[0m\u001b[2m:\u001b[0m daemon build failed: routing_mode Economy admits no candidate for 2 configured model(s) (p1/default, p1/m); a first model call would otherwise fail as NoCapableModel. Every configured model has Unknown pricing (p1/default, p1/m), which economy cannot cost or budget. Configure an exact quote or a pricing ceiling for that endpoint, point base_url at a canonical official endpoint, or use routing_mode maximum_quality/pinned.\n"
+        "reason": "Error: route probe daemon did not start: \u001b[2m2026-10-29T16:10:45.749414Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mfaktor_cli::daemon::serve\u001b[0m\u001b[2m:\u001b[0m daemon build failed: routing_mode Economy admits no candidate for 2 configured model(s) (p1/default, p1/m); a first model call would otherwise fail as NoCapableModel. Every configured model has Unknown pricing (p1/default, p1/m), which economy cannot cost or budget. Configure an exact quote or a pricing ceiling for that endpoint, point base_url at a canonical official endpoint, or use routing_mode maximum_quality/pinned.\n"
       }
     },
     {

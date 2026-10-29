@@ -24,7 +24,7 @@ pub(crate) enum CallBegin {
 pub(crate) struct CallHandles {
     pub(crate) request: GenericAgentRequest,
     pub(crate) route_json: Option<String>,
-    pub(crate) reservation: faktor_session::ReservationId,
+    pub(crate) reservation: Option<faktor_session::ReservationId>,
     pub(crate) attempt_identity: ModelCallAttempt,
     pub(crate) acct: crate::AttemptAccounting,
     pub(crate) debits: crate::credits::AttemptDebits,
@@ -212,7 +212,7 @@ impl AgentRuntime {
         {
             st.handle.record_provider_call_attempt(
                 attempt_identity,
-                reservation_link(reservation),
+                reservation_link(Some(reservation)),
                 st.provider.id(),
                 &st.model,
                 "completed",
@@ -501,58 +501,72 @@ impl AgentRuntime {
             .routed_decision
             .as_ref()
             .and_then(|d| serde_json::to_string(d).ok());
-        let reservation = match self
-            .deps
-            .budgets
-            .reserve_attempt(
-                st.handle.id(),
-                st.task_id,
-                attempt_identity,
-                predicted,
-                // P0-1: the reserve freezes the route decision's
-                // price capture on the reservation row (None = no
-                // pricing authority — the unpriced pin/passthrough
-                // paths; settlement then refuses under a hard cap
-                // instead of fabricating an actual).
-                st.routed_decision
-                    .as_ref()
-                    .and_then(|d| d.pricing_snapshot.clone()),
-                // P1 classification: the route decision's durable execution
-                // class rides the reservation beside its snapshot (Unknown
-                // when no decision/authority exists — never a guessed local
-                // or hosted class).
-                st.routed_decision
-                    .as_ref()
-                    .map(|d| d.execution_class)
-                    .unwrap_or(faktor_core::model::ExecutionClass::Unknown),
-            )
-            .await
-        {
-            Ok(r) => r,
-            Err(SessionBudgetError::BudgetExceeded { .. }) => {
-                st.outcome.final_state = AgentState::FailedRecoverable;
-                let message = format!(
+        // Ask turns carry NO task row and refuse task caps by contract: an
+        // ask is an UNBUDGETED conversational call, represented by the
+        // documented NOOP reservation (raw 0) — the attempt accounting
+        // machine's silent no-op and a refused fabricated provider-call
+        // link. Spend is still recorded (provider-call rows + the managed
+        // commercial debit below): metering without an engineering budget.
+        let unbudgeted = st.execution.is_ask();
+        let reservation: Option<faktor_session::ReservationId> = if unbudgeted {
+            None
+        } else {
+            Some(
+                match self
+                    .deps
+                    .budgets
+                    .reserve_attempt(
+                        st.handle.id(),
+                        st.task_id,
+                        attempt_identity,
+                        predicted,
+                        // P0-1: the reserve freezes the route decision's
+                        // price capture on the reservation row (None = no
+                        // pricing authority — the unpriced pin/passthrough
+                        // paths; settlement then refuses under a hard cap
+                        // instead of fabricating an actual).
+                        st.routed_decision
+                            .as_ref()
+                            .and_then(|d| d.pricing_snapshot.clone()),
+                        // P1 classification: the route decision's durable execution
+                        // class rides the reservation beside its snapshot (Unknown
+                        // when no decision/authority exists — never a guessed local
+                        // or hosted class).
+                        st.routed_decision
+                            .as_ref()
+                            .map(|d| d.execution_class)
+                            .unwrap_or(faktor_core::model::ExecutionClass::Unknown),
+                    )
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(SessionBudgetError::BudgetExceeded { .. }) => {
+                        st.outcome.final_state = AgentState::FailedRecoverable;
+                        let message = format!(
                             "budget exceeded: request would cost {predicted} micro of the remaining task budget"
                         );
-                st.outcome.stop_reason = Some(OutcomeReason::new(
-                    ReasonCode::BudgetExceeded,
-                    message.clone(),
-                ));
-                // Classified end: the budget refusal must not be
-                // masked by a journal error — record the lost append.
-                self.dw_note_journal_failed(
-                    st.handle,
-                    st.op_id,
-                    AgentState::FailedRecoverable,
-                    serde_json::json!({ "message": message }),
-                    DW_SITE_BUDGET_JOURNAL,
-                )
-                .await;
-                return Ok(CallBegin::End);
-            }
-            Err(e) => return Err(e.into()),
+                        st.outcome.stop_reason = Some(OutcomeReason::new(
+                            ReasonCode::BudgetExceeded,
+                            message.clone(),
+                        ));
+                        // Classified end: the budget refusal must not be
+                        // masked by a journal error — record the lost append.
+                        self.dw_note_journal_failed(
+                            st.handle,
+                            st.op_id,
+                            AgentState::FailedRecoverable,
+                            serde_json::json!({ "message": message }),
+                            DW_SITE_BUDGET_JOURNAL,
+                        )
+                        .await;
+                        return Ok(CallBegin::End);
+                    }
+                    Err(e) => return Err(e.into()),
+                },
+            )
         };
-        st.settled_reservation = Some(reservation);
+        // A settled attempt carries a REAL reservation only.
+        st.settled_reservation = reservation;
         // The attempt's budget machine (attempt-accounting audit):
         // every terminal call of this attempt goes through the
         // guarded machine — refund only pre-dispatch, UNCERTAIN for
@@ -562,7 +576,7 @@ impl AgentRuntime {
             st.handle.id(),
             st.provider.id(),
             st.model.clone(),
-            Some(reservation),
+            reservation,
         );
         // The additive commercial debit (Wave 5 residual): a
         // Faktor-managed attempt opens a durable credit hold BEFORE
@@ -584,7 +598,7 @@ impl AgentRuntime {
                 if let Err(refund_err) = acct.fail_before_dispatch().await {
                     tracing::error!(
                         session = %st.handle.id(),
-                        "refund of reservation {reservation} after a malformed debit identity failed: {refund_err}"
+                        "refund of reservation {reservation:?} after a malformed debit identity failed: {refund_err}"
                     );
                 }
                 st.outcome.final_state = AgentState::FailedRecoverable;
@@ -617,7 +631,7 @@ impl AgentRuntime {
             if let Err(refund_err) = acct.fail_before_dispatch().await {
                 tracing::error!(
                     session = %st.handle.id(),
-                    "refund of reservation {reservation} after a refused debit failed: {refund_err}"
+                    "refund of reservation {reservation:?} after a refused debit failed: {refund_err}"
                 );
             }
             st.outcome.final_state = AgentState::FailedRecoverable;
@@ -649,7 +663,7 @@ impl AgentRuntime {
         if let Err(e) = acct.mark_dispatched().await {
             tracing::error!(
                 session = %st.handle.id(),
-                "cannot mark reservation {reservation} dispatched: {e}"
+                "cannot mark reservation {reservation:?} dispatched: {e}"
             );
             // The marker write failed BEFORE the request was sent:
             // the provider was provably never contacted — release
@@ -657,7 +671,7 @@ impl AgentRuntime {
             if let Err(refund_err) = acct.fail_before_dispatch().await {
                 tracing::error!(
                     session = %st.handle.id(),
-                    "refund of the never-dispatched reservation {reservation} failed: {refund_err}"
+                    "refund of the never-dispatched reservation {reservation:?} failed: {refund_err}"
                 );
             }
             // Same pre-dispatch truth for the credit hold: the
@@ -691,7 +705,7 @@ impl AgentRuntime {
         st: &mut TurnDriveState<'_>,
         request: GenericAgentRequest,
         attempt_identity: ModelCallAttempt,
-        reservation: faktor_session::ReservationId,
+        reservation: Option<faktor_session::ReservationId>,
         acct: &mut crate::AttemptAccounting,
         debits: &mut crate::credits::AttemptDebits,
         attempt: u32,
@@ -1131,7 +1145,7 @@ impl AgentRuntime {
         self: &Arc<Self>,
         st: &mut TurnDriveState<'_>,
         attempt_identity: ModelCallAttempt,
-        reservation: faktor_session::ReservationId,
+        reservation: Option<faktor_session::ReservationId>,
         acct: &mut crate::AttemptAccounting,
         debits: &mut crate::credits::AttemptDebits,
         violation: ProviderOutputLimitExceeded,
@@ -1165,7 +1179,7 @@ impl AgentRuntime {
         self: &Arc<Self>,
         st: &mut TurnDriveState<'_>,
         attempt_identity: ModelCallAttempt,
-        reservation: faktor_session::ReservationId,
+        reservation: Option<faktor_session::ReservationId>,
         acct: &mut crate::AttemptAccounting,
         debits: &mut crate::credits::AttemptDebits,
         detail: String,
@@ -1247,7 +1261,7 @@ impl AgentRuntime {
         self: &Arc<Self>,
         st: &mut TurnDriveState<'_>,
         route_json: Option<String>,
-        reservation: faktor_session::ReservationId,
+        reservation: Option<faktor_session::ReservationId>,
         attempt_identity: ModelCallAttempt,
         acct: &mut crate::AttemptAccounting,
         debits: &mut crate::credits::AttemptDebits,
@@ -1279,7 +1293,7 @@ impl AgentRuntime {
             Err(settle_err) => {
                 tracing::warn!(
                     session = %st.handle.id(),
-                    "reservation {reservation} settlement refused: {settle_err}; marking the attempt uncertain"
+                    "reservation {reservation:?} settlement refused: {settle_err}; marking the attempt uncertain"
                 );
                 if let Err(uncertain_err) = acct.fail_after_dispatch("settle_refused", None).await {
                     tracing::error!(

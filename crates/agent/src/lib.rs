@@ -1795,19 +1795,24 @@ impl AttemptAccounting {
         route_decision_json: Option<String>,
     ) -> Result<Option<u64>, faktor_session::BudgetError> {
         self.guard_not_closed()?;
+        // An UNBUDGETED call (no reservation) has nothing to settle and no
+        // dispatch marker to wait for: close the machine as a silent no-op.
+        // This must precede the dispatch guard — an unbudgeted call never
+        // writes a durable reservation, so `dispatched` stays false and the
+        // guard would fabricate a "reservation 0" machine-order error.
+        let Some(reservation) = self.reservation else {
+            self.closed = true;
+            return Ok(None);
+        };
         if !self.dispatched {
             // A stream that never dispatched cannot settle: a clean end
             // without a dispatch marker is a machine-order violation (the
             // durable marker must precede the request).
-            let raw = self.reservation.map(|r| r.raw()).unwrap_or(0);
             return Err(faktor_session::BudgetError::NotOpen {
-                reservation: raw,
+                reservation: reservation.raw(),
                 status: "reserved".into(),
             });
         }
-        let Some(reservation) = self.reservation else {
-            return Ok(None);
-        };
         let out = self
             .budgets
             .settle_usage_with_context(
@@ -1840,16 +1845,20 @@ impl AttemptAccounting {
         request_id: Option<String>,
     ) -> Result<(), faktor_session::BudgetError> {
         self.guard_not_closed()?;
+        // Unbudgeted (no reservation): nothing can become uncertain — close
+        // the machine as the documented silent no-op. This precedes the
+        // dispatch guard because an unbudgeted call never writes a durable
+        // dispatch marker.
+        let Some(reservation) = self.reservation else {
+            self.closed = true;
+            return Ok(());
+        };
         if !self.dispatched {
-            let raw = self.reservation.map(|r| r.raw()).unwrap_or(0);
             return Err(faktor_session::BudgetError::NotOpen {
-                reservation: raw,
+                reservation: reservation.raw(),
                 status: "reserved".into(),
             });
         }
-        let Some(reservation) = self.reservation else {
-            return Ok(());
-        };
         self.budgets
             .mark_uncertain(self.session_id, reservation, reason_code.into(), request_id)
             .await?;

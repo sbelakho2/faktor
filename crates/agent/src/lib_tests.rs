@@ -3132,14 +3132,22 @@ mod attempt_accounting_tests {
             !acct.dispatched(),
             "nothing was dispatched (no reservation)"
         );
-        assert!(matches!(
-            acct.settle_usage(1, 0, 0, 1, None, None).await.unwrap_err(),
-            faktor_session::BudgetError::NotOpen { status, .. } if status == "reserved"
-        ));
-        assert!(matches!(
-            acct.fail_after_dispatch("x", None).await.unwrap_err(),
-            faktor_session::BudgetError::NotOpen { .. }
-        ));
+        // The documented contract: with NO reservation every machine call is
+        // a SILENT NO-OP (never a fabricated "reservation 0" machine-order
+        // error — that ordering broke real unbudgeted Ask turns).
+        assert_eq!(
+            acct.settle_usage(1, 0, 0, 1, None, None).await.unwrap(),
+            None,
+            "an unbudgeted settle is a silent no-op"
+        );
+        assert!(acct.closed(), "settle closed the never-open machine");
+        let mut acct = AttemptAccounting::new(authority.clone(), SessionId::new(1), "p", "m", None);
+        acct.mark_dispatched().await.unwrap();
+        // POST-dispatch terminal failures on an unbudgeted call: still a
+        // no-op (nothing to mark uncertain, no authority call).
+        acct.fail_after_dispatch("x", None).await.unwrap();
+        assert!(acct.closed());
+        let mut acct = AttemptAccounting::new(authority.clone(), SessionId::new(1), "p", "m", None);
         acct.fail_before_dispatch().await.unwrap();
         assert!(acct.closed());
         assert_eq!(

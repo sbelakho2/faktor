@@ -1171,7 +1171,7 @@ pub(crate) async fn run_independent_review_call(
         // not resolve — no verified sample (this site never learned a gate).
         if let Err(row_err) = handle.record_provider_call_attempt(
             attempt_identity,
-            reservation.and_then(reservation_link),
+            reservation_link(reservation),
             &provider_id,
             &model,
             "failed",
@@ -1251,7 +1251,7 @@ pub(crate) async fn run_independent_review_call(
             if settled {
                 if let Err(row_err) = handle.record_provider_call_attempt(
                     attempt_identity,
-                    reservation.and_then(reservation_link),
+                    reservation_link(reservation),
                     &provider_id,
                     &model,
                     "completed",
@@ -1324,7 +1324,7 @@ pub(crate) async fn run_independent_review_call(
             if settled {
                 if let Err(row_err) = handle.record_provider_call_attempt(
                     attempt_identity,
-                    reservation.and_then(reservation_link),
+                    reservation_link(reservation),
                     &provider_id,
                     &model,
                     "completed",

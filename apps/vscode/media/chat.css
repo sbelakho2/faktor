@@ -1024,6 +1024,15 @@ button.toggle[aria-expanded='true'] {
   outline-offset: 2px;
 }
 
+/* One logical Faktor turn: assistant message rows of the same user turn
+   read as one continuous reply (the author head renders once at the run
+   start; subsequent rows carry no separating gap or border). */
+.entry-assistant.entry-follow {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
+}
+
 .entry {
   border-left: 2px solid var(--faktor-border);
   padding-left: var(--space-2);

@@ -4849,6 +4849,12 @@ function renderToolNode(tool) {
       previousEntry != null &&
       typeof previousEntry === 'object' &&
       previousEntry.role === entry.role;
+    // One logical Faktor turn (audit): assistant rows belonging to the same
+    // user turn render as a CONTINUOUS reply — one author head, no inter-row
+    // separation — instead of a series of numbered fragments.
+    if (sameRoleRun && entry.role !== 'user') {
+      wrapper.className += ' entry-follow';
+    }
     head.textContent = sameRoleRun ? '' : entry.role === 'user' ? 'You' : 'Faktor';
     head.setAttribute('title', 'message ' + entry.id + ' (seq ' + entry.seq + ')');
     wrapper.appendChild(head);

@@ -613,10 +613,23 @@ impl AgentRuntime {
             .map(|t| t.text.clone())
             .filter(|t| !t.is_empty())
             .unwrap_or_else(|| st.handle.title().unwrap_or_default());
+        // ContextProfile (audit): an ASK is conversational. Its retrieval
+        // signal is the current prompt ONLY — the previous engineering
+        // task's changed files and failures must never bias an unrelated
+        // question. Task keeps today's inputs byte-identically.
+        let ask_turn = st.execution.is_ask();
         let evidence_query = EvidenceQuery {
             prompt,
-            changed_files: st.ledger.changed_files.clone(),
-            failures: st.ledger.known_failures.clone(),
+            changed_files: if ask_turn {
+                Vec::new()
+            } else {
+                st.ledger.changed_files.clone()
+            },
+            failures: if ask_turn {
+                Vec::new()
+            } else {
+                st.ledger.known_failures.clone()
+            },
         };
         // Evidence swap (audits 30/64 + P0-30): a READY index
         // generation serves durable index evidence; otherwise the CHEAP
@@ -647,54 +660,61 @@ impl AgentRuntime {
         // a policy that already treats missing evidence as failing can
         // distinguish the two from the durable record.
         let mut evidence_package_meta: Option<faktor_index::EvidencePackageMeta> = None;
-        let mut evidence = match self.index_evidence_if_ready(st.handle, &evidence_query)? {
-            Some(package) => {
-                evidence_package_meta = Some(package.meta);
-                package.evidence
+        let mut evidence = if ask_turn {
+            // On-demand repository access (audit ContextProfile): no index
+            // query, no cold ladder, no legacy scan before an answer — the
+            // model's read/search tools are the path.
+            Vec::new()
+        } else {
+            match self.index_evidence_if_ready(st.handle, &evidence_query)? {
+                Some(package) => {
+                    evidence_package_meta = Some(package.meta);
+                    package.evidence
+                }
+                None => match self
+                    .cold_evidence_if_unready(st.handle, &evidence_query)
+                    .await
+                {
+                    ColdEvidenceOutcome::Served(evidence, meta) => {
+                        evidence_package_meta = Some(meta);
+                        evidence
+                    }
+                    ColdEvidenceOutcome::Degraded(status) => {
+                        // The cold ladder ran but its off-turn bridge failed
+                        // (provider panic / unschedulable bridge): the SAME
+                        // durable archive + diagnostic path as the legacy
+                        // poll, so a broken cold ladder is an EXPLICIT
+                        // degradation — never "no evidence", never silent.
+                        log_evidence_poll_outcome(&status, LEGACY_EVIDENCE_MAX_WAIT);
+                        st.outcome.evidence_poll = Some(encode_evidence_poll_status(&status));
+                        st.evidence_poll_status = Some(status);
+                        Vec::new()
+                    }
+                    ColdEvidenceOutcome::NotHosted => {
+                        // Index hosting failed entirely: the legacy bounded
+                        // scan is the documented degrade for that case,
+                        // polled off the turn thread under a hard wall
+                        // deadline (the runtime's verification-path source
+                        // probes keep the pooling API out of this file; the
+                        // helper lives in lib.rs). The TYPED outcome is kept
+                        // (status archived; package unchanged).
+                        let crate::EvidencePollOutcome {
+                            evidence: polled,
+                            status,
+                        } = crate::poll_evidence_with_wall_budget_outcome(
+                            self.deps.evidence.clone(),
+                            st.handle.id(),
+                            evidence_query.clone(),
+                            LEGACY_EVIDENCE_MAX_WAIT,
+                        )
+                        .await;
+                        log_evidence_poll_outcome(&status, LEGACY_EVIDENCE_MAX_WAIT);
+                        st.outcome.evidence_poll = Some(encode_evidence_poll_status(&status));
+                        st.evidence_poll_status = Some(status);
+                        polled
+                    }
+                },
             }
-            None => match self
-                .cold_evidence_if_unready(st.handle, &evidence_query)
-                .await
-            {
-                ColdEvidenceOutcome::Served(evidence, meta) => {
-                    evidence_package_meta = Some(meta);
-                    evidence
-                }
-                ColdEvidenceOutcome::Degraded(status) => {
-                    // The cold ladder ran but its off-turn bridge failed
-                    // (provider panic / unschedulable bridge): the SAME
-                    // durable archive + diagnostic path as the legacy
-                    // poll, so a broken cold ladder is an EXPLICIT
-                    // degradation — never "no evidence", never silent.
-                    log_evidence_poll_outcome(&status, LEGACY_EVIDENCE_MAX_WAIT);
-                    st.outcome.evidence_poll = Some(encode_evidence_poll_status(&status));
-                    st.evidence_poll_status = Some(status);
-                    Vec::new()
-                }
-                ColdEvidenceOutcome::NotHosted => {
-                    // Index hosting failed entirely: the legacy bounded
-                    // scan is the documented degrade for that case,
-                    // polled off the turn thread under a hard wall
-                    // deadline (the runtime's verification-path source
-                    // probes keep the pooling API out of this file; the
-                    // helper lives in lib.rs). The TYPED outcome is kept
-                    // (status archived; package unchanged).
-                    let crate::EvidencePollOutcome {
-                        evidence: polled,
-                        status,
-                    } = crate::poll_evidence_with_wall_budget_outcome(
-                        self.deps.evidence.clone(),
-                        st.handle.id(),
-                        evidence_query.clone(),
-                        LEGACY_EVIDENCE_MAX_WAIT,
-                    )
-                    .await;
-                    log_evidence_poll_outcome(&status, LEGACY_EVIDENCE_MAX_WAIT);
-                    st.outcome.evidence_poll = Some(encode_evidence_poll_status(&status));
-                    st.evidence_poll_status = Some(status);
-                    polled
-                }
-            },
         };
         if let Some(meta) = &evidence_package_meta {
             // Audit 16: the package's generation/identity/freshness is a
@@ -714,7 +734,7 @@ impl AgentRuntime {
         // provider absence, failure or a parked call leaves the turn's
         // decisions byte-identical (parity) while a registered provider
         // that cannot answer degrades to conservative Unknown risk.
-        if st.semantic_turn.is_none() {
+        if !ask_turn && st.semantic_turn.is_none() {
             st.semantic_turn = semantic_turn_consult(
                 &self.deps,
                 st.handle,
@@ -739,7 +759,13 @@ impl AgentRuntime {
         // durable corpus — the mined loop reaches selection here. Flag
         // off or an empty corpus adds nothing (byte parity); a corrupt
         // row is logged loudly and leaves the turn neutral.
-        let learning_evidence = self.learning_corpus_evidence(st.handle);
+        let learning_evidence = if ask_turn {
+            // ContextProfile (audit): no engineering learning corpus before
+            // an ordinary answer.
+            Vec::new()
+        } else {
+            self.learning_corpus_evidence(st.handle)
+        };
         // THE durable evidence authority is the store of record (schema
         // v21): the retrieval ladder, the semantic DATA and the learning
         // corpus archive into it as PRODUCERS (cold/index stay

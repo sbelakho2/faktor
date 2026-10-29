@@ -1557,7 +1557,7 @@ impl AgentRuntime {
         });
         let trace = CompactCallTrace {
             attempt: attempt_identity,
-            reservation: reservation_link(reservation),
+            reservation: reservation_link(Some(reservation)),
             provider: s.provider.id().to_string(),
             model: s.model.clone(),
         };

@@ -601,9 +601,11 @@ pub(crate) fn authoritative_reported_micro(cost: &ReportedCost) -> Option<u64> {
 /// no durable row) maps to `None` — a fabricated link to nothing must never
 /// be persisted; every real reservation (ids start at 1) is preserved.
 pub(crate) fn reservation_link(
-    reservation: faktor_session::ReservationId,
+    reservation: Option<faktor_session::ReservationId>,
 ) -> Option<faktor_session::ReservationId> {
-    (reservation.raw() != 0).then_some(reservation)
+    // `None` (an unbudgeted conversational call) and the NOOP marker (raw 0)
+    // both refuse a fabricated durable link.
+    reservation.filter(|id| id.raw() != 0)
 }
 
 /// One production model-call receipt, emitted at physical-attempt

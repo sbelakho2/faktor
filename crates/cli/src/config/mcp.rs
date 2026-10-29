@@ -34,6 +34,7 @@ impl Default for Config {
                 "Final answer: list the changed files and the verification command/result."
             )
             .into(),
+            ask_instructions: String::new(),
             provider_env_file: None,
             providers: vec![],
             routing_mode: None,
