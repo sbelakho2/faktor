@@ -973,6 +973,8 @@ export interface NativeMessage {
   readonly role: string;
   readonly createdMs: number;
   readonly data: Json;
+  /** ADDITIVE turn identity (item 6); absent for legacy rows. */
+  readonly turn_id?: string;
   readonly parts: NativeMessagePart[];
 }
 
@@ -1703,11 +1705,11 @@ export interface StartTaskRunRequest {
    * the plain-prompt path, so callers pair it with an explicit work item. */
   readonly completion_contract?: NativeCompletionContract;
   /**
-   * User-authored engineering-contract rows (Task mode): plain non-empty
-   * lines, bounded <=64 entries per array and <=512 UTF-8 bytes per line
-   * (the daemon's own bounds; a violation is its typed 400). The daemon
-   * derives ids/origins itself (origin=user) and merges by id. All four
-   * members are optional and omitted when the composer has no rows.
+   * User-authored engineering-contract rows (engineering runs only): plain
+   * non-empty lines, bounded <=64 entries per array and <=512 UTF-8 bytes
+   * per line (the daemon's own bounds; a violation is its typed 400). The
+   * daemon derives ids/origins itself (origin=user) and merges by id. All
+   * four members are optional and omitted when the composer has no rows.
    */
   readonly constraints?: readonly string[];
   readonly invariants?: readonly string[];
@@ -2835,12 +2837,27 @@ export function validateMessagePage(json: Json): NativeMessagePage {
     messages: fObjectArray(object, 'messages', path).map((entry, index) => {
       const itemPath = `${path}.messages[${index}]`;
       checkResponseKeys(entry, itemPath, ['seq', 'id', 'role', 'createdMs', 'data', 'parts']);
+      // ADDITIVE turn identity (audit item 6): the projection may carry
+      // `turn_id`; it is threaded through verbatim so the transcript
+      // reducer can group by the AUTHORITY that produced a message. Absent
+      // (legacy rows) or null keeps the field off the object entirely.
+      const rawTurnId = Object.prototype.hasOwnProperty.call(entry, 'turn_id')
+        ? entry.turn_id
+        : undefined;
+      let turnId: string | null = null;
+      if (rawTurnId !== undefined && rawTurnId !== null) {
+        if (typeof rawTurnId !== 'string') {
+          fail(`${itemPath}.turn_id`, `expected a string or null, got ${describe(rawTurnId)}`);
+        }
+        turnId = rawTurnId;
+      }
       return {
         seq: fInt(entry, 'seq', itemPath),
         id: fInt(entry, 'id', itemPath),
         role: fString(entry, 'role', itemPath),
         createdMs: fEpochMs(entry, 'createdMs', itemPath),
         data: fJson(entry, 'data', itemPath),
+        ...(turnId !== null ? { turn_id: turnId } : {}),
         parts: fObjectArray(entry, 'parts', itemPath).map((part, partIndex) => {
           const partPath = `${itemPath}.parts[${partIndex}]`;
           checkResponseKeys(part, partPath, ['kind', 'createdMs', 'data']);

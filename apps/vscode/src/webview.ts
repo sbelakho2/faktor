@@ -299,10 +299,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    * The ONE turn lifecycle state (idle → submitting → queued/starting →
    * streaming/tool-running/awaiting-user → completed/interrupted/failed):
    * the turn-state rendering source (label + Stop visibility) — distinct
-   * from the task-run snapshot fields.
+   * from the task-run snapshot fields. `queuedOpIds` names the QUEUED
+   * follow-ups (each individually removable through the typed abort route;
+   * never the operation Stop targets).
    */
-  postTurnState(phase: string, opId: string | null, source: 'ask' | 'task' | null): void {
-    this.post({ type: 'turnState', phase, opId, source });
+  postTurnState(
+    phase: string,
+    opId: string | null,
+    source: 'ask' | 'task' | null,
+    queuedOpIds: readonly string[] = [],
+  ): void {
+    this.post({ type: 'turnState', phase, opId, source, queuedOpIds });
   }
 
   /**
@@ -626,7 +633,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     </div>
     <div id="pending-entries" class="pending-entries" aria-label="Messages awaiting durable confirmation"></div>
   </section>
-  <form id="composer" data-intent="ask">
+  <form id="composer">
     <textarea id="goal" rows="1" aria-label="Ask Faktor" placeholder="Ask anything…"></textarea>
     <div class="composer-toolbar">
       <button id="btn-attach" class="composer-icon" type="button" title="Attach files" aria-label="Attach files">
@@ -635,10 +642,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       <button id="btn-clear-attachments" class="composer-icon" type="button" title="Clear attachments" aria-label="Clear attachments" hidden>
         <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false"><path d="m4 4 8 8M12 4l-8 8" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
       </button>
-      <div id="composer-intent" class="composer-intent" role="radiogroup" aria-label="Intent">
-        <button id="btn-intent-ask" class="intent-option" type="button" role="radio" aria-checked="true" data-intent="ask" title="Ask a question without starting a task">Ask</button>
-        <button id="btn-intent-task" class="intent-option" type="button" role="radio" aria-checked="false" data-intent="task" title="Start a task run with the options below">Task</button>
-      </div>
       <span id="composer-model" class="chip chip-model" hidden></span>
       <span class="composer-spacer" aria-hidden="true"></span>
       <button id="btn-send" class="primary-action" type="submit">Send</button>
@@ -646,8 +649,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     <ul id="attachment-list" aria-label="Attached files"></ul>
     <div id="attachment-notice" class="muted" hidden role="status"></div>
     <details id="contract-options" class="contract-options task-options">
-      <summary>Task options</summary>
-      <p class="muted">These apply only in Task mode. Ask sends a plain message and never attaches them.</p>
+      <summary>Advanced engineering options</summary>
+      <p class="muted">Send always starts a conversational turn and never attaches these. Start task escalates the current draft to an engineering run that carries them.</p>
+      <button id="btn-start-task" type="button">Start task</button>
       <fieldset id="completion-contract" class="completion-contract">
         <legend>Finish actions for this task run</legend>
         <label><input type="radio" name="finish-level" id="contract-local" value="local" checked /> Leave changes locally</label>
@@ -675,6 +679,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       <span id="composer-state-label" class="state-strip-label"></span>
       <span id="composer-state-copy" class="state-strip-copy muted"></span>
     </div>
+    <ul id="queued-list" class="queued-list" aria-label="Queued messages" hidden></ul>
   </form>
   </main>
   <section id="inspect-panel" class="view-panel" role="region" aria-label="Inspect" tabindex="-1" hidden>

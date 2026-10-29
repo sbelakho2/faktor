@@ -99,6 +99,22 @@ export function turnStopOpId(state: TurnLifecycle): string | null {
 }
 
 /**
+ * The QUEUED follow-ups waiting behind the active turn, in submission
+ * order. Each is individually removable through the typed abort route
+ * (a queued-prompt kill cancels its durable row without touching the
+ * state machine or the operation Stop targets).
+ */
+export function turnQueuedOpIds(state: TurnLifecycle): string[] {
+  const queued: string[] = [];
+  for (const entry of state.entries) {
+    if (entry.phase === 'queued' && entry.opId !== null) {
+      queued.push(entry.opId);
+    }
+  }
+  return queued;
+}
+
+/**
  * The one display phase: the NEWEST submission's phase (a queued follow-up
  * therefore renders `queued` while an earlier turn still streams), else
  * the newest live entry, else the newest terminal outcome, else idle.

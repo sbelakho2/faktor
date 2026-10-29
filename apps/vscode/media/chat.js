@@ -184,8 +184,10 @@
   var inFlightSubmissions = {};
   var pendingUserRows = [];
   var MAX_PENDING_USER_ROWS = 4;
-  /** The ONE composer's explicit intent. Ask is the product default. */
-  var composerIntent = 'ask';
+  /** The ONE composer sends ONE conversational ChatTurn (execution 'ask' on
+   * the wire; the host never sees a mode). The advanced disclosure's Start
+   * task button is the ONLY escalation to an engineering run (`intent:
+   * 'task'` rides that message and nothing else). */
   /**
    * True after the host explicitly reported a RETRYABLE failed start
    * (`startResult` ok false with `retryable: true`): the draft was kept and
@@ -251,6 +253,11 @@
   var turnStatePhase = 'idle';
   var turnStateStopOp = null;
   var turnStateSource = null;
+  /** The QUEUED follow-ups the host projects (each individually removable
+   * through the typed abort route; never the Stop target). */
+  var turnStateQueuedOps = [];
+  /** Hard bound of rendered queued rows (bounded everything). */
+  var MAX_QUEUED_OPS = 8;
   /** The last rendered snapshot (header/Stop re-render without a snapshot). */
   var lastSnapshotForHeader = null;
   var transcriptPinRequested = false;
@@ -4852,7 +4859,25 @@ function renderToolNode(tool) {
     // One logical Faktor turn (audit): assistant rows belonging to the same
     // user turn render as a CONTINUOUS reply — one author head, no inter-row
     // separation — instead of a series of numbered fragments.
-    if (sameRoleRun && entry.role !== 'user') {
+    //
+    // AUTHORITATIVE grouping (audit item 6): when the projection carries a
+    // ChatTurnId, the turn id ALONE decides membership — two consecutive
+    // rows of the SAME turn group together and a different turn id starts a
+    // new group even under the same role. The legacy role-adjacency
+    // (`entry-follow`) applies only when either side lacks a turn id.
+    var turnGrouped =
+      entry.role !== 'user' &&
+      entry.turnId != null &&
+      entry.turnId !== '' &&
+      previousEntry != null &&
+      typeof previousEntry === 'object' &&
+      previousEntry.turnId != null &&
+      previousEntry.turnId !== '';
+    if (turnGrouped) {
+      if (sameRoleRun && previousEntry.turnId === entry.turnId) {
+        wrapper.className += ' entry-follow';
+      }
+    } else if (sameRoleRun && entry.role !== 'user') {
       wrapper.className += ' entry-follow';
     }
     head.textContent = sameRoleRun ? '' : entry.role === 'user' ? 'You' : 'Faktor';
@@ -5093,10 +5118,12 @@ function renderToolNode(tool) {
       return model.length > 0 ? spec.label + ' · ' + model : spec.label;
     }
     if (turnLabel !== null) {
-      // A successful Ask falls back to Ready — normal chat must not read
-      // like a finished job. Abnormal settled states (Stopped / Failed)
-      // stay labelled, as does every Task outcome.
-      if (turnStateSource === 'ask' && turnStatePhase === 'completed') {
+      // Universal chat lifecycle: a successful turn of ANY kind falls back
+      // to Ready — the product's resting state after success is the same
+      // for a conversational reply and a finished engineering run (the run
+      // itself still reports its outcome on its own surfaces). Abnormal
+      // settled states (Stopped / Failed) stay labelled.
+      if (turnStatePhase === 'completed') {
         return model.length > 0 ? 'Ready · ' + model : 'Ready';
       }
       return model.length > 0 ? turnLabel + ' · ' + model : turnLabel;
@@ -6455,8 +6482,7 @@ function renderToolNode(tool) {
     var locked = composerLocked();
     var ids = [
       'btn-send',
-      'btn-intent-ask',
-      'btn-intent-task',
+      'btn-start-task',
       'contract-local',
       'contract-commit',
       'contract-push',
@@ -7047,15 +7073,67 @@ function renderToolNode(tool) {
         : null;
     var source =
       message.source === 'ask' || message.source === 'task' ? message.source : null;
+    // The QUEUED follow-ups (bounded, typed): each row is individually
+    // removable through the typed abort route and NEVER the Stop target.
+    // A forged shape collapses to the empty list (typed state only).
+    var queued = [];
+    if (Array.isArray(message.queuedOpIds)) {
+      for (var qi = 0; qi < message.queuedOpIds.length && queued.length < MAX_QUEUED_OPS; qi += 1) {
+        var qid = message.queuedOpIds[qi];
+        if (typeof qid === 'string' && qid.length > 0 && qid.length <= 64) {
+          queued.push(qid);
+        }
+      }
+    }
+    var queuedKey = queued.join(',');
     var changed =
-      phase !== turnStatePhase || stopOp !== turnStateStopOp || source !== turnStateSource;
+      phase !== turnStatePhase ||
+      stopOp !== turnStateStopOp ||
+      source !== turnStateSource ||
+      queuedKey !== turnStateQueuedOps.join(',');
     turnStatePhase = phase;
     turnStateStopOp = stopOp;
     turnStateSource = source;
+    turnStateQueuedOps = queued;
     if (!changed) {
       return;
     }
     renderTurnState();
+  }
+
+  /** Render the queued follow-ups list with per-row remove affordances. */
+  function renderQueuedList() {
+    var list = byId('queued-list');
+    if (!list) {
+      return;
+    }
+    clear(list);
+    list.hidden = turnStateQueuedOps.length === 0;
+    for (var i = 0; i < turnStateQueuedOps.length; i += 1) {
+      (function (opId) {
+        var row = document.createElement('li');
+        row.className = 'queued-item';
+        row.setAttribute('data-queued-op', opId);
+        var label = document.createElement('span');
+        label.className = 'queued-label';
+        label.textContent = 'Queued';
+        row.appendChild(label);
+        var remove = document.createElement('button');
+        remove.type = 'button';
+        remove.className = 'queued-remove';
+        remove.textContent = 'Remove';
+        remove.setAttribute('aria-label', 'Remove queued message');
+        remove.addEventListener('click', function () {
+          // Removal targets ONLY this queued operation: the host re-checks
+          // it against the tracked lifecycle and the typed abort's op_id
+          // cancels this queued prompt's durable row — the operation ahead
+          // of it is never touched.
+          vscode.postMessage({ type: 'cancelQueuedTurn', opId: opId });
+        });
+        row.appendChild(remove);
+        list.appendChild(row);
+      })(turnStateQueuedOps[i]);
+    }
   }
 
   function renderTurnState() {
@@ -7065,6 +7143,7 @@ function renderToolNode(tool) {
     // The composer strip (item 16) follows the SAME single live-status
     // channel — never a reread of a growing reply.
     renderComposerState();
+    renderQueuedList();
     if (lastSnapshotForHeader !== null) {
       setText('daemon-text', headerStatusText(lastSnapshotForHeader));
     }
@@ -7437,8 +7516,14 @@ function renderToolNode(tool) {
    * message is the IMMUTABLE snapshot: the attachment envelope carries the
    * host-side ids in visible order; the host owns the logical submission id
    * (minted from the complete parsed snapshot, never from a webview key).
+   *
+   * `escalateToTask` is TRUE only for the advanced disclosure's Start task
+   * button: the ONE composer's normal Send/Enter is always a conversational
+   * ChatTurn (no intent member — the host's default execution is 'ask'), and
+   * no contract/rows/budget ever rides it. The engineering escalation is an
+   * explicit affordance, never a mode switch.
    */
-  function requestStart() {
+  function requestStart(escalateToTask) {
     if (composerLocked()) {
       return;
     }
@@ -7448,10 +7533,7 @@ function renderToolNode(tool) {
     }
     // Draft preservation: the goal is NOT cleared here. The extension posts
     // a startResult; only a successful start clears the (unchanged) draft.
-    // Ask is a plain conversational turn: no contract, rows, budget or
-    // completion member is ever attached. Task carries only what the user
-    // authored in the ONE Task options disclosure.
-    var message = { type: 'sendGoal', goal: goal, intent: composerIntent };
+    var message = { type: 'sendGoal', goal: goal };
     if (attachments.length > 0) {
       var ids = [];
       for (var i = 0; i < attachments.length; i++) {
@@ -7459,7 +7541,8 @@ function renderToolNode(tool) {
       }
       message.attachmentIds = ids;
     }
-    if (composerIntent === 'task') {
+    if (escalateToTask === true) {
+      message.intent = 'task';
       var contract = completionContractFromControls();
       var contractRows = contractRowsFromControls();
       var budget = runBudgetFromControls();
@@ -7497,7 +7580,10 @@ function renderToolNode(tool) {
     var token = 'wp-' + composerSubmitSeq;
     message.submissionToken = token;
     var conversation = currentConversationKey();
-    inFlightSubmissions[token] = { conversationId: conversation, intent: composerIntent };
+    inFlightSubmissions[token] = {
+      conversationId: conversation,
+      intent: escalateToTask === true ? 'task' : 'ask',
+    };
     var baseline = countDurableUserText(lastDurableTranscript, goal);
     pendingUserRows.push({
       token: token,
@@ -7526,25 +7612,10 @@ function renderToolNode(tool) {
   }
 
 
-  function setComposerIntent(intent) {
-    composerIntent = intent === 'task' ? 'task' : 'ask';
-    var form = byId('composer');
-    if (form && typeof form.setAttribute === 'function') {
-      form.setAttribute('data-intent', composerIntent);
-    }
-    var ask = byId('btn-intent-ask');
-    var task = byId('btn-intent-task');
-    if (ask) ask.setAttribute('aria-checked', composerIntent === 'ask' ? 'true' : 'false');
-    if (task) task.setAttribute('aria-checked', composerIntent === 'task' ? 'true' : 'false');
-  }
-
-  byId('btn-intent-ask').addEventListener('click', function () {
-    setComposerIntent('ask');
+  // The engineering escalation: the ONLY affordance that starts a task run.
+  byId('btn-start-task').addEventListener('click', function () {
+    requestStart(true);
   });
-  byId('btn-intent-task').addEventListener('click', function () {
-    setComposerIntent('task');
-  });
-  setComposerIntent('ask');
   autoGrowGoal();
 
   // Item 13: explicit scrollback affordance — fetches the OLDER history

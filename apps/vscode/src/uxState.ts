@@ -10,11 +10,18 @@
 // Everything here is pure and dependency-free so the webview contract, the
 // extension projection and the headless tests share one source of truth.
 
+// The wire-level submission vocabulary — NOT a UI mode. The ONE composer
+// has no intent selector: every send is an ordinary conversational turn
+// (no intent member on the wire), and only the advanced disclosure's
+// explicit Start task escalation submits `task` alongside its engineering
+// contract. The host normalises anything but the exact escalation to the
+// conversational default.
 export type ComposerIntent = 'ask' | 'task';
 
 export const DEFAULT_COMPOSER_INTENT: ComposerIntent = 'ask';
 
-/** Normalise a submitted composer intent. Anything but `task` is Ask. */
+/** Normalise a submitted intent. Anything but the exact `task` escalation
+ * is a conversational turn. */
 export function composerIntentOf(raw: unknown): ComposerIntent {
   return raw === 'task' ? 'task' : 'ask';
 }
@@ -356,7 +363,7 @@ function basePresentation(input: UxInput): TaskPresentation {
 const PRESENTATION_COPY: Record<TaskPresentation, { label: string; detail: string; action: UxAction | null }> = {
   Idle: {
     label: 'Ready',
-    detail: 'Ask a question, or switch to Task for a full run.',
+    detail: 'Ask anything, attach files, or start an engineering run from Advanced engineering options.',
     action: null,
   },
   Starting: {

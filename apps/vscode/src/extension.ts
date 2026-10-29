@@ -107,6 +107,7 @@ import {
   emptyTurnLifecycle,
   turnDisplayPhase,
   turnLifecycleIsLive,
+  turnQueuedOpIds,
   turnReducer,
   turnDisplaySource,
   turnStopOpId,
@@ -2105,7 +2106,7 @@ function transcriptOf(page: NativeMessagePage): TranscriptEntry[] {
 // ACCEPTANCE, showing Ready with no Stop mid-reply) and names the exact
 // operation Stop aborts.
 let turns: TurnLifecycle = emptyTurnLifecycle();
-/** The last (display phase, stop op) posted to the panel (dedupe). */
+/** The last (display phase, stop op, queued ops) posted to the panel (dedupe). */
 let lastPostedTurnKey: string | null = null;
 
 function dispatchTurn(event: TurnEvent): void {
@@ -2118,10 +2119,15 @@ function dispatchTurn(event: TurnEvent): void {
   const phase = turnDisplayPhase(turns);
   const stopOp = turnStopOpId(turns);
   const source = turnDisplaySource(turns);
-  const key = `${phase}:${stopOp ?? ''}:${source ?? ''}`;
+  // The QUEUED follow-ups (each individually removable through the typed
+  // abort route) ride the SAME projection: the panel renders them as
+  // Queued rows with their own cancel affordance, never as the Stop
+  // target.
+  const queuedOps = turnQueuedOpIds(turns);
+  const key = `${phase}:${stopOp ?? ''}:${source ?? ''}:${queuedOps.join(',')}`;
   if (key !== lastPostedTurnKey) {
     lastPostedTurnKey = key;
-    chatProvider?.postTurnState(phase, stopOp, source);
+    chatProvider?.postTurnState(phase, stopOp, source, queuedOps);
   }
 }
 
@@ -3896,7 +3902,8 @@ async function promptCompletionContract(): Promise<
     {
       canPickMany: true,
       title: 'Faktor: Task completion contract',
-      placeHolder: 'Conditional steps the durable completion gate must certify (Task mode only)',
+      placeHolder:
+        'Conditional steps the durable completion gate must certify (engineering runs only)',
       ignoreFocusOut: true,
     },
   );
@@ -5048,9 +5055,11 @@ async function handleWebviewMessage(
       if (goal.length === 0) {
         return;
       }
-      // The ONE composer carries an explicit Ask|Task intent. Ask is the
-      // default and is a plain conversational turn; it returns BEFORE any
-      // task contract, task-run, proof, verification or billing path runs.
+      // The ONE composer sends ONE conversational turn: a sendGoal without
+      // an intent member (or with `intent: 'ask'`) is the plain path and
+      // returns BEFORE any task contract, task-run, proof, verification or
+      // billing path runs. `intent: 'task'` rides ONLY the advanced
+      // disclosure's explicit Start task escalation — never a mode switch.
       if (composerIntentOf(message.intent) === 'ask') {
         await sendAskTurnFromComposer(message, goal, context);
         return;
@@ -5224,6 +5233,48 @@ async function handleWebviewMessage(
     case 'cancelRun':
       await cancelActiveRun();
       return;
+    case 'cancelQueuedTurn': {
+      // Item 4: remove ONE queued follow-up without disturbing the active
+      // operation ahead of it. The host re-validates against the tracked
+      // lifecycle: only an op currently projected as QUEUED is cancellable
+      // — a forged/stale id, the active Stop target, or an unrelated op is
+      // refused locally and never reaches the daemon. The typed abort's
+      // `op_id` targets exactly that queued prompt (its durable row is
+      // cancelled without touching the state machine).
+      const queuedOp =
+        typeof message.opId === 'string' && message.opId.length > 0 && message.opId.length <= 64
+          ? message.opId
+          : null;
+      const sessionId = active.sessionId;
+      const client = active.client;
+      if (queuedOp === null || sessionId === null || client === null) {
+        return;
+      }
+      if (turnQueuedOpIds(turns).indexOf(queuedOp) < 0) {
+        chatProvider?.postNotice(
+          'error',
+          'that message is no longer queued; the conversation state was refreshed',
+        );
+        scheduleRefresh(0);
+        return;
+      }
+      try {
+        const ack = await client.abortSession(sessionId, queuedOp);
+        if (ack.aborted.indexOf(queuedOp) >= 0) {
+          dispatchTurn({ type: 'stopped', opId: queuedOp });
+          chatProvider?.postNotice('info', 'queued message removed');
+        } else {
+          chatProvider?.postNotice(
+            'error',
+            'the daemon did not remove this queued message; its authoritative status will follow',
+          );
+        }
+        scheduleRefresh(0);
+      } catch (error) {
+        reportError(error);
+      }
+      return;
+    }
     case 'liveGap':
       // The panel detected an offset gap in the live frames: fetch the
       // authoritative snapshot and reconcile (never a silent text hole).

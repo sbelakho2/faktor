@@ -134,7 +134,17 @@ try {
     const prompt = requests.find((entry) => entry.path === '/native/session/7/prompt');
     assert.ok(prompt, 'the prompt request was observed');
     const body = JSON.parse(prompt.body);
-    assert.deepEqual(Object.keys(body).sort(), ['files', 'prompt', 'session_id', 'submission_id']);
+    // The conversational execution kind is EXPLICIT on the wire (without it
+    // the daemon's legacy default would admit an engineering task for a
+    // chat); it is the only member beyond the prompt identity + text.
+    assert.equal(body.execution, 'ask', 'the ask path sends execution=ask');
+    assert.deepEqual(Object.keys(body).sort(), [
+      'execution',
+      'files',
+      'prompt',
+      'session_id',
+      'submission_id',
+    ]);
     for (const key of [
       'completionContract',
       'completion_contract',

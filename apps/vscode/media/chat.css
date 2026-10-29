@@ -1211,6 +1211,9 @@ button.toggle[aria-expanded='true'] {
   gap: var(--space-2);
   align-items: center;
   font-weight: 400;
+  /* The label IS the checkbox's hit target (the render check measures the
+     wrapping label): keep it at the 24px touch minimum. */
+  min-height: 24px;
 }
 
 .entry-head {
@@ -1905,53 +1908,60 @@ button.attachment-remove {
   outline-offset: 2px;
 }
 
-/* ------------------------------------------------ intent and task options
-   ONE composer with one explicit intent (Ask | Task). Task options are a
-   single disclosure: no second composer, no separate Task button. */
-.composer-intent {
-  display: inline-flex;
-  border: 1px solid var(--faktor-border);
-  border-radius: var(--faktor-radius-control);
-  overflow: hidden;
-  flex: none;
-}
-
-/* Ask is a plain conversation: its compact composer carries no Task options
-   row at all. Selecting Task reveals the one disclosure; an explicitly
-   opened disclosure is never hidden. */
-#composer[data-intent='ask'] .task-options:not([open]) {
-  display: none;
-}
-
-button.intent-option {
-  min-height: 28px;
-  padding: 2px 12px;
-  border: none;
-  border-radius: 0;
-  background: transparent;
-  color: var(--vscode-foreground);
-  font-size: 0.9em;
-}
-
-button.intent-option[aria-checked='true'] {
-  background: var(--vscode-button-background);
-  color: var(--vscode-button-foreground);
-  font-weight: 600;
-}
-
-button.intent-option:focus-visible {
-  outline-offset: -2px;
-}
-
-#composer[data-intent='ask'] .task-options summary::after {
-  content: ' \00b7 Task only';
-  color: var(--vscode-descriptionForeground);
-  font-weight: 400;
-}
-
+/* ------------------------------------------------ advanced engineering options
+   ONE composer, ONE Send: every send is an ordinary conversational turn.
+   The advanced disclosure is the ONLY escalation to an engineering run —
+   an explicit affordance, never a mode switch. */
 .task-options {
   border-top: 1px solid var(--faktor-border-quiet);
   padding-top: var(--space-1);
+}
+
+/* ------------------------------------------------ queued follow-ups
+   Each QUEUED message renders one row with its own remove affordance. The
+   active operation ahead of it is never a queued row and Stop never
+   targets one. */
+ul.queued-list {
+  list-style: none;
+  margin: var(--space-1) 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+li.queued-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 2px 6px;
+  border: 1px solid var(--faktor-border-quiet);
+  border-radius: var(--faktor-radius-control);
+  font-size: 0.9em;
+  min-width: 0;
+}
+
+.queued-label {
+  flex: 1 1 auto;
+  color: var(--vscode-descriptionForeground);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+button.queued-remove {
+  flex: none;
+  min-height: 22px;
+  padding: 0 8px;
+  border: 1px solid var(--faktor-border);
+  border-radius: var(--faktor-radius-control);
+  background: transparent;
+  color: var(--vscode-foreground);
+  font-size: 0.85em;
+}
+
+button.queued-remove:hover {
+  background: var(--vscode-button-secondaryBackground, rgba(128, 128, 128, 0.2));
 }
 
 /* ------------------------------------------------ ONE attention problem
@@ -2698,16 +2708,9 @@ button.intent-option:focus-visible {
     padding: var(--space-1);
   }
   /* The toolbar stays ONE row at the 120px effective zoom budget: the model
-     token ellipsizes and the intent control keeps its intrinsic width. */
+     token ellipsizes and the primary action keeps its intrinsic width. */
   .composer-toolbar {
     gap: 2px;
-  }
-  .composer-intent {
-    flex: none;
-  }
-  button.intent-option {
-    padding: 2px 6px;
-    font-size: 0.82em;
   }
   /* Labels above their fields. */
   .meta-row,

@@ -44,6 +44,7 @@ import * as oc from '../src/outcomes.ts';
 import * as ux from '../src/uxState.ts';
 import * as rr from '../src/refreshReads.ts';
 import * as ar from '../src/askRecovery.ts';
+import * as af from '../src/askFlow.ts';
 import { renderEdition8Html, scriptJson } from '../src/edition8/html.ts';
 import { descriptorMap, loadEdition8Snapshot } from '../src/edition8/source.ts';
 import { controlView, screenView } from '../src/edition8/view.ts';
@@ -5078,19 +5079,25 @@ async function completionContractTests() {
       },
     };
     const snapshot = { ...webviewSnapshot([]), task: contractTask };
-    const { posted, dom, deliver } = runChatWebview(snapshot);
-    // Plain start: no contract field at all (chat never carries one).
+    const { posted, dom, deliver, startTask } = runChatWebview(snapshot);
+    // The ONE composer's Send is ALWAYS a conversational turn: no intent
+    // member, no contract — even with the advanced options populated.
     dom.document.getElementById('goal').value = 'plain goal';
+    dom.document.getElementById('contract-pr').checked = true;
     dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
-    assertDeepEqual(withoutSubmissionToken(posted[posted.length - 1]), { type: 'sendGoal', goal: 'plain goal', intent: 'task' });
+    assertDeepEqual(withoutSubmissionToken(posted[posted.length - 1]), {
+      type: 'sendGoal',
+      goal: 'plain goal',
+    });
     // The explicit result releases the single-flight lock before the next
     // logical submission (the lock itself is covered separately).
     deliver({ type: 'startResult', goal: 'plain goal', ok: true });
+    // The engineering escalation: Start task posts the checked contract.
     // The ordered finish choice: one radio group, later options imply the
     // earlier steps. Selecting "Open pull request" implies commit + push.
     dom.document.getElementById('goal').value = 'contracted goal';
     dom.document.getElementById('contract-pr').checked = true;
-    dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
+    startTask();
     assertDeepEqual(withoutSubmissionToken(posted[posted.length - 1]), {
       type: 'sendGoal',
       goal: 'contracted goal',
@@ -5124,18 +5131,19 @@ async function completionContractTests() {
   });
 
   await test('the finish choice is ONE ordered radio group: later levels imply earlier steps', () => {
-    const { posted, dom, deliver } = runChatWebview(webviewSnapshot([]));
+    const { posted, dom, deliver, startTask } = runChatWebview(webviewSnapshot([]));
     const goal = dom.document.getElementById('goal');
     const submit = () => dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
-    // Leave changes locally (the default) sends no contract at all.
+    // Leave changes locally (the default) sends no contract at all. The
+    // escalation carries it (intent: task + the ordered finish choice).
     goal.value = 'local only';
-    submit();
+    startTask();
     assertDeepEqual(withoutSubmissionToken(posted[posted.length - 1]), { type: 'sendGoal', goal: 'local only', intent: 'task' });
     deliver({ type: 'startResult', goal: 'local only', ok: true });
     // Push branch implies commit.
     dom.document.getElementById('contract-push').checked = true;
     goal.value = 'push it';
-    submit();
+    startTask();
     assertDeepEqual(posted[posted.length - 1].completionContract, {
       include_commit: true,
       include_push: true,
@@ -5145,7 +5153,7 @@ async function completionContractTests() {
     // Commit changes alone.
     dom.document.getElementById('contract-commit').checked = true;
     goal.value = 'commit it';
-    submit();
+    startTask();
     assertDeepEqual(posted[posted.length - 1].completionContract, {
       include_commit: true,
       include_push: false,
@@ -5157,6 +5165,17 @@ async function completionContractTests() {
     assertEqual(dom.document.getElementById('contract-commit').checked, false);
     assertEqual(dom.document.getElementById('contract-push').checked, false);
     assertEqual(dom.document.getElementById('contract-pr').checked, false);
+    // The conversational Send NEVER carries the finish choice, however the
+    // radios are set (extension point: no accidental engineering escalation).
+    dom.document.getElementById('contract-pr').checked = true;
+    goal.value = 'conversational after contract';
+    submit();
+    const conversational = posted[posted.length - 1];
+    assertDeepEqual(withoutSubmissionToken(conversational), {
+      type: 'sendGoal',
+      goal: 'conversational after contract',
+    });
+    assert(!('completionContract' in conversational), 'Send never attaches a contract');
   });
 }
 
@@ -8001,7 +8020,7 @@ async function contractTests() {
     const snapshot = webviewSnapshot([]);
     snapshot.cockpit = view;
     snapshot.cockpitSections = cp.cockpitSections(view);
-    const { posted, dom, deliver } = runChatWebview(snapshot);
+    const { posted, dom, deliver, startTask } = runChatWebview(snapshot);
     dom.document.getElementById('subtab-verification').click();
     const cockpit = dom.document.getElementById('cockpit');
     assert(
@@ -8024,7 +8043,9 @@ async function contractTests() {
     assert(text.includes('example.graph'), 'external provenance names the provider');
     assert(text.includes('test execution'), 'the evidence kind is a label, not a token');
     assert(text.includes('disclosure: risk:high'), 'high risks carry explicit disclosure text');
-    // Composer: non-blank lines become the bounded rows message.
+    // Composer: non-blank lines become the bounded rows message — but ONLY
+    // through the Start task escalation; the conversational Send never
+    // carries them, however the fields are populated.
     const goal = dom.document.getElementById('goal');
     goal.value = 'contracted composer goal';
     dom.document.getElementById('contract-constraints').value = ' keep sessions valid \n\n never break clients ';
@@ -8032,6 +8053,21 @@ async function contractTests() {
     dom.document.getElementById('contract-obligations').value = '';
     dom.document.getElementById('contract-invariants').value = '\n  \n';
     dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
+    const plain = posted[posted.length - 1];
+    assertDeepEqual(withoutSubmissionToken(plain), {
+      type: 'sendGoal',
+      goal: 'contracted composer goal',
+    });
+    assert(!('contractRows' in plain), 'the conversational Send never attaches contract rows');
+    deliver({ type: 'startResult', goal: 'contracted composer goal', ok: true });
+    // The escalation posts the rows as the typed contractRows member (the
+    // success ack cleared the draft, so it is typed again).
+    goal.value = 'contracted composer goal';
+    dom.document.getElementById('contract-constraints').value = ' keep sessions valid \n\n never break clients ';
+    dom.document.getElementById('contract-risks').value = 'race conditions';
+    dom.document.getElementById('contract-obligations').value = '';
+    dom.document.getElementById('contract-invariants').value = '\n  \n';
+    startTask();
     assertDeepEqual(withoutSubmissionToken(posted[posted.length - 1]), {
       type: 'sendGoal',
       goal: 'contracted composer goal',
@@ -8049,7 +8085,7 @@ async function contractTests() {
     assertEqual(dom.document.getElementById('contract-constraints').value, '');
     dom.document.getElementById('contract-constraints').value = 'retry row';
     dom.document.getElementById('goal').value = 'third goal';
-    dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
+    startTask();
     deliver({ type: 'startResult', goal: 'third goal', ok: false });
     assertEqual(
       dom.document.getElementById('contract-constraints').value,
@@ -9135,16 +9171,18 @@ function runChatWebview(snapshot) {
   vm.runInContext(source, sandbox);
   assert(messageHandler, 'chat.js must register a window message listener');
   messageHandler({ data: { type: 'snapshot', snapshot } });
-  // The production composer defaults to Ask. The historical suite here drives
-  // task starts; new Ask-first tests explicitly select Ask through the same
-  // control. Selecting Task here keeps the task-start assertions honest.
-  dom.document.getElementById('btn-intent-task').click();
   return {
     posted,
     dom,
     renderCounts,
     window: sandbox.window,
     deliver: (message) => messageHandler({ data: message.data ? message.data : message }),
+    // The ONE composer's Send/Enter is a conversational turn; the advanced
+    // disclosure's Start task is the ONLY escalation to an engineering run.
+    // Historical contract/budget/rows tests drive the escalation explicitly.
+    startTask: () => {
+      dom.document.getElementById('btn-start-task').click();
+    },
     // A real reader scrolls with an input gesture. The webview's explicit pin
     // state machine only treats a recent gesture as user intent, so tests
     // dispatch the wheel event before moving the scroll position.
@@ -9661,10 +9699,13 @@ async function attentionWebviewTests() {
     );
     assert(!/LOCATE/.test(askProfile), 'the ask profile never commands LOCATE');
     assert(!/changed files/i.test(askProfile), 'the ask profile never demands a changed-file list');
-    // A successful ask settles to Ready, never a job-like Completed.
+    // A successful turn of ANY kind settles to Ready — the product's
+    // resting state after success is the same for a conversational reply
+    // and a finished engineering run (universal lifecycle, item 2).
     assert(
-      chatSource.includes("turnStateSource === 'ask' && turnStatePhase === 'completed'"),
-      'a completed ask falls back to Ready',
+      chatSource.includes("if (turnStatePhase === 'completed')") &&
+        chatSource.includes("return model.length > 0 ? 'Ready · ' + model : 'Ready';"),
+      'a completed turn of any kind falls back to Ready',
     );
   });
 
@@ -10069,14 +10110,24 @@ async function composerAttachmentTests() {
     const composerEnd = markup.indexOf('</form>', composerStart);
     assert(composerStart >= 0 && composerEnd > composerStart, 'the composer form must be present');
     const composer = markup.slice(composerStart, composerEnd);
+    // ONE composer, ONE Send: no intent radiogroup — the advanced
+    // engineering-options disclosure carries the ONLY escalation control.
+    assert(!composer.includes('btn-intent-ask'), 'no Ask mode button exists');
+    assert(!composer.includes('btn-intent-task'), 'no Task mode button exists');
+    assert(!composer.includes('composer-intent'), 'no intent radiogroup exists');
+    assert(!composer.includes('data-intent'), 'the composer carries no mode attribute');
+    assert(composer.includes('id="btn-start-task"'), 'the escalation control exists');
+    assert(
+      composer.includes('<summary>Advanced engineering options</summary>'),
+      'the disclosure is relabelled honestly as advanced engineering options',
+    );
     const order = [
       'id="goal"',
       'id="btn-attach"',
       'id="btn-clear-attachments"',
-      'id="btn-intent-ask"',
-      'id="btn-intent-task"',
       'id="composer-model"',
       'id="btn-send"',
+      'id="btn-start-task"',
       'id="contract-commit"',
       'id="contract-push"',
       'id="contract-pr"',
@@ -10831,10 +10882,11 @@ async function composerAttachmentTests() {
     });
     assertEqual(prevented, true, 'plain Enter prevents the default newline');
     assertEqual(harness.posted.length, count + 1);
+    // Enter is the ONE composer's Send: an ordinary conversational turn —
+    // no intent member ever rides the keyboard path.
     assertDeepEqual(withoutSubmissionToken(harness.posted[harness.posted.length - 1]), {
       type: 'sendGoal',
       goal: 'keyboard task',
-      intent: 'task',
     });
     // The per-conversation lock holds for keyboard starts too.
     goal.dispatch('keydown', { key: 'Enter', metaKey: true, preventDefault() {} });
@@ -12716,7 +12768,7 @@ async function transcriptScrollTests() {
   });
 
   await test('the composer is single-flight: submit locks controls and only an explicit result releases', () => {
-    const { posted, dom, deliver } = runChatWebview(webviewSnapshot([]));
+    const { posted, dom, deliver, startTask } = runChatWebview(webviewSnapshot([]));
     const goal = dom.document.getElementById('goal');
     const composer = dom.document.getElementById('composer');
     const send = dom.document.getElementById('btn-send');
@@ -12724,8 +12776,10 @@ async function transcriptScrollTests() {
     composer.dispatch('submit', { preventDefault() {} });
     // posted[0] is the initial ready message.
     assertEqual(posted.length, 2, 'the first submit posts exactly one sendGoal');
-    assertDeepEqual(withoutSubmissionToken(posted[1]), { type: 'sendGoal', goal: 'first goal', intent: 'task' });
-    assertEqual(send.disabled, true, 'Run task is disabled while submitting');
+    // The conversational Send carries no intent member (the host's default
+    // execution is 'ask').
+    assertDeepEqual(withoutSubmissionToken(posted[1]), { type: 'sendGoal', goal: 'first goal' });
+    assertEqual(send.disabled, true, 'Send is disabled while submitting');
     assertEqual(
       dom.document.getElementById('contract-commit').disabled,
       true,
@@ -12734,12 +12788,13 @@ async function transcriptScrollTests() {
     // Text typed while pending and a second submit never join the request.
     goal.value = 'second goal typed while pending';
     composer.dispatch('submit', { preventDefault() {} });
+    startTask();
     assertEqual(posted.length, 2, 'a second submit while pending must not post');
     assert(!('completionContract' in posted[1]), 'the pending message body is immutable');
     // An explicit failure releases the lock and preserves draft + contract.
     dom.document.getElementById('contract-commit').checked = true;
     deliver({ type: 'startResult', goal: 'first goal', ok: false });
-    assertEqual(send.disabled, false, 'a failure re-enables Run task');
+    assertEqual(send.disabled, false, 'a failure re-enables Send');
     assertEqual(
       goal.value,
       'second goal typed while pending',
@@ -12747,10 +12802,11 @@ async function transcriptScrollTests() {
     );
     assertEqual(dom.document.getElementById('contract-commit').checked, true, 'contract kept for retry');
     assertEqual(dom.document.getElementById('contract-commit').disabled, false);
-    // The next submit is a new logical submission with the current body.
-    composer.dispatch('submit', { preventDefault() {} });
+    // The next escalation is a new logical submission with the current body.
+    startTask();
     assertEqual(posted.length, 3);
     assertEqual(posted[2].goal, 'second goal typed while pending');
+    assertEqual(posted[2].intent, 'task', 'the escalation carries the task intent');
     assertDeepEqual(posted[2].completionContract, {
       include_commit: true,
       include_push: false,
@@ -16409,19 +16465,31 @@ async function runBudgetTests() {
     assertEqual(gate.inFlight(), false, 'durable acceptance clears the captured submission');
   });
 
-  await test('webview: per-run budget fields ride sendGoal and clear only on durable acceptance', () => {
+  await test('webview: per-run budget fields ride the Start task escalation and clear only on durable acceptance', () => {
     const harness = runChatWebview(webviewSnapshot([]));
-    const { dom, posted, deliver } = harness;
+    const { dom, posted, deliver, startTask } = harness;
     const goal = dom.document.getElementById('goal');
     const tokens = dom.document.getElementById('contract-budget-tokens');
     const cost = dom.document.getElementById('contract-budget-cost');
-    assert(tokens && cost, 'both per-run budget fields exist in the Acceptance & contract disclosure');
+    assert(tokens && cost, 'both per-run budget fields exist in the advanced engineering options disclosure');
     goal.value = 'budgeted goal';
     tokens.value = ' 120000 ';
     // Item 12: the DOLLAR-labeled field parses with exact integer
     // arithmetic — `5.00` is five dollars and converts to "5000000" micro.
     cost.value = '5.00';
+    // The conversational Send never attaches a budget, however the fields
+    // are populated.
     dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
+    assertDeepEqual(withoutSubmissionToken(posted[posted.length - 1]), {
+      type: 'sendGoal',
+      goal: 'budgeted goal',
+    });
+    deliver({ type: 'startResult', goal: 'budgeted goal', ok: true });
+    // The escalation carries the typed budget.
+    tokens.value = ' 120000 ';
+    cost.value = '5.00';
+    goal.value = 'budgeted goal';
+    startTask();
     assertDeepEqual(withoutSubmissionToken(posted[posted.length - 1]), {
       type: 'sendGoal',
       goal: 'budgeted goal',
@@ -16434,7 +16502,6 @@ async function runBudgetTests() {
     assertEqual(cost.value, '5.00');
     // Item 12: `5`, `5.0`, `5.00` and `$5.00` are EXACTLY "5000000" micro.
     for (const dollarForm of ['5', '5.0', '5.00', '$5.00']) {
-      const parsed = dom.document.getElementById('composer');
       const before = posted.length;
       // release the lock the previous submit may hold (a durable ack
       // CLEARS the budget fields, so the form is typed after it)
@@ -16442,10 +16509,10 @@ async function runBudgetTests() {
       tokens.value = '';
       cost.value = dollarForm;
       goal.value = `dollar form ${dollarForm}`;
-      parsed.dispatch('submit', { preventDefault() {} });
+      startTask();
       assertEqual(posted[posted.length - 1].budgetCostMicro, '5000000', `exact micro for ${dollarForm}`);
       assertEqual(posted[posted.length - 1].goal, `dollar form ${dollarForm}`);
-      assert(posted.length === before + 1, 'each form submits once');
+      assert(posted.length === before + 1, 'each escalation submits once');
     }
     deliver({ type: 'startResult', goal: 'dollar form $5.00', ok: true });
     // Item 12: the explicit ADVANCED surface keeps raw micro entry.
@@ -16454,7 +16521,7 @@ async function runBudgetTests() {
     raw.checked = true;
     cost.value = '725';
     goal.value = 'raw micro goal';
-    dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
+    startTask();
     assertEqual(posted[posted.length - 1].budgetCostMicro, '725', 'raw micro rides only behind the advanced checkbox');
     deliver({ type: 'startResult', goal: 'raw micro goal', ok: true });
     raw.checked = false;
@@ -16462,7 +16529,7 @@ async function runBudgetTests() {
     cost.value = '1,000';
     goal.value = 'refused budget goal';
     const beforeRefusal = posted.length;
-    dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
+    startTask();
     assertEqual(posted.length, beforeRefusal, 'a malformed cost budget refuses the START');
     assertEqual(goal.value, 'refused budget goal', 'the draft is kept');
     const errorCard = dom.document.getElementById('attention-card');
@@ -16470,7 +16537,7 @@ async function runBudgetTests() {
     tokens.value = '   ';
     cost.value = '';
     goal.value = 'plain goal';
-    dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
+    startTask();
     assertDeepEqual(withoutSubmissionToken(posted[posted.length - 1]), { type: 'sendGoal', goal: 'plain goal', intent: 'task' });
     deliver({ type: 'startResult', goal: 'plain goal', ok: true });
     assertEqual(tokens.value, '', 'durable acceptance clears the token override');
@@ -16481,11 +16548,16 @@ async function runBudgetTests() {
 // ------------------------------------------------- Ask-first UX (P0/P1)
 
 async function askFirstUxTests() {
-  await test('the ONE composer defaults to Ask and hides every task option behind one disclosure', () => {
+  await test('the ONE composer has no mode switch: one Send, one escalation behind the advanced disclosure', () => {
     const markup = readFileSync(new URL('../src/webview.ts', import.meta.url), 'utf8');
-    assert(/id="btn-intent-ask"[^>]*aria-checked="true"/.test(markup), 'Ask is the default intent');
-    assert(/id="btn-intent-task"[^>]*aria-checked="false"/.test(markup), 'Task is explicit, not default');
-    assert(markup.includes('<summary>Task options</summary>'), 'one Task options disclosure');
+    assert(!markup.includes('btn-intent-ask'), 'no Ask mode button exists');
+    assert(!markup.includes('btn-intent-task'), 'no Task mode button exists');
+    assert(!markup.includes('composer-intent'), 'no intent radiogroup exists');
+    assert(!markup.includes('data-intent'), 'the composer carries no mode attribute');
+    assert(
+      markup.includes('<summary>Advanced engineering options</summary>'),
+      'the disclosure is relabelled honestly as advanced engineering options',
+    );
     const composerStart = markup.indexOf('<form id="composer"');
     const composerEnd = markup.indexOf('</form>', composerStart);
     const composerMarkup = markup.slice(composerStart, composerEnd);
@@ -16493,39 +16565,50 @@ async function askFirstUxTests() {
     assert(!markup.includes('btn-new-task'), 'no second Run task control');
     assert(!/id="btn-(run-task|ask-task)"/.test(markup), 'no separate Run task/Ask buttons');
     assert(markup.includes('id="btn-send"'), 'one Send control');
+    assert(markup.includes('id="btn-stop"') || markup.includes('id="menu-stop"'), 'one Stop path');
     assert(markup.includes('id="btn-attach"'), 'attachments stay in the simple composer');
     assert(markup.includes('id="composer-model"'), 'model stays in the simple composer');
+    assert(
+      markup.includes('id="btn-start-task"') && composerMarkup.indexOf('id="btn-start-task"') >= 0,
+      'the ONLY engineering escalation lives inside the advanced disclosure',
+    );
+    assert(
+      markup.includes('Send always starts a conversational turn and never attaches these'),
+      'the disclosure copy is honest about what a send is',
+    );
   });
 
+  // The label is pinned by INV-VSCODE-ASK-ISOLATION (tests/invariants.toml);
+  // the assertions below pin the NEW contract (Send never carries a mode
+  // or a contract — the escalation is the only engineering path).
   await test('Ask sends hello as a plain conversational turn with no contract or task options', () => {
     const { posted, dom, deliver } = runChatWebview(webviewSnapshot([]));
-    dom.document.getElementById('btn-intent-ask').click();
-    assertEqual(dom.document.getElementById('btn-intent-ask').getAttribute('aria-checked'), 'true');
     dom.document.getElementById('goal').value = 'hello';
-    // Even if a Task option was left populated, Ask must not attach it.
+    // Even if an advanced option was left populated, Send must not attach it.
     dom.document.getElementById('contract-pr').checked = true;
     dom.document.getElementById('contract-risks').value = 'must not leak';
     dom.document.getElementById('contract-budget-tokens').value = '500';
     dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
-    assertDeepEqual(withoutSubmissionToken(posted[posted.length - 1]), {
+    const sent = posted[posted.length - 1];
+    assertDeepEqual(withoutSubmissionToken(sent), {
       type: 'sendGoal',
       goal: 'hello',
-      intent: 'ask',
     });
+    assert(!('intent' in sent), 'no intent member ever rides a conversational send');
+    assert(!('completionContract' in sent) && !('contractRows' in sent), 'no contract rides it');
+    assert(!('budgetTokens' in sent) && !('budgetCostMicro' in sent), 'no budget rides it');
     deliver({ type: 'startResult', goal: 'hello', ok: true });
-    assertEqual(dom.document.getElementById('goal').value, '', 'a successful Ask clears the draft');
+    assertEqual(dom.document.getElementById('goal').value, '', 'a successful send clears the draft');
   });
 
-  await test('Task intent still posts the checked contract after an Ask turn', () => {
-    const { posted, dom, deliver } = runChatWebview(webviewSnapshot([]));
-    dom.document.getElementById('btn-intent-ask').click();
+  await test('the Start task escalation still posts the checked contract after a conversational turn', () => {
+    const { posted, dom, deliver, startTask } = runChatWebview(webviewSnapshot([]));
     dom.document.getElementById('goal').value = 'hello';
     dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
     deliver({ type: 'startResult', goal: 'hello', ok: true });
-    dom.document.getElementById('btn-intent-task').click();
     dom.document.getElementById('contract-pr').checked = true;
     dom.document.getElementById('goal').value = 'ship it';
-    dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
+    startTask();
     const sent = posted[posted.length - 1];
     assertEqual(sent.intent, 'task');
     assertEqual(sent.goal, 'ship it');
@@ -18285,6 +18368,574 @@ function entryTextOf(harness) {
   return node === null ? '' : String(node.textContent);
 }
 
+// ------------------------------------------- unified composer E2E (items 1-5)
+//
+// ONE genuine installed-extension E2E section: the SAME modules the
+// installed extension runs (the real `media/chat.js` in the fake DOM, the
+// REAL `nativeClient`/`askFlow`/`turnState`/`eventStream` modules, and the
+// real host attachment store) against a REAL fake-daemon HTTP server
+// (node:http) — not a stubbed fetch map. The chain a regression must break:
+// attachment chip → host staging (upload) → submission (execution=ask +
+// durable attachment ids) → live DOM application → Stop (typed abort of
+// THE accepted operation) → durable reconciliation. It FAILS if the
+// attachment is dropped at any hop or if Stop does nothing.
+
+const E2E_INSTANCE = '0123456789abcdef';
+
+/**
+ * A REAL HTTP fake daemon serving the exact native routes the unified
+ * conversational flow touches, with an inspectable request log. It records
+ * the prompt body verbatim (execution + attachments), serves the live SSE
+ * route (handshake snapshot then one live chunk on demand), acknowledges
+ * the typed abort and serves the durable transcript page for the final
+ * reconciliation. It REFUSES the upload bytes when they do not match the
+ * expected payload, so a dropped/corrupted attachment fails loudly here.
+ */
+async function startUnifiedE2eDaemon(options) {
+  const http = await import('node:http');
+  const log = [];
+  const state = {
+    uploads: [],
+    promptBodies: [],
+    aborts: [],
+    liveClients: [],
+    turnStatus: 'active',
+    durableMessages: options.durableMessages ?? [],
+  };
+  let liveConnectedResolve = null;
+  const liveConnectedPromise = new Promise((done) => {
+    liveConnectedResolve = done;
+  });
+  const encoder = new TextEncoder();
+  const sendLive = (event, data) => {
+    const payload = encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    for (const client of state.liveClients) {
+      client.write(payload);
+    }
+  };
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url, 'http://127.0.0.1');
+    let body = '';
+    req.on('data', (chunk) => {
+      body += chunk;
+    });
+    req.on('end', () => {
+      const record = {
+        method: req.method,
+        path: url.pathname,
+        body: body.length > 0 ? JSON.parse(body) : null,
+      };
+      log.push(record);
+      const json = (status, value) => {
+        res.writeHead(status, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(value));
+      };
+      if (req.method === 'POST' && /^\/native\/session\/[^/]+\/attachments$/.test(url.pathname)) {
+        const parsed = record.body;
+        const bytes = Buffer.from(parsed?.data_base64 ?? '', 'base64');
+        if (options.expectedUploadBase64 !== undefined && parsed?.data_base64 !== options.expectedUploadBase64) {
+          json(400, { error: { code: 'bad_request', message: 'attachment bytes do not match' } });
+          return;
+        }
+        const ref = {
+          ref_id: state.uploads.length + 1,
+          digest: createHash('sha256').update(bytes).digest('hex'),
+          mime: parsed.mime,
+          filename: parsed.filename ?? null,
+          size: bytes.byteLength,
+        };
+        state.uploads.push(ref);
+        json(200, ref);
+        return;
+      }
+      if (req.method === 'POST' && /^\/native\/session\/[^/]+\/prompt$/.test(url.pathname)) {
+        state.promptBodies.push(record.body);
+        json(200, { op_id: options.opId, run_id: 'run-e2e', accepted: true, queued: false });
+        return;
+      }
+      if (req.method === 'POST' && /^\/native\/session\/[^/]+\/abort$/.test(url.pathname)) {
+        const opId = record.body?.op_id;
+        state.aborts.push(opId ?? null);
+        if (opId === options.opId || opId === options.queuedOpId) {
+          if (opId === options.opId) {
+            state.turnStatus = 'cancelled';
+          }
+          json(200, { aborted: [opId] });
+          return;
+        }
+        json(200, { aborted: [] });
+        return;
+      }
+      if (req.method === 'GET' && /^\/native\/session\/[^/]+\/live\/output$/.test(url.pathname)) {
+        res.writeHead(200, {
+          'content-type': 'text/event-stream',
+          'cache-control': 'no-cache',
+          connection: 'keep-alive',
+        });
+        state.liveClients.push(res);
+        liveConnectedResolve(true);
+        res.write(
+          encoder.encode(
+            `event: snapshot\ndata: ${JSON.stringify({
+              instance: E2E_INSTANCE,
+              session: 5,
+              sequence: 10,
+              watermark: 0,
+              turn: { op: options.opId, status: state.turnStatus },
+              parts: [],
+            })}\n\n`,
+          ),
+        );
+        // The RESPONSE owns the connection lifetime: `req` 'close' fires
+        // when the GET request is fully received (immediately), which would
+        // drop the client before any live frame is written.
+        res.on('close', () => {
+          const index = state.liveClients.indexOf(res);
+          if (index >= 0) {
+            state.liveClients.splice(index, 1);
+          }
+        });
+        return;
+      }
+      if (req.method === 'GET' && url.pathname === '/native/messages') {
+        json(200, {
+          sessionId: '5',
+          messages: state.durableMessages,
+          hasMore: false,
+          nextBefore: null,
+        });
+        return;
+      }
+      json(404, { error: { code: 'not_found', message: `no route for ${req.method} ${url.pathname}` } });
+    });
+  });
+  await new Promise((done) => server.listen(0, '127.0.0.1', done));
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  return {
+    baseUrl,
+    log,
+    state,
+    sendLive,
+    waitForLiveClient: () => liveConnectedPromise,
+    close: () =>
+      new Promise((done) => {
+        for (const client of state.liveClients) {
+          client.destroy();
+        }
+        server.close(() => done());
+      }),
+  };
+}
+
+async function unifiedComposerE2eTests() {
+  await test('E2E: attachment chip → host staging → execution=ask submission with attachments → live DOM → Stop → reconciliation', async () => {
+    const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    const expectedBase64 = pngBytes.toString('base64');
+    const daemon = await startUnifiedE2eDaemon({
+      opId: 'op-e2e-1',
+      queuedOpId: 'op-e2e-queued',
+      expectedUploadBase64: expectedBase64,
+      durableMessages: [],
+    });
+    try {
+      // ---- The REAL webview (media/chat.js) in the fake DOM: the chip.
+      // The durable base the live overlay patches into (assistant message
+      // id '2' — the same durable row the final reconciliation serves).
+      const harness = runChatWebview(
+        transcriptSnapshot([transcriptEntry(2, '', { id: '2', role: 'assistant' })]),
+      );
+      harness.deliver({
+        type: 'attachments',
+        items: [attachmentMeta('att-e2e', { filename: 'diagram.png', mime: 'image/png', bytes: 8, isImage: true })],
+      });
+      const chip = harness.dom.document.getElementById('attachment-list').children[0];
+      assert(chip !== undefined, 'the attachment chip must render');
+      assert(
+        String(chip.className).includes('attachment'),
+        `the chip row must carry the attachment class: ${chip.className}`,
+      );
+      // ---- The submission: the ONE composer's Send with the chip attached.
+      harness.dom.document.getElementById('goal').value = 'what is in this diagram?';
+      harness.dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
+      const sent = harness.posted[harness.posted.length - 1];
+      assertDeepEqual(sent.attachmentIds, ['att-e2e'], 'the sendGoal carries the chip id');
+      assert(!('intent' in sent), 'a conversational send never carries an intent member');
+
+      // ---- The REAL host staging path: ComposerAttachmentStore (the real
+      // module) + the REAL nativeClient upload against the REAL daemon.
+      let counter = 0;
+      const store = new ts.ComposerAttachmentStore(() => `att-e2e`);
+      const added = store.add({
+        mime: 'image/png',
+        filename: 'diagram.png',
+        bytes: pngBytes.byteLength,
+        dataBase64: expectedBase64,
+        isImage: true,
+      });
+      assertEqual(added.reason, null, 'the real host store accepts the attachment');
+      const selected = store.select(sent.attachmentIds);
+      assertEqual(selected.reason, null, 'the submitted chip id resolves in the host store');
+      const client = new nc.NativeClient({
+        baseUrl: daemon.baseUrl,
+        bearerToken: 'e2e-token',
+        timeoutMs: 2000,
+      });
+      const staged = [];
+      for (const pending of selected.attachments) {
+        const ref = await client.uploadAttachment('5', {
+          mime: pending.mime,
+          filename: pending.filename,
+          data_base64: pending.dataBase64,
+        });
+        staged.push(nc.attachmentIdOf(ref));
+      }
+      assertEqual(daemon.state.uploads.length, 1, 'the daemon received the staged bytes');
+      assertEqual(
+        daemon.state.uploads[0].size,
+        pngBytes.byteLength,
+        'the staged upload carries the EXACT byte count',
+      );
+
+      // ---- The submission through the REAL askFlow module: execution=ask
+      // + the durable attachment ids. The daemon's recorded body is the
+      // authority — a dropped attachment fails here.
+      const receipt = await af.sendAskTurn(client, {
+        sessionId: '5',
+        prompt: 'what is in this diagram?',
+        files: [],
+        submissionId: 'e2e-submission-1',
+        attachments: staged,
+      });
+      assertEqual(receipt.op_id, 'op-e2e-1', 'the prompt was accepted');
+      assertEqual(daemon.state.promptBodies.length, 1, 'the daemon saw exactly one prompt');
+      const promptBody = daemon.state.promptBodies[0];
+      assertEqual(promptBody.execution, 'ask', 'the wire carries execution=ask');
+      assert(
+        Array.isArray(promptBody.attachments) && promptBody.attachments.length === 1,
+        `the prompt body must carry the attachment id: ${JSON.stringify(promptBody.attachments)}`,
+      );
+      assertEqual(promptBody.attachments[0].digest, daemon.state.uploads[0].digest, 'the id matches the staged digest');
+
+      // ---- The REAL turn-state reducer: admission is not completion.
+      let turns = tl.emptyTurnLifecycle();
+      turns = tl.turnReducer(turns, { type: 'submit', source: 'ask' });
+      turns = tl.turnReducer(turns, {
+        type: 'receipt',
+        opId: receipt.op_id,
+        runId: receipt.run_id,
+        queued: receipt.queued,
+      });
+      assertEqual(tl.turnStopOpId(turns), 'op-e2e-1', 'Stop targets THE accepted operation');
+      harness.deliver({
+        type: 'turnState',
+        phase: tl.turnDisplayPhase(turns),
+        opId: tl.turnStopOpId(turns),
+        source: tl.turnDisplaySource(turns),
+      });
+      assertEqual(
+        harness.dom.document.getElementById('menu-stop').hidden,
+        false,
+        'Stop is visible while the turn is live',
+      );
+
+      // ---- Live DOM application: the REAL LiveOutputStream over the REAL
+      // daemon SSE route delivers a chunk; the webview applies it.
+      const liveMessages = [];
+      const stream = new es.LiveOutputStream({
+        baseUrl: daemon.baseUrl,
+        bearerToken: 'e2e-token',
+        sessionId: '5',
+        sleep: async () => {},
+        onMessage: (message) => liveMessages.push(message),
+      });
+      stream.start();
+      const connected = await Promise.race([
+        daemon.waitForLiveClient().then(() => true),
+        new Promise((done) => setTimeout(() => done(false), 3000)),
+      ]);
+      assert(connected === true, 'the live subscription must connect to the daemon');
+      daemon.sendLive('live', {
+        instance: E2E_INSTANCE,
+        session: 5,
+        messageId: 2,
+        kind: 'text',
+        partId: '2:text',
+        turn: 'op-e2e-1',
+        attempt: 0,
+        sequence: 11,
+        revision: 1,
+        offset: 0,
+        content: 'It shows a magenta square.',
+      });
+      // Bounded poll: the frame travels a REAL socket, so delivery is not
+      // synchronous — but it must arrive (a dropped chunk fails the test).
+      let liveFrame = null;
+      for (let attempt = 0; attempt < 100 && liveFrame === null; attempt += 1) {
+        await new Promise((done) => setTimeout(done, 10));
+        liveFrame = liveMessages.find((message) => message.type === 'live') ?? null;
+      }
+      assert(
+        liveFrame !== undefined && liveFrame !== null,
+        `the live chunk must reach the stream consumer (messages: ${JSON.stringify(liveMessages.map((m) => m.type))}; daemon live clients: ${daemon.state.liveClients.length})`,
+      );
+      harness.deliver({ type: 'liveOutput', frames: [liveFrame.frame] });
+      assert(
+        entryTextOf(harness).includes('It shows a magenta square.'),
+        `the live text must apply to the DOM: ${entryTextOf(harness)}`,
+      );
+
+      // ---- Stop: the webview posts cancelRun; the host path aborts EXACTLY
+      // the tracked operation through the REAL client. A no-op Stop (the
+      // daemon not seeing the abort) fails this section.
+      harness.dom.document.getElementById('menu-stop').click();
+      assertDeepEqual(harness.posted[harness.posted.length - 1], { type: 'cancelRun' });
+      const stopOp = tl.turnStopOpId(turns);
+      const abortAck = await client.abortSession('5', stopOp);
+      assert(
+        abortAck.aborted.indexOf(stopOp) >= 0,
+        `the daemon must confirm the abort of ${stopOp}: ${JSON.stringify(abortAck)}`,
+      );
+      assertEqual(daemon.state.aborts[0], 'op-e2e-1', 'the abort targeted the accepted operation');
+      assertEqual(daemon.state.turnStatus, 'cancelled', 'the daemon cancelled the turn');
+      turns = tl.turnReducer(turns, { type: 'stopped', opId: stopOp });
+      assertEqual(tl.turnDisplayPhase(turns), 'interrupted', 'the reducer settles to interrupted');
+      harness.deliver({
+        type: 'turnState',
+        phase: tl.turnDisplayPhase(turns),
+        opId: tl.turnStopOpId(turns),
+        source: tl.turnDisplaySource(turns),
+      });
+      assertEqual(
+        harness.dom.document.getElementById('menu-stop').hidden,
+        true,
+        'Stop hides once the turn settles',
+      );
+      // The PARTIAL live reply is preserved across the stop (never blanked).
+      assert(
+        entryTextOf(harness).includes('It shows a magenta square.'),
+        'the partial reply survives the stop',
+      );
+
+      // ---- Reconciliation: the durable transcript page (with the additive
+      // turn_id) replaces the live overlay; the text must survive verbatim.
+      // The page serves messages NEWEST FIRST (the reducer reverses).
+      daemon.state.durableMessages = [
+        {
+          seq: 2,
+          id: 2,
+          role: 'assistant',
+          createdMs: 2,
+          turn_id: 'op-e2e-1',
+          data: null,
+          parts: [{ kind: 'text', createdMs: 2, data: { text: 'It shows a magenta square.' } }],
+        },
+        {
+          seq: 1,
+          id: 1,
+          role: 'user',
+          createdMs: 1,
+          data: { text: 'what is in this diagram?' },
+          parts: [],
+        },
+      ];
+      const page = await client.messages('5', { limit: 50 });
+      const transcript = st.transcriptFromMessages(page.messages);
+      harness.deliver({ type: 'snapshot', snapshot: transcriptSnapshot(transcript) });
+      assert(
+        entryTextOf(harness).includes('It shows a magenta square.'),
+        `the durable reconciliation keeps the streamed text: ${entryTextOf(harness)}`,
+      );
+      const assistant = transcript.find((entry) => entry.role === 'assistant');
+      assert(assistant !== undefined, 'the durable page carries the assistant row');
+      assertEqual(assistant.turnId, 'op-e2e-1', 'the additive turn_id reaches the projection');
+      stream.stop();
+      await stream.whenStopped();
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  await test('E2E: a dropped attachment fails loudly at the daemon boundary (never silent)', async () => {
+    const daemon = await startUnifiedE2eDaemon({
+      opId: 'op-e2e-2',
+      queuedOpId: 'op-e2e-queued-2',
+      expectedUploadBase64: Buffer.from([1, 2, 3, 4]).toString('base64'),
+    });
+    try {
+      const client = new nc.NativeClient({
+        baseUrl: daemon.baseUrl,
+        bearerToken: 'e2e-token',
+        timeoutMs: 2000,
+      });
+      let refused = null;
+      try {
+        await client.uploadAttachment('5', {
+          mime: 'image/png',
+          filename: 'tampered.png',
+          data_base64: Buffer.from([9, 9, 9, 9]).toString('base64'),
+        });
+      } catch (error) {
+        refused = error;
+      }
+      assert(refused !== null, 'a tampered upload must refuse loudly');
+      assertEqual(daemon.state.promptBodies.length, 0, 'nothing was submitted after the refusal');
+      assertEqual(daemon.state.uploads.length, 0, 'no attachment row was created');
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  await test('turn reducer: turnQueuedOpIds names the queued follow-ups, never the Stop target', () => {
+    let state = tl.emptyTurnLifecycle();
+    state = tl.turnReducer(state, { type: 'submit', source: 'ask' });
+    state = tl.turnReducer(state, { type: 'receipt', opId: '1', runId: 'a', queued: false });
+    state = tl.turnReducer(state, { type: 'journal', kind: 'model_started', opId: '1' });
+    state = tl.turnReducer(state, { type: 'submit', source: 'ask' });
+    state = tl.turnReducer(state, { type: 'receipt', opId: '2', runId: 'b', queued: true });
+    state = tl.turnReducer(state, { type: 'submit', source: 'ask' });
+    state = tl.turnReducer(state, { type: 'receipt', opId: '3', runId: 'c', queued: true });
+    assertDeepEqual(
+      tl.turnQueuedOpIds(state),
+      ['2', '3'],
+      'the queued follow-ups are named in submission order',
+    );
+    assertEqual(tl.turnStopOpId(state), '1', 'Stop still targets the streaming op');
+    // Admission of the first queued follow-up removes it from the queued set.
+    state = tl.turnReducer(state, { type: 'journal', kind: 'prompt_admitted', opId: '2' });
+    assertDeepEqual(tl.turnQueuedOpIds(state), ['3'], 'admission clears the queued row');
+    // A stopped queued op leaves the queued set (sticky interrupted).
+    state = tl.turnReducer(state, { type: 'stopped', opId: '3' });
+    assertDeepEqual(tl.turnQueuedOpIds(state), [], 'a stopped follow-up is no longer queued');
+  });
+
+  await test('webview: queued follow-ups render Queued rows with remove controls that post cancelQueuedTurn', () => {
+    const harness = runChatWebview(transcriptSnapshot([]));
+    const list = harness.dom.document.getElementById('queued-list');
+    // The fake DOM starts every node unhidden; chat.js owns the list's
+    // visibility from the turn-state projections on. A live turn with an
+    // empty queue renders the list hidden.
+    harness.deliver({ type: 'turnState', phase: 'streaming', opId: '1', source: 'ask' });
+    assertEqual(list.hidden, true, 'a live turn without queued follow-ups keeps the list hidden');
+    // The live turn streams while TWO follow-ups wait behind it.
+    harness.deliver({ type: 'turnState', phase: 'streaming', opId: '1', source: 'ask' });
+    harness.deliver({
+      type: 'turnState',
+      phase: 'queued',
+      opId: '1',
+      source: 'ask',
+      queuedOpIds: ['2', '3'],
+    });
+    assertEqual(list.hidden, false, 'the queued list appears');
+    assertEqual(list.children.length, 2, 'one row per queued follow-up');
+    const firstRow = list.children[0];
+    assertEqual(firstRow.getAttribute('data-queued-op'), '2', 'the row names its operation');
+    assert(
+      findFake(firstRow, (node) => node.textContent === 'Queued'),
+      'the row renders the Queued label',
+    );
+    // Removing row 2 posts the typed cancel for THAT op only.
+    const remove = findFake(firstRow, (node) => node.tagName === 'button' && node.textContent === 'Remove');
+    assert(remove !== null, 'the queued row carries a remove control');
+    remove.click();
+    assertDeepEqual(harness.posted[harness.posted.length - 1], {
+      type: 'cancelQueuedTurn',
+      opId: '2',
+    });
+    // The Stop affordance still targets the ACTIVE op, never a queued one.
+    harness.deliver({
+      type: 'turnState',
+      phase: 'queued',
+      opId: '1',
+      source: 'ask',
+      queuedOpIds: ['3'],
+    });
+    assertEqual(list.children.length, 1, 'the cancelled row disappears on the next projection');
+    harness.deliver({ type: 'turnState', phase: 'idle', opId: null, source: null, queuedOpIds: [] });
+    assertEqual(list.hidden, true, 'an empty projection hides the list');
+    // A forged queuedOpIds shape collapses to the empty list (typed state).
+    harness.deliver({
+      type: 'turnState',
+      phase: 'streaming',
+      opId: '1',
+      queuedOpIds: { evil: true },
+    });
+    assertEqual(list.hidden, true, 'a forged queuedOpIds shape is ignored');
+  });
+
+  await test('webview: transcript rows group by ChatTurnId when present, role-adjacency remains the fallback', () => {
+    const entries = [
+      transcriptEntry(1, 'question', { role: 'user' }),
+      { ...transcriptEntry(2, 'answer part one', { role: 'assistant' }), turnId: 'turn-a' },
+      { ...transcriptEntry(3, 'answer part two', { role: 'assistant' }), turnId: 'turn-a' },
+      { ...transcriptEntry(4, 'next turn answer', { role: 'assistant' }), turnId: 'turn-b' },
+      { ...transcriptEntry(5, 'legacy answer one', { role: 'assistant' }) },
+      { ...transcriptEntry(6, 'legacy answer two', { role: 'assistant' }) },
+    ];
+    const harness = runChatWebview(transcriptSnapshot(entries));
+    const container = harness.dom.document.getElementById('entries');
+    const classOf = (index) => String(container.children[index].className);
+    // Index 1 follows a USER row: the role run starts there, so no
+    // entry-follow (a turn boundary is also a role boundary).
+    assert(
+      !classOf(1).includes('entry-follow'),
+      'the first row of a turn after a user row starts the run',
+    );
+    assert(classOf(2).includes('entry-follow'), 'same-turn rows group (part two)');
+    assert(
+      !classOf(3).includes('entry-follow'),
+      'a DIFFERENT turn id starts a new group even under the same role',
+    );
+    assert(
+      classOf(4).includes('entry-follow'),
+      'role-adjacency fallback applies when EITHER side lacks a turn id',
+    );
+    assert(classOf(5).includes('entry-follow'), 'role-adjacency fallback still groups turn-less rows');
+    // Mutation witness: without turn ids, consecutive assistant rows would
+    // ALL fuse; with them, the boundary is exact.
+    const noTurnIds = entries.map((entry) => {
+      const copy = { ...entry };
+      delete copy.turnId;
+      return copy;
+    });
+    const legacy = runChatWebview(transcriptSnapshot(noTurnIds));
+    const legacyContainer = legacy.dom.document.getElementById('entries');
+    assert(
+      String(legacyContainer.children[3].className).includes('entry-follow'),
+      'mutation witness: the legacy fallback fuses the role run',
+    );
+  });
+
+  await test('extension host contract: sendGoal without intent is conversational; escalation and queued-cancel glue are pinned', () => {
+    const source = readFileSync(new URL('../src/extension.ts', import.meta.url), 'utf8');
+    // Item 1: the sendGoal arm defaults to the conversational path.
+    const sendGoalCase = sourceCaseSlice(source, 'sendGoal');
+    assert(
+      sendGoalCase.indexOf("composerIntentOf(message.intent) === 'ask'") >= 0,
+      'the sendGoal arm routes the default (no intent) to the conversational turn',
+    );
+    // Item 4: the queued-cancel arm exists, re-validates against the tracked
+    // lifecycle and calls the TYPED abort with that op id.
+    const cancelCase = sourceCaseSlice(source, 'cancelQueuedTurn');
+    assert(
+      cancelCase.includes('turnQueuedOpIds(turns)'),
+      'the queued cancel re-validates against the tracked lifecycle',
+    );
+    assert(
+      cancelCase.includes('client.abortSession(sessionId, queuedOp)'),
+      'the queued cancel calls the typed abort with the queued op id',
+    );
+    assert(
+      !cancelCase.includes('cancelTaskRun'),
+      'the queued cancel never touches a task run (the active op is untouched)',
+    );
+    // The dispatch projection carries the queued ops to the panel.
+    assert(
+      source.includes('chatProvider?.postTurnState(phase, stopOp, source, queuedOps)'),
+      'the turn projection carries the queued op ids',
+    );
+  });
+}
+
 async function liveOutputTests() {
   await test('turn reducer: acceptance is admission — live states, exact Stop target, durable-only terminal', () => {
     let state = tl.emptyTurnLifecycle();
@@ -18734,7 +19385,12 @@ async function liveOutputTests() {
     assert(header().includes('Stopped'), `outcome label survives Stop: ${header()}`);
     assertEqual(stop().hidden, true, 'a settled turn hides Stop again');
     harness.deliver({ type: 'turnState', phase: 'completed', opId: '1' });
-    assert(header().includes('Completed'), `completed label: ${header()}`);
+    assert(header().includes('Ready'), `completed falls back to Ready for any turn: ${header()}`);
+    harness.deliver({ type: 'turnState', phase: 'completed', opId: '1', source: 'task' });
+    assert(
+      header().includes('Ready'),
+      `a completed ENGINEERING run also rests at Ready: ${header()}`,
+    );
     harness.deliver({ type: 'turnState', phase: 'failed', opId: '1' });
     assert(header().includes('Failed'), `failed label: ${header()}`);
     harness.deliver({ type: 'turnState', phase: 'idle', opId: null });
@@ -19742,6 +20398,7 @@ async function main() {
   await reducedMotionTests();
   await verdictContrastTests();
   await liveOutputTests();
+  await unifiedComposerE2eTests();
   await capabilityMatrixTests();
   await edition8HtmlSafetyTests();
   if (packagedDir !== null && packagedDir !== undefined) {

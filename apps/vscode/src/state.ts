@@ -82,6 +82,14 @@ export interface TranscriptEntry {
    * instead of a silent truncation.
    */
   readonly clipped: boolean;
+  /**
+   * The turn/operation identity that produced this message (additive, from
+   * the durable projection's `turn_id`): consecutive non-user rows of the
+   * SAME turn group as one continuous reply. ABSENT for legacy rows and
+   * projections that do not carry it — the renderer then falls back to the
+   * documented role-adjacency grouping (`entry-follow`).
+   */
+  readonly turnId?: string | null;
 }
 
 /**
@@ -982,6 +990,14 @@ function entryFromMessage(id: string, message: Record<string, Json>): Transcript
     asInt(message.seq) ?? 0,
     asInt(message.created_ms) ?? 0,
   );
+  // The additive turn identity (item 6): the durable projection carries
+  // `turn_id`; a live-style `turnId`/`chat_turn_id` spelling is accepted
+  // defensively. Absent/empty keeps the entry turn-less (legacy fallback
+  // grouping at the renderer).
+  const turnId = asString(message.turn_id) ?? asString(message.turnId) ?? asString(message.chat_turn_id);
+  if (turnId !== null && turnId.length > 0) {
+    entry = { ...entry, turnId };
+  }
   // User prompt rows carry their text in the message payload (`data.text`,
   // e.g. `{files, text}`) with an empty parts list; assistant rows carry it
   // in parts. Both must render (parts win when both exist).
@@ -1170,6 +1186,9 @@ export function transcriptSignature(entries: readonly TranscriptEntry[]): string
     mix(entry.reasoning, 4);
     mix(entry.summary, 5);
     mix(entry.clipped ? 'clipped' : '', 11);
+    // The additive turn identity (item 6): two pages identical except for
+    // their turn grouping are different documents for the renderer.
+    mix(entry.turnId ?? '', 13);
     // The ORDERED part sequence (item 8): two transcripts with identical
     // buckets but a different interleaving must never share a digest.
     mix((entry.parts ?? []).map((part) => (part.kind === 'tool' ? `t:${part.toolCallId}` : part.kind)).join('\u0001'), 12);
@@ -1212,7 +1231,8 @@ export function transcriptContentEqual(
       a.text !== b.text ||
       a.reasoning !== b.reasoning ||
       a.summary !== b.summary ||
-      a.clipped !== b.clipped
+      a.clipped !== b.clipped ||
+      (a.turnId ?? null) !== (b.turnId ?? null)
     ) {
       return false;
     }
