@@ -1518,7 +1518,11 @@ internal class Edition8ScreenPanel(
     private fun bindCmdEnter(run: () -> Unit) {
         val key = KeyStroke.getKeyStroke(
             KeyEvent.VK_ENTER,
-            java.awt.Toolkit.getDefaultToolkit().menuShortcutKeyMaskEx
+            // The ONE headless-safe platform mask (Command on macOS, Ctrl
+            // on X11/Windows, CTRL fallback under a headless JVM): asking
+            // the toolkit directly throws HeadlessException and broke every
+            // work screen's build on the pinned headless CI image.
+            menuShortcutMask()
         )
         inputMap.put(key, "edition8.run")
         actionMap.put("edition8.run", object : javax.swing.AbstractAction() {

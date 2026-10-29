@@ -106,7 +106,14 @@ object Edition8ControlExercise {
                         panel = Edition8ScreenRegistry.build(screen.id, host) as Edition8ScreenPanel
                     }
                 } catch (t: Throwable) {
-                    failures.add("${screen.id} failed to build: ${t.message}")
+                    // invokeAndWait wraps the EDT throwable in an
+                    // InvocationTargetException whose message is null: report
+                    // the TARGET exception so a real build failure is never
+                    // printed as "null".
+                    val cause = (t as? java.lang.reflect.InvocationTargetException)?.targetException
+                        ?: t
+                    val frames = cause.stackTrace.take(6).joinToString(" <- ") { it.toString() }
+                    failures.add("${screen.id} failed to build: $cause @ $frames")
                     continue
                 }
                 val view = panel ?: continue

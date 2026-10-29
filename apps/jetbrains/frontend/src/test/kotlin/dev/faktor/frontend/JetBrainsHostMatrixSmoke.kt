@@ -2194,7 +2194,11 @@ object JetBrainsHostMatrixSmoke {
             checks.add(HostCheck(name, "passed", "observable matched"))
         } catch (t: Throwable) {
             failures++
-            val message = t.message ?: t.toString()
+            // invokeAndWait wraps EDT throwables in an InvocationTargetException
+            // whose message is null — report the TARGET cause instead.
+            val cause = (t as? java.lang.reflect.InvocationTargetException)?.targetException ?: t
+            val message = (cause.message ?: cause.toString()) + " @ " +
+                cause.stackTrace.take(5).joinToString(" <- ") { it.toString() }
             checks.add(HostCheck(name, "failed", message))
             println("HOST MATRIX FAIL: $name: $message")
         }

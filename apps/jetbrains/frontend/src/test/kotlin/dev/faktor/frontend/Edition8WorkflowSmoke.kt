@@ -105,11 +105,25 @@ object Edition8WorkflowSmoke {
     private fun keyboardCell(wf: String, screen: String, panel: JComponent, out: MutableMap<String, JsonValue>) {
         val hasEscape = panel.getInputMap(JComponent.WHEN_ANCESTOR_OF_FOCUSED_COMPONENT)
             .get(javax.swing.KeyStroke.getKeyStroke(java.awt.event.KeyEvent.VK_ESCAPE, 0)) != null
-        val buttonsFocusable = collect(panel).filterIsInstance<AbstractButton>().all { it.isFocusable }
+        // A DISABLED button is not operable by design (Send with an empty
+        // draft, Stop while idle): Swing reports it isFocusable=false. The
+        // keyboard contract is "every ENABLED control is reachable".
+        // JScrollBar arrow chrome (MetalScrollButton under the linux L&F) is
+        // toolkit chrome, never an authored control: it is intentionally
+        // non-focusable and must not fail the authored-button contract.
+        val focusOffenders = collect(panel)
+            .filterIsInstance<AbstractButton>()
+            .filter { javax.swing.SwingUtilities.getAncestorOfClass(javax.swing.JScrollBar::class.java, it) == null }
+            .filter { it.isEnabled && !it.isFocusable }
+        val buttonsFocusable = focusOffenders.isEmpty()
         val fieldsFocusable = collect(panel).filterIsInstance<JTextField>().all { it.isFocusable }
         out["keyboard"] = JsonValue.Str(
             if (hasEscape && buttonsFocusable && fieldsFocusable) "passed"
-            else "escape=${hasEscape} buttons=$buttonsFocusable fields=$fieldsFocusable"
+            else "escape=${hasEscape} buttons=$buttonsFocusable fields=$fieldsFocusable" +
+                if (focusOffenders.isEmpty()) ""
+                else " offenders=" + focusOffenders.joinToString(",") {
+                    (it.text.ifEmpty { it.javaClass.simpleName }) + "#" + it.name
+                }
         )
     }
 
