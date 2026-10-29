@@ -297,7 +297,7 @@ class NativeClient(
      * The AUTHORITATIVE part snapshot behind an explicit live-output resync
      * (`GET /native/session/{id}/live/snapshot[?message=&kind=]`). The
      * optional filter must be supplied as a pair; a hostile body is a typed
-     * [NativeProtocolException], never a silently wrong transcript.
+     * [LiveOutputError], never a silently wrong transcript.
      */
     fun liveSnapshot(
         sessionId: String,

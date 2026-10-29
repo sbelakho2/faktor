@@ -16,8 +16,12 @@
 // ToolWindowFactory can embed directly.
 package dev.faktor.frontend
 
+import dev.faktor.backend.LiveChunkFrame
+import dev.faktor.backend.LiveOutputMessage
+import dev.faktor.backend.LiveSnapshot
 import dev.faktor.backend.NativeSseEvent
 import dev.faktor.backend.ProtocolBlocked
+import dev.faktor.shared.JsonValue
 import dev.faktor.shared.MicroMoney
 import dev.faktor.shared.NativeAgent
 import dev.faktor.shared.NativeApiException
@@ -77,6 +81,26 @@ private const val MAX_NOTABLE_EVENTS_PER_FLUSH = 8
 
 /** One stream frame plus the session that produced it (stale batches drop). */
 private data class StreamDelta(val sessionId: String?, val event: NativeSseEvent)
+
+/**
+ * Live model output is host-batched per 16–33ms window: every whole-code-
+ * point delta is applied to the part-keyed overlay and ONE EDT flush renders
+ * the window. A burst can never cause a restart/render per token.
+ */
+private const val LIVE_FLUSH_INTERVAL_MS = 16
+
+/** Bound of live frames applied in ONE EDT flush (beyond it: flush now). */
+private const val LIVE_FLUSH_MAX_BATCH = 128
+
+/** Bounded cooldown of the authoritative resync fetch (no resync storm). */
+private const val LIVE_RESYNC_COOLDOWN_MS = 250L
+
+/**
+ * Bounded subscribe-before-submit wait: the worker waits at most this long
+ * for the live handshake snapshot BEFORE the prompt POST. A daemon without
+ * live output releases it immediately (typed `unavailable`).
+ */
+private const val LIVE_HANDSHAKE_WAIT_MS = 1_000L
 
 /**
  * One completion-contract FINISH LEVEL of the four-level selector. The wire
@@ -602,6 +626,34 @@ class FaktorChatPanel(
      */
     private val transcriptModel = TranscriptModel()
 
+    /**
+     * The live model-output pump: the stream thread only offers parsed
+     * chunks; the EDT applies and renders ONE coalesced window. Bounded by
+     * [UI_MAX_QUEUED] frames and [UI_MAX_QUEUED_BYTES] payload bytes.
+     */
+    private val livePump = EdtFlushPump<LiveChunkFrame>(
+        "live",
+        LIVE_FLUSH_INTERVAL_MS,
+        LIVE_FLUSH_MAX_BATCH,
+        uiMetrics,
+        { frame: LiveChunkFrame -> frame.content.length }
+    ) { batch -> applyLiveBatch(batch) }
+
+    /**
+     * The ONE turn reducer (idle → submitting → queued/starting → streaming/
+     * tool-running/awaiting-user → completed | interrupted | failed). HTTP
+     * acceptance is admission only; completion comes from durable authority.
+     */
+    private var turnLifecycle: TurnLifecycle = TurnLifecycle.empty()
+
+    /** The last (display phase, stop op) rendered (dedupe). */
+    private var lastPostedTurnKey: String? = null
+
+    /** Single-flight + cooldown of the authoritative live resync fetch. */
+    private val liveResyncInFlight = AtomicBoolean(false)
+
+    private var liveResyncLastAt = 0L
+
     private var currentTree: TaskTreeModel? = null
 
     private var currentAgents: List<NativeAgent> = emptyList()
@@ -619,6 +671,10 @@ class FaktorChatPanel(
         // Per-session teardown: queued deltas from the old session must never
         // render into the new one.
         sessionScope.onDispose { streamPump.discardPending() }
+        sessionScope.onDispose { livePump.discardPending() }
+        // A live offset/revision gap requests the AUTHORITATIVE part snapshot
+        // (single-flight, bounded cooldown); a gap never fabricates text.
+        transcriptModel.setLiveGapListener { partId -> requestLiveResync("gap $partId") }
         // Clipboard/paste staging notices (refusals included) surface in the
         // transcript exactly once, on the EDT.
         attachments.onNotice = { message -> onEdt { appendSystem(message) } }
@@ -1018,9 +1074,16 @@ class FaktorChatPanel(
         workDetailsButton.toolTipText = "Open the run details in Inspect"
         workDetailsButton.a11y("Open run details", "Opens the full run summary in Inspect.")
         workDetailsButton.addActionListener { inspectCurrentRun() }
-        workStopButton.toolTipText = "Cancel the selected task run"
-        workStopButton.a11y("Stop the current run", "Requests cancellation of the selected task run.")
-        workStopButton.addActionListener { cancelRunButton.doClick() }
+        workStopButton.toolTipText = "Stop the live turn, or cancel the selected task run"
+        workStopButton.a11y(
+            "Stop the current run",
+            "Requests cancellation of the live turn (the accepted operation) or the selected task run."
+        )
+        workStopButton.addActionListener {
+            // The reducer names the accepted operation; only a task-run
+            // surface without a live turn falls back to the run cancel.
+            if (turnStopOpId(turnLifecycle) != null) stopActiveTurn() else cancelRunButton.doClick()
+        }
         workStateCopy.a11y("Run state detail", "The cause-specific detail of the current run state.")
         workStateAction.addActionListener { performUxAction(currentUxState()) }
         val statusBody = pageColumn(gap = Spacing.XS, padding = 0)
@@ -1865,6 +1928,9 @@ class FaktorChatPanel(
             appendSystem("task start refused: $reason")
             return
         }
+        // A settled Ask label never governs a Task run's strip; a LIVE Ask
+        // turn keeps its reducer entry (and its Stop target).
+        if (!turnLifecycleIsLive(turnLifecycle)) resetTurnLifecycle()
         if (!startInFlight.compareAndSet(false, true)) {
             appendSystem("a task start is already in flight; this submit was ignored")
             return
@@ -2298,12 +2364,7 @@ class FaktorChatPanel(
         refreshButton.addActionListener {
             runAsync("refresh") { refreshAllBlocking() }
         }
-        abortButton.addActionListener {
-            runControl("abort") {
-                val ack = service.abort()
-                onEdt { appendSystem("abort requested: ${ack.aborted}") }
-            }
-        }
+        abortButton.addActionListener { stopActiveTurn() }
         submitButton.addActionListener { startTaskFromControls() }
         cancelRunButton.addActionListener {
             val run = runsCombo.selectedItem as? NativeTaskRun
@@ -3154,6 +3215,9 @@ class FaktorChatPanel(
             text
         ) { UUID.randomUUID().toString() }
         pendingPromptSubmission = pending
+        // HTTP 2xx is admission, never completion: the reducer owns the phase
+        // (and Stop) from here until durable authority settles the turn.
+        dispatchTurn(TurnEvent.Submit(TurnSource.ASK))
         runAsync("prompt") {
             if (service.currentSessionId() != sessionId) {
                 // The session switched between capture and dispatch: never
@@ -3162,11 +3226,29 @@ class FaktorChatPanel(
                 onEdt { appendSystem("session changed; the draft is kept") }
                 return@runAsync
             }
+            // SUBSCRIBE-BEFORE-SUBMIT: the live subscription's first frame is
+            // the handshake snapshot at the exact sequence watermark, so a
+            // fast reply can never outrun this listener. An older daemon that
+            // does not serve live output answers typed `unavailable`; the
+            // durable journal path keeps the product working.
+            runCatching {
+                service.watchLiveOutput(sessionId, awaitHandshakeMs = LIVE_HANDSHAKE_WAIT_MS)
+            }
             try {
                 val receipt = service.prompt(text, submissionId = pending.submissionId)
                 pendingPromptSubmission = null
                 clearUxFailure()
                 onEdt {
+                    // The admission receipt moves submitting → queued/starting;
+                    // it NEVER completes the turn (the daemon may still be
+                    // generating long after this 2xx).
+                    dispatchTurn(
+                        TurnEvent.Receipt(
+                            opId = receipt.opId,
+                            runId = null,
+                            queued = receipt.queued
+                        )
+                    )
                     // Clear ONLY the exact submitted draft; text typed while
                     // the prompt was in flight is never destroyed.
                     if (input.text.trim() == pending.text) {
@@ -3187,6 +3269,10 @@ class FaktorChatPanel(
                 // id. Typed refusal: mint a new id on the next attempt.
                 if (!promptFailureIsRetryable(error)) {
                     pendingPromptSubmission = null
+                    // A typed refusal is a terminal admission outcome; a
+                    // transport failure is UNKNOWN (the request may have been
+                    // accepted), so the submission stays retryable.
+                    onEdt { dispatchTurn(TurnEvent.TurnStatus(null, "failed")) }
                 }
                 noteUxFailure(error)
                 onEdt { appendSystem("error: prompt: ${error.message}") }
@@ -3612,6 +3698,10 @@ class FaktorChatPanel(
             // ONE document insert for a pure append batch; row updates edit
             // their exact ranges.
             transcriptSink.flush()
+            // Reconcile the live suffix on top of the saved page immediately:
+            // a durable flush that lags the stream never truncates visible
+            // text, and a caught-up page never duplicates it.
+            applyLiveOverlayOps()
         }
     }
 
@@ -3661,8 +3751,17 @@ class FaktorChatPanel(
      */
     private fun updateWorkStatus() {
         val ux = currentUxState()
-        workStateChip.text = ux.label
-        workStateChip.foreground = semanticForeground(ux.tone)
+        // The ONE turn reducer's display phase owns the live/settled label
+        // (Sending/Queued/Starting/Generating/Working/Needs approval and the
+        // settled Completed/Stopped/Failed outcomes); idle falls back to the
+        // cause-specific UX state.
+        val turnLabel = turnPhaseLabel(turnDisplayPhase(turnLifecycle))
+        workStateChip.text = turnLabel ?: ux.label
+        workStateChip.foreground = if (turnLabel == null) {
+            semanticForeground(ux.tone)
+        } else {
+            semanticForeground(SemanticState.DIM)
+        }
         workStateCopy.fullText = ux.copy
         workStateCopy.isVisible =
             ux.kind != UxStateKind.READY || currentRunView != null || currentRunStateTag != null
@@ -4551,6 +4650,31 @@ class FaktorChatPanel(
         streamPump.offer(StreamDelta(service.currentSessionId(), event))
     }
 
+    override fun onLiveMessage(message: LiveOutputMessage) {
+        handleLiveMessage(message)
+    }
+
+    override fun onLiveStatus(status: String, detail: String?) {
+        onEdt {
+            diagnosticsPanel.setStream(
+                "live: $status" + (if (detail == null) "" else " ($detail)")
+            )
+            if (status == "retrying" || status == "stopped" || status == "unavailable") {
+                // A reconnect will re-handshake with a fresh snapshot:
+                // everything buffered under the old connection is stale.
+                livePump.discardPending()
+            }
+            updateWorkStatus()
+        }
+    }
+
+    override fun onLiveError(message: String) {
+        // Live transport diagnostics stay in Diagnostics: a malformed/foreign
+        // frame or an older daemon without the route never writes a synthetic
+        // transcript line (the durable journal remains the visible path).
+        onEdt { diagnosticsPanel.setStream("live: $message") }
+    }
+
     /**
      * ONE EDT render pass for a coalesced batch: stale-session frames and
      * replayed cursors are dropped, only durable milestones are written to
@@ -4575,6 +4699,18 @@ class FaktorChatPanel(
             }
             lastAppliedEventSeq = delta.event.id
             accepted++
+            // The durable journal drives the ONE turn reducer: admission,
+            // machine-state tags, tool phases and the terminal events.
+            // Terminal transitions come ONLY from these durable events or the
+            // turn record — never from a quiet stream or an HTTP 2xx.
+            dispatchTurn(
+                TurnEvent.Journal(
+                    kind = delta.event.event,
+                    opId = journalField(delta.event, "opId", "op_id"),
+                    state = journalField(delta.event, "state")
+                        ?: nestedState(delta.event)
+                )
+            )
             if (isNotableEvent(delta.event.event)) notable.add(delta)
         }
         if (accepted == 0) return
@@ -4591,6 +4727,162 @@ class FaktorChatPanel(
         }
         transcriptSink.flush()
         scheduleStatusRefresh()
+    }
+
+    /** One top-level journal field (camelCase native form first). */
+    private fun journalField(event: NativeSseEvent, vararg keys: String): String? {
+        val record = event.data as? JsonValue.Obj ?: return null
+        for (key in keys) {
+            val value = (record.fields[key] as? JsonValue.Str)?.value
+            if (value != null && value.isNotEmpty()) return value
+        }
+        return null
+    }
+
+    /** The machine-state tag may ride the journal `payload`. */
+    private fun nestedState(event: NativeSseEvent): String? {
+        val record = event.data as? JsonValue.Obj ?: return null
+        val payload = record.fields["payload"] as? JsonValue.Obj ?: return null
+        return (payload.fields["state"] as? JsonValue.Str)?.value
+    }
+
+    // ------------------------------------------------------- turn reducer
+
+    /** Apply one reducer event on the EDT and re-render the state strip. */
+    private fun dispatchTurn(event: TurnEvent) {
+        if (!SwingUtilities.isEventDispatchThread()) {
+            SwingUtilities.invokeLater { dispatchTurn(event) }
+            return
+        }
+        turnLifecycle = turnReducer(turnLifecycle, event)
+        val phase = turnDisplayPhase(turnLifecycle)
+        val stopOp = turnStopOpId(turnLifecycle)
+        val key = phase.wire + ":" + (stopOp ?: "")
+        if (key != lastPostedTurnKey) {
+            lastPostedTurnKey = key
+            updateWorkStatus()
+        }
+    }
+
+    private fun resetTurnLifecycle() {
+        turnLifecycle = TurnLifecycle.empty()
+        lastPostedTurnKey = null
+        updateWorkStatus()
+    }
+
+    /**
+     * Stop targets THE accepted operation the reducer tracks (never a queued
+     * follow-up, never a bare "abort everything" when an op is known). The
+     * typed abort ack is the authority that marks the turn `interrupted`.
+     */
+    private fun stopActiveTurn() {
+        val stopOp = turnStopOpId(turnLifecycle)
+        runControl("abort") {
+            val ack = service.abort(stopOp)
+            onEdt {
+                val settled = stopOp ?: ack.aborted.firstOrNull()
+                if (settled != null) dispatchTurn(TurnEvent.Stopped(settled))
+                appendSystem("abort requested: ${ack.aborted}")
+            }
+        }
+    }
+
+    // ------------------------------------------------------- live output
+
+    /**
+     * One live-output message. Chunk deltas go through the bounded EDT pump;
+     * the snapshot/turn/resync signals are authoritative and apply on the EDT.
+     */
+    private fun handleLiveMessage(message: LiveOutputMessage) {
+        when (message) {
+            is LiveOutputMessage.Chunk -> {
+                val current = service.currentSessionId()
+                if (current == null || message.frame.session.toString() != current) return
+                livePump.offer(message.frame)
+            }
+            is LiveOutputMessage.Snapshot -> onEdt { applyLiveSnapshotMessage(message.snapshot) }
+            is LiveOutputMessage.Turn -> onEdt {
+                val turn = message.frame.turn ?: return@onEdt
+                val status = message.frame.status ?: return@onEdt
+                dispatchTurn(TurnEvent.TurnStatus(turn, status))
+            }
+            is LiveOutputMessage.Resync -> {
+                // The stream client already fetched the authoritative snapshot
+                // after a lag; a snapshot message follows. Never fabricate
+                // text from the gap itself.
+                onEdt { updateWorkStatus() }
+            }
+        }
+    }
+
+    /** The subscribe handshake and every reconnect baseline. */
+    private fun applyLiveSnapshotMessage(snapshot: LiveSnapshot) {
+        if (!SwingUtilities.isEventDispatchThread()) {
+            SwingUtilities.invokeLater { applyLiveSnapshotMessage(snapshot) }
+            return
+        }
+        val current = service.currentSessionId()
+        if (current == null || snapshot.session.toString() != current) return
+        transcriptModel.applyLiveSnapshot(snapshot)
+        applyLiveOverlayOps()
+        snapshot.turn?.let { dispatchTurn(TurnEvent.TurnStatus(it.op, it.status)) }
+    }
+
+    /**
+     * ONE EDT pass for a coalesced live window: apply every delta to the
+     * part-keyed overlay, then render the window once.
+     */
+    private fun applyLiveBatch(batch: List<LiveChunkFrame>) {
+        val current = service.currentSessionId()
+        var touched = false
+        for (frame in batch) {
+            if (current == null || frame.session.toString() != current) {
+                uiMetrics.droppedStaleEvents.incrementAndGet()
+                continue
+            }
+            if (transcriptModel.applyLiveChunk(frame)) touched = true
+        }
+        if (touched) applyLiveOverlayOps()
+    }
+
+    /** Render exactly the rows whose merged text moved (one flush). */
+    private fun applyLiveOverlayOps() {
+        val ops = transcriptModel.liveOps()
+        if (ops.isEmpty()) return
+        for (op in ops) {
+            when (op) {
+                is TranscriptRowOp.Upsert -> transcriptSink.upsertRow(
+                    op.key.render(), op.line + "\n", op.beforeKey?.render()
+                )
+                is TranscriptRowOp.Rekey -> transcriptSink.rekeyRow(
+                    op.key.render(), op.newKey.render(), op.line + "\n", op.beforeKey?.render()
+                )
+            }
+        }
+        transcriptSink.flush()
+    }
+
+    /**
+     * The explicit gap resync: fetch the authoritative part snapshot
+     * (single-flight with a bounded cooldown) and reconcile. A saved page
+     * never duplicates live text and never overwrites a newer live suffix.
+     */
+    private fun requestLiveResync(reason: String) {
+        if (service.currentSessionId() == null || !service.isRunning()) return
+        val now = System.currentTimeMillis()
+        if (liveResyncInFlight.get() || now - liveResyncLastAt < LIVE_RESYNC_COOLDOWN_MS) return
+        liveResyncLastAt = now
+        liveResyncInFlight.set(true)
+        runAsync("live resync") {
+            try {
+                val snapshot = service.liveSnapshot()
+                onEdt { applyLiveSnapshotMessage(snapshot) }
+            } catch (e: Exception) {
+                onEdt { appendSystem("live resync ($reason): ${e.message ?: e.javaClass.simpleName}") }
+            } finally {
+                liveResyncInFlight.set(false)
+            }
+        }
     }
 
     /** Durable lifecycle milestones; per-chunk frames stay silent. */
@@ -4660,9 +4952,11 @@ class FaktorChatPanel(
         controlPlaneWatcher?.stop()
         refreshDelayTimer.stop()
         streamPump.stop()
+        livePump.stop()
         attachments.shutdown()
         sessionScope.disposeAll()
         service.stopStream()
+        service.stopLiveOutput()
         worker.shutdownNow()
         controlWorker.shutdownNow()
     }
@@ -4765,6 +5059,51 @@ class FaktorChatPanel(
         } else {
             SwingUtilities.invokeAndWait { streamPump.flushNow() }
         }
+    }
+
+    /** Deliver one live-output message exactly like the service listener. */
+    internal fun onLiveMessageForTest(message: LiveOutputMessage) {
+        handleLiveMessage(message)
+    }
+
+    /** Apply every queued live chunk in ONE EDT flush (seam). */
+    internal fun flushLiveForTest() {
+        onEdtValue { livePump.flushNow() }
+    }
+
+    /** Apply a reducer event synchronously on the EDT (seam). */
+    internal fun dispatchTurnForTest(event: TurnEvent) {
+        onEdtValue { dispatchTurn(event) }
+    }
+
+    internal fun turnPhaseForTest(): String =
+        onEdtValue { turnDisplayPhase(turnLifecycle).wire }
+
+    internal fun turnStopOpForTest(): String? =
+        onEdtValue { turnStopOpId(turnLifecycle) }
+
+    internal fun turnIsLiveForTest(): Boolean =
+        onEdtValue { turnLifecycleIsLive(turnLifecycle) }
+
+    internal fun liveGapSignalsForTest(): Long =
+        onEdtValue { transcriptModel.liveGapSignals }
+
+    internal fun liveForeignDroppedForTest(): Long =
+        onEdtValue { transcriptModel.liveForeignDropped }
+
+    internal fun liveDuplicatesDroppedForTest(): Long =
+        onEdtValue { transcriptModel.liveDuplicatesDropped }
+
+    /** The live part-keyed overlay (raw text + UTF-8 byte counter). */
+    internal fun livePartsForTest(): Map<String, String> = onEdtValue {
+        transcriptModel.livePartsForTest().mapValues { (_, part) -> part.text + "@" + part.bytes }
+    }
+
+    internal fun workStateChipTextForTest(): String = onEdtValue { workStateChip.text }
+
+    /** Invoke the Stop/Abort action exactly as a host gesture would. */
+    internal fun triggerAbortForTest() {
+        onEdtValue { stopActiveTurn() }
     }
 
     /** True while the transcript follows appended content. */
@@ -5470,9 +5809,12 @@ class FaktorChatPanel(
             sessionScope.disposeAll()
             sessionScope = SessionUiScope(uiMetrics)
             sessionScope.onDispose { streamPump.discardPending() }
+            sessionScope.onDispose { livePump.discardPending() }
             refreshDirty.set(false)
             refreshDelayTimer.stop()
             lastAppliedEventSeq = 0L
+            runCatching { service.stopLiveOutput() }
+            resetTurnLifecycle()
             transcriptSink.reset()
             transcriptModel.reset()
             boardPanel.reset()

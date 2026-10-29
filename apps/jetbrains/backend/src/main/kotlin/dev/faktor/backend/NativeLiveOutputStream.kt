@@ -49,6 +49,8 @@ import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
 import java.util.Random
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 /** The bounded active-turn projection carried by a snapshot. */
 data class LiveTurn(val op: String, val status: String)
@@ -120,7 +122,7 @@ sealed class LiveOutputMessage {
 }
 
 /** One typed live-output protocol refusal (a hostile payload shape). */
-class LiveOutputError(detail: String) : NativeProtocolException("live output", detail)
+class LiveOutputError(detail: String) : Exception("live output: $detail")
 
 /** A non-retryable subscription refusal (route/credential/contract). */
 class LiveOutputUnavailableError(detail: String) : Exception(detail)
@@ -295,6 +297,17 @@ class NativeLiveOutputStream(
     @Volatile
     private var instanceValue: String? = null
 
+    /**
+     * True until THIS connection delivered its `snapshot` handshake. A live
+     * delta before the handshake is a contract violation: it is dropped (and
+     * reported), never rendered against a guessed lineage.
+     */
+    @Volatile
+    private var awaitingHandshake = true
+
+    /** Counts down at the FIRST handshake snapshot (subscribe-before-submit). */
+    private val handshake = CountDownLatch(1)
+
     @Volatile
     private var stopped = true
 
@@ -318,6 +331,22 @@ class NativeLiveOutputStream(
     val status: String
         get() = stage
 
+    /**
+     * Bounds the subscribe-before-submit wait: true once the FIRST handshake
+     * snapshot was received (the daemon subscribed at that exact sequence
+     * watermark). False on timeout, a typed `unavailable`, or stop — the
+     * caller then proceeds (the durable journal keeps the product working).
+     */
+    fun awaitHandshake(timeoutMs: Long): Boolean {
+        if (handshake.count == 0L) return true
+        return try {
+            handshake.await(timeoutMs, TimeUnit.MILLISECONDS)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
+    }
+
     fun start() {
         if (!stopped) return
         stopped = false
@@ -330,6 +359,7 @@ class NativeLiveOutputStream(
     fun stop() {
         if (stopped) return
         stopped = true
+        handshake.countDown()
         closeQuietly()
         thread?.interrupt()
         try {
@@ -369,6 +399,7 @@ class NativeLiveOutputStream(
                 // reconnecting: stop instead of spinning forever. The journal
                 // stream and durable refreshes keep the product working.
                 stopped = true
+                handshake.countDown()
                 closeQuietly()
                 onError(e)
                 setStage("unavailable", e.message)
@@ -405,6 +436,8 @@ class NativeLiveOutputStream(
         }
         val body = response.body()
         activeBody = body
+        // Every connection MUST open with its own snapshot handshake.
+        awaitingHandshake = true
         setStage("open")
         try {
             pump(body)
@@ -522,6 +555,14 @@ class NativeLiveOutputStream(
             when (eventName) {
                 "snapshot" -> adoptSnapshot(LivePayloads.parseSnapshotObject(record))
                 "live" -> {
+                    if (awaitingHandshake) {
+                        onError(
+                            LiveOutputError(
+                                "live frame before the snapshot handshake; dropping (snapshot-first contract)"
+                            )
+                        )
+                        return
+                    }
                     val frame = LivePayloads.parseChunk(record)
                     if (instanceValue != null && frame.instance != instanceValue) {
                         // A previous daemon's lineage: drop; the handshake
@@ -552,6 +593,8 @@ class NativeLiveOutputStream(
     private fun adoptSnapshot(snapshot: LiveSnapshot) {
         instanceValue = snapshot.instance
         cursorValue = snapshot.sequence
+        awaitingHandshake = false
+        handshake.countDown()
         onMessage(LiveOutputMessage.Snapshot(snapshot))
     }
 

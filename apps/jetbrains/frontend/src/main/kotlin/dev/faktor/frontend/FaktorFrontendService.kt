@@ -15,8 +15,11 @@ import dev.faktor.backend.BackendEndpoint
 import dev.faktor.backend.BackendException
 import dev.faktor.backend.BackendProcessManager
 import dev.faktor.backend.DaemonBinary
+import dev.faktor.backend.LiveOutputMessage
+import dev.faktor.backend.LiveSnapshot
 import dev.faktor.backend.NativeClient
 import dev.faktor.backend.NativeEventStream
+import dev.faktor.backend.NativeLiveOutputStream
 import dev.faktor.backend.NativeSseEvent
 import dev.faktor.backend.ProtocolBlocked
 import dev.faktor.backend.ServeReuse
@@ -100,6 +103,16 @@ class FaktorFrontendService(
         fun onStreamStatus(status: String, detail: String?) {}
         fun onStreamBlocked(block: ProtocolBlocked) {}
         fun onEvent(event: NativeSseEvent) {}
+        /** Live model-output (chunk/snapshot/turn/resync) delivery. */
+        fun onLiveMessage(message: LiveOutputMessage) {}
+        fun onLiveStatus(status: String, detail: String?) {}
+        /**
+         * Live-transport diagnostics. Kept separate from [onError] so an
+         * older daemon that does not serve `/live/output` (a typed
+         * `unavailable`) never pollutes the conversation transcript; the
+         * durable journal remains the visible path.
+         */
+        fun onLiveError(message: String) {}
         fun onError(message: String) {}
     }
 
@@ -119,6 +132,12 @@ class FaktorFrontendService(
     private var client: NativeClient? = null
 
     private var stream: NativeEventStream? = null
+
+    /** The live model-output subscription (snapshot-first per-token stream). */
+    private var liveStream: NativeLiveOutputStream? = null
+
+    /** The session id the current live subscription belongs to. */
+    private var liveSessionId: String? = null
 
     /** Stops an externally adopted connection (test/embedding hook). */
     private var externalStop: (() -> Unit)? = null
@@ -347,6 +366,7 @@ class FaktorFrontendService(
         var toStop: Pair<BackendProcessManager, BackendConnection>? = null
         var adoptedStop: (() -> Unit)? = null
         var streamToStop: NativeEventStream? = null
+        var liveToStop: NativeLiveOutputStream? = null
         var wasConnected = false
         synchronized(lifecycleLock) {
             stopRequested = true
@@ -354,6 +374,9 @@ class FaktorFrontendService(
             streamEpoch += 1
             streamToStop = stream
             stream = null
+            liveToStop = liveStream
+            liveStream = null
+            liveSessionId = null
             sessionId = null
             val mgr = manager
             val owned = ownedConnection
@@ -372,6 +395,7 @@ class FaktorFrontendService(
         }
         // The stream join is bounded but can still take up to 1 s: never hold
         // the lifecycle lock (the EDT reads it via isRunning/daemonDescription).
+        liveToStop?.stop()
         streamToStop?.stop()
         val stopPair = toStop
         val external = adoptedStop
@@ -844,6 +868,8 @@ class FaktorFrontendService(
      * replay from the beginning). Events are delivered to the listener.
      */
     fun watchSession(id: String, cursor: Long = 0) {
+        // A session switch invalidates the old live lineage.
+        stopLiveOutput()
         val epoch: Long
         val previous: NativeEventStream?
         val s: NativeEventStream
@@ -884,6 +910,7 @@ class FaktorFrontendService(
             current
         }
         s?.stop()
+        stopLiveOutput()
     }
 
     fun streamCursor(): Long = synchronized(lifecycleLock) { stream?.cursor ?: 0L }
@@ -901,6 +928,76 @@ class FaktorFrontendService(
     /** The recovery affordances of a blocked stream (empty when healthy). */
     fun streamRecovery(): List<String> =
         synchronized(lifecycleLock) { stream?.blocked?.recovery ?: emptyList() }
+
+    /**
+     * (Re)starts the live model-output subscription for [id]. Call BEFORE a
+     * prompt POST (subscribe-before-submit): the FIRST frame is the handshake
+     * snapshot carrying the exact sequence watermark, so a fast reply cannot
+     * outrun the listener. Idempotent: a previous subscription is stopped.
+     */
+    fun watchLiveOutput(id: String? = null, awaitHandshakeMs: Long = 0L) {
+        val target = id ?: sessionId ?: return
+        val epoch: Long
+        val previous: NativeLiveOutputStream?
+        val created: NativeLiveOutputStream
+        var createdNew = false
+        synchronized(lifecycleLock) {
+            val existing = liveStream
+            if (existing != null && liveSessionId == target) {
+                // A queued follow-up in the SAME session reuses the live
+                // subscription; restarting it would discard the handshake.
+                created = existing
+                epoch = streamEpoch
+                previous = null
+            } else {
+                val backendConnection = connection ?: throw BackendException("daemon is not running")
+                val snapshotClient = client ?: throw BackendException("daemon is not running")
+                sessionId = target
+                streamEpoch += 1
+                epoch = streamEpoch
+                previous = liveStream
+                liveSessionId = target
+                created = NativeLiveOutputStream.forConnection(
+                    backendConnection,
+                    target,
+                    snapshotClient,
+                    onMessage = { message -> listener?.onLiveMessage(message) },
+                    onStatus = { status, detail -> listener?.onLiveStatus(status, detail) },
+                    onError = { e -> listener?.onLiveError(e.message ?: e.javaClass.simpleName) }
+                )
+                liveStream = created
+                createdNew = true
+            }
+        }
+        previous?.stop()
+        if (createdNew) {
+            synchronized(lifecycleLock) {
+                if (streamEpoch == epoch && liveStream === created) created.start()
+            }
+        }
+        // Subscribe-before-submit: the caller may wait (bounded) for the
+        // handshake snapshot, so the daemon subscribed at its exact sequence
+        // watermark before the prompt POST. A typed `unavailable` (older
+        // daemon / 404) releases the wait immediately.
+        if (awaitHandshakeMs > 0) created.awaitHandshake(awaitHandshakeMs)
+    }
+
+    /** Stops the live subscription (session switch, daemon stop, shutdown). */
+    fun stopLiveOutput() {
+        val current = synchronized(lifecycleLock) {
+            streamEpoch += 1
+            val existing = liveStream
+            liveStream = null
+            liveSessionId = null
+            existing
+        }
+        current?.stop()
+    }
+
+    /** The authoritative live-part snapshot behind an explicit resync. */
+    fun liveSnapshot(): LiveSnapshot = clientOrThrow().liveSnapshot(requireSession())
+
+    fun liveOutputStatus(): String = synchronized(lifecycleLock) { liveStream?.status ?: "off" }
 
     // ------------------------------------------------------------- internals
 

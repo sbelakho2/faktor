@@ -225,6 +225,14 @@ internal class TranscriptModel {
 
     private fun liveKey(messageId: Long, kind: String): String = "$messageId:$kind"
 
+    /** Bounded part lineages: the oldest part is evicted past the cap. */
+    private fun boundLiveParts() {
+        while (liveParts.size > MAX_LIVE_PARTS) {
+            val oldest = liveParts.keys.firstOrNull() ?: break
+            liveParts.remove(oldest)
+        }
+    }
+
     /** The durable floor of a part: the saved message text (reasoning has none). */
     private fun durableFloor(messageId: Long, kind: String): String {
         if (kind != "text") return ""
@@ -255,6 +263,11 @@ internal class TranscriptModel {
             liveTools[toolKey] = LiveToolSegment(
                 frame.messageId, kind, frame.sequence, frame.content
             )
+            // Bounded: a hostile tool-frame flood evicts the oldest rows.
+            while (liveTools.size > MAX_LIVE_TOOL_ROWS) {
+                val oldest = liveTools.keys.firstOrNull() ?: break
+                liveTools.remove(oldest)
+            }
             return true
         }
         val key = liveKey(frame.messageId, kind)
@@ -273,6 +286,7 @@ internal class TranscriptModel {
                 sequence = frame.sequence
             )
             liveParts[key] = part
+            boundLiveParts()
         }
         if (part.attempt != null && part.attempt != frame.attempt) {
             // Lineage epoch changed (a snapshot rebase): one resync, never a
@@ -347,6 +361,7 @@ internal class TranscriptModel {
                         part.messageId, kind, snapText, snapBytes,
                         part.attempt, part.revision, snapshot.sequence
                     )
+                    boundLiveParts()
                 }
                 continue
             }
@@ -473,6 +488,10 @@ internal class TranscriptModel {
         private const val LIVE_ROW_SEQ_BASE = Long.MAX_VALUE / 2
 
         const val LIVE_TOOL_KIND = "lt"
+
+        /** Hard bounds of the part-keyed live overlay (bounded everything). */
+        const val MAX_LIVE_PARTS = 512
+        const val MAX_LIVE_TOOL_ROWS = 256
     }
 
     /** The ordered rows (durable first by seq, provisional last). */
