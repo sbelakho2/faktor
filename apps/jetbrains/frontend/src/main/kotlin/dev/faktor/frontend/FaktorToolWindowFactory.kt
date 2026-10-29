@@ -8,9 +8,17 @@
 // Daemon resolution is MACHINE-scoped only (FaktorDaemonSettings ->
 // DaemonBinary): the application-level Faktor binary path, FAKTOR_BIN or the
 // app-level signed install layout (~/.faktor/install). A project/repository
-// target/ build is never consulted. The daemon starts ONLY on the explicit
-// "Start service" action, and that action resolves (with "Locate daemon…"
-// on a miss) and reports the exact executable before spawning.
+// target/ build is never consulted.
+//
+// Lifecycle (trusted-install parity with the VS Code supervisor): the window
+// lifecycle start below auto-starts ONLY a checksum-verified executable
+// inside the trusted install root — adopting a live serve.lock holder
+// through the daemon's reuse contract instead of spawning a competitor.
+// Every other authority state (missing binary, checksum mismatch,
+// unverified bytes, a binary outside the trusted root) surfaces TYPED and
+// waits for the explicit "Start service" action, which resolves (with
+// "Locate daemon…" on a miss), reports the exact executable and requires an
+// operator confirmation for anything unverified.
 package dev.faktor.frontend
 
 import com.intellij.openapi.Disposable
@@ -69,9 +77,14 @@ class FaktorToolWindowFactory : ToolWindowFactory {
             }
         )
         toolWindow.contentManager.addContent(content)
-        // NO automatic daemon start: the daemon starts only on the explicit
-        // "Start service" action (the resolver below then reports the
-        // resolved executable and refuses anything unverified).
+        // NO automatic daemon start from the composer, a send or any other
+        // user action, and never for an untrusted binary. The window
+        // LIFECYCLE hook below starts (or serve.lock-adopts) only a
+        // checksum-verified executable inside the trusted install root — the
+        // VS Code supervisor parity — off the EDT, with every other
+        // authority state typed and waiting for the explicit
+        // "Start service" action.
+        startLifecycleAutoStart(service, panel)
     }
 
     companion object {
@@ -105,6 +118,51 @@ class FaktorToolWindowFactory : ToolWindowFactory {
             val env = System.getenv("FAKTOR_DATA_DIR")
             if (!env.isNullOrBlank()) return Paths.get(env)
             return Paths.get(System.getProperty("user.home"), ".faktor")
+        }
+
+        /** The dialog-free machine resolution (auto-start never prompts). */
+        fun resolveQuiet(): DaemonBinary.Resolution =
+            DaemonBinary.resolve(
+                FaktorDaemonSettings.applicationBinaryPath(),
+                Paths.get(System.getProperty("user.home", "."))
+            )
+
+        /**
+         * The tool-window lifecycle auto-start: one daemon thread runs the
+         * trusted-install policy against the REAL service (adoption first,
+         * then the verified spawn) and surfaces the typed result on the
+         * panel. [resolve]/[trustedRoot]/[service]/[panel] are injectable so
+         * the shipped adapter seam is testable without a showing IDE.
+         */
+        internal fun startLifecycleAutoStart(
+            service: FaktorFrontendService,
+            panel: FaktorChatPanel,
+            resolve: () -> DaemonBinary.Resolution = { resolveQuiet() },
+            trustedRoot: Path = DaemonBinary.trustedInstallRoot(
+                Paths.get(System.getProperty("user.home", "."))
+            ),
+            trustOf: (Path) -> DaemonBinary.Trust = { DaemonBinary.checksumTrust(it) }
+        ) {
+            val thread = Thread(
+                {
+                    val outcome = ToolWindowAutoStart.lifecycleAutoStart(
+                        service, resolve, trustedRoot, trustOf
+                    )
+                    if (outcome.started) {
+                        panel.hostLifecycleStarted(
+                            outcome.version ?: "unknown", outcome.adopted
+                        )
+                    } else {
+                        panel.hostLifecycleRefused(
+                            outcome.refusalKind ?: ToolWindowAutoStart.KIND_STARTUP_FAILED,
+                            outcome.refusalDetail ?: ""
+                        )
+                    }
+                },
+                "faktor-lifecycle-autostart"
+            )
+            thread.isDaemon = true
+            thread.start()
         }
     }
 }

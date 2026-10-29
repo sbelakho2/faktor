@@ -18,13 +18,11 @@ package dev.faktor.frontend
 
 import dev.faktor.backend.NativeSseEvent
 import dev.faktor.backend.ProtocolBlocked
-import dev.faktor.shared.JsonValue
 import dev.faktor.shared.MicroMoney
 import dev.faktor.shared.NativeAgent
 import dev.faktor.shared.NativeApiException
 import dev.faktor.shared.NativeCompletionContract
 import dev.faktor.shared.NativeContractRows
-import dev.faktor.shared.NativeMessage
 import dev.faktor.shared.NativeModelInfo
 import dev.faktor.shared.NativePermissionEntry
 import dev.faktor.shared.NativePermissionReplyRefusal
@@ -596,7 +594,13 @@ class FaktorChatPanel(
 
     private var utilityShown = false
 
-    private var renderedSeq: Long = 0
+    /**
+     * The durable transcript rows: id-keyed with ordered indices and a
+     * content-revision guard (see [TranscriptModel]). The durable seq
+     * decides ORDERING only — it never gates whether an existing row's
+     * content may update (the P0 "permanently incomplete reply" defect).
+     */
+    private val transcriptModel = TranscriptModel()
 
     private var currentTree: TaskTreeModel? = null
 
@@ -3009,8 +3013,10 @@ class FaktorChatPanel(
 
             override fun onReconnect() {
                 runAsync("reconnect stream") {
-                    val cursor = service.reconnectStream()
-                    onEdt { appendSystem("stream reconnected at cursor ${cursor ?: 0}") }
+                    service.reconnectStream()
+                    // The journal cursor is a Diagnostics detail (the
+                    // connection readout), never ordinary transcript copy.
+                    onEdt { appendSystem("Live updates reconnected") }
                     refreshHistoryBlocking()
                 }
             }
@@ -3166,8 +3172,11 @@ class FaktorChatPanel(
                     if (input.text.trim() == pending.text) {
                         input.text = ""
                     }
-                    appendUser(pending.text)
-                    appendSystem("turn ${receipt.opId} accepted (queued=${receipt.queued})")
+                    // The optimistic user line carries the logical submission
+                    // id: the durable twin reconciles with it by identity
+                    // (one row, never two).
+                    appendUser(pending.submissionId, pending.text)
+                    appendSystem("message accepted (queued=${receipt.queued})")
                 }
                 // The plain Ask path refreshes ONLY the conversation surface:
                 // no task-run, proof, verification, repo/index, usage or
@@ -3582,12 +3591,26 @@ class FaktorChatPanel(
         onEdt {
             if (service.currentSessionId() != sessionAtRead) return@onEdt
             navigator.setMessages(page.messages)
-            val fresh = page.messages.filter { it.seq > renderedSeq }.sortedBy { it.seq }
-            for (message in fresh) {
-                renderedSeq = maxOf(renderedSeq, message.seq)
-                appendMessage(message)
+            // Upsert by stable id + content revision: a message first seen
+            // empty/partial still receives its later content (same seq), an
+            // out-of-order arrival lands at its seq position, and the
+            // optimistic user row reconciles with its durable twin by
+            // identity instead of duplicating.
+            val ops = transcriptModel.upsertDurable(page.messages) { key ->
+                transcriptSink.locatedRow(key.render())
             }
-            // ONE document insert for the whole page's fresh rows.
+            for (op in ops) {
+                when (op) {
+                    is TranscriptRowOp.Upsert -> transcriptSink.upsertRow(
+                        op.key.render(), op.line + "\n", op.beforeKey?.render()
+                    )
+                    is TranscriptRowOp.Rekey -> transcriptSink.rekeyRow(
+                        op.key.render(), op.newKey.render(), op.line + "\n", op.beforeKey?.render()
+                    )
+                }
+            }
+            // ONE document insert for a pure append batch; row updates edit
+            // their exact ranges.
             transcriptSink.flush()
         }
     }
@@ -4430,12 +4453,9 @@ class FaktorChatPanel(
         }
     }
 
-    private fun appendMessage(message: NativeMessage) {
-        transcriptSink.appendMessage(message.role, message.text, message.seq)
-    }
-
     private fun jumpToTranscript(seq: Long) {
-        val range = transcriptSink.offsetOf(seq)
+        val key = transcriptModel.keyForSeq(seq)
+        val range = key?.let { transcriptSink.rowOffset(it.render()) }
         if (range == null) {
             appendSystem("message #$seq is outside the retained transcript window")
             return
@@ -4517,7 +4537,7 @@ class FaktorChatPanel(
                 StreamRecoveryState.PAUSED,
                 "${block.kind} at cursor ${block.cursor}: ${block.detail}"
             )
-            appendSystem("stream blocked (${block.kind}) at cursor ${block.cursor}: ${block.detail}")
+            appendSystem("Live updates paused: ${block.detail}")
             appendSystem("recovery: ${block.recovery.joinToString(" / ")}")
         }
     }
@@ -4535,8 +4555,10 @@ class FaktorChatPanel(
      * ONE EDT render pass for a coalesced batch: stale-session frames and
      * replayed cursors are dropped, only durable milestones are written to
      * the transcript (routine model chunks stay off the screen-reader
-     * channel), the whole batch is ONE document insert, and the slow
-     * surfaces refresh at their own bounded cadence.
+     * channel) as HUMAN-READABLE status lines — the wire kind and journal
+     * id land in the Diagnostics details surface, never as raw transcript
+     * copy — the batch is applied, and the slow surfaces refresh at their
+     * own bounded cadence.
      */
     private fun applyStreamBatch(batch: List<StreamDelta>) {
         val session = service.currentSessionId()
@@ -4557,10 +4579,15 @@ class FaktorChatPanel(
         }
         if (accepted == 0) return
         for (delta in notable.takeLast(MAX_NOTABLE_EVENTS_PER_FLUSH)) {
-            transcriptSink.append(
-                "[faktor] [${delta.event.event}] id=${delta.event.id} " +
-                    eventSummary(delta.event.data) + "\n"
-            )
+            val copy = milestoneCopy(delta.event.event)
+            transcriptSink.append(copy + "\n")
+            // The raw wire kind + journal id stay reachable in the details
+            // surface, never in the ordinary transcript copy.
+            onEdt {
+                diagnosticsPanel.setStreamMilestone(
+                    copy, delta.event.event, delta.event.id
+                )
+            }
         }
         transcriptSink.flush()
         scheduleStatusRefresh()
@@ -4577,16 +4604,6 @@ class FaktorChatPanel(
 
     override fun onError(message: String) {
         onEdt { appendSystem("error: $message") }
-    }
-
-    private fun eventSummary(data: JsonValue): String {
-        val obj = data as? JsonValue.Obj ?: return ""
-        val state = (obj.fields["state"] as? JsonValue.Str)?.value
-        val kind = (obj.fields["kind"] as? JsonValue.Str)?.value
-        val parts = ArrayList<String>()
-        if (kind != null) parts.add("kind=$kind")
-        if (state != null) parts.add("state=$state")
-        return parts.joinToString(" ")
     }
 
     /**
@@ -4650,6 +4667,40 @@ class FaktorChatPanel(
         controlWorker.shutdownNow()
     }
 
+    // ------------------------------------------------ tool-window lifecycle
+
+    /**
+     * The tool-window lifecycle auto-start result (the host adapter seam,
+     * called by the factory's trusted-install hook off the EDT): a
+     * started/adopted service enables the same controls as the explicit
+     * "Start service" action and surfaces the exact version; it never
+     * fabricates a session. The panel itself never starts the daemon.
+     */
+    internal fun hostLifecycleStarted(version: String, adopted: Boolean) {
+        onEdt {
+            setControlsEnabled(true)
+            diagnosticsPanel.setReadiness("ready", "version $version")
+            if (adopted) {
+                appendSystem("Connected to the running Faktor service (version $version)")
+            } else {
+                appendSystem("daemon ready: version $version")
+            }
+            ensureEdition5SessionPanelsLoaded()
+        }
+    }
+
+    /**
+     * A typed auto-start refusal surfaces in Diagnostics and the transcript
+     * (human copy; the machine kind stays in the readiness detail) and
+     * leaves the explicit "Start service" action as the only start path.
+     */
+    internal fun hostLifecycleRefused(kind: String, detail: String) {
+        onEdt {
+            diagnosticsPanel.setReadiness("auto-start refused", "$kind · $detail")
+            appendSystem(autoStartRefusalCopy(kind, detail))
+        }
+    }
+
     /** One synchronous credential-watch poll (internal smoke hook). */
     internal fun pollControlPlaneWatcherOnce(): Boolean =
         controlPlaneWatcher?.pollOnce() ?: false
@@ -4679,6 +4730,30 @@ class FaktorChatPanel(
 
     /** Frames waiting for the next coalesced flush. */
     internal fun pendingStreamDeltasForTest(): Int = streamPump.pending
+
+    /**
+     * One durable-message refresh, drained to the EDT before returning
+     * (deterministic transcript-upsert seam; production goes through the
+     * worker + cadence timers).
+     */
+    internal fun refreshMessagesForTest() {
+        if (!service.isRunning() || service.currentSessionId() == null) return
+        if (SwingUtilities.isEventDispatchThread()) {
+            refreshMessagesBlocking()
+            return
+        }
+        refreshMessagesBlocking()
+        SwingUtilities.invokeAndWait { }
+    }
+
+    /** The durable transcript model's stale-snapshot refusals (seam). */
+    internal fun transcriptRevisionGuardHitsForTest(): Long =
+        onEdtValue { transcriptModel.revisionGuardHits }
+
+    /** The rendered transcript row keys in document order (seam). */
+    internal fun transcriptRowKeysForTest(): List<String> = onEdtValue {
+        transcriptModel.rows().map { it.key.render() }
+    }
 
     /**
      * Flush queued stream frames synchronously on the EDT (deterministic
@@ -5086,6 +5161,9 @@ class FaktorChatPanel(
     /** The Diagnostics readiness value as the panel renders it. */
     internal fun diagnosticsReadinessForTest(): String = diagnosticsPanel.readinessText()
 
+    /** The last-milestone detail row (raw kind + journal id live here). */
+    internal fun diagnosticsMilestoneForTest(): String = diagnosticsPanel.milestoneText()
+
     internal fun taskTreeView(): TaskTreePanel = treePanel
 
     internal fun blockersView(): BlockersPanel = blockersPanel
@@ -5323,8 +5401,20 @@ class FaktorChatPanel(
         appendTranscript("[faktor] " + text + "\n")
     }
 
-    private fun appendUser(text: String) {
-        appendTranscript("you: " + text + "\n")
+    /**
+     * The optimistic user row: rendered immediately under its logical
+     * submission id; the durable message with the same text reconciles into
+     * this exact row (see [TranscriptModel.upsertDurable]).
+     */
+    private fun appendUser(submissionId: String, text: String) {
+        onEdt {
+            transcriptModel.addProvisional(submissionId, text)?.let { op ->
+                if (op is TranscriptRowOp.Upsert) {
+                    transcriptSink.upsertRow(op.key.render(), op.line + "\n", op.beforeKey?.render())
+                }
+            }
+            transcriptSink.flush()
+        }
     }
 
     private fun appendTranscript(text: String) {
@@ -5369,8 +5459,8 @@ class FaktorChatPanel(
     /**
      * Clears every per-session durable view on a session switch: message
      * seqs are per-session (a new session restarts below the previous max),
-     * so a stale `renderedSeq` filtered every new message out while the old
-     * transcript text stayed visible.
+     * so the transcript model resets with the sink — a stale row map could
+     * otherwise reorder or suppress the new session's rows.
      */
     private fun resetSessionView() {
         onEdt {
@@ -5384,7 +5474,7 @@ class FaktorChatPanel(
             refreshDelayTimer.stop()
             lastAppliedEventSeq = 0L
             transcriptSink.reset()
-            renderedSeq = 0
+            transcriptModel.reset()
             boardPanel.reset()
             navigator.resetSessionView()
             currentTree = null
@@ -5552,6 +5642,54 @@ object FaktorFrontendApp {
             panel.startDaemon()
         }
     }
+}
+
+/**
+ * The human-readable transcript line of one durable stream milestone. The
+ * raw wire kind and journal id never render here: they land in the
+ * Diagnostics details surface ([DiagnosticsPanel.setStreamMilestone]).
+ * Unmapped kinds degrade to a calm generic status — wire identifiers are
+ * never echoed into ordinary user-visible copy.
+ */
+internal fun milestoneCopy(kind: String): String = when (kind) {
+    "turn_completed" -> "Turn completed"
+    "session_ended" -> "Conversation ended"
+    "suspended" -> "Streaming paused"
+    "resumed" -> "Streaming resumed"
+    "failed" -> "The run failed"
+    "permission_granted" -> "Permission granted"
+    "permission_denied" -> "Permission denied"
+    "permission_expired" -> "The permission request expired"
+    "subagent_completed" -> "A delegated task finished"
+    "tool_cancelled" -> "A tool call was cancelled"
+    "context_compacted" -> "Older context was compacted"
+    "compact_rejected" -> "Context compaction was refused"
+    "replay_started" -> "Reconnecting…"
+    "crash_detected" -> "Recovered from an interruption"
+    "recovery_applied" -> "Recovery applied"
+    else -> "Live update"
+}
+
+/**
+ * The human transcript line of one typed auto-start refusal (the tool-window
+ * lifecycle hook); the machine kind stays in the Diagnostics readiness
+ * detail. Every refusal names the explicit "Start service" recovery.
+ */
+internal fun autoStartRefusalCopy(kind: String, detail: String): String = when (kind) {
+    "binary_missing" ->
+        "The Faktor service is not installed on this machine; " +
+            "use Start service to locate the daemon."
+    "outside_trusted_install" ->
+        "The configured daemon is outside the trusted Faktor install, " +
+            "so it was not started automatically; use Start service to review and start it."
+    "trust_unverified" ->
+        "The daemon has no recorded checksum, so it was not started automatically; " +
+            "use Start service to confirm it."
+    "trust_refused" ->
+        "The daemon failed its checksum verification and was not started; " +
+            "use Start service to review the install."
+    "startup_failed" -> "The service did not start: $detail"
+    else -> "The service was not started automatically: $detail"
 }
 
 /**

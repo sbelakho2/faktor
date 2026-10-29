@@ -1100,13 +1100,14 @@ object FrontendSmoke {
         }
 
         step("I06: opening the tool window never starts the daemon implicitly") {
-            // Adversarial pin (VAL-HOST-5 / PROH-06 / F01 guard): the tool
-            // window content path only CONSTRUCTS the service + panel
-            // (FaktorToolWindowFactory createToolWindowContent does exactly
-            // that; the kotlinc smoke compiles without the IntelliJ-platform
-            // factory class). The resolver below is the service's start path:
-            // any future implicit start during/after panel construction
-            // resolves the daemon and fails this test.
+            // Adversarial pin (VAL-HOST-5 / PROH-06 / F01 guard): the panel
+            // construction path only CONSTRUCTS the service + panel and the
+            // resolver below is the service's start path: any implicit start
+            // during/after panel construction resolves the daemon and fails
+            // this test. The factory's separate window-LIFECYCLE hook is the
+            // ONLY auto-start, and only for a checksum-verified executable
+            // inside the trusted install root — pinned by
+            // ToolWindowAutoStartTest (policy matrix + the factory adapter).
             val startCalls = java.util.concurrent.atomic.AtomicInteger(0)
             val service = FaktorFrontendService(
                 { startCalls.incrementAndGet(); Paths.get("unused-binary") },

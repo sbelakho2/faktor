@@ -11,6 +11,7 @@
 package dev.faktor.frontend
 
 import dev.faktor.backend.BackendConnection
+import dev.faktor.backend.BackendEndpoint
 import dev.faktor.backend.BackendException
 import dev.faktor.backend.BackendProcessManager
 import dev.faktor.backend.DaemonBinary
@@ -18,6 +19,7 @@ import dev.faktor.backend.NativeClient
 import dev.faktor.backend.NativeEventStream
 import dev.faktor.backend.NativeSseEvent
 import dev.faktor.backend.ProtocolBlocked
+import dev.faktor.backend.ServeReuse
 import dev.faktor.shared.NativeAbortAck
 import dev.faktor.shared.NativeAgent
 import dev.faktor.shared.NativeAgentControlAck
@@ -108,7 +110,11 @@ class FaktorFrontendService(
 
     private var manager: BackendProcessManager? = null
 
-    private var connection: BackendConnection? = null
+    /** The live endpoint (spawned child or adopted serve.lock holder). */
+    private var connection: BackendEndpoint? = null
+
+    /** The SPAWNED child connection (null for an adopted daemon). */
+    private var ownedConnection: BackendConnection? = null
 
     private var client: NativeClient? = null
 
@@ -140,6 +146,14 @@ class FaktorFrontendService(
      */
     @Volatile
     private var lastBinaryTrust: BinaryTrust? = null
+
+    /**
+     * True when the last successful [start] ADOPTED the live serve.lock
+     * holder instead of spawning a child (the daemon's reuse contract).
+     */
+    @Volatile
+    var lastStartAdopted: Boolean = false
+        private set
 
     /** Bumped by every stop; an attach that began before it is aborted. */
     private var stopGeneration = 0L
@@ -256,6 +270,12 @@ class FaktorFrontendService(
                 )
             }
         }
+        // The daemon's reuse contract: a live serve.lock holder already owns
+        // this data dir (an IDE reload, a second window). ADOPT it — health
+        // checked, readiness-polled, no child spawned — instead of racing a
+        // competitor (a duplicate serve refuses typed and exits).
+        val adopted = adoptServingDaemon()
+        if (adopted != null) return adopted
         // Resolve on the explicit start action only: a missing daemon or a
         // workspace/target path can never reach the spawn, and the resolved
         // path is reported before anything starts.
@@ -292,7 +312,9 @@ class FaktorFrontendService(
                 } else {
                     manager = mgr
                     connection = backendConnection
+                    ownedConnection = backendConnection
                     client = cl
+                    lastStartAdopted = false
                     FaktorConnectionRegistry.register(backendConnection, controlToken)
                 }
             }
@@ -325,6 +347,7 @@ class FaktorFrontendService(
         var toStop: Pair<BackendProcessManager, BackendConnection>? = null
         var adoptedStop: (() -> Unit)? = null
         var streamToStop: NativeEventStream? = null
+        var wasConnected = false
         synchronized(lifecycleLock) {
             stopRequested = true
             stopGeneration += 1
@@ -333,13 +356,15 @@ class FaktorFrontendService(
             stream = null
             sessionId = null
             val mgr = manager
-            val conn = connection
+            val owned = ownedConnection
+            wasConnected = client != null || connection != null
             manager = null
             connection = null
+            ownedConnection = null
             client = null
             FaktorConnectionRegistry.register(null, null)
-            if (mgr != null && conn != null) {
-                toStop = Pair(mgr, conn)
+            if (mgr != null && owned != null) {
+                toStop = Pair(mgr, owned)
             } else {
                 adoptedStop = externalStop
                 externalStop = null
@@ -352,22 +377,24 @@ class FaktorFrontendService(
         val external = adoptedStop
         if (stopPair != null) {
             stopPair.first.stop(stopPair.second)
-            listener?.onDaemonStatus("stopped", null)
         } else if (external != null) {
             external()
+        }
+        if (stopPair != null || external != null || wasConnected) {
             listener?.onDaemonStatus("stopped", null)
         }
     }
 
     /**
-     * Adopts an ALREADY-RUNNING daemon connection (test/embedding hook): no
-     * child process is owned unless [stopAction] says how to stop it. The
-     * connection is health-checked and readiness-polled exactly like
-     * [start], so an adopted fake/remote daemon cannot silently bypass the
-     * contract. Restarting an adopted connection requires a real [start].
+     * Adopts an ALREADY-RUNNING daemon connection (the serve.lock reuse
+     * contract, tests and embedders): no child process is owned unless
+     * [stopAction] says how to stop it. The connection is health-checked and
+     * readiness-polled exactly like [start], so an adopted fake/remote
+     * daemon cannot silently bypass the contract. Restarting an adopted
+     * connection requires a real [start].
      */
     fun attachConnection(
-        backendConnection: BackendConnection,
+        backendConnection: BackendEndpoint,
         stopAction: (() -> Unit)? = null
     ): NativeHealth {
       synchronized(startLock) {
@@ -389,6 +416,7 @@ class FaktorFrontendService(
                 connection = backendConnection
                 client = cl
                 manager = null
+                ownedConnection = null
                 externalStop = stopAction
                 FaktorConnectionRegistry.register(backendConnection, controlToken)
             }
@@ -403,6 +431,33 @@ class FaktorFrontendService(
         )
         return health
       }
+    }
+
+    /**
+     * Adopts the ALREADY-SERVING daemon this data dir records (the
+     * serve.lock/serve.password reuse contract): health-checked and
+     * readiness-polled exactly like [start]; no child process is owned (the
+     * spawn owner keeps it), so [stop] detaches this client only and a later
+     * start may re-adopt. Returns null when the data dir records no LIVE
+     * holder (absent, malformed or stale) — the caller may spawn.
+     */
+    fun adoptServingDaemon(): NativeHealth? {
+        synchronized(startLock) {
+            synchronized(lifecycleLock) {
+                if (client != null) return client!!.health()
+            }
+            val endpoint = ServeReuse.adoptedEndpoint(dataDir) ?: return null
+            if (!endpoint.isAlive()) return null
+            val health = try {
+                attachConnection(endpoint, null)
+            } catch (e: Exception) {
+                // A holder that dies between the probe and the attach is a
+                // stale record: the caller falls back to a fresh spawn.
+                return null
+            }
+            lastStartAdopted = true
+            return health
+        }
     }
 
     /**

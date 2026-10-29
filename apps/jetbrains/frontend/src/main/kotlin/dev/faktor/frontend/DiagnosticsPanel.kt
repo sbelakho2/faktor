@@ -118,6 +118,13 @@ class DiagnosticsPanel : JPanel(BorderLayout()) {
 
     private val streamRow = StatusRow().apply { applyKey("Live updates", "off") }
 
+    /**
+     * The last durable stream milestone: the human copy plus the RAW wire
+     * kind and journal id. This details surface is where internal
+     * identifiers belong — the transcript renders the human line only.
+     */
+    private val milestoneRow = StatusRow().apply { applyKey("Last event", "—") }
+
     private val stateRow = StatusRow().apply { applyKey("State", "—") }
 
     private val modelRow = StatusRow().apply { applyKey("Model", "—") }
@@ -137,8 +144,8 @@ class DiagnosticsPanel : JPanel(BorderLayout()) {
     private val trustRow = StatusRow().apply { applyKey("Trust", "—") }
 
     private val rows = listOf(
-        serviceRow, readinessRow, streamRow, stateRow, modelRow, toolRow,
-        queuedRow, usageRow, verificationRow, filesRow, indexRow, trustRow
+        serviceRow, readinessRow, streamRow, milestoneRow, stateRow, modelRow,
+        toolRow, queuedRow, usageRow, verificationRow, filesRow, indexRow, trustRow
     )
 
     private val restartButton = secondaryButton("Restart service")
@@ -291,6 +298,15 @@ class DiagnosticsPanel : JPanel(BorderLayout()) {
         }
     }
 
+    /**
+     * The last durable stream milestone as [copy] with its raw wire kind and
+     * journal id ([eventSeq]) — the details surface that keeps internal
+     * identifiers off the ordinary transcript.
+     */
+    fun setStreamMilestone(copy: String, kind: String, eventSeq: Long) {
+        milestoneRow.applyKey("Last event", "$copy · $kind · journal event $eventSeq")
+    }
+
     fun setState(text: String) {
         stateRow.apply(text)
     }
@@ -407,6 +423,9 @@ class DiagnosticsPanel : JPanel(BorderLayout()) {
     fun available(): Boolean = available
 
     fun streamText(): String = streamRow.value.fullText
+
+    /** The verbatim last-milestone detail row (smoke assertions). */
+    fun milestoneText(): String = milestoneRow.value.fullText
 
     fun daemonText(): String = serviceRow.value.fullText
 

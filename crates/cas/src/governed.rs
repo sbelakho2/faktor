@@ -56,6 +56,13 @@ impl StorageBackend for CasStorageBackend {
         Ok(out)
     }
 
+    /// The destination volume of a CAS write is the CAS root (blobs stage
+    /// and land beneath it); admission must resolve THAT volume's reserve
+    /// instead of guessing from candidates.
+    fn admission_path(&self, _key: &str) -> Option<std::path::PathBuf> {
+        Some(self.cas.root().to_path_buf())
+    }
+
     fn evict(
         &self,
         _governor: &StorageGovernor,

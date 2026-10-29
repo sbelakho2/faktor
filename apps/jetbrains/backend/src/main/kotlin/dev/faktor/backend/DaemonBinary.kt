@@ -36,6 +36,17 @@ object DaemonBinary {
     /** The app-level install layout root relative to the user home. */
     val INSTALL_RELATIVE: Path = Paths.get(".faktor", "install")
 
+    /** The trusted install root (the app-level signed layout). */
+    fun trustedInstallRoot(home: Path): Path = home.resolve(INSTALL_RELATIVE).normalize()
+
+    /**
+     * True when [executable] resolves INSIDE the trusted install root — the
+     * only location an automatic (unattended) start may execute from. An
+     * explicit operator start may still run a confirmed binary elsewhere.
+     */
+    fun isInsideTrustedInstall(executable: Path, home: Path): Boolean =
+        executable.toAbsolutePath().normalize().startsWith(trustedInstallRoot(home))
+
     /** The stable bootstrap launcher inside the install layout. */
     const val LAUNCHER_NAME = "launcher"
 

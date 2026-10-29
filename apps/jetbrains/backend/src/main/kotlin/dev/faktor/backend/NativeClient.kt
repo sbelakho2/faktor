@@ -199,7 +199,7 @@ class NativeClient(
         private val bodyDeadlineTimer = Timer("faktor-native-body-deadline", true)
 
         fun forConnection(
-            connection: BackendConnection,
+            connection: BackendEndpoint,
             controlToken: String? = null,
             // Submitting a prompt starts real work (candidate prep,
             // verification, integration); the 15 s default read timeout can

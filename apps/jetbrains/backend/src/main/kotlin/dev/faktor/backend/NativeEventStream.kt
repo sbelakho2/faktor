@@ -130,7 +130,7 @@ class NativeEventStream(
         private const val MAX_ERROR_BODY_CHARS = 200
 
         fun forConnection(
-            connection: BackendConnection,
+            connection: BackendEndpoint,
             sessionId: String,
             cursor: Long = 0,
             onEvent: (NativeSseEvent) -> Unit,

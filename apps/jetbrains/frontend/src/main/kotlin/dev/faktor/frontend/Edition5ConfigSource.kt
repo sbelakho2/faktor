@@ -4,7 +4,7 @@
 // "missing daemon contract" inventory reported by the control exercise.
 package dev.faktor.frontend
 
-import dev.faktor.backend.BackendConnection
+import dev.faktor.backend.BackendEndpoint
 import dev.faktor.backend.NativeClient
 import dev.faktor.shared.JsonCodec
 import dev.faktor.shared.NativeApiException
@@ -111,12 +111,12 @@ internal object Edition5Routes {
 internal object FaktorConnectionRegistry {
 
     @Volatile
-    private var connection: BackendConnection? = null
+    private var connection: BackendEndpoint? = null
 
     @Volatile
     private var controlToken: String? = null
 
-    fun register(next: BackendConnection?, token: String?) {
+    fun register(next: BackendEndpoint?, token: String?) {
         connection = next
         controlToken = token
     }

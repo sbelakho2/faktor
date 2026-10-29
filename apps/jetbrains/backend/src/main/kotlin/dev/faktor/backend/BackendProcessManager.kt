@@ -72,6 +72,15 @@ private const val HEALTH_PROBE_TIMEOUT_MS = 2_000L
 private const val ANNOUNCEMENT_VERIFY_MS = 3_000L
 
 /**
+ * The bounded grace after the startup latch trips WITHOUT a parsed line
+ * (process exit / stdout EOF): the drainer may have latched a micro-instant
+ * before parsing the final line, but a DEAD or closed stdout can never
+ * produce one later — the old full-window spin here burned the entire
+ * startup timeout on every early-exit child.
+ */
+private const val STARTUP_EXIT_GRACE_MS = 500L
+
+/**
  * The default retained-output cap of one external command ([runCommand]);
  * the drainer keeps reading past it (discarding) so the child never blocks.
  */
@@ -95,16 +104,16 @@ private const val DRAIN_CHUNK_BYTES = 8 shl 10
  * without a live health-digest match.
  */
 class BackendConnection(
-    val port: Int,
-    val password: String,
+    override val port: Int,
+    override val password: String,
     val process: Process,
     internal val sink: StdoutSink,
     private val releasePid: Long? = null,
     private val announced: ReleasePidHandshake? = null,
     val releaseTrustError: ReleaseTrustFailure? = null
-) {
+) : BackendEndpoint {
     internal fun recentLines(max: Int): List<String> = sink.recentLines(max)
-    val baseUrl: String = "http://127.0.0.1:$port"
+    override val baseUrl: String = "http://127.0.0.1:$port"
 
     @Volatile
     var stopRefusal: ReleaseTrustFailure? = null
@@ -124,7 +133,7 @@ class BackendConnection(
      * (launcher-only child, unresolved pid, resident wrapper) is decided by
      * the health probe — the launcher's exit is never daemon death.
      */
-    fun isAlive(): Boolean {
+    override fun isAlive(): Boolean {
         val pid = releasePid
         if (pid != null && pid > 0 && pid != process.pid() && !pidAlive(pid)) {
             return false
@@ -133,7 +142,7 @@ class BackendConnection(
     }
 
     /** The RELEASE pid when resolved; never a stale launcher pid. */
-    fun pid(): Long = releasePid ?: process.pid()
+    override fun pid(): Long = releasePid ?: process.pid()
 
     private fun healthAlive(): Boolean = try {
         NativeClient(baseUrl, password, timeoutMs = HEALTH_PROBE_TIMEOUT_MS).health().ok
@@ -711,9 +720,13 @@ class StdoutSink(process: Process) {
     fun awaitStartupLine(timeoutMs: Long): Int? {
         val deadline = System.currentTimeMillis() + timeoutMs
         if (!startup.await(timeoutMs, TimeUnit.MILLISECONDS)) return null
-        // The latch may have been tripped by onExit a micro-instant before
-        // the drainer parsed the line; give it a brief chance.
-        while (startupPort == null && System.currentTimeMillis() < deadline) {
+        // The latch may have been tripped by process exit/EOF a micro-instant
+        // before the drainer parsed a final line; give it a BOUNDED grace.
+        // A dead or closed stdout can never produce the line later, so this
+        // never spins the whole startup window on an early-exit child.
+        val grace = System.currentTimeMillis() + STARTUP_EXIT_GRACE_MS
+        val bound = minOf(deadline, grace)
+        while (startupPort == null && System.currentTimeMillis() < bound) {
             try {
                 Thread.sleep(10)
             } catch (e: InterruptedException) {

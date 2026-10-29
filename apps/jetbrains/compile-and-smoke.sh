@@ -264,7 +264,8 @@ $JETBRAINS/shared/src/main/kotlin/dev/faktor/shared/GeneratedProtocolDto.kt"
 BACKEND_SRC="$JETBRAINS/backend/src/main/kotlin/dev/faktor/backend/BackendProcessManager.kt
 $JETBRAINS/backend/src/main/kotlin/dev/faktor/backend/DaemonBinary.kt
 $JETBRAINS/backend/src/main/kotlin/dev/faktor/backend/NativeClient.kt
-$JETBRAINS/backend/src/main/kotlin/dev/faktor/backend/NativeEventStream.kt"
+$JETBRAINS/backend/src/main/kotlin/dev/faktor/backend/NativeEventStream.kt
+$JETBRAINS/backend/src/main/kotlin/dev/faktor/backend/ServeReuse.kt"
 TEST_SRC="$JETBRAINS/backend/src/test/kotlin/dev/faktor/backend/BackendProcessManagerTest.kt
 $JETBRAINS/backend/src/test/kotlin/dev/faktor/backend/NativeClientTest.kt
 $JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/FrontendTestSupport.kt
@@ -321,6 +322,8 @@ $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/DiagnosticsPanel.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/AgentsPanel.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/OverviewPanel.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/VerificationPanel.kt
+$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/TranscriptModel.kt
+$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/ToolWindowAutoStart.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/UiWork.kt"
 
 BIN="${FAKTOR_CLI_BIN:-$ROOT/target/debug/faktor-cli}"

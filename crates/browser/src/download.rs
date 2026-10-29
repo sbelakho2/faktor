@@ -581,10 +581,13 @@ impl DownloadManager {
         let reservation_key = self.reservation_key(&dest_rel);
         let reservation = match self.governor() {
             Some(governor) => {
-                match governor.reserve(
+                match governor.reserve_into(
                     faktor_storage::StorageClass::BrowserStorage,
                     &reservation_key,
                     self.policy.max_bytes,
+                    // The download lands at this exact destination: admission
+                    // must hold THIS volume's reserve, not a pooled guess.
+                    self.root.join(&dest_rel),
                 ) {
                     Ok(reservation) => Some(reservation),
                     Err(error) => {
