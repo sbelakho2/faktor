@@ -1341,6 +1341,10 @@ fn native_r8_routes(router: Router<AppState>) -> Router<AppState> {
             "/native/session/{id}/task-runs/{run_id}/cancel",
             post(native_task_run_cancel),
         )
+        .route(
+            "/native/session/{id}/task-runs/{run_id}/resume",
+            post(native_task_run_resume),
+        )
         // Native binary attachments (additive, strict): upload ONE bounded
         // payload into the session's durable CAS-backed store, resolve ONE
         // reference by its stable `ref_id` (metadata and THAT reference's

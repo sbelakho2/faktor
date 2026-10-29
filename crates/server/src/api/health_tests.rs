@@ -106,6 +106,12 @@ async fn native_health_and_ready_semantics() {
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["ok"], true);
     assert!(body["version"].is_string());
+    // R6 (audit item 17): the additive protocol-capability handshake — a
+    // client degrades coherently instead of assuming an apparently-ready
+    // interface with missing live streaming/attachments/turn state.
+    assert_eq!(body["protocol"]["liveStreaming"], true);
+    assert_eq!(body["protocol"]["attachments"], true);
+    assert_eq!(body["protocol"]["turnState"], true);
     let resp = client
         .get(format!("{base}/native/ready"))
         .bearer_auth(token.as_str())

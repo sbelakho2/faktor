@@ -286,6 +286,14 @@ pub(crate) async fn native_health(State(state): State<AppState>, headers: Header
         "ok": true,
         "version": state.deps.version.clone(),
         "worker_plane": state.deps.worker_plane_health().to_json(),
+        // Additive protocol-capability handshake (audit item 17): a client
+        // that needs live streaming / attachments / turn state degrades
+        // coherently instead of assuming an apparently-ready interface.
+        "protocol": {
+            "liveStreaming": true,
+            "attachments": true,
+            "turnState": true,
+        },
     }))
     .into_response()
 }

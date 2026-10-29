@@ -426,6 +426,27 @@ impl<'a> TurnDriveState<'a> {
     }
 }
 
+/// The conversational overlay (audit policy split): appended for ASK turns
+/// only. The shared base (answer the latest request honestly, preserve prior
+/// decisions, use supplied evidence, state uncertainty, never fabricate
+/// completions or checks) stays identical for both kinds; Task keeps the
+/// engineering protocol verbatim.
+const ASK_POLICY_OVERLAY: &str = "Answer the latest request directly in ordinary prose. Use only read-only tools when they materially improve the answer. Do NOT produce implementation plans, changed-file summaries, or verification rituals unless the user asks for them.";
+
+/// Kind-selected instructions: Task keeps the engineering protocol verbatim
+/// (`Cow::Borrowed`); Ask gets the same base plus the conversational overlay.
+fn ask_or_task_instructions(
+    base: &str,
+    execution: faktor_protocol::ExecutionKind,
+) -> std::borrow::Cow<'_, str> {
+    match execution {
+        faktor_protocol::ExecutionKind::Ask => {
+            std::borrow::Cow::Owned(format!("{base}\n\n{ASK_POLICY_OVERLAY}"))
+        }
+        _ => std::borrow::Cow::Borrowed(base),
+    }
+}
+
 impl AgentRuntime {
     /// The failure-aware context prior gate (unchanged): the prior applies
     /// only when `failure_learning` is on AND a handle was installed.
@@ -873,8 +894,9 @@ impl AgentRuntime {
         // The prior runs inline on this thread and its panics are NOT
         // caught (a prior must be total); hostile VALUES are clamped by
         // the planner's `prior_adjusted_gain`.
+        let turn_instructions = ask_or_task_instructions(&self.deps.instructions, st.execution);
         let baseline_plan = plan_wire_turn_with_prior(
-            &self.deps.instructions,
+            turn_instructions.as_ref(),
             &st.system_extra,
             &tool_bundle.tools,
             &project_rules,
@@ -894,7 +916,7 @@ impl AgentRuntime {
         let focused = match focused_evidence {
             Some(focused) if focused != evidence => {
                 let focused_plan = plan_wire_turn_with_prior(
-                    &self.deps.instructions,
+                    turn_instructions.as_ref(),
                     &st.system_extra,
                     &tool_bundle.tools,
                     &project_rules,
@@ -978,8 +1000,10 @@ impl AgentRuntime {
                     st.provider.as_ref(),
                     st.turn_attachments.as_deref(),
                 )?;
+                let turn_instructions =
+                    ask_or_task_instructions(&self.deps.instructions, st.execution);
                 wire_plan = plan_wire_turn_with_prior(
-                    &self.deps.instructions,
+                    turn_instructions.as_ref(),
                     &st.system_extra,
                     &tool_bundle.tools,
                     &st.project_rules,
@@ -1143,8 +1167,9 @@ impl AgentRuntime {
             // back and REPLACES the pre-route render below — the winner
             // is never tokenized or built twice. The pre-route plan is
             // seeded so the planning model itself is never rebuilt.
+            let turn_instructions = ask_or_task_instructions(&self.deps.instructions, st.execution);
             let candidate_planner = crate::wire_plan::TurnCandidatePlanner::new(
-                &self.deps.instructions,
+                turn_instructions.as_ref(),
                 &st.system_extra,
                 &tool_bundle.tools,
                 &st.project_rules,

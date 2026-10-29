@@ -1003,6 +1003,35 @@ impl TaskExecutor {
     /// are `Conflict` (a cancelled run is never cancelled twice), and a
     /// stale task-row revision (a concurrent verifier won the race) is a
     /// `Conflict` naming the run — retrying is the only forward path.
+    /// Server-facing resume entry: the SAME resume authority as
+    /// [`TaskExecutor::resume_run`] with the documented defaults, hiding the
+    /// feature-gated crash-seam parameter (its cfg is valid only here, in the
+    /// orchestrator crate). Unknown/nothing-to-drive runs are typed
+    /// `NotFound`; an ACTIVE or terminal run is a typed `Conflict`.
+    pub fn resume_run_durable(
+        self: &Arc<Self>,
+        parent: SessionId,
+        run_id: &str,
+        parent_caps: crate::caps::CapabilitySet,
+    ) -> Result<super::TaskRunReceipt, ExecError> {
+        if run_id.is_empty()
+            || run_id.len() > MAX_RUN_ID_CHARS
+            || !run_id.is_ascii()
+            || run_id.contains('/')
+        {
+            return Err(ExecError::NotFound(format!("task run {run_id:?}")));
+        }
+        TaskExecutor::resume_run(
+            self,
+            parent,
+            run_id,
+            crate::runtime::Ceilings::default(),
+            parent_caps,
+            #[cfg(any(test, feature = "fault-injection"))]
+            None,
+        )
+    }
+
     pub fn cancel_run(self: &Arc<Self>, parent: SessionId, run_id: &str) -> Result<(), ExecError> {
         if run_id.is_empty()
             || run_id.len() > MAX_RUN_ID_CHARS

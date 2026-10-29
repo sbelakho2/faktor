@@ -1727,6 +1727,12 @@ pub(crate) struct NativePromptRequestBody {
     /// (`deny_unknown_fields` on each id); never workspace paths.
     #[serde(default)]
     pub attachments: Option<Vec<faktor_core::attachment::AttachmentId>>,
+    /// Per-run model override (parity with the task-run request): the model
+    /// the admitted turn's provider request must use. Shape-validated at the
+    /// wire here; the executor's model resolution refuses an unknown model
+    /// typed, never silently swapping.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 /// The strict shape of the required prompt `submission_id`: the SAME
@@ -1768,16 +1774,25 @@ fn prompt_admission_digest(
     files: &[String],
     execution: faktor_protocol::ExecutionKind,
     attachments: &[faktor_core::attachment::AttachmentId],
+    model: Option<&str>,
 ) -> String {
     let refs: Vec<String> = attachments
         .iter()
         .map(|id| format!("{}:{}", id.digest, id.mime))
         .collect();
+    // The model rides the digest ONLY when present: a no-model body keeps
+    // every legacy domain byte-identical, while a flipped model under one
+    // submission id is a different body (typed KeyReused), never a silent
+    // model swap on replay.
     let base = || {
-        faktor_core::authority::Fields::new()
+        let fields = faktor_core::authority::Fields::new()
             .text(&session.to_string())
             .text(prompt)
-            .list(files)
+            .list(files);
+        match model {
+            Some(model) => fields.text(model),
+            None => fields,
+        }
     };
     match (execution, attachments.is_empty()) {
         (faktor_protocol::ExecutionKind::Task, true) => {
@@ -1882,6 +1897,14 @@ pub(crate) async fn native_prompt(
     if let Err(e) = validate_prompt_submission_id(&req.submission_id) {
         return wire_status(e);
     }
+    if let Some(model) = req.model.as_deref() {
+        if model.trim().is_empty()
+            || model.chars().count() > 200
+            || model.chars().any(char::is_control)
+        {
+            return wire_status(malformed_body("invalid model override"));
+        }
+    }
     // The session must exist, but admission time comes from the manager's
     // MONOTONIC clock (never this handle's wall-clock reading).
     let _handle = match state.deps.session.get_session(sid) {
@@ -1912,7 +1935,14 @@ pub(crate) async fn native_prompt(
         return response;
     }
     let store = state.deps.session.store();
-    let digest = prompt_admission_digest(sid, &req.prompt, &files, req.execution, &attachments);
+    let digest = prompt_admission_digest(
+        sid,
+        &req.prompt,
+        &files,
+        req.execution,
+        &attachments,
+        req.model.as_deref(),
+    );
     let reserved_op = match state.deps.session.try_next_op_id() {
         Ok(op) => op,
         Err(e) => return api_err(&faktor_core::Error::from(e)),
@@ -2007,6 +2037,7 @@ pub(crate) async fn native_prompt(
         files,
         attachments,
         execution: req.execution,
+        model: req.model,
         // The server-level admission IS this path's durable key: the
         // executor is called unkeyed so a prompt key can never alias a
         // task-start key (separate tables, separate semantics). The
@@ -2070,3 +2101,36 @@ pub(crate) async fn native_prompt(
 #[cfg(test)]
 #[path = "session_tests.rs"]
 mod tests;
+
+/// `POST /native/session/{id}/task-runs/{run_id}/resume` — re-attach an
+/// interrupted run through the executor's ONE resume authority
+/// ([`TaskExecutor::resume_run`]): the durable rows re-drive every
+/// non-terminal child from its recorded op and pending control rows apply
+/// exactly once. Unknown runs are typed 404s; an ACTIVE or terminal run
+/// refuses (409 — no double drive, no resurrection). The response converges
+/// through the durable rows (the per-run GET reflects the resumed state).
+pub(crate) async fn native_task_run_resume(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, run_id)): Path<(String, String)>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let handle = match native_resolve_session(&state, &id) {
+        Ok(h) => h,
+        Err(r) => return *r,
+    };
+    match state.deps.tasks.resume_run_durable(
+        handle.id(),
+        &run_id,
+        super::task::native_run_parent_caps(),
+    ) {
+        Ok(_receipt) => Json(serde_json::json!({
+            "run_id": run_id,
+            "resumed": true,
+        }))
+        .into_response(),
+        Err(e) => super::agents::exec_error_response(&e),
+    }
+}

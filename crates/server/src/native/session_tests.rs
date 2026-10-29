@@ -1451,7 +1451,62 @@ async fn prompt_replay_returns_the_stored_receipt_byte_for_byte_with_one_prompt_
     // The key carries exactly ONE completed admission storing the exact
     // response bytes (a claim for any other row would answer Fresh/
     // KeyReused, and the byte compare pins the stored receipt).
-    let digest = prompt_admission_digest(sid, "hi", &[], faktor_protocol::ExecutionKind::Task, &[]);
+    // R2 (audit item 13): the model is part of the admission identity — a
+    // flipped model under one submission id is a DIFFERENT body (typed
+    // KeyReused on replay), never a silent model swap; a no-model body keeps
+    // the legacy digest unchanged.
+    let no_model = prompt_admission_digest(
+        sid,
+        "hi",
+        &[],
+        faktor_protocol::ExecutionKind::Task,
+        &[],
+        None,
+    );
+    let model_a = prompt_admission_digest(
+        sid,
+        "hi",
+        &[],
+        faktor_protocol::ExecutionKind::Task,
+        &[],
+        Some("deepseek/deepseek-chat"),
+    );
+    let model_b = prompt_admission_digest(
+        sid,
+        "hi",
+        &[],
+        faktor_protocol::ExecutionKind::Task,
+        &[],
+        Some("deepseek/deepseek-v4-flash"),
+    );
+    assert_ne!(
+        model_a, model_b,
+        "different models are different admission bodies"
+    );
+    assert_ne!(
+        model_a, no_model,
+        "a model override changes the admission identity"
+    );
+    assert_eq!(
+        model_a,
+        prompt_admission_digest(
+            sid,
+            "hi",
+            &[],
+            faktor_protocol::ExecutionKind::Task,
+            &[],
+            Some("deepseek/deepseek-chat"),
+        ),
+        "the same model replays byte-identically"
+    );
+    let digest = prompt_admission_digest(
+        sid,
+        "hi",
+        &[],
+        faktor_protocol::ExecutionKind::Task,
+        &[],
+        None,
+    );
     assert_eq!(
         store
             .prompt_admission_claim(sid, PROMPT_KEY, &digest, "tx-replay-probe", 0)
@@ -1501,7 +1556,14 @@ async fn prompt_pending_key_with_the_same_body_is_an_in_flight_409_before_any_mu
     let (state, sid) = test_state(dir.path(), "prompt-in-flight");
     let handle = state.deps.session.get_session(sid).unwrap().unwrap();
     let store = state.deps.session.store();
-    let digest = prompt_admission_digest(sid, "hi", &[], faktor_protocol::ExecutionKind::Task, &[]);
+    let digest = prompt_admission_digest(
+        sid,
+        "hi",
+        &[],
+        faktor_protocol::ExecutionKind::Task,
+        &[],
+        None,
+    );
     assert_eq!(
         store
             .prompt_admission_claim(
@@ -1734,8 +1796,14 @@ async fn prompt_crash_after_accepted_prompt_before_receipt_replays_from_facts() 
     let (state, sid) = test_state(dir.path(), "prompt-crash-accepted");
     let handle = state.deps.session.get_session(sid).unwrap().unwrap();
     let prompt = "crash matrix prompt";
-    let digest =
-        prompt_admission_digest(sid, prompt, &[], faktor_protocol::ExecutionKind::Task, &[]);
+    let digest = prompt_admission_digest(
+        sid,
+        prompt,
+        &[],
+        faktor_protocol::ExecutionKind::Task,
+        &[],
+        None,
+    );
     let op = state.deps.session.try_next_op_id().unwrap();
     let reservation = format!("tx-{:016x}", op.raw());
     assert!(state
@@ -1815,6 +1883,7 @@ async fn prompt_crash_after_receipt_completion_replays_stored_bytes() {
         &[],
         faktor_protocol::ExecutionKind::Task,
         &[],
+        None,
     );
     let stored = match state
         .deps
@@ -1850,6 +1919,7 @@ async fn prompt_unlinkable_pending_row_lands_typed_conflict_and_never_executes()
         &[],
         faktor_protocol::ExecutionKind::Task,
         &[],
+        None,
     );
     assert!(state
         .deps
