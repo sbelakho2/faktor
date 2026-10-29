@@ -905,7 +905,7 @@ pub struct AgentRuntime {
     /// builder after construction (the same additive-installer pattern as
     /// [`AgentRuntime::set_receipt_sink`]), so the 30+ literal `AgentDeps`
     /// construction sites stay untouched. Empty (the default) = the
-    /// built-in conversational profile alone; a non-empty value REPLACES it
+    /// built-in conversational profile alone; a non-empty value is APPENDED beneath it (immutable safety prefix first)
     /// (documented precedence in `ask_or_task_instructions`).
     pub(crate) ask_instructions: std::sync::RwLock<String>,
 }

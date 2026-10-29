@@ -46,6 +46,8 @@ mod rust_lex;
 pub mod state;
 pub mod time;
 
+#[cfg(any(test, feature = "test-utils"))]
+pub use crate::design_readiness::apply_design_readiness;
 pub use attachment::{
     validate_filename, validate_mime, AttachmentId, MAX_ATTACHMENTS_PER_TASK, MAX_ATTACHMENT_BYTES,
     MAX_ATTACHMENT_FILENAME_BYTES, MAX_ATTACHMENT_MIME_BYTES,
@@ -95,12 +97,12 @@ pub use contract_compile::{
     MAX_FINDING_DIAGNOSTIC_BYTES, MAX_FINDING_REVISION_BYTES, MAX_FINDING_TEXT_BYTES,
 };
 pub use design_readiness::{
-    apply_design_readiness, audit_compiled_design, contains_design_readiness_marker,
-    design_focus_has_dividend, design_focus_policy, design_focus_should_run, design_focus_terms,
-    is_design_readiness_id, DesignFocusPolicy, DesignReadinessAudit, DesignReadinessFinding,
-    DesignReadinessKind, DESIGN_READINESS_DESCRIPTION_PREFIX, DESIGN_READINESS_ID_PREFIX,
-    MAX_DESIGN_FOCUS_TERMS, MAX_DESIGN_FOCUS_TERM_BYTES, MAX_DESIGN_READINESS_FINDINGS,
-    MIN_DESIGN_FOCUS_DUPLICATED_BYTES, MIN_DESIGN_FOCUS_SAVINGS_TOKENS,
+    audit_compiled_design, contains_design_readiness_marker, design_focus_has_dividend,
+    design_focus_policy, design_focus_should_run, design_focus_terms, is_design_readiness_id,
+    DesignFocusPolicy, DesignReadinessAudit, DesignReadinessFinding, DesignReadinessKind,
+    DESIGN_READINESS_DESCRIPTION_PREFIX, DESIGN_READINESS_ID_PREFIX, MAX_DESIGN_FOCUS_TERMS,
+    MAX_DESIGN_FOCUS_TERM_BYTES, MAX_DESIGN_READINESS_FINDINGS, MIN_DESIGN_FOCUS_DUPLICATED_BYTES,
+    MIN_DESIGN_FOCUS_SAVINGS_TOKENS,
 };
 pub use entitlement::{
     EnforcementHook, ValueEntitlement, ValueEntitlementGate, ValueGate, ValueGateRefusal,

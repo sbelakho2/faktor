@@ -41,6 +41,9 @@ tracing.workspace = true
 tempfile.workspace = true
 
 [dev-dependencies]
+# Design-readiness mutation seam is feature-gated in faktor-core; tests
+# that apply a readiness audit need it.
+faktor-core = { workspace = true, features = ["test-utils"] }
 # Unit tests arm the store's deterministic crash seam (queue windows).
 faktor-store = { workspace = true, features = ["fault-injection"] }
 # Readiness wire probes compile evidence through the real in-memory store.

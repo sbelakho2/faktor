@@ -16,10 +16,11 @@ pub struct Config {
     pub compaction_min_reduction: f64,
     pub compact_at_usage: f64,
     pub instructions: String,
-    /// Optional SECOND instruction profile for Ask (conversational) turns.
-    /// When set, ask turns receive THIS profile (never the engineering task
-    /// protocol); when empty, the agent's built-in conversational profile is
-    /// used. Task turns always receive `instructions`.
+    /// Optional CUSTOM conversational instructions for chat turns. They are
+    /// APPENDED beneath the agent's built-in immutable ask authority prefix
+    /// (safety/effect invariants always come first — this text governs
+    /// style, workflow and domain only) and never replace the engineering
+    /// protocol's counterpart. Task turns always receive `instructions`.
     #[serde(default)]
     pub ask_instructions: String,
     /// Optional machine-scoped `KEY=VALUE` file loaded during boot preflight,

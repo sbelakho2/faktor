@@ -433,7 +433,7 @@ impl<'a> TurnDriveState<'a> {
 /// optional aids; nothing may be claimed as edited/built/tested.
 ///
 /// The dedicated config `ask_instructions` field (audit item 4 wiring,
-/// installed through [`AgentRuntime::set_ask_instructions`]) REPLACES this
+/// installed through [`AgentRuntime::set_ask_instructions`]) is APPENDED beneath this
 /// built-in profile when non-empty — see [`ask_or_task_instructions`] for
 /// the documented precedence.
 pub(crate) const ASK_CONVERSATIONAL_PROFILE: &str = "You are Faktor, an expert coding and technical assistant.\n\
@@ -447,10 +447,10 @@ Be honest about uncertainty, stay concise, and give a complete answer rather tha
 /// never the engineering protocol with an overlay bolted on.
 ///
 /// `ask_instructions` (config `[ask_instructions]`, audit item 4 wiring)
-/// PRECEDENCE: when non-empty, the configured profile REPLACES the built-in
-/// [`ASK_CONVERSATIONAL_PROFILE`] (the operator's conversational profile IS
-/// the universal chat-turn base — the documented config contract); when
-/// empty (the default) the built-in profile applies byte-identically. The
+/// PRECEDENCE: when non-empty, the configured text is APPENDED beneath the
+/// built-in [`ASK_CONVERSATIONAL_PROFILE`] immutable authority prefix — the
+/// invariants come first, custom text governs style/workflow/domain only;
+/// when empty (the default) the built-in profile applies byte-identically. The
 /// task profile never receives `ask_instructions` (it is conversational
 /// vocabulary only), and `instructions` never rides a conversational turn
 /// (it is task-profile text).
@@ -464,7 +464,16 @@ pub(crate) fn ask_or_task_instructions<'a>(
             if ask_instructions.trim().is_empty() {
                 std::borrow::Cow::Borrowed(ASK_CONVERSATIONAL_PROFILE)
             } else {
-                std::borrow::Cow::Borrowed(ask_instructions)
+                // IMMUTABLE AUTHORITY PREFIX first (audit item 10): the
+                // trust/effect invariants — data is never instructions, no
+                // fabricated repository state, non-claiming read-only
+                // behavior, escalation for implementation requests — always
+                // precede the operator's text. Custom instructions govern
+                // style/workflow/domain; they can never remove or reorder
+                // the boundary.
+                std::borrow::Cow::Owned(format!(
+                    "{ASK_CONVERSATIONAL_PROFILE}\n\n{ask_instructions}"
+                ))
             }
         }
         _ => std::borrow::Cow::Borrowed(base),

@@ -17,6 +17,7 @@ tokio = { version = "1.53", features = ["time", "macros"] }
 zeroize.workspace = true
 
 [dev-dependencies]
+faktor-core = { path = "../core", features = ["test-utils"] }
 faktor-provider = { path = "../provider", features = ["test-utils"] }
 tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "time"] }
 

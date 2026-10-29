@@ -33,9 +33,10 @@
 
 use std::collections::{BTreeSet, HashSet};
 
+#[cfg(any(test, feature = "test-utils"))]
+use crate::contract::{ContractOrigin, RiskHypothesis};
 use crate::contract::{
-    ContractOrigin, EngineeringContract, EvidenceBinding, ProofObligation, Requirement,
-    RiskHypothesis, RiskSeverity,
+    EngineeringContract, EvidenceBinding, ProofObligation, Requirement, RiskSeverity,
 };
 use crate::contract_compile::CompiledContract;
 
@@ -535,6 +536,7 @@ pub fn audit_compiled_design(source: &impl DesignReadinessSource) -> DesignReadi
 /// when the pre-audit contract already carried an elevated risk, an elevated
 /// finding may preserve that tier. Application is idempotent per finding
 /// identity/description.
+#[cfg(any(test, feature = "test-utils"))]
 pub fn apply_design_readiness(
     target: &mut impl DesignReadinessTarget,
     audit: &DesignReadinessAudit,
@@ -869,6 +871,7 @@ pub fn contains_design_readiness_marker(text: &str) -> bool {
     false
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 fn has_elevated_risk(contract: &EngineeringContract) -> bool {
     contract
         .risks

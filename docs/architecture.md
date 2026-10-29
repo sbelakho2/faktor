@@ -501,6 +501,19 @@ panics (test-locked).
 - Accepted strategies: `LlmSummary` (weak-but-honest summarizer output is
   rejected when it does not shrink enough) or `DeterministicPruning`
   (task ledger preserved whole; only old recent turns archived).
+
+#### Archive retention (storage-governed)
+
+The compaction archive obeys the same physical-disk truth as everything
+else — there is NO "everything preserved / no total cap" exception:
+
+- all logical compaction state has a durable identity;
+- full archive payloads are retained while policy/quota permits;
+- eviction is explicit, accounted and marked (`[archive evicted: …]`
+  loss markers on the wire; recovery-critical generations are pinned and
+  can never be evicted prematurely);
+- after eviction the digest-bearing identity remains the continuity
+  record (see § storage governor / CAS).
 - Proactive trigger: effective usage (`used / context_max`) ≥
   `compact_at_usage` (default 0.65) before a provider call.
 

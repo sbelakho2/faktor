@@ -14,5 +14,11 @@ tracing.workspace = true
 rand.workspace = true
 tempfile.workspace = true
 
+[features]
+# Test-only mutation seams (design-readiness application). Production
+# builds never compile them — the ephemeral-critic contract forbids wiring
+# contract mutation into a turn path, and the build graph cannot offer it.
+test-utils = []
+
 [lints]
 workspace = true

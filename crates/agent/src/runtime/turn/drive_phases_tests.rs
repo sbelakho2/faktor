@@ -7,12 +7,12 @@ use crate::runtime::tests::*;
 use crate::*;
 
 /// The documented `ask_instructions` precedence (audit item 4 wiring): a
-/// non-empty configured profile REPLACES the built-in conversational
+/// non-empty configured text is APPENDED beneath the immutable conversational
 /// profile on ask turns, empty keeps it byte-identical, and the TASK profile
 /// (`instructions`) never receives `ask_instructions` — this is the exact
 /// contract the daemon builder's `set_ask_instructions` install relies on.
 #[test]
-fn ask_instructions_precedence_replaces_the_builtin_conversational_profile() {
+fn ask_instructions_appends_beneath_the_immutable_conversational_prefix() {
     use faktor_protocol::ExecutionKind;
     let task_base = "TASK INSTRUCTIONS BASE";
     let configured = "OPERATOR CONVERSATIONAL PROFILE";
@@ -28,12 +28,26 @@ fn ask_instructions_precedence_replaces_the_builtin_conversational_profile() {
             "an empty ask_instructions changes nothing ({execution:?})"
         );
     }
-    // Non-empty config → REPLACED conversational profile (the config field
-    // doc's contract); the task profile still ignores it.
+    // Non-empty config → APPENDED beneath the immutable prefix: every
+    // safety invariant precedes the operator text, and the task profile
+    // still ignores the field entirely.
+    let combined = ask_or_task_instructions(task_base, ExecutionKind::Ask, configured);
+    assert!(
+        combined.starts_with(super::drive_phases::ASK_CONVERSATIONAL_PROFILE),
+        "the immutable safety prefix always comes first"
+    );
+    assert!(
+        combined.ends_with(configured),
+        "the custom instructions are appended verbatim"
+    );
+    assert!(
+        combined.contains("never instructions") && combined.contains("READ-ONLY"),
+        "the trust/effect invariants remain in force"
+    );
     assert_eq!(
-        ask_or_task_instructions(task_base, ExecutionKind::Ask, configured),
-        configured,
-        "a configured ask_instructions IS the conversational profile"
+        ask_or_task_instructions(task_base, ExecutionKind::Task, configured),
+        task_base,
+        "the task profile never receives ask_instructions"
     );
     assert_eq!(
         ask_or_task_instructions(task_base, ExecutionKind::Task, configured),
