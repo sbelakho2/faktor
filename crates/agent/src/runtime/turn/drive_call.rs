@@ -766,7 +766,7 @@ impl AgentRuntime {
                         // empty assistant message.
                         if !st.text_buf.is_empty() || !st.reasoning_buf.is_empty() {
                             let mid = self
-                                .ensure_assistant_message(st.handle, &mut st.assistant_message)
+                                .ensure_assistant_message(st.handle, &mut st.assistant_message, st.op_id)
                                 .await?;
                             if !st.text_buf.is_empty() {
                                 st.handle.append_text_part(mid, &st.text_buf).await?;
@@ -799,7 +799,7 @@ impl AgentRuntime {
                                     .await;
                             }
                             st.text_buf.push_str(&text);
-                            let mid = self.ensure_assistant_message(st.handle, &mut st.assistant_message).await?;
+                            let mid = self.ensure_assistant_message(st.handle, &mut st.assistant_message, st.op_id).await?;
                             // The chunk buffer is MOVED to the sink (no copy).
                             self.emit_chunk(st.handle.id(), Some(mid), "text", text);
                             st.iteration_progress = true;
@@ -830,7 +830,7 @@ impl AgentRuntime {
                                     .await;
                             }
                             st.reasoning_buf.push_str(&text);
-                            let mid = self.ensure_assistant_message(st.handle, &mut st.assistant_message).await?;
+                            let mid = self.ensure_assistant_message(st.handle, &mut st.assistant_message, st.op_id).await?;
                             // The chunk buffer is MOVED to the sink (no copy).
                             self.emit_chunk(st.handle.id(), Some(mid), "reasoning", text);
                             st.iteration_progress = true;
@@ -874,7 +874,7 @@ impl AgentRuntime {
                                     )
                                     .await;
                             }
-                            let mid = self.ensure_assistant_message(st.handle, &mut st.assistant_message).await?;
+                            let mid = self.ensure_assistant_message(st.handle, &mut st.assistant_message, st.op_id).await?;
                             st.handle.append_tool_call_part(
                                 mid,
                                 &id,
@@ -1230,7 +1230,7 @@ impl AgentRuntime {
         st: &mut TurnDriveState<'_>,
     ) -> faktor_core::Result<()> {
         let mid = self
-            .ensure_assistant_message(st.handle, &mut st.assistant_message)
+            .ensure_assistant_message(st.handle, &mut st.assistant_message, st.op_id)
             .await?;
         if !st.reasoning_buf.is_empty() {
             st.handle

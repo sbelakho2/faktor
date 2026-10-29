@@ -189,7 +189,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 5335,
+            "line": 5386,
             "note": "VS Code native host action (no daemon write is invented).",
             "line_text": "        case 'M-03': {"
           },
@@ -219,7 +219,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 5335,
+            "line": 5386,
             "note": "Host-owned control: the daemon has no route for this effect.",
             "line_text": "        case 'M-03': {"
           },
@@ -4015,7 +4015,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 5340,
+            "line": 5391,
             "note": "VS Code native host action (no daemon write is invented).",
             "line_text": "        case 'C-04': {"
           },
@@ -4045,7 +4045,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 5340,
+            "line": 5391,
             "note": "Host-owned control: the daemon has no route for this effect.",
             "line_text": "        case 'C-04': {"
           },
@@ -8558,7 +8558,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 5388,
+            "line": 5439,
             "note": "VS Code native host action (no daemon write is invented).",
             "line_text": "        case 'S-05':"
           },
@@ -8588,7 +8588,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 5388,
+            "line": 5439,
             "note": "Host-owned control: the daemon has no route for this effect.",
             "line_text": "        case 'S-05':"
           },
@@ -9864,7 +9864,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 5354,
+            "line": 5405,
             "note": "VS Code native host action (no daemon write is invented).",
             "line_text": "        case 'X-10': {"
           },
@@ -9894,7 +9894,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 5354,
+            "line": 5405,
             "note": "Host-owned control: the daemon has no route for this effect.",
             "line_text": "        case 'X-10': {"
           },
@@ -9935,7 +9935,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 5368,
+            "line": 5419,
             "note": "VS Code native host action (no daemon write is invented).",
             "line_text": "        case 'X-11': {"
           },
@@ -9965,7 +9965,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 5368,
+            "line": 5419,
             "note": "Host-owned control: the daemon has no route for this effect.",
             "line_text": "        case 'X-11': {"
           },
@@ -12251,7 +12251,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 5391,
+            "line": 5442,
             "note": "VS Code native host action (no daemon write is invented).",
             "line_text": "        case 'D-08':"
           },
@@ -12281,7 +12281,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 5391,
+            "line": 5442,
             "note": "Host-owned control: the daemon has no route for this effect.",
             "line_text": "        case 'D-08':"
           },
@@ -12319,7 +12319,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 5393,
+            "line": 5444,
             "note": "VS Code native host action (no daemon write is invented).",
             "line_text": "        case 'D-09':"
           },
@@ -12349,7 +12349,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 5393,
+            "line": 5444,
             "note": "Host-owned control: the daemon has no route for this effect.",
             "line_text": "        case 'D-09':"
           },
@@ -12387,7 +12387,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 5396,
+            "line": 5447,
             "note": "VS Code native host action (no daemon write is invented).",
             "line_text": "        case 'D-10':"
           },
@@ -12417,7 +12417,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 5396,
+            "line": 5447,
             "note": "Host-owned control: the daemon has no route for this effect.",
             "line_text": "        case 'D-10':"
           },
@@ -12455,7 +12455,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 5399,
+            "line": 5450,
             "note": "VS Code native host action (no daemon write is invented).",
             "line_text": "        case 'D-11':"
           },
@@ -12485,7 +12485,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 5399,
+            "line": 5450,
             "note": "Host-owned control: the daemon has no route for this effect.",
             "line_text": "        case 'D-11':"
           },
@@ -12655,7 +12655,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 5402,
+            "line": 5453,
             "note": "VS Code native host action (no daemon write is invented).",
             "line_text": "        case 'D-14':"
           },
@@ -12685,7 +12685,7 @@
           "status": "exists",
           "implementation": {
             "file": "apps/vscode/src/extension.ts",
-            "line": 5402,
+            "line": 5453,
             "note": "Host-owned control: the daemon has no route for this effect.",
             "line_text": "        case 'D-14':"
           },

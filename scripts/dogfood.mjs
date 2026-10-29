@@ -986,15 +986,14 @@ const UIUX_CONTRACT = [
   // ------------------------------------------------------------------ modes
   {
     id: 'UIUX-MODE-VSC',
-    spec: 'COPY-MODES [L107] "clear Task/Ask mode" via DEC-VSC-COMPOSER (Ask-first redesign: the ONE composer carries an explicit Ask/Task intent radiogroup; btn-send is the single primary action that submits with the selected intent)',
+    spec: 'COPY-MODES [L107] "clear Task/Ask mode" re-pinned to the unified no-mode design (DEC-VSC-COMPOSER superseded): the ONE composer has no Ask/Task mode switch; every send is an ordinary conversational turn (no intent member on sendGoal); engineering options live behind the Advanced engineering options disclosure whose Start task button is the sole escalation (contract/rows/budget ride it); one Send, one Stop targeting the accepted op while live, one transcript with ChatTurnId grouping (role-adjacency is the legacy fallback), one model selector.',
     host: 'vscode',
     must: [
-      ['apps/vscode/src/webview.ts', 'id="composer-intent"'],
-      ['apps/vscode/src/webview.ts', 'id="btn-intent-ask"'],
-      ['apps/vscode/src/webview.ts', 'id="btn-intent-task"'],
+      ['apps/vscode/src/webview.ts', 'id="btn-start-task"'],
+      ['apps/vscode/src/webview.ts', '<summary>Advanced engineering options</summary>'],
       ['apps/vscode/src/webview.ts', 'id="btn-send"'],
     ],
-    tests: { vscode: ['btn-intent-ask', 'btn-intent-task'] },
+    tests: { vscode: ['btn-start-task'] },
   },
   {
     id: 'UIUX-MODE-JB',

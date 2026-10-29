@@ -560,13 +560,21 @@ impl AgentRuntime {
         &self,
         handle: &faktor_session::SessionHandle,
         mid: &mut Option<i64>,
+        turn_id: OpId,
     ) -> faktor_core::Result<i64> {
         if let Some(m) = *mid {
             return Ok(m);
         }
         let seq = handle.proposed_message_seq()?;
+        // ChatTurnId (audit): the durable row carries the logical turn
+        // identity the live frames already stream, so the UI groups by
+        // authority instead of role adjacency (legacy rows stay null).
         let m = handle
-            .append_message(seq, "assistant", serde_json::json!({ "parts": [] }))
+            .append_message(
+                seq,
+                "assistant",
+                serde_json::json!({ "parts": [], "turn_id": turn_id.to_string() }),
+            )
             .await?;
         *mid = Some(m);
         Ok(m)
