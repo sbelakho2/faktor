@@ -76,12 +76,18 @@ pub struct ServerDeps {
     pub lsp: Option<Arc<faktor_lsp::LspManager>>,
     /// Live chunk stream from the agent (audit round 11). The native
     /// surface is durable and journal-driven (clients page
-    /// `/native/events` and `/native/messages`), so no live subscriber
-    /// exists: serve() drains this bounded receiver eagerly and drops the
-    /// ephemeral text (the durable message parts are the authority). The
-    /// agent's [`faktor_agent::ChunkSink`] sender half still coalesces
-    /// under backpressure instead of growing memory.
+    /// `/native/events` and `/native/messages`); live TEXT additionally
+    /// rides the bounded broadcaster below: serve() drains this receiver
+    /// into [`ServerDeps::live_output`] (never a per-token durable write —
+    /// the durable message parts remain the authority). The agent's
+    /// [`faktor_agent::ChunkSink`] sender half still coalesces under
+    /// backpressure instead of growing memory.
     pub chunk_rx: Option<tokio::sync::mpsc::Receiver<faktor_agent::ChunkEvent>>,
+    /// The daemon-owned live-output broadcaster: the bounded fan-out of the
+    /// agent's chunk stream behind `GET /native/session/{id}/live/output`.
+    /// Constructed with the envelope (one server-instance id per daemon
+    /// construction); `drain_chunk_stream` feeds it from [`Self::chunk_rx`].
+    pub live_output: Arc<crate::native::live_output::LiveOutputHub>,
     /// Deterministic readiness knob (audit 55; mirrors the suggested
     /// `FAKTOR_SIMULATE_NOT_READY=1` gate as a field — an env gate would
     /// race parallel tests in one process). When true, the ready flag stays
@@ -276,6 +282,7 @@ impl ServerDeps {
             semantic: None,
             lsp: None,
             chunk_rx: None,
+            live_output: Arc::new(crate::native::live_output::LiveOutputHub::new()),
             simulate_not_ready: false,
             control_plane: None,
             scm: None,

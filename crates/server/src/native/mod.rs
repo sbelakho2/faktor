@@ -69,6 +69,10 @@ pub(crate) use foundation_r8 as r8;
 /// Rev8 long-task surfaces (durable compaction operations, memory records,
 /// instruction precedence/editing) layered beside the foundation routes.
 pub(crate) mod instructions;
+/// Live model output: the daemon-owned bounded broadcaster fed by the
+/// agent's chunk stream, plus the session-scoped subscription routes
+/// (`/native/session/{id}/live/output`, `/live/snapshot`).
+pub(crate) mod live_output;
 pub(crate) mod longtask;
 pub(crate) mod lsp;
 pub(crate) mod models;
@@ -130,6 +134,7 @@ pub(crate) use board::*;
 pub(crate) use control_plane::*;
 pub(crate) use enterprise::*;
 pub(crate) use evidence::*;
+pub(crate) use live_output::*;
 pub(crate) use models::*;
 pub(crate) use outcomes::*;
 pub use prompt::*;

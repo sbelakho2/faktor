@@ -411,16 +411,23 @@ pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHan
     serve_arc(Arc::new(deps), port).await
 }
 
-/// Take and eagerly drain the bounded live chunk stream of one dependency
-/// envelope (idempotent: a second call is a no-op). The native surface is
-/// durable and journal-driven (clients page `/native/events` and
-/// `/native/messages`), so there is no live subscriber to fan out to; the
-/// bounded channel is consumed eagerly so the agent's coalescing sink never
-/// blocks on a dead consumer. Hosts that start a SECOND listener over the
-/// same deps (the worker plane) call this once before sharing the `Arc`.
+/// Take the bounded live chunk stream and feed it into the daemon-owned
+/// live-output broadcaster (idempotent: a second call is a no-op). This is
+/// the ONE consumer of the agent's chunk stream: every live delta is
+/// republished to the session-scoped `live/output` subscription with a
+/// bounded queue and NO per-token durable write — the durable journal and
+/// message parts stay the recovery authority. The bounded channel is
+/// consumed eagerly, so the agent's coalescing sink never blocks on a slow
+/// subscriber. Hosts that start a SECOND listener over the same deps (the
+/// worker plane) call this once before sharing the `Arc`.
 pub fn drain_chunk_stream(deps: &mut ServerDeps) {
     if let Some(mut rx) = deps.chunk_rx.take() {
-        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let hub = Arc::clone(&deps.live_output);
+        tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                hub.publish(&event);
+            }
+        });
     }
 }
 
@@ -643,6 +650,15 @@ fn native_core_routes(router: Router<AppState>) -> Router<AppState> {
         .route("/native/session/{id}/prompt", post(native_prompt))
         // The native durable journal SSE stream (cursor-resumable).
         .route("/native/session/{id}/events", get(native_session_events))
+        // Live model output (the bounded broadcaster fed by the agent's
+        // chunk stream): the session-scoped SSE subscription (first frame =
+        // exact snapshot + starting watermark) and the authoritative part
+        // snapshot a client fetches after an explicit `resync`.
+        .route("/native/session/{id}/live/output", get(native_live_output))
+        .route(
+            "/native/session/{id}/live/snapshot",
+            get(native_live_snapshot),
+        )
         .route("/native/session/{id}/turns", get(native_session_turns))
         .route("/native/session/{id}/tasks", get(native_session_tasks))
         .route(

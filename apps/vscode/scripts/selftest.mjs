@@ -25,6 +25,7 @@ import * as dm from '../src/daemon.ts';
 import * as sl from '../src/serviceLifecycle.ts';
 import * as lf from '../src/lifecycleFence.ts';
 import * as ts from '../src/taskStart.ts';
+import * as tl from '../src/turnState.ts';
 import * as wb from '../src/workspaceBinding.ts';
 import * as ss from '../src/sessionSwitch.ts';
 import * as px from '../src/pixelAgents.ts';
@@ -18066,6 +18067,597 @@ async function outcomeTests() {
  * Adding a contribution without a handler (or a handler without a
  * contribution) turns this red, so a dead/placeholder surface cannot ship.
  */
+// ---------------------------------------- live model output + turn lifecycle
+//
+// Audit P0: the daemon discarded live chunks (text could never be fluid
+// before the 8 KiB durable flush) and the Ask path cleared busy on HTTP
+// acceptance (Ready with no Stop mid-reply). These tests pin the whole
+// client contract: the subscription's typed frames, the bounded batching,
+// the byte-offset reconciliation (never duplicated, never overwritten) and
+// the ONE turn reducer's states/Stop target.
+
+const LIVE_INSTANCE = '0123456789abcdef';
+
+function liveSnapshotFixture(overrides = {}) {
+  return {
+    instance: LIVE_INSTANCE,
+    session: 5,
+    sequence: 10,
+    watermark: 3,
+    turn: { op: '9', status: 'active' },
+    parts: [],
+    ...overrides,
+  };
+}
+
+function liveChunkFixture(overrides = {}) {
+  return {
+    instance: LIVE_INSTANCE,
+    session: 5,
+    messageId: 42,
+    kind: 'text',
+    partId: '42:text',
+    turn: '9',
+    attempt: 0,
+    sequence: 11,
+    revision: 1,
+    offset: 0,
+    content: 'Hel',
+    ...overrides,
+  };
+}
+
+/** One LiveOutputStream over one finite body, instrumented for asserts. */
+function liveStreamOutcome(sseText, options = {}) {
+  const messages = [];
+  const errors = [];
+  const statuses = [];
+  const urls = [];
+  let stream = null;
+  const fetchImpl = async (url) => {
+    urls.push(url);
+    if (options.status) {
+      return sseResponse([], options.status);
+    }
+    return sseResponse([sseText]);
+  };
+  stream = new es.LiveOutputStream({
+    baseUrl: 'http://127.0.0.1:9',
+    bearerToken: 'tok',
+    sessionId: '5',
+    fetch: fetchImpl,
+    sleep: async () => {},
+    onMessage: (message) => messages.push(message),
+    onStatus: (status, detail) => {
+      statuses.push([status, String(detail ?? '')]);
+      if (status === 'retrying' && String(detail).startsWith('stream ended')) {
+        stream.stop();
+      }
+    },
+    onError: (error) => errors.push(error),
+    ...(options.cursor !== undefined ? { cursor: options.cursor } : {}),
+  });
+  return { stream, messages, errors, statuses, urls };
+}
+
+function entryTextNode(harness) {
+  const container = harness.dom.document.getElementById('entries');
+  const node = container.children[container.children.length - 1];
+  if (!node) return null;
+  const parts = node.__faktorParts || null;
+  return parts && parts.text ? parts.text : null;
+}
+
+function entryTextOf(harness) {
+  const node = entryTextNode(harness);
+  return node === null ? '' : String(node.textContent);
+}
+
+async function liveOutputTests() {
+  await test('turn reducer: acceptance is admission — live states, exact Stop target, durable-only terminal', () => {
+    let state = tl.emptyTurnLifecycle();
+    assertEqual(tl.turnLifecycleIsLive(state), false, 'idle is not live');
+    assertEqual(tl.turnStopOpId(state), null, 'idle offers no Stop target');
+    state = tl.turnReducer(state, { type: 'submit', source: 'ask' });
+    assertEqual(tl.turnDisplayPhase(state), 'submitting', 'submit starts at submitting');
+    assertEqual(tl.turnLifecycleIsLive(state), true, 'submitting keeps busy (no Ready-without-Stop)');
+    state = tl.turnReducer(state, { type: 'receipt', opId: '77', runId: 'r1', queued: false });
+    assertEqual(tl.turnDisplayPhase(state), 'starting', 'an accepted receipt is a STARTING turn');
+    assertEqual(tl.turnStopOpId(state), '77', 'Stop targets the receipt operation');
+    // A quiet/ready machine never completes a turn (no inference):
+    state = tl.turnReducer(state, { type: 'machine', state: 'ready_for_next_turn', opId: '77' });
+    assertEqual(tl.turnDisplayPhase(state), 'starting', 'ready_for_next_turn never completes');
+    state = tl.turnReducer(state, { type: 'journal', kind: 'model_started', opId: '77' });
+    assertEqual(tl.turnDisplayPhase(state), 'streaming');
+    state = tl.turnReducer(state, {
+      type: 'journal',
+      kind: 'phase_changed',
+      opId: '77',
+      state: 'executing_tool',
+    });
+    assertEqual(tl.turnDisplayPhase(state), 'tool-running', 'tool phase maps to tool-running');
+    state = tl.turnReducer(state, { type: 'turnStatus', opId: '77', status: 'active' });
+    assertEqual(tl.turnDisplayPhase(state), 'tool-running', 'active never demotes a live phase');
+    state = tl.turnReducer(state, { type: 'journal', kind: 'turn_completed', opId: '77' });
+    assertEqual(tl.turnDisplayPhase(state), 'completed', 'the durable journal completes it');
+    assertEqual(tl.turnLifecycleIsLive(state), false, 'completed ends busy');
+    assertEqual(tl.turnStopOpId(state), null, 'a finished turn has no Stop target');
+    state = tl.turnReducer(state, {
+      type: 'journal',
+      kind: 'phase_changed',
+      opId: '77',
+      state: 'streaming',
+    });
+    assertEqual(tl.turnDisplayPhase(state), 'completed', 'a terminal outcome is sticky');
+  });
+
+  await test('turn reducer: a queued follow-up renders queued while Stop targets the streaming op', () => {
+    let state = tl.emptyTurnLifecycle();
+    state = tl.turnReducer(state, { type: 'submit', source: 'ask' });
+    state = tl.turnReducer(state, { type: 'receipt', opId: '1', runId: 'a', queued: false });
+    state = tl.turnReducer(state, { type: 'journal', kind: 'model_started', opId: '1' });
+    assertEqual(tl.turnDisplayPhase(state), 'streaming');
+    // The follow-up submits while the first still streams:
+    state = tl.turnReducer(state, { type: 'submit', source: 'ask' });
+    state = tl.turnReducer(state, { type: 'receipt', opId: '2', runId: 'b', queued: true });
+    assertEqual(tl.turnDisplayPhase(state), 'queued', 'the queued follow-up renders queued');
+    assertEqual(
+      tl.turnStopOpId(state),
+      '1',
+      'Stop targets the STREAMING operation, never the queued one',
+    );
+    assertEqual(tl.turnLifecycleIsLive(state), true, 'a queued follow-up keeps busy');
+    // The queued turn is admitted: it starts; Stop still targets the first
+    // until IT finishes.
+    state = tl.turnReducer(state, { type: 'journal', kind: 'prompt_admitted', opId: '2' });
+    assertEqual(tl.turnDisplayPhase(state), 'starting', 'admission moves queued → starting');
+    assertEqual(tl.turnStopOpId(state), '1', 'Stop still targets the still-streaming first turn');
+    state = tl.turnReducer(state, { type: 'turnStatus', opId: '1', status: 'completed' });
+    assertEqual(tl.turnStopOpId(state), '2', 'after the first finishes, Stop retargets turn 2');
+  });
+
+  await test('turn reducer: Stop keeps the partial reply with an accurate label; a later prompt works', () => {
+    let state = tl.emptyTurnLifecycle();
+    state = tl.turnReducer(state, { type: 'submit', source: 'ask' });
+    state = tl.turnReducer(state, { type: 'receipt', opId: '5', runId: 'r', queued: false });
+    state = tl.turnReducer(state, { type: 'journal', kind: 'model_started', opId: '5' });
+    // The typed abort ack confirms IT cancelled exactly this operation:
+    state = tl.turnReducer(state, { type: 'stopped', opId: '5' });
+    assertEqual(tl.turnDisplayPhase(state), 'interrupted', 'the Stop outcome is interrupted');
+    assertEqual(tl.turnPhaseLabel(tl.turnDisplayPhase(state)), 'Stopped');
+    assertEqual(tl.turnLifecycleIsLive(state), false, 'a stopped turn releases busy');
+    assertEqual(tl.turnStopOpId(state), null, 'no Stop target after the ack');
+    // The durable authority may still report cancelled (it must not revive):
+    state = tl.turnReducer(state, { type: 'turnStatus', opId: '5', status: 'cancelled' });
+    assertEqual(tl.turnDisplayPhase(state), 'interrupted', 'cancelled agrees with interrupted');
+    // A later prompt starts a fresh, independent turn:
+    state = tl.turnReducer(state, { type: 'submit', source: 'ask' });
+    assertEqual(tl.turnDisplayPhase(state), 'submitting', 'a later prompt starts over');
+    state = tl.turnReducer(state, { type: 'receipt', opId: '6', runId: 'r2', queued: false });
+    assertEqual(tl.turnStopOpId(state), '6', 'Stop targets the new operation');
+    state = tl.turnReducer(state, { type: 'turnStatus', opId: '6', status: 'failed' });
+    assertEqual(tl.turnDisplayPhase(state), 'failed', 'a durable failed status labels the outcome');
+    assertEqual(tl.turnLifecycleIsLive(state), false);
+    // Bounded: terminal entries beyond the cap are pruned, never unbounded.
+    for (let i = 0; i < 10; i += 1) {
+      state = tl.turnReducer(state, { type: 'submit', source: 'ask' });
+      state = tl.turnReducer(state, {
+        type: 'receipt',
+        opId: String(100 + i),
+        runId: 'x',
+        queued: false,
+      });
+      state = tl.turnReducer(state, { type: 'turnStatus', opId: String(100 + i), status: 'completed' });
+    }
+    assert(state.entries.length <= tl.MAX_TURNS, `entries stay bounded: ${state.entries.length}`);
+  });
+
+  await test('turn reducer: restart re-adopts an active turn; machine tags never fake terminals', () => {
+    // The durable daemon reports an ACTIVE turn the local reducer never saw
+    // (fresh session / restart): adopt it instead of idle-without-Stop.
+    let state = tl.emptyTurnLifecycle();
+    state = tl.turnReducer(state, { type: 'turnStatus', opId: '42', status: 'active' });
+    assertEqual(tl.turnLifecycleIsLive(state), true, 'an active durable turn is live');
+    assertEqual(tl.turnStopOpId(state), '42', 'and it carries its operation as the Stop target');
+    // Terminal machine tags never complete a turn on their own:
+    state = tl.turnReducer(state, { type: 'machine', state: 'ready_for_next_turn', opId: '42' });
+    assertEqual(tl.turnLifecycleIsLive(state), true, 'machine ready never completes a turn');
+    state = tl.turnReducer(state, { type: 'turnStatus', opId: '42', status: 'completed' });
+    assertEqual(tl.turnDisplayPhase(state), 'completed', 'only the durable status completes it');
+    // The reducer is pure: no event mutates the previous state object.
+    const frozen = state;
+    tl.turnReducer(state, { type: 'submit', source: 'ask' });
+    assertEqual(frozen.entries.length, 1, 'the reducer never mutates its input');
+    const reset = tl.turnReducer(state, { type: 'reset' });
+    assertEqual(reset.entries.length, 0, 'reset returns to idle');
+  });
+
+  await test('live output client: handshake first, replay/foreign frames dropped, resync and turn typed', async () => {
+    const body =
+      frame('snapshot', null, JSON.stringify(liveSnapshotFixture({ sequence: 10 }))) +
+      frame('live', null, JSON.stringify(liveChunkFixture())) +
+      // Replayed frame (same sequence) and a lower sequence: never redelivered.
+      frame('live', null, JSON.stringify(liveChunkFixture())) +
+      frame('live', null, JSON.stringify(liveChunkFixture({ sequence: 5 }))) +
+      // A foreign server-instance frame (daemon restart): dropped.
+      frame('live', null, JSON.stringify(liveChunkFixture({ instance: 'ffffffffffffffff' }))) +
+      // An unknown event name: reported, never delivered.
+      frame('hostile', null, '{"instance":"0123456789abcdef"}') +
+      frame('resync', null, JSON.stringify({ instance: LIVE_INSTANCE, session: 5, reason: 'lagged', dropped: 7 })) +
+      frame('turn', null, JSON.stringify({ instance: LIVE_INSTANCE, session: 5, turn: '9', status: 'completed' })) +
+      frame('heartbeat', null, '{}');
+    const { stream, messages, errors, statuses, urls } = liveStreamOutcome(body);
+    stream.start();
+    await stream.whenStopped();
+    assertEqual(messages.length, 4, 'snapshot + live + resync + turn (nothing replayed or foreign)');
+    assertEqual(messages[0].type, 'snapshot', 'the FIRST frame is the handshake snapshot');
+    assertEqual(messages[0].snapshot.sequence, 10, 'exact starting watermark');
+    assertEqual(messages[0].snapshot.turn.op, '9', 'the handshake carries the turn projection');
+    assertEqual(messages[1].type, 'live');
+    assertEqual(messages[1].frame.content, 'Hel');
+    assertEqual(messages[1].frame.offset, 0, 'UTF-8 byte offset rides the frame');
+    assertEqual(messages[2].type, 'resync');
+    assertEqual(messages[2].frame.dropped, 7, 'the lag signal is explicit (never silent loss)');
+    assertEqual(messages[3].type, 'turn');
+    assertEqual(messages[3].frame.status, 'completed', 'turn frames carry the durable outcome');
+    assert(
+      errors.some((error) => /foreign server instance/.test(String(error.message))),
+      `foreign instance must be reported: ${errors.map((e) => e.message).join(' | ')}`,
+    );
+    assert(
+      errors.some((error) => /unknown live frame/.test(String(error.message))),
+      'an unknown frame name is reported, not delivered'
+    );
+    assertEqual(stream.instance, LIVE_INSTANCE, 'the accepted instance id is exposed');
+    assert(urls[0].includes('/native/session/5/live/output?after=0'), `URL contract: ${urls[0]}`);
+    assert(statuses.some(([status]) => status === 'open'), 'the stream opened');
+  });
+
+  await test('live output client: a non-retryable route failure stops (no reconnect loop)', async () => {
+    const { stream, statuses, urls } = liveStreamOutcome('', { status: 404 });
+    stream.start();
+    await stream.whenStopped();
+    assertEqual(urls.length, 1, 'no retry loop against a route that does not exist');
+    const last = statuses[statuses.length - 1];
+    assertEqual(last[0], 'unavailable', 'the terminal state is a typed unavailable');
+  });
+
+  await test('fetchLiveSnapshot: exact part contract and hostile shapes typed', async () => {
+    const urls = [];
+    const fixture = liveSnapshotFixture({
+      parts: [
+        {
+          partId: '42:text',
+          messageId: 42,
+          kind: 'text',
+          turn: '9',
+          attempt: 0,
+          revision: 4,
+          offset: 11,
+          text: 'Hello world',
+          durableBytes: 8,
+          durableRevision: 2,
+          liveTail: true,
+        },
+      ],
+    });
+    const ok = await es.fetchLiveSnapshot('http://127.0.0.1:9/', 'tok', '5', {
+      fetch: async (url) => {
+        urls.push(url);
+        return new Response(JSON.stringify(fixture), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      },
+      message: 42,
+      kind: 'text',
+    });
+    assert(
+      urls[0].endsWith('/native/session/5/live/snapshot?message=42&kind=text'),
+      `resync URL contract: ${urls[0]}`,
+    );
+    assertEqual(ok.parts[0].text, 'Hello world', 'the authoritative part text is returned');
+    assertEqual(ok.parts[0].offset, 11, 'byte offset included');
+    assertEqual(ok.parts[0].durableBytes, 8, 'durable floor included');
+    let typed = false;
+    try {
+      await es.fetchLiveSnapshot('http://127.0.0.1:9/', 'tok', '5', {
+        fetch: async () =>
+          new Response(JSON.stringify({ ...fixture, parts: 'hostile' }), { status: 200 }),
+      });
+    } catch (error) {
+      typed = error instanceof es.LiveOutputError;
+    }
+    assert(typed, 'a hostile snapshot shape throws a typed LiveOutputError');
+  });
+
+  await test('webview live output: one animation frame per burst (DOM batches to a single frame)', async () => {
+    const harness = runChatWebview(
+      transcriptSnapshot([transcriptEntry(2, '', { id: '42', role: 'assistant' })]),
+    );
+    // Deferred rAF: prove coalescing instead of running frames synchronously.
+    const pending = [];
+    harness.window.requestAnimationFrame = (callback) => {
+      pending.push(callback);
+      return pending.length;
+    };
+    for (let i = 0; i < 30; i += 1) {
+      const index = String(i + 1).padStart(2, '0');
+      harness.deliver({
+        type: 'liveOutput',
+        frames: [
+          liveChunkFixture({
+            sequence: 100 + i,
+            revision: i + 1,
+            offset: i * 8,
+            content: `chunk-${index}`,
+          }),
+        ],
+      });
+    }
+    assertEqual(pending.length, 1, '30 burst messages schedule exactly ONE animation frame');
+    assertEqual(
+      harness.renderCounts['live-coalesced'] || 0,
+      29,
+      'every message after the first coalesces into that frame',
+    );
+    assertEqual(
+      harness.renderCounts['live-flush'] || 0,
+      0,
+      'no DOM work happens until the scheduled frame runs',
+    );
+    pending[0]();
+    assertEqual(harness.renderCounts['live-flush'] || 0, 1, 'the burst performs ONE flush');
+    assertEqual(
+      entryTextOf(harness),
+      'chunk-01chunk-02chunk-03chunk-04chunk-05chunk-06chunk-07chunk-08chunk-09chunk-10chunk-11chunk-12chunk-13chunk-14chunk-15chunk-16chunk-17chunk-18chunk-19chunk-20chunk-21chunk-22chunk-23chunk-24chunk-25chunk-26chunk-27chunk-28chunk-29chunk-30',
+      'the visible text advanced through ONE frame with byte-exact ordering',
+    );
+  });
+
+  await test('webview live output: duplicate/omit/replay frames → resync yields byte-identical text, no duplicates', async () => {
+    const harness = runChatWebview(
+      transcriptSnapshot([transcriptEntry(2, '', { id: '42', role: 'assistant' })]),
+    );
+    const frames = (list) => harness.deliver({ type: 'liveOutput', frames: list });
+    frames([liveChunkFixture({ sequence: 1, revision: 1, offset: 0, content: 'Hello' })]);
+    // Replay of the SAME frame (duplicate): dropped before any DOM work.
+    frames([liveChunkFixture({ sequence: 1, revision: 1, offset: 0, content: 'Hello' })]);
+    frames([liveChunkFixture({ sequence: 2, revision: 2, offset: 5, content: ' wo' })]);
+    assertEqual(entryTextOf(harness), 'Hello wo', 'in-order frames append exactly once');
+    const flushesBefore = harness.renderCounts['live-flush'] || 0;
+    // A reordered stale frame (old revision): dropped.
+    frames([liveChunkFixture({ sequence: 3, revision: 1, offset: 0, content: 'Hello' })]);
+    assertEqual(entryTextOf(harness), 'Hello wo', 'a stale frame never re-renders');
+    // OMITTED frames: revision jumps 2 → 5 (three frames lost mid-stream).
+    frames([liveChunkFixture({ sequence: 6, revision: 5, offset: 100, content: 'lost' })]);
+    const gapPosts = harness.posted.filter((message) => message.type === 'liveGap');
+    assert(gapPosts.length >= 1, 'the offset/revision gap requests an explicit resync');
+    assertEqual(gapPosts[0].partId, '42:text', 'the gap names the exact part');
+    assertEqual(entryTextOf(harness), 'Hello wo', 'a gap never fabricates visible text');
+    // The authoritative snapshot arrives and reconciles byte-identically.
+    harness.deliver({
+      type: 'liveSnapshot',
+      snapshot: liveSnapshotFixture({
+        sequence: 60,
+        turn: { op: '9', status: 'active' },
+        parts: [
+          {
+            partId: '42:text',
+            messageId: 42,
+            kind: 'text',
+            turn: '9',
+            attempt: 0,
+            revision: 5,
+            offset: 15,
+            text: 'Hello world from',
+            durableBytes: 11,
+            durableRevision: 3,
+            liveTail: true,
+          },
+        ],
+      }),
+    });
+    assertEqual(
+      entryTextOf(harness),
+      'Hello world from',
+      'the resync snapshot yields the byte-identical authoritative text',
+    );
+    // Streaming continues EXACTLY at the snapshot offset (no duplicate).
+    frames([liveChunkFixture({ sequence: 7, revision: 6, offset: 15, content: ' the server' })]);
+    assertEqual(
+      entryTextOf(harness),
+      'Hello world from the server',
+      'post-resync frames append once — never duplicated side effects',
+    );
+    const flushesAfter = harness.renderCounts['live-flush'] || 0;
+    assert(
+      flushesAfter - flushesBefore <= 4,
+      `DOM flushes stay bounded to the applied bursts: ${flushesAfter - flushesBefore}`,
+    );
+  });
+
+  await test('webview live output: a saved snapshot never overwrites a newer live suffix', async () => {
+    const harness = runChatWebview(
+      transcriptSnapshot([transcriptEntry(2, 'Hello', { id: '42', role: 'assistant' })]),
+    );
+    harness.deliver({
+      type: 'liveOutput',
+      frames: [liveChunkFixture({ sequence: 1, revision: 1, offset: 5, content: ' world' })],
+    });
+    assertEqual(entryTextOf(harness), 'Hello world', 'the live tail extends the durable prefix');
+    assert(
+      (harness.renderCounts['live-patched'] || 0) >= 1,
+      'the delta patches the rendered entry in place (one frame, no rebuild)',
+    );
+    // A STALE saved snapshot (shorter than what is already on screen):
+    harness.deliver({
+      type: 'liveSnapshot',
+      snapshot: liveSnapshotFixture({
+        parts: [
+          {
+            partId: '42:text',
+            messageId: 42,
+            kind: 'text',
+            turn: '9',
+            attempt: 0,
+            revision: 0,
+            offset: 5,
+            text: 'Hello',
+            durableBytes: 5,
+            durableRevision: 1,
+            liveTail: false,
+          },
+        ],
+      }),
+    });
+    assertEqual(
+      entryTextOf(harness),
+      'Hello world',
+      'the newer live suffix survives the stale saved snapshot (no truncation, no duplicate)',
+    );
+    // A durable page catch-up equals the live text: still exactly once.
+    harness.deliver({
+      type: 'snapshot',
+      snapshot: transcriptSnapshot([
+        transcriptEntry(2, 'Hello world', { id: '42', role: 'assistant' }),
+      ]),
+    });
+    assertEqual(entryTextOf(harness), 'Hello world', 'a caught-up page never duplicates');
+    harness.deliver({
+      type: 'liveOutput',
+      frames: [liveChunkFixture({ sequence: 2, revision: 2, offset: 11, content: '!' })],
+    });
+    assertEqual(entryTextOf(harness), 'Hello world!', 'streaming continues past the page');
+  });
+
+  await test('webview live output: foreign server-instance frames never render (restart confusion)', async () => {
+    const harness = runChatWebview(
+      transcriptSnapshot([transcriptEntry(2, 'base', { id: '42', role: 'assistant' })]),
+    );
+    harness.deliver({
+      type: 'liveSnapshot',
+      snapshot: liveSnapshotFixture({ parts: [] }),
+    });
+    harness.deliver({
+      type: 'liveOutput',
+      frames: [
+        liveChunkFixture({
+          instance: 'ffffffffffffffff',
+          sequence: 900,
+          revision: 50,
+          offset: 500,
+          content: 'from-an-old-daemon',
+        }),
+      ],
+    });
+    assertEqual(
+      harness.renderCounts['live-foreign-instance'] || 0,
+      1,
+      'a foreign-instance frame is dropped and counted, never rendered',
+    );
+    assertEqual(entryTextOf(harness), 'base', 'the old lineage never touches the transcript');
+    // A NEW instance (the restarted daemon) is adopted via its snapshot:
+    harness.deliver({
+      type: 'liveSnapshot',
+      snapshot: liveSnapshotFixture({ instance: 'aaaaaaaaaaaaaaaa', parts: [] }),
+    });
+    harness.deliver({
+      type: 'liveOutput',
+      frames: [
+        liveChunkFixture({
+          instance: 'aaaaaaaaaaaaaaaa',
+          sequence: 1,
+          revision: 1,
+          offset: 4,
+          content: ' after-restart',
+        }),
+      ],
+    });
+    assertEqual(
+      entryTextOf(harness),
+      'base after-restart',
+      'the new instance streams into the same conversation',
+    );
+  });
+
+  await test('webview turn-state: exact phase labels and Stop visibility across the lifecycle', async () => {
+    const harness = runChatWebview(transcriptSnapshot([]));
+    const header = () => String(harness.dom.document.getElementById('daemon-text').textContent);
+    const stop = () => harness.dom.document.getElementById('menu-stop');
+    assertEqual(stop().hidden, true, 'no live turn: Stop is hidden');
+    harness.deliver({ type: 'turnState', phase: 'submitting', opId: null });
+    assert(header().includes('Sending'), `submitting label: ${header()}`);
+    assertEqual(stop().hidden, false, 'Stop appears the moment a turn is live');
+    harness.deliver({ type: 'turnState', phase: 'queued', opId: '2' });
+    assert(header().includes('Queued'), `queued label: ${header()}`);
+    assertEqual(stop().hidden, false, 'a queued follow-up still offers Stop (for the live turn)');
+    harness.deliver({ type: 'turnState', phase: 'streaming', opId: '1' });
+    assert(header().includes('Generating'), `streaming label: ${header()}`);
+    harness.deliver({ type: 'turnState', phase: 'tool-running', opId: '1' });
+    assert(header().includes('Working'), `tool-running label: ${header()}`);
+    harness.deliver({ type: 'turnState', phase: 'awaiting-user', opId: '1' });
+    assert(header().includes('Needs approval'), `awaiting-user label: ${header()}`);
+    harness.deliver({ type: 'turnState', phase: 'interrupted', opId: '1' });
+    assert(header().includes('Stopped'), `outcome label survives Stop: ${header()}`);
+    assertEqual(stop().hidden, true, 'a settled turn hides Stop again');
+    harness.deliver({ type: 'turnState', phase: 'completed', opId: '1' });
+    assert(header().includes('Completed'), `completed label: ${header()}`);
+    harness.deliver({ type: 'turnState', phase: 'failed', opId: '1' });
+    assert(header().includes('Failed'), `failed label: ${header()}`);
+    harness.deliver({ type: 'turnState', phase: 'idle', opId: null });
+    assert(header().includes('Ready'), `idle falls back to Ready: ${header()}`);
+    // A later prompt: back to live immediately.
+    harness.deliver({ type: 'turnState', phase: 'submitting', opId: null });
+    assert(header().includes('Sending'), 'a later prompt starts over');
+    assertEqual(stop().hidden, false, 'and Stop is back');
+    // An unknown/forged phase can never render (typed state only).
+    harness.deliver({ type: 'turnState', phase: 'exploded', opId: null });
+    assert(header().includes('Sending'), 'a forged phase is ignored');
+  });
+
+  await test('extension host contract: subscribe-before-submit, session fence, typed Stop, reducer-owned busy', () => {
+    const source = readFileSync(new URL('../src/extension.ts', import.meta.url), 'utf8');
+    // Subscribe-before-submit: the handshake opens BEFORE the prompt POST.
+    assert(
+      /await ensureAskConnection\(context\);\s*startLiveOutput\(\);/.test(source.replace(/\n\s*\n/g, '\n')),
+      'the live subscription is opened before the prompt POST (subscribe-before-submit)',
+    );
+    // Session fence: frames of a previous session never reach the panel.
+    assert(
+      source.includes("String(frame.session) !== active.sessionId"),
+      'live frames are fenced to the active session',
+    );
+    assert(
+      source.includes('String(snapshot.session) !== active.sessionId'),
+      'snapshots are fenced to the active session',
+    );
+    // Stop targets THE tracked operation through the typed native abort.
+    assert(
+      source.includes('client.abortSession(sessionId, opId)'),
+      'Stop aborts the tracked operation via the typed native abort',
+    );
+    assert(
+      !source.includes("postNotice('info', 'no active task run to cancel')"),
+      'the Ask stop path is never answered with the task-only refusal',
+    );
+    // Busy follows the reducer, never the HTTP status line.
+    assert(
+      source.includes('busy: turnLifecycleIsLive(turns) || active.activeRunId !== null'),
+      'the accepted Ask receipt derives busy from the turn reducer',
+    );
+    assert(
+      !source.includes('store.patch({ activeRunId: null, busy: false, lastError: null })'),
+      'the Ask acceptance patch must not clear busy (the P0 defect)',
+    );
+    // Resync fetches the authoritative snapshot (single-flight, bounded).
+    assert(
+      source.includes('fetchLiveSnapshot(daemon.baseUrl'),
+      'a resync fetches the authoritative part snapshot',
+    );
+  });
+}
+
 async function capabilityMatrixTests() {
   const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
   const extensionSource =
@@ -18577,6 +19169,7 @@ async function main() {
   await tournamentWebviewTests();
   await reducedMotionTests();
   await verdictContrastTests();
+  await liveOutputTests();
   await capabilityMatrixTests();
   await edition8HtmlSafetyTests();
   if (packagedDir !== null && packagedDir !== undefined) {

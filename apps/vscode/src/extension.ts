@@ -91,9 +91,23 @@ import {
 import {
   EventStream,
   EventStreamStatus,
+  LiveChunkFrame,
+  LiveOutputMessage,
+  LiveOutputStream,
+  LiveOutputStreamStatus,
   SseFetchLike,
   SseResponseLike,
+  fetchLiveSnapshot,
 } from './eventStream';
+import {
+  TurnEvent,
+  TurnLifecycle,
+  emptyTurnLifecycle,
+  turnDisplayPhase,
+  turnLifecycleIsLive,
+  turnReducer,
+  turnStopOpId,
+} from './turnState';
 import {
   BoardStateSummary,
   FaktorStore,
@@ -244,6 +258,8 @@ interface ActiveSession {
   daemon: DaemonHandle | null;
   client: NativeClient | null;
   stream: EventStream | null;
+  /** The session-scoped live model-output subscription (`/live/output`). */
+  liveStream: LiveOutputStream | null;
   sessionId: string | null;
   activeRunId: string | null;
   /** TRUE after an Ask turn until a Task starts or the user switches
@@ -288,6 +304,7 @@ const active: ActiveSession = {
   daemon: null,
   client: null,
   stream: null,
+  liveStream: null,
   sessionId: null,
   activeRunId: null,
   askOnly: false,
@@ -691,6 +708,11 @@ async function shutdownService(
       resumeCursor = active.stream?.cursor ?? resumeCursor;
       active.stream?.stop();
       active.stream = null;
+      // The turn lifecycle is KEPT across a crash: turn records are
+      // durable, and the rebound session's subscription re-drives the same
+      // entries with the new server-instance id (a restart never fakes a
+      // completion from a dropped stream).
+      stopLiveOutput();
       active.daemon = null;
       active.client = null;
       // The durable workspace binding rebinds the SAME conversation after
@@ -1482,6 +1504,8 @@ function resetHostState(context: vscode.ExtensionContext | null = activeContext)
   preflightHost.failureDetail = null;
   active.stream?.stop();
   active.stream = null;
+  stopLiveOutput();
+  resetTurnLifecycle();
   active.daemon = null;
   active.client = null;
   active.sessionId = null;
@@ -1712,6 +1736,9 @@ async function switchSession(
     active.refreshTimer = null;
   }
   active.activeRunId = null;
+  // Turn lifecycle is per conversation: a switch starts a fresh one (the
+  // new session's subscription drives it from its own handshake).
+  resetTurnLifecycle();
   active.taskVerificationCache.clear();
   active.taskProofKey = null;
   active.taskProof = null;
@@ -1870,6 +1897,215 @@ function transcriptOf(page: NativeMessagePage): TranscriptEntry[] {
   return transcriptFromMessages(page.messages as unknown as Json[]);
 }
 
+// ------------------------------------------------- turn lifecycle + live output
+//
+// The ONE turn reducer (idle → submitting → queued/starting → streaming/
+// tool-running/awaiting-user → completed | interrupted | failed). It owns
+// `busy` while a turn is live (the Ask path previously cleared busy on HTTP
+// ACCEPTANCE, showing Ready with no Stop mid-reply) and names the exact
+// operation Stop aborts.
+let turns: TurnLifecycle = emptyTurnLifecycle();
+/** The last (display phase, stop op) posted to the panel (dedupe). */
+let lastPostedTurnKey: string | null = null;
+
+function dispatchTurn(event: TurnEvent): void {
+  const wasLive = turnLifecycleIsLive(turns);
+  turns = turnReducer(turns, event);
+  const isLive = turnLifecycleIsLive(turns);
+  if (wasLive !== isLive) {
+    store.patch({ busy: isLive || active.activeRunId !== null });
+  }
+  const phase = turnDisplayPhase(turns);
+  const stopOp = turnStopOpId(turns);
+  const key = `${phase}:${stopOp ?? ''}`;
+  if (key !== lastPostedTurnKey) {
+    lastPostedTurnKey = key;
+    chatProvider?.postTurnState(phase, stopOp);
+  }
+}
+
+function resetTurnLifecycle(): void {
+  turns = emptyTurnLifecycle();
+  lastPostedTurnKey = null;
+  chatProvider?.postTurnState('idle', null);
+}
+
+/** Host-side live batching: frames accumulate for one flush window. */
+const LIVE_FLUSH_MS = 16;
+/** Bound of frames held in ONE flush (beyond it: flush now). */
+const LIVE_FLUSH_FRAME_CAP = 128;
+let livePendingFrames: LiveChunkFrame[] = [];
+let liveFlushTimer: NodeJS.Timeout | null = null;
+/** The instance id of the last handshake (frames from any other instance
+ * are a foreign lineage after a daemon restart and are dropped). */
+let liveExpectedInstance: string | null = null;
+/** Single-flight + cooldown of the authoritative resync fetch. */
+let liveResyncInFlight = false;
+let liveResyncLastAt = 0;
+
+function queueLiveFrame(frame: LiveChunkFrame): void {
+  if (active.sessionId === null || String(frame.session) !== active.sessionId) {
+    // Frames of a previous session can never reach the current panel.
+    return;
+  }
+  if (liveExpectedInstance !== null && frame.instance !== liveExpectedInstance) {
+    return;
+  }
+  livePendingFrames.push(frame);
+  if (livePendingFrames.length >= LIVE_FLUSH_FRAME_CAP) {
+    flushLiveFrames();
+    return;
+  }
+  if (liveFlushTimer === null) {
+    liveFlushTimer = setTimeout(() => {
+      liveFlushTimer = null;
+      flushLiveFrames();
+    }, LIVE_FLUSH_MS);
+  }
+}
+
+/** Deliver the accumulated batch as ONE panel message (one DOM frame). */
+function flushLiveFrames(): void {
+  if (liveFlushTimer !== null) {
+    clearTimeout(liveFlushTimer);
+    liveFlushTimer = null;
+  }
+  if (livePendingFrames.length === 0) {
+    return;
+  }
+  const frames = livePendingFrames;
+  livePendingFrames = [];
+  chatProvider?.postLiveOutput(frames);
+}
+
+function clearLiveBatch(): void {
+  if (liveFlushTimer !== null) {
+    clearTimeout(liveFlushTimer);
+    liveFlushTimer = null;
+  }
+  livePendingFrames = [];
+}
+
+/**
+ * The explicit resync: fetch the AUTHORITATIVE part snapshot (by part id/
+ * revision/offset/watermark) and hand it to the panel, which reconciles so
+ * a saved page never duplicates live text nor overwrites a newer suffix.
+ * Single-flight with a bounded cooldown (a resync storm cannot happen).
+ */
+async function requestLiveResync(reason: string): Promise<void> {
+  const daemon = active.daemon;
+  const sessionId = active.sessionId;
+  if (daemon === null || sessionId === null) {
+    return;
+  }
+  const now = Date.now();
+  if (liveResyncInFlight || now - liveResyncLastAt < 250) {
+    return;
+  }
+  liveResyncInFlight = true;
+  liveResyncLastAt = now;
+  try {
+    const snapshot = await fetchLiveSnapshot(daemon.baseUrl, daemon.bearerToken, sessionId, {
+      fetch: sseAdapter(),
+    });
+    applyLiveSnapshot(snapshot);
+  } catch (error) {
+    recordBackgroundError(error instanceof Error ? error : new Error(`${reason}: ${String(error)}`));
+  } finally {
+    liveResyncInFlight = false;
+  }
+}
+
+function applyLiveSnapshot(snapshot: {
+  readonly instance: string;
+  readonly session: number;
+  readonly turn: { readonly op: string; readonly status: string } | null;
+}): void {
+  if (active.sessionId === null || String(snapshot.session) !== active.sessionId) {
+    return;
+  }
+  // A new instance (daemon restart) makes every buffered frame foreign.
+  if (liveExpectedInstance !== snapshot.instance) {
+    if (liveExpectedInstance !== null) {
+      clearLiveBatch();
+    }
+    liveExpectedInstance = snapshot.instance;
+  }
+  if (snapshot.turn !== null) {
+    dispatchTurn({ type: 'turnStatus', opId: snapshot.turn.op, status: snapshot.turn.status });
+  }
+  chatProvider?.postLiveSnapshot(snapshot);
+}
+
+function handleLiveMessage(message: LiveOutputMessage): void {
+  // NOTE: if/else (not `case`) — the incoming webview-message switch owns
+  // `case` labels; this live-transport dispatch is host-internal.
+  if (message.type === 'snapshot') {
+    // The subscribe-before-submit handshake (and every reconnect
+    // baseline): exact starting watermark + authoritative parts.
+    applyLiveSnapshot(message.snapshot);
+    return;
+  }
+  if (message.type === 'turn') {
+    // The durable turn projection: the ONLY completion authority.
+    const { turn, status } = message.frame;
+    if (turn !== null && status !== null) {
+      dispatchTurn({ type: 'turnStatus', opId: turn, status });
+    }
+    return;
+  }
+  if (message.type === 'resync') {
+    // The bounded per-subscriber queue overran: explicit signal, then
+    // the authoritative reconciliation (never silent loss).
+    void requestLiveResync(`lagged: ${message.frame.reason}`);
+    return;
+  }
+  if (message.type === 'live') {
+    queueLiveFrame(message.frame);
+  }
+}
+
+/**
+ * Subscribe to the session's live model output (idempotent). Call BEFORE a
+ * prompt POST so the handshake snapshot lands first and a fast reply can
+ * never outrun the listener (subscribe-before-submit).
+ */
+function startLiveOutput(): void {
+  const daemon = active.daemon;
+  const sessionId = active.sessionId;
+  if (!daemon || !sessionId) {
+    return;
+  }
+  active.liveStream?.stop();
+  clearLiveBatch();
+  const stream = new LiveOutputStream({
+    baseUrl: daemon.baseUrl,
+    bearerToken: daemon.bearerToken,
+    sessionId,
+    fetch: sseAdapter(),
+    onMessage: handleLiveMessage,
+    onStatus: (status: LiveOutputStreamStatus) => {
+      if (status === 'stopped' || status === 'retrying') {
+        // A reconnect will re-handshake with a fresh snapshot: everything
+        // buffered under the old connection is stale by definition.
+        clearLiveBatch();
+      }
+    },
+    onError: (error) => {
+      recordBackgroundError(error);
+    },
+  });
+  active.liveStream = stream;
+  stream.start();
+}
+
+/** Stop the live subscription (daemon crash/stop, session switch). */
+function stopLiveOutput(): void {
+  active.liveStream?.stop();
+  active.liveStream = null;
+  clearLiveBatch();
+}
+
 function startStream(cursor = 0): void {
   const daemon = active.daemon;
   const sessionId = active.sessionId;
@@ -1913,6 +2149,23 @@ function startStream(cursor = 0): void {
           chatProvider?.postUserError(projection);
         }
       }
+      // The durable journal drives the ONE turn reducer: admission,
+      // machine-state tags, tool phases and the terminal events. Terminal
+      // transitions only ever come from these durable events or the turn
+      // record — never from a quiet stream or an HTTP 2xx.
+      {
+        const data = frame.data;
+        const record =
+          data !== null && typeof data === 'object' && !Array.isArray(data)
+            ? (data as Record<string, unknown>)
+            : null;
+        dispatchTurn({
+          type: 'journal',
+          kind: frame.event,
+          opId: typeof record?.opId === 'string' ? record.opId : null,
+          state: typeof record?.state === 'string' ? record.state : undefined,
+        });
+      }
       streamRefresh?.request();
     },
     onStatus: (status: EventStreamStatus, detail) => {
@@ -1955,6 +2208,10 @@ function startStream(cursor = 0): void {
   stream.start();
   store.patch({ streamStatus: 'connecting' });
   chatProvider?.postStreamRecovery(false);
+  // The live model-output subscription rides the same lifecycle (and the
+  // same session): its handshake snapshot is the baseline every later
+  // snapshot/frame reconciles against.
+  startLiveOutput();
 }
 
 // -------------------------------------------------------------------- refresh
@@ -2145,7 +2402,9 @@ async function refresh(): Promise<void> {
         permissionList === null ? store.snapshot().permissions : permissionSummaries(permissionList),
       runs: runs.map(runSummary),
       activeRunId,
-      busy: activeRunId !== null,
+      // The turn reducer owns busy for Ask turns (a Task run still maps to
+      // activeRunId): a live turn NEVER displays as Ready without Stop.
+      busy: activeRunId !== null || turnLifecycleIsLive(turns),
       cockpit: cockpitProjection.cockpit,
       cockpitSections: cockpitProjection.sections,
       tournament: cockpitProjection.cockpit?.tournament ?? null,
@@ -3012,7 +3271,20 @@ async function sendAskTurnFromComposer(
     );
   }
   active.conversationInFlight = true;
+  // ONE turn reducer: idle → submitting. Busy follows the reducer from
+  // here on (never the HTTP status line).
+  dispatchTurn({ type: 'submit', source: 'ask' });
   try {
+    // Subscribe-before-submit: the live-output handshake must be open
+    // BEFORE the prompt POST so a fast reply cannot outrun the listener.
+    // Live output is best-effort — a failed subscription degrades to the
+    // existing page refresh, it never fails the turn.
+    try {
+      await ensureAskConnection(context);
+      startLiveOutput();
+    } catch (error) {
+      recordBackgroundError(error);
+    }
     const outcome = await sendAskTurnWithRecovery(
       {
         ensureConnection: () => ensureAskConnection(context),
@@ -3033,12 +3305,30 @@ async function sendAskTurnFromComposer(
     active.askOnly = true;
     active.activeRunId = null;
     active.completionContract = null;
-    store.patch({ activeRunId: null, busy: false, lastError: null });
+    // The receipt's operation/execution ids are stored as INTERNAL
+    // correlation (queued → `queued`, accepted → `starting`). HTTP
+    // acceptance is admission only: it never completes a turn and never
+    // clears busy while the reply is still generating.
+    dispatchTurn({
+      type: 'receipt',
+      opId: outcome.receipt.op_id,
+      runId: outcome.receipt.run_id,
+      queued: outcome.receipt.queued === true,
+    });
+    store.patch({
+      activeRunId: null,
+      busy: turnLifecycleIsLive(turns) || active.activeRunId !== null,
+      lastError: null,
+    });
     chatProvider?.postStartResult(goal, true);
     await refreshConversation();
   } catch (error) {
     const retryable = error instanceof NativeApiError ? error.retryable : true;
     const reason = messageOf(error);
+    // The submission never landed (or its response was lost): the tracked
+    // entry ends with its exact outcome — busy must not stick on a turn
+    // the daemon never admitted. A retry starts a fresh entry.
+    dispatchTurn({ type: 'turnStatus', opId: null, status: 'failed' });
     store.patch({ lastError: reason });
     reportError(error, askErrorKind(error));
     chatProvider?.postStartResult(goal, false, retryable);
@@ -3277,15 +3567,42 @@ async function cancelActiveRun(): Promise<void> {
   // Target ONLY an active (non-terminal) run: a terminal run in the list is
   // not cancellable and the server's typed 409 is never provoked.
   const runId = cancelRunTarget(active.activeRunId, store.snapshot().runs);
-  if (!client || !sessionId || runId === null) {
-    chatProvider?.postNotice('info', 'no active task run to cancel');
+  if (!client || !sessionId) {
+    chatProvider?.postNotice('info', 'no active session to stop');
+    return;
+  }
+  if (runId !== null) {
+    try {
+      const ack = await client.cancelTaskRun(sessionId, runId);
+      chatProvider?.postNotice('info', `run ${ack.run_id} cancel requested`);
+      active.activeRunId = null;
+      store.patch({ activeRunId: null, busy: turnLifecycleIsLive(turns) });
+      scheduleRefresh(0);
+    } catch (error) {
+      reportError(error);
+    }
+    return;
+  }
+  // Ask turn: abort EXACTLY the tracked operation through the typed native
+  // abort capability — never an unrelated task cancel, never a guess.
+  const opId = turnStopOpId(turns);
+  if (opId === null) {
+    chatProvider?.postNotice('info', 'no active turn to stop');
     return;
   }
   try {
-    const ack = await client.cancelTaskRun(sessionId, runId);
-    chatProvider?.postNotice('info', `run ${ack.run_id} cancel requested`);
-    active.activeRunId = null;
-    store.patch({ activeRunId: null, busy: false });
+    const ack = await client.abortSession(sessionId, opId);
+    if (ack.aborted.indexOf(opId) >= 0) {
+      // The daemon confirms IT cancelled this operation: the exact outcome
+      // label (partial reply kept, phase `interrupted`).
+      dispatchTurn({ type: 'stopped', opId });
+      chatProvider?.postNotice('info', 'turn stopped');
+    } else {
+      chatProvider?.postNotice(
+        'error',
+        'the daemon did not cancel this turn; its authoritative status will follow',
+      );
+    }
     scheduleRefresh(0);
   } catch (error) {
     reportError(error);
@@ -4475,6 +4792,11 @@ async function handleWebviewMessage(
     }
     case 'cancelRun':
       await cancelActiveRun();
+      return;
+    case 'liveGap':
+      // The panel detected an offset gap in the live frames: fetch the
+      // authoritative snapshot and reconcile (never a silent text hole).
+      void requestLiveResync(`panel gap: ${String(message.partId ?? '')}`);
       return;
     case 'agentControl':
       await controlAgent(message);

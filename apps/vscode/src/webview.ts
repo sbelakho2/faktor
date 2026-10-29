@@ -277,6 +277,35 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   /**
+   * Host-batched live model output (P0 fluidity): ONE message per 16–33ms
+   * window carrying the chunk frames that advanced since the last flush.
+   * The panel applies them to the active ordered part on a single
+   * animation frame — it never re-reads message pages per token.
+   */
+  postLiveOutput(frames: readonly unknown[]): void {
+    this.post({ type: 'liveOutput', frames });
+  }
+
+  /**
+   * The authoritative live-part snapshot: the subscribe-before-submit
+   * handshake baseline and the reconciliation answer to an explicit
+   * `resync` / client gap (byte-identical text, no duplicated suffix).
+   */
+  postLiveSnapshot(snapshot: unknown): void {
+    this.post({ type: 'liveSnapshot', snapshot });
+  }
+
+  /**
+   * The ONE turn lifecycle state (idle → submitting → queued/starting →
+   * streaming/tool-running/awaiting-user → completed/interrupted/failed):
+   * the turn-state rendering source (label + Stop visibility) — distinct
+   * from the task-run snapshot fields.
+   */
+  postTurnState(phase: string, opId: string | null): void {
+    this.post({ type: 'turnState', phase, opId });
+  }
+
+  /**
    * The result of one selected-change review (I03): `opened` names the
    * served evidence id whose immutable document (or side-by-side diff) the
    * native editor now shows; `unavailable` asks the Changes view to render

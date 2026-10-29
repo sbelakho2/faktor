@@ -198,6 +198,23 @@
   var transcriptEntryStructures = null;
   var transcriptEntries = null;
   var transcriptRevision = null;
+  // Live model-output overlay (P0 fluidity): the last DURABLE transcript
+  // the snapshot renderer saw (the merge base — never mutated) and the
+  // bounded live tail per `(message, kind)`, kept in UTF-8 BYTES.
+  var lastDurableTranscript = null;
+  var lastDurableRevision = null;
+  var liveParts = {};
+  var liveExpectedInstance = null;
+  var liveDomFlushScheduled = false;
+  var liveResyncRequestedAt = 0;
+  var liveRevisionCounter = 0;
+  var liveUtf8Encoder = typeof TextEncoder !== 'undefined' ? new TextEncoder() : null;
+  // The ONE turn lifecycle state (host reducer projection): phase label +
+  // Stop visibility. `idle` until the host posts a `turnState`.
+  var turnStatePhase = 'idle';
+  var turnStateStopOp = null;
+  /** The last rendered snapshot (header/Stop re-render without a snapshot). */
+  var lastSnapshotForHeader = null;
   var transcriptPinRequested = false;
   var transcriptWindowed = false;
   var transcriptWindowStart = 0;
@@ -2111,10 +2128,14 @@
     // The product header carries the run status; there is no second status
     // row in the chat body. Run detail (goal, tokens, plan, candidate
     // boundary) lives in Inspect, and Stop lives in the overflow menu.
-    // Stop is offered only while a run is LIVE. `task` is the durable last
-    // task (it outlives interrupted/finished runs) — keying on it left
-    // "Stop current run" stuck in the menu with nothing to stop.
-    var hasRun = snapshot ? snapshot.busy === true || snapshot.activeRunId != null : false;
+    // Stop is offered only while a run TURN is LIVE. `task` is the durable
+    // last task (it outlives interrupted/finished runs) — keying on it left
+    // "Stop current run" stuck in the menu with nothing to stop. The turn
+    // reducer's liveness is OR-ed in: a live Ask turn shows Stop before the
+    // busy snapshot may even have landed.
+    var hasRun = snapshot
+      ? snapshot.busy === true || snapshot.activeRunId != null || turnStateIsLive()
+      : turnStateIsLive();
     var stopItem = byId('menu-stop');
     if (stopItem) {
       stopItem.hidden = !hasRun;
@@ -4671,6 +4692,14 @@
     var task = snapshot.task;
     var hasActiveRun = snapshot.busy === true || snapshot.activeRunId != null;
     var spec = runStateSpec(snapshot);
+    var model = snapshot.session && snapshot.session.model ? String(snapshot.session.model) : '';
+    var turnLabel = turnPhaseCopy(turnStatePhase);
+    if (turnLabel !== null && turnStateIsLive() && !(hasActiveRun && task)) {
+      // Turn-state rendering: while a turn is live the reducer's exact
+      // phase wins (Stop in the menu targets that operation). Ask turns
+      // have no task row; a live TASK run keeps its own Running line.
+      return model.length > 0 ? turnLabel + ' · ' + model : turnLabel;
+    }
     if (hasActiveRun && task) {
       var agents = Array.isArray(snapshot.agents) ? snapshot.agents.length : 0;
       var label = spec !== null && spec.label && spec.label !== 'Ready' ? spec.label : 'Running';
@@ -4680,9 +4709,14 @@
       }
       return parts.join(' · ');
     }
-    var model = snapshot.session && snapshot.session.model ? String(snapshot.session.model) : '';
     if (spec !== null && spec.label && spec.label !== 'Ready') {
       return model.length > 0 ? spec.label + ' · ' + model : spec.label;
+    }
+    if (turnLabel !== null) {
+      // A settled Ask keeps its exact outcome (Completed / Stopped /
+      // Failed) where the base line would only say Ready — the partial
+      // reply after Stop stays labelled until the next submission.
+      return model.length > 0 ? turnLabel + ' · ' + model : turnLabel;
     }
     return model.length > 0 ? 'Ready · ' + model : 'Ready';
   }
@@ -5702,8 +5736,14 @@
       transcriptPinned = true;
       transcriptAnchor = null;
       transcriptLastWrittenTop = 0;
+      // Live output is per conversation: the overlay, its durable base and
+      // the accepted instance lineage never leak into the new session.
+      liveParts = {};
+      lastDurableTranscript = null;
+      lastDurableRevision = null;
     }
     currentSessionId = sessionId;
+    lastSnapshotForHeader = snapshot;
     machineStateValue =
       typeof snapshot.machineState === 'string' && snapshot.machineState.length > 0
         ? snapshot.machineState
@@ -5743,7 +5783,11 @@
     renderHistory(snapshot);
     renderOutcomes(snapshot);
     renderWelcome(snapshot.transcript);
-    renderTranscript(snapshot.transcript, snapshot.transcriptRevision);
+    // Transcript rendering consumes the OVERLAY-MERGED entries; the durable
+    // array stays the immutable base every later merge reconciles against.
+    lastDurableTranscript = snapshot.transcript;
+    lastDurableRevision = snapshot.transcriptRevision;
+    renderTranscript(withLiveOverlay(snapshot.transcript), snapshot.transcriptRevision);
     // The raw last error lives in Diagnostics; the structured projection
     // reached the panel through `userError`. A last error with no posted
     // projection (e.g. a cockpit projection failure) still surfaces ONCE
@@ -6013,6 +6057,476 @@
     }
   }
 
+  // --------------------------------------------- live model output (applied)
+  //
+  // The host forwards the daemon's bounded live-output frames batched per
+  // 16–33ms window as ONE `liveOutput` message. This section:
+  //   * applies each delta to the active ordered part by UTF-8 BYTE offset
+  //     (offset === held bytes → append; < bytes → duplicate dropped, never
+  //     re-rendered; > bytes or a revision/attempt jump → explicit resync
+  //     request — the host fetches the authoritative part snapshot);
+  //   * reconciles `liveSnapshot` payloads so a saved page NEVER duplicates
+  //     live text and NEVER overwrites a newer live suffix;
+  //   * batches ALL DOM work of a window into ONE animation frame — never
+  //     a page reread per token (the 120ms snapshot refresh stays the
+  //     reconciliation fallback only).
+  var TURN_PHASES_KNOWN = [
+    'idle',
+    'submitting',
+    'queued',
+    'starting',
+    'streaming',
+    'tool-running',
+    'awaiting-user',
+    'completed',
+    'interrupted',
+    'failed',
+  ];
+  var TURN_PHASES_LIVE = [
+    'submitting',
+    'queued',
+    'starting',
+    'streaming',
+    'tool-running',
+    'awaiting-user',
+  ];
+
+  function liveUtf8Length(value) {
+    var text = value == null ? '' : String(value);
+    return liveUtf8Encoder ? liveUtf8Encoder.encode(text).length : text.length;
+  }
+
+  function livePartKey(messageId, kind) {
+    return String(messageId) + ':' + String(kind);
+  }
+
+  function turnStateIsLive() {
+    return TURN_PHASES_LIVE.indexOf(turnStatePhase) >= 0;
+  }
+
+  /** The product copy for one turn phase (mirror of the host reducer). */
+  function turnPhaseCopy(phase) {
+    switch (phase) {
+      case 'submitting':
+        return 'Sending…';
+      case 'queued':
+        return 'Queued';
+      case 'starting':
+        return 'Starting…';
+      case 'streaming':
+        return 'Generating…';
+      case 'tool-running':
+        return 'Working…';
+      case 'awaiting-user':
+        return 'Needs approval';
+      case 'completed':
+        return 'Completed';
+      case 'interrupted':
+        return 'Stopped';
+      case 'failed':
+        return 'Failed';
+      default:
+        return null;
+    }
+  }
+
+  /** Explicit client-side gap signal: at most one host fetch per window. */
+  function requestLiveGapSync(key) {
+    var now = Date.now();
+    if (now - liveResyncRequestedAt < 250) {
+      return;
+    }
+    liveResyncRequestedAt = now;
+    renderProbe('live-gap');
+    vscode.postMessage({ type: 'liveGap', partId: key });
+  }
+
+  /** The durable floor of one `(message, kind)` part (the seed for a part
+   * the overlay has not seen yet — byte offsets are absolute, so a part can
+   * start mid-stream over an already-durable prefix). */
+  function liveDurableBase(messageId, kind) {
+    var entries = lastDurableTranscript;
+    if (!Array.isArray(entries)) {
+      return '';
+    }
+    var want = String(messageId);
+    for (var i = 0; i < entries.length; i += 1) {
+      var entry = entries[i];
+      if (entry && String(entry.id) === want) {
+        var value = kind === 'reasoning' ? entry.reasoning : entry.text;
+        return value == null ? '' : String(value);
+      }
+    }
+    return '';
+  }
+
+  /** Apply ONE live frame to the overlay. True = text advanced. */
+  function applyLiveFrameToOverlay(frame) {
+    if (!frame || typeof frame !== 'object') {
+      return false;
+    }
+    if (typeof frame.instance !== 'string' || frame.instance.length === 0) {
+      return false;
+    }
+    if (liveExpectedInstance === null) {
+      liveExpectedInstance = frame.instance;
+    } else if (frame.instance !== liveExpectedInstance) {
+      // A changed server-instance id is a foreign lineage (daemon restart):
+      // drop it; the new handshake snapshot is the authority.
+      renderProbe('live-foreign-instance');
+      return false;
+    }
+    var kind = String(frame.kind || '');
+    if (kind !== 'text' && kind !== 'reasoning') {
+      // Discrete kinds (tool payloads) are rendered from the durable parts.
+      return false;
+    }
+    if (typeof frame.content !== 'string' || frame.content.length === 0) {
+      return false;
+    }
+    var offset =
+      typeof frame.offset === 'number' && isFinite(frame.offset) && frame.offset >= 0
+        ? frame.offset
+        : -1;
+    var revision =
+      typeof frame.revision === 'number' && isFinite(frame.revision) && frame.revision >= 0
+        ? frame.revision
+        : -1;
+    var attempt = typeof frame.attempt === 'number' && isFinite(frame.attempt) ? frame.attempt : 0;
+    if (offset < 0 || revision < 0) {
+      return false;
+    }
+    var key = livePartKey(frame.messageId, kind);
+    var part = liveParts[key];
+    if (!part) {
+      // First frame for this part: seed from the DURABLE floor (offsets are
+      // absolute — a live part can start above an already-rendered prefix).
+      // The offset/revision checks below then classify it exactly: append
+      // at the floor, duplicate inside it, or an explicit resync gap.
+      var base = liveDurableBase(frame.messageId, kind);
+      liveParts[key] = {
+        text: base,
+        bytes: liveUtf8Length(base),
+        attempt: null,
+        revision: -1,
+      };
+      part = liveParts[key];
+    }
+    if (part.attempt !== null && part.attempt !== attempt) {
+      // Lineage epoch changed (a snapshot-triggered rebase): one resync,
+      // never a merge of two lineages.
+      delete liveParts[key];
+      requestLiveGapSync(key);
+      return false;
+    }
+    if (part.attempt === null) {
+      part.attempt = attempt;
+    }
+    if (revision <= part.revision) {
+      // Duplicate/replayed frame: dropped before any DOM work (no doubled
+      // side effects, no duplicated text).
+      return false;
+    }
+    if (part.revision >= 0 && revision > part.revision + 1) {
+      requestLiveGapSync(key);
+      return false;
+    }
+    var contentBytes = liveUtf8Length(frame.content);
+    if (offset > part.bytes) {
+      requestLiveGapSync(key);
+      return false;
+    }
+    if (offset < part.bytes) {
+      if (offset + contentBytes <= part.bytes) {
+        // Fully held already (the duplicate covers only known bytes).
+        part.revision = revision;
+        return false;
+      }
+      requestLiveGapSync(key);
+      return false;
+    }
+    part.text += frame.content;
+    part.bytes += contentBytes;
+    part.revision = revision;
+    return true;
+  }
+
+  /**
+   * Reconcile the authoritative snapshot into the overlay:
+   *   * snapshot extends held → adopt it (we were behind);
+   *   * held extends the snapshot → KEEP the newer live suffix (a saved
+   *     snapshot never overwrites it);
+   *   * divergence → the durable/composed authority wins (byte-identical
+   *     convergence; the lineage pins on the next frame/snapshot).
+   */
+  function applyLiveSnapshotToOverlay(snapshot) {
+    if (!snapshot || typeof snapshot !== 'object') {
+      return;
+    }
+    if (typeof snapshot.instance === 'string' && snapshot.instance.length > 0) {
+      if (liveExpectedInstance !== null && liveExpectedInstance !== snapshot.instance) {
+        renderProbe('live-restart-reconcile');
+        liveParts = {};
+      }
+      liveExpectedInstance = snapshot.instance;
+    }
+    var parts = Array.isArray(snapshot.parts) ? snapshot.parts : [];
+    for (var i = 0; i < parts.length; i++) {
+      var part = parts[i];
+      if (!part || typeof part !== 'object') {
+        continue;
+      }
+      var kind = String(part.kind || '');
+      if (kind !== 'text' && kind !== 'reasoning') {
+        continue;
+      }
+      var key = livePartKey(part.messageId, kind);
+      var snapText = typeof part.text === 'string' ? part.text : '';
+      var snapBytes =
+        typeof part.offset === 'number' && isFinite(part.offset) && part.offset >= 0
+          ? part.offset
+          : liveUtf8Length(snapText);
+      var snapAttempt = typeof part.attempt === 'number' ? part.attempt : 0;
+      var snapRevision = typeof part.revision === 'number' ? part.revision : 0;
+      var held = liveParts[key];
+      if (!held) {
+        if (snapBytes > 0) {
+          liveParts[key] = {
+            text: snapText,
+            bytes: snapBytes,
+            attempt: snapAttempt,
+            revision: snapRevision,
+          };
+        }
+        continue;
+      }
+      if (snapText.indexOf(held.text) === 0) {
+        // Snapshot at least as new: adopt byte-exactly (held was behind).
+        held.text = snapText;
+        held.bytes = snapBytes;
+        held.attempt = snapAttempt;
+      } else if (held.text.indexOf(snapText) !== 0) {
+        // Divergence: the authority wins; the next frame re-pins the
+        // lineage (attempt = null until then, no false resync loop).
+        held.text = snapText;
+        held.bytes = snapBytes;
+        held.attempt = null;
+      }
+      // snapIsPrefix → held keeps its newer live suffix untouched.
+      if (held.revision < snapRevision) {
+        held.revision = snapRevision;
+      }
+    }
+  }
+
+  /**
+   * Merge the overlay into the DURABLE entries (clones only when something
+   * changed; the durable array is the immutable base for later merges).
+   * UTF-8 prefix rules: for well-formed text a JS `indexOf(...) === 0`
+   * prefix test is exactly a byte-prefix test (both cut at code points).
+   */
+  function withLiveOverlay(entries) {
+    if (!Array.isArray(entries) || entries.length === 0) {
+      return entries;
+    }
+    var hasAny = false;
+    for (var scan = 0; scan < entries.length; scan += 1) {
+      var scanId = entries[scan] ? String(entries[scan].id) : '';
+      if (liveParts[scanId + ':text'] || liveParts[scanId + ':reasoning']) {
+        hasAny = true;
+        break;
+      }
+    }
+    if (!hasAny) {
+      return entries;
+    }
+    var out = entries.slice();
+    for (var i = 0; i < out.length; i++) {
+      var entry = out[i];
+      if (!entry) {
+        continue;
+      }
+      var id = String(entry.id);
+      var text = liveMergedField(id + ':text', entry.text);
+      var reasoning = liveMergedField(id + ':reasoning', entry.reasoning);
+      if (text === entry.text && reasoning === entry.reasoning) {
+        continue;
+      }
+      var merged = {};
+      for (var field in entry) {
+        if (Object.prototype.hasOwnProperty.call(entry, field)) {
+          merged[field] = entry[field];
+        }
+      }
+      merged.text = text;
+      merged.reasoning = reasoning;
+      out[i] = merged;
+    }
+    return out;
+  }
+
+  function liveMergedField(key, baseValue) {
+    var held = liveParts[key];
+    var base = baseValue == null ? '' : String(baseValue);
+    if (!held) {
+      return base;
+    }
+    if (held.text.indexOf(base) === 0) {
+      // The live overlay extends the saved text: append-only, no duplicate.
+      return held.text;
+    }
+    // Either the durable floor caught the overlay up completely or the two
+    // diverged: the durable authority wins byte-for-byte, and the overlay
+    // resets to that floor so the NEXT frame appends from exactly its byte
+    // length (lineage pinned by the next frame or snapshot).
+    held.text = base;
+    held.bytes = liveUtf8Length(base);
+    held.attempt = null;
+    return base;
+  }
+
+  function liveNodeAt(container, i) {
+    if (transcriptWindowed) {
+      if (i < transcriptWindowStart || i >= transcriptWindowEnd) {
+        return null;
+      }
+      return container.children[i - transcriptWindowStart] || null;
+    }
+    return container.children[i] || null;
+  }
+
+  /**
+   * ONE DOM pass for the whole flush window: patch only the entries whose
+   * merged text moved (the streaming entry), otherwise hand the batch to the
+   * full incremental renderer once. Never a per-token page reread.
+   */
+  function applyLiveBatchToDom() {
+    renderProbe('live-flush');
+    var durable = lastDurableTranscript;
+    if (!Array.isArray(durable) || durable.length === 0 || transcriptEntries === null) {
+      return;
+    }
+    var merged = withLiveOverlay(durable);
+    if (merged === durable) {
+      return; // no overlay key matched a rendered entry (nothing to show yet)
+    }
+    var container = byId('entries');
+    if (!container) {
+      return;
+    }
+    var applied = true;
+    for (var i = 0; i < merged.length; i += 1) {
+      var current = transcriptEntries[i];
+      var next = merged[i];
+      if (!current || !next) {
+        applied = false;
+        break;
+      }
+      if (
+        String(current.text) === String(next.text) &&
+        String(current.reasoning) === String(next.reasoning) &&
+        String(current.summary) === String(next.summary)
+      ) {
+        continue;
+      }
+      var node = liveNodeAt(container, i);
+      if (!node || !patchEntryNode(node, next)) {
+        applied = false;
+        break;
+      }
+      transcriptEntries[i] = next;
+      if (transcriptEntryKeys && transcriptEntryKeys.length === merged.length) {
+        // Keep the key cache coherent with what is actually rendered, so a
+        // later snapshot can never mistake stale keys for unchanged content.
+        transcriptEntryKeys[i] = transcriptEntryKey(next);
+      }
+      renderProbe('live-patched');
+    }
+    if (!applied) {
+      // Structure moved (a fresh entry appeared, windowing, tool rows): the
+      // full incremental renderer takes over — still ONE pass per batch.
+      renderProbe('transcript');
+      liveRevisionCounter += 1;
+      renderTranscript(
+        merged,
+        (lastDurableRevision == null ? 'live' : String(lastDurableRevision)) +
+          '#live' +
+          liveRevisionCounter,
+      );
+    }
+  }
+
+  function scheduleLiveDomFlush() {
+    if (liveDomFlushScheduled) {
+      renderProbe('live-coalesced');
+      return;
+    }
+    liveDomFlushScheduled = true;
+    var run = function () {
+      liveDomFlushScheduled = false;
+      applyLiveBatchToDom();
+    };
+    if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
+      window.requestAnimationFrame(run);
+    } else {
+      setTimeout(run, 16);
+    }
+  }
+
+  function handleLiveOutputFrames(frames) {
+    if (!Array.isArray(frames) || frames.length === 0) {
+      return;
+    }
+    var touched = false;
+    for (var i = 0; i < frames.length; i += 1) {
+      if (applyLiveFrameToOverlay(frames[i])) {
+        touched = true;
+      }
+    }
+    if (touched) {
+      scheduleLiveDomFlush();
+    }
+  }
+
+  /** The host's turn-state projection: label + Stop visibility. */
+  function applyTurnStateMessage(message) {
+    var phase = typeof message.phase === 'string' ? message.phase : 'idle';
+    if (TURN_PHASES_KNOWN.indexOf(phase) < 0) {
+      // A forged/unknown phase is IGNORED (typed state only): the last
+      // known phase stays on screen instead of being reset by garbage.
+      renderProbe('turn-state-forged');
+      return;
+    }
+    var stopOp =
+      typeof message.opId === 'string' && message.opId.length > 0 && message.opId.length <= 64
+        ? message.opId
+        : null;
+    var changed = phase !== turnStatePhase || stopOp !== turnStateStopOp;
+    turnStatePhase = phase;
+    turnStateStopOp = stopOp;
+    if (!changed) {
+      return;
+    }
+    renderTurnState();
+  }
+
+  function renderTurnState() {
+    // Turn-state rendering: the header status carries the exact phase (and
+    // the settled outcome); Stop is visible while ANY turn is live, even
+    // before the busy snapshot lands (receipt and snapshot are separate).
+    if (lastSnapshotForHeader !== null) {
+      setText('daemon-text', headerStatusText(lastSnapshotForHeader));
+    }
+    var stopItem = byId('menu-stop');
+    if (stopItem) {
+      var hasRun =
+        turnStateIsLive() ||
+        (lastSnapshotForHeader !== null &&
+          (lastSnapshotForHeader.busy === true || lastSnapshotForHeader.activeRunId != null));
+      stopItem.hidden = !hasRun;
+    }
+  }
+
   window.addEventListener('message', function (event) {
     var message = event.data || {};
     renderProbe('message');
@@ -6024,6 +6538,21 @@
     if (message.type === 'snapshot') {
       pendingSnapshot = message.snapshot;
       scheduleSnapshotFlush();
+    } else if (message.type === 'liveOutput') {
+      // Host-batched live model output: apply the deltas to the overlay and
+      // schedule ONE animation frame of DOM work for the whole window.
+      handleLiveOutputFrames(message.frames);
+    } else if (message.type === 'liveSnapshot') {
+      // The authoritative part snapshot (handshake baseline / resync
+      // reconciliation): never duplicates live text, never overwrites a
+      // newer live suffix (see applyLiveSnapshotToOverlay).
+      applyLiveSnapshotToOverlay(message.snapshot);
+      if (lastSnapshotForHeader !== null) {
+        setText('daemon-text', headerStatusText(lastSnapshotForHeader));
+      }
+      scheduleLiveDomFlush();
+    } else if (message.type === 'turnState') {
+      applyTurnStateMessage(message);
     } else if (message.type === 'faktorShowView') {
       // The host selected an internal destination of this SAME panel. No
       // panel, column or sidebar is created; the local view router moves.
