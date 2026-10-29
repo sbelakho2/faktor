@@ -512,6 +512,15 @@ impl SessionHandle {
                 session_id: row.session_id.to_string(),
                 seq: row.seq,
                 created_ms: row.created_ms,
+                // Turn/operation identity (protocol `Message.turn_id`, audit
+                // item 6): read from the durable row's data payload when the
+                // writer stamped one; every legacy row (no field) falls back
+                // to null — history is never rewritten.
+                turn_id: row
+                    .data
+                    .get("turn_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned),
                 parts,
             });
         }

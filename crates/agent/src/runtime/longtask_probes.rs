@@ -144,6 +144,7 @@ async fn cancel_during_compaction_leaves_no_checkpoint_and_no_event() {
             &ContextBudget::default(),
             &cancel,
             Some(1),
+            false,
         )
         .await
         .unwrap();

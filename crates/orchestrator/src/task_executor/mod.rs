@@ -67,7 +67,8 @@ use faktor_core::state::{
     VerificationStatus,
 };
 use faktor_protocol::{
-    turn_execution_row_key, ExecutionKind, TurnExecution, TURN_EXECUTION_ROW_KIND,
+    turn_execution_row_key, turn_intent_row_key, ExecutionKind, TurnExecution, TurnIntentRow,
+    TURN_EXECUTION_ROW_KIND, TURN_INTENT_ROW_KIND,
 };
 use faktor_session::task::{ProofBasis, ProofBasisCheck, ProofBasisCriterion, ProofReuse};
 use faktor_session::{
@@ -115,6 +116,11 @@ const RUN_BASE_SKIP_DIRS: &[&str] = faktor_fs::tree_manifest::TREE_MANIFEST_SKIP
 /// Bounded retries of the stable run-base copy before a typed
 /// [`ExecError::WorkspaceDrift`].
 const RUN_BASE_COPY_ATTEMPTS: usize = 3;
+
+/// Lazy contract establishment (audit item 4): the ONE deterministic typed
+/// intent classifier of an ordinary chat turn, consulted by this
+/// executor's admission and by the server's prompt facade.
+pub mod intent;
 
 /// The canonical tree-manifest digest of one root (`tm1:<64-hex>`; the ONE
 /// tree identity defined in `faktor_fs::tree_manifest`). Every run-base,
@@ -607,7 +613,11 @@ impl TaskRunRequest {
         // Ask admission (audit P0-ASK): a conversational ask is exactly ONE
         // read-permitted in-session turn. Every engineering seam is a TYPED
         // refusal here — never a silent drop, never a half-applied task
-        // behavior.
+        // behavior. Lazy contract (audit item 4): an ESTABLISHING ask is
+        // promoted to a task run by
+        // [`TaskExecutor::start_task_with_turn_cap`] BEFORE this
+        // validation, so these refusals only ever bind the CONVERSATIONAL
+        // ask that reaches here.
         if self.execution.is_ask() {
             if self.work_items.len() != 1 {
                 return Err(ExecError::InvalidPlan(
@@ -2214,17 +2224,47 @@ impl TaskExecutor {
         req: TaskRunRequest,
         max_turns: Option<u32>,
     ) -> Result<TaskRunReceipt, ExecError> {
+        let mut req = req;
+        // Lazy contract establishment (audit item 4): an ORDINARY CHAT TURN
+        // (`execution: ask`) is classified by the ONE deterministic typed
+        // classifier BEFORE validation — never by a user-selected mode. An
+        // establishing verdict promotes the request to the SAME executor's
+        // engineering admission path (durable task row, contract compile,
+        // shadow isolation, completion gate); a conversational verdict keeps
+        // the ask path byte-identical. The resolved verdict is persisted on
+        // its OWN op-keyed row (never a task row) inside the admitted body.
+        let mut ask_decision: Option<intent::AskAdmissionDecision> = None;
+        let mut ask_handle: Option<faktor_session::SessionHandle> = None;
+        if req.execution.is_ask() {
+            // An ask fetches its handle up front (the classifier consults
+            // the session's ACTIVE objective); a task request keeps the
+            // historical validate-then-fetch order untouched.
+            let handle = self
+                .session
+                .get_session(parent)?
+                .ok_or_else(|| ExecError::NotFound(format!("session {parent}")))?;
+            let decision = intent::resolve_ask_admission(&handle, &req)?;
+            intent::promote_ask_request(&mut req, &decision);
+            ask_decision = Some(decision);
+            ask_handle = Some(handle);
+        }
         req.validate()?;
+        // Only a CONVERSATIONAL ask still carries ask semantics here (a
+        // promoting verdict already flipped the request to a task run, whose
+        // turn bound binds its durable task row exactly like a legacy start).
         if req.execution.is_ask() && max_turns.is_some() {
             return Err(ExecError::InvalidPlan(
                 "an ask carries no task-scoped turn budget; a configured max-turns bound applies to task runs only"
                     .into(),
             ));
         }
-        let handle = self
-            .session
-            .get_session(parent)?
-            .ok_or_else(|| ExecError::NotFound(format!("session {parent}")))?;
+        let handle = match ask_handle {
+            Some(handle) => handle,
+            None => self
+                .session
+                .get_session(parent)?
+                .ok_or_else(|| ExecError::NotFound(format!("session {parent}")))?,
+        };
         // Idempotency finding 1: the submission-keyed decision is made
         // BEFORE every pre-run step (attachment resolution, identity
         // adoption, live-run blockers, worker placement, shadow
@@ -2345,7 +2385,7 @@ impl TaskExecutor {
             self.settle_existing_shadow(parent, &handle)?;
         }
         if req.work_items.len() == 1 {
-            self.start_in_session(parent, &handle, req, max_turns)
+            self.start_in_session(parent, &handle, req, max_turns, ask_decision)
         } else {
             self.start_orchestrated(parent, req)
         }
@@ -2601,6 +2641,7 @@ impl TaskExecutor {
         handle: &faktor_session::SessionHandle,
         req: TaskRunRequest,
         max_turns: Option<u32>,
+        ask_decision: Option<intent::AskAdmissionDecision>,
     ) -> Result<TaskRunReceipt, ExecError> {
         let admission = match begin_start_admission(
             &self.session,
@@ -2620,6 +2661,7 @@ impl TaskExecutor {
             admission.as_ref(),
             &mut accepted,
             max_turns,
+            ask_decision,
         );
         if result.is_err() && !accepted {
             release_start_admission(&self.session, parent, admission.as_ref());
@@ -2630,6 +2672,7 @@ impl TaskExecutor {
     /// The admitted body of ONE in-session start: the existing single-item
     /// drive, wrapped so acceptance is durably admitted (the wrapper above
     /// owns the claim/replay/release decision).
+    #[allow(clippy::too_many_arguments)]
     fn start_in_session_admitted(
         self: &Arc<Self>,
         parent: SessionId,
@@ -2638,6 +2681,7 @@ impl TaskExecutor {
         admission: Option<&TaskStartAdmission>,
         accepted: &mut bool,
         max_turns: Option<u32>,
+        ask_decision: Option<intent::AskAdmissionDecision>,
     ) -> Result<TaskRunReceipt, ExecError> {
         let item = &req.work_items[0];
         // P0 isolation: a MUTATING single-item run ALWAYS works in a
@@ -2731,17 +2775,28 @@ impl TaskExecutor {
                     // the wrong task row. A distinctly new goal instead lands a
                     // new CONTRACT (fresh criteria/attachments + a revision bump
                     // that invalidates prior proofs) on that identity.
-                    handle
-                        .update_task(
-                            task_id,
-                            faktor_session::TaskPatch {
-                                goal: Some(goal.clone()),
-                                acceptance_criteria: req.effective_criteria_patch(),
-                                attachments: req.effective_attachments_patch(),
-                                ..Default::default()
-                            },
-                        )
-                        .map_err(|e| ExecError::Internal(format!("task row goal update: {e}")))?;
+                    //
+                    // Lazy-contract CONTINUATION (audit item 4): a follow-up
+                    // that resolved against the ACTIVE objective never
+                    // re-goals it — "continue" is conversation, never a new
+                    // recorded goal — so the row (goal included) is kept
+                    // verbatim and no patch is applied.
+                    let continuation = ask_decision.is_some_and(|d| d.suppress_regal);
+                    if !continuation {
+                        handle
+                            .update_task(
+                                task_id,
+                                faktor_session::TaskPatch {
+                                    goal: Some(goal.clone()),
+                                    acceptance_criteria: req.effective_criteria_patch(),
+                                    attachments: req.effective_attachments_patch(),
+                                    ..Default::default()
+                                },
+                            )
+                            .map_err(|e| {
+                                ExecError::Internal(format!("task row goal update: {e}"))
+                            })?;
+                    }
                 }
                 None => {
                     handle
@@ -2896,6 +2951,29 @@ impl TaskExecutor {
                 req.no_op_disposition,
                 Some(task_id.raw()),
             )?;
+        }
+        // Lazy-contract persistence (audit item 4): EVERY classified ask
+        // admission — conversational, promoted- establish or promoted
+        // continuation — records its resolved intent on its OWN op-keyed
+        // durable row, SEPARATE from any task row/ledger (the decision is
+        // durable history and can never contaminate an engineering
+        // projection). Legacy `task` starts classify nothing and write no
+        // row (the documented absence default).
+        if let Some(decision) = ask_decision {
+            let intent_row = TurnIntentRow {
+                intent: decision.intent,
+                execution: req.execution,
+            };
+            let value = intent_row
+                .encode()
+                .map_err(|e| ExecError::Internal(format!("turn intent row encode: {e}")))?;
+            handle
+                .upsert_memory_fact(
+                    TURN_INTENT_ROW_KIND,
+                    &turn_intent_row_key(receipt.op_id.raw()),
+                    &value,
+                )
+                .map_err(|e| ExecError::Internal(format!("turn intent row write: {e}")))?;
         }
         // Acceptance: the prompt is durably recorded and the run's linkage +
         // policy rows exist. The exact receipt is admitted BEFORE the spawn

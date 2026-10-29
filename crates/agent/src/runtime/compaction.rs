@@ -713,7 +713,7 @@ impl AgentRuntime {
         budget: &ContextBudget,
         cancel: &CancellationToken,
     ) -> faktor_core::Result<Option<CompactionPlan>> {
-        self.try_compact_with_head(handle, recent, ledger, budget, cancel, None)
+        self.try_compact_with_head(handle, recent, ledger, budget, cancel, None, false)
             .await
     }
 
@@ -839,6 +839,7 @@ impl AgentRuntime {
         })
     }
 
+    #[allow(clippy::too_many_arguments)] // the head + neutrality seams are explicit, not combinable knobs
     pub(crate) async fn try_compact_with_head(
         &self,
         handle: &faktor_session::SessionHandle,
@@ -850,6 +851,15 @@ impl AgentRuntime {
         cancel: &CancellationToken,
         // Durable high-water mark of the window `recent` was loaded from.
         head_seq: Option<u64>,
+        // Compaction neutrality (audit item 5): a CONVERSATIONAL turn
+        // (no established engineering contract) compacts from CONVERSATION
+        // state ONLY — the projection never derives from `ledger.goal` /
+        // task rows / typed ledger entries, the working ledger handed to
+        // the compactor is the NEUTRAL one, and the accepted plan never
+        // rewrites the durable engineering ledger or prunes the typed entry
+        // stream (those are ENGINEERING authorities a chat turn may not
+        // touch). Task compaction (`false`) is byte-identical to before.
+        conversational: bool,
     ) -> faktor_core::Result<Option<CompactionPlan>> {
         // Strip the PREVIOUS compaction's synthesized blocks before the
         // next compaction: the identity/durable-facts turns are regenerated
@@ -949,10 +959,25 @@ impl AgentRuntime {
         // re-sent history from the durable task rows below; OFF falls back
         // to the legacy transcript-derived fold (`from_task_ledger`), which
         // is the byte-identical pre-flag rendering.
-        let projection = if self.deps.efficiency.typed_handoff {
-            Self::compaction_projection(handle, ledger)?
+        //
+        // Compaction neutrality (audit item 5): a CONVERSATIONAL turn's
+        // projection is built from CONVERSATION state only — an EMPTY
+        // working ledger, never the durable task row, typed ledger head or
+        // the previous task's goal/failures/files. Task compaction keeps
+        // the flag-selected path byte-identically.
+        let neutral_ledger = TaskLedger::default();
+        let (projection, working_ledger) = if conversational {
+            (
+                faktor_context::ledger::TaskContextProjection::from_task_ledger(&neutral_ledger),
+                &neutral_ledger,
+            )
+        } else if self.deps.efficiency.typed_handoff {
+            (Self::compaction_projection(handle, ledger)?, ledger)
         } else {
-            faktor_context::ledger::TaskContextProjection::from_task_ledger(ledger)
+            (
+                faktor_context::ledger::TaskContextProjection::from_task_ledger(ledger),
+                ledger,
+            )
         };
         // ONE configured invariant: the same minimum reduction drives the
         // request's hard cap AND the durable acceptance policy. A daemon
@@ -962,7 +987,7 @@ impl AgentRuntime {
         let mut request = CompactionRequest::new(before, target);
         request.min_reduction_ratio = min_reduction;
         let mut plan = compactor
-            .compact_projected(recent, &projection, ledger, &request)
+            .compact_projected(recent, &projection, working_ledger, &request)
             .await;
         // Reservation terminal state moves through the attempt machine
         // exactly once: accepted => settle; dispatched-but-unsettled =>
@@ -1290,7 +1315,16 @@ impl AgentRuntime {
                 );
             }
         }
-        self.persist_compaction_ledger(handle, &plan)?;
+        // Compaction neutrality (audit item 5): an accepted CONVERSATIONAL
+        // compaction persists the conversation checkpoint above (the
+        // transcript replacement) but NEVER the engineering ledger blob and
+        // NEVER the typed-entry watermark prune — a chat turn may not
+        // rewrite durable task state. The durable ledger stays byte-identical
+        // to what the conversational turn loaded (never cleared, never
+        // rendered — see `wire_task_projection`).
+        if !conversational {
+            self.persist_compaction_ledger(handle, &plan)?;
+        }
         Ok(Some(plan))
     }
 

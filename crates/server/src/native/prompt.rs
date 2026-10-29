@@ -285,10 +285,26 @@ impl PromptExecutionService {
                 || request.max_turns.is_some()
                 || !request.criteria.is_empty())
         {
-            return Err(ExecError::InvalidPlan(
-                "an ask (conversational) prompt carries no task budget/turn/criteria seam (they bind to a durable task row an ask never creates); start a task run for budgeted work"
-                    .into(),
-            ));
+            // Lazy contract (audit item 4): the SAME deterministic typed
+            // classifier the executor admission consults decides here whether
+            // this ordinary chat turn ESTABLISHES an engineering contract
+            // (user-supplied contract/verification fields, an explicit
+            // mutation lead or a start-task escalation). An establishing turn
+            // binds its seams to the durable task row the executor's
+            // promotion creates; a CONVERSATIONAL turn carries no task
+            // budget/turn/criteria seam (they bind to a durable task row a
+            // conversational turn never creates) and is refused typed — the
+            // caps are never silently dropped.
+            let verdict = faktor_orchestrator::runtime::task_executor::intent::classify_turn_intent(
+                &request.prompt,
+                !request.criteria.is_empty(),
+            );
+            if !verdict.is_engineering() {
+                return Err(ExecError::InvalidPlan(
+                    "an ask (conversational) prompt carries no task budget/turn/criteria seam (they bind to a durable task row a conversational turn never creates); start a task run for budgeted work"
+                        .into(),
+                ));
+            }
         }
         let item = WorkItem::new(
             "main",

@@ -204,7 +204,15 @@ async fn rev8_long_task_end_to_end() {
         .and_then(|v| serde_json::from_value(v).ok())
         .unwrap_or_default();
     let plan = runtime
-        .try_compact_with_head(&handle, &recent, &ledger, &budget, &cancel, Some(head))
+        .try_compact_with_head(
+            &handle,
+            &recent,
+            &ledger,
+            &budget,
+            &cancel,
+            Some(head),
+            false,
+        )
         .await
         .unwrap();
     assert!(plan.is_none(), "a cancelled compaction must not apply");

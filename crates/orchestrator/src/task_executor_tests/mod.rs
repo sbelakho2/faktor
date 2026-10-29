@@ -86,6 +86,11 @@ pub(crate) struct PerCallProvider {
     /// Full text of every request, in order (the recording witness for
     /// request-content assertions: which goal actually reached the model).
     request_texts: StdMutex<Vec<String>>,
+    /// The EXACT provider requests, in order (audit item: the
+    /// poison-sentinel regression asserts the whole wire shape — system,
+    /// history and tools — never carries engineering sentinels into a
+    /// conversational turn).
+    requests: StdMutex<Vec<faktor_provider::GenericAgentRequest>>,
 }
 
 impl PerCallProvider {
@@ -100,6 +105,7 @@ impl PerCallProvider {
             script_index: AtomicUsize::new(0),
             request_count: AtomicUsize::new(0),
             request_texts: StdMutex::new(Vec::new()),
+            requests: StdMutex::new(Vec::new()),
         }
     }
 
@@ -110,6 +116,11 @@ impl PerCallProvider {
     /// System + every message text of request `idx`.
     fn text_of(&self, idx: usize) -> Option<String> {
         self.request_texts.lock().unwrap().get(idx).cloned()
+    }
+
+    /// The EXACT wire request of call `idx` (system + messages + tools).
+    fn full_request(&self, idx: usize) -> Option<faktor_provider::GenericAgentRequest> {
+        self.requests.lock().unwrap().get(idx).cloned()
     }
 }
 
@@ -141,6 +152,7 @@ impl Provider for PerCallProvider {
             }
             self.request_texts.lock().unwrap().push(text);
         }
+        self.requests.lock().unwrap().push(req.clone());
         let i = self.script_index.fetch_add(1, Ordering::SeqCst);
         let script: Vec<ScriptedResponse> = self
             .calls
@@ -588,5 +600,7 @@ mod tests_cancel_f068;
 mod tests_control;
 #[cfg(test)]
 mod tests_core;
+#[cfg(test)]
+mod tests_intent;
 #[cfg(test)]
 mod tests_verification;

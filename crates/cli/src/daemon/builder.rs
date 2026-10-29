@@ -1675,6 +1675,17 @@ pub(crate) fn build_daemon_core(
     // setting applied only to manual compaction and proactive compaction
     // silently kept the 25% default.
     agent.set_compaction_min_reduction(config.compaction_min_reduction);
+    // Conversational instruction profile (audit item 4 wiring): the parsed
+    // `[ask_instructions]` config field — previously parsed but DEAD — now
+    // has effect: it is installed on the runtime and becomes the
+    // conversational profile of every ordinary chat turn, REPLACING the
+    // built-in ASK_CONVERSATIONAL_PROFILE when non-empty (the documented
+    // config contract in `Config::ask_instructions`); empty (the default)
+    // keeps the built-in profile byte-identical. The TASK profile
+    // (`instructions` above) never receives `ask_instructions` — it is
+    // conversational vocabulary only. Installed through the same additive
+    // seam as the receipt sink, so the AgentDeps literal stays untouched.
+    agent.set_ask_instructions(config.ask_instructions);
     // The completion spine (audit item 6): install the ONE daemon registry on
     // the runtime so unresolved contract claims dispatch through the same
     // neutral surface the graph exposes. A native-only registry (the default

@@ -324,6 +324,7 @@ async fn rejected_plan_is_journaled_rejected_with_the_configured_policy() {
             &ContextBudget::default(),
             &CancellationToken::new(),
             Some(1),
+            false,
         )
         .await
         .unwrap();
@@ -2566,6 +2567,7 @@ async fn compaction_evidence_refs_resolve_after_the_compactor_is_dropped() {
             &ContextBudget::default(),
             &faktor_core::cancellation::CancellationToken::new(),
             None,
+            false,
         )
         .await
         .unwrap()
@@ -2729,6 +2731,7 @@ async fn tiny_history_size_matrix_is_refused_typed_at_every_boundary() {
                 &ContextBudget::default(),
                 &CancellationToken::new(),
                 Some(1),
+                false,
             )
             .await
             .unwrap_or_else(|e| panic!("{tokens}-token history must not error: {e}"));
@@ -2767,6 +2770,7 @@ async fn tiny_history_size_matrix_is_refused_typed_at_every_boundary() {
             &ContextBudget::default(),
             &CancellationToken::new(),
             Some(1),
+            false,
         )
         .await
         .unwrap();
@@ -2937,7 +2941,15 @@ async fn pinned_ledger_rows_survive_runtime_compaction_byte_identical() {
     for round in 0..3usize {
         let seq = u64::try_from(round + 1).unwrap();
         let plan = runtime
-            .try_compact_with_head(&handle, &history, &ledger, &budget, &cancel, Some(seq))
+            .try_compact_with_head(
+                &handle,
+                &history,
+                &ledger,
+                &budget,
+                &cancel,
+                Some(seq),
+                false,
+            )
             .await
             .unwrap()
             .unwrap_or_else(|| panic!("round {round}: the long history must compact"));
@@ -3236,6 +3248,7 @@ async fn corrupted_summary_checkpoint_is_a_typed_error_never_silent_context_loss
             &ContextBudget::default(),
             &CancellationToken::new(),
             Some(7),
+            false,
         )
         .await
         .unwrap()
@@ -3585,7 +3598,15 @@ async fn compaction_soak_core(turns: usize) -> SoakReport {
         }
         let seq = u64::try_from(report.compactions + 1).unwrap();
         let plan = runtime
-            .try_compact_with_head(&handle, &history, &ledger, &budget, &cancel, Some(seq))
+            .try_compact_with_head(
+                &handle,
+                &history,
+                &ledger,
+                &budget,
+                &cancel,
+                Some(seq),
+                false,
+            )
             .await
             .unwrap()
             .unwrap_or_else(|| panic!("turn {turn}: the plateau history must compact"));

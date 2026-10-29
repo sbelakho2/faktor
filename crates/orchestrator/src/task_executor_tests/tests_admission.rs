@@ -988,7 +988,7 @@ pub(crate) async fn post_admission_read_failure_is_typed_and_recovers_exactly_on
 
 /// Build an ASK start: conversational execution kind, exactly one
 /// read-only work item (the typed admission rule), no engineering seams.
-fn ask_request(goal: &str, env: &Env) -> TaskRunRequest {
+pub(crate) fn ask_request(goal: &str, env: &Env) -> TaskRunRequest {
     let mut req = request(goal, vec![wi("a1", WorkKind::Analysis, &[])], env);
     req.execution = ExecutionKind::Ask;
     req
@@ -996,7 +996,7 @@ fn ask_request(goal: &str, env: &Env) -> TaskRunRequest {
 
 /// Wait for ONE turn: machine ready AND the op's durable turn record closed
 /// (the two writes are separate; readiness alone races the row sync).
-async fn wait_turn_done(env: &Env, op: OpId) {
+pub(crate) async fn wait_turn_done(env: &Env, op: OpId) {
     wait_until(
         || state_of(env, env.parent) == faktor_core::state::AgentState::ReadyForNextTurn,
         240,
@@ -1016,7 +1016,7 @@ async fn wait_turn_done(env: &Env, op: OpId) {
 /// The ZERO witness (audit P0-ASK): an ask leaves no engineering surface
 /// behind — no task row, no completion-contract row, no shadow copy, no
 /// verification record/attempt fact, no goal, and no working-ledger blob.
-async fn assert_ask_left_no_engineering_rows(env: &Env) {
+pub(crate) async fn assert_ask_left_no_engineering_rows(env: &Env) {
     let handle = env.manager.get_session(env.parent).unwrap().unwrap();
     for id in 1..=5u64 {
         let task_id = TaskId::new(id);

@@ -1469,6 +1469,7 @@ fn interop_history_page(session: &str) -> MessagesPage {
                 session_id: session.to_string(),
                 seq: 2,
                 created_ms: 0,
+                turn_id: None,
                 parts: vec![
                     NativePart::ToolCall {
                         tool_call_id: "call-1".into(),
@@ -1487,6 +1488,7 @@ fn interop_history_page(session: &str) -> MessagesPage {
                 session_id: session.to_string(),
                 seq: 1,
                 created_ms: 0,
+                turn_id: None,
                 parts: vec![NativePart::Text {
                     text: "hello".into(),
                 }],

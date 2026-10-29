@@ -1160,6 +1160,7 @@ fn native_history_page(session: &str) -> MessagesPage {
                 session_id: session.to_string(),
                 seq: 2,
                 created_ms: 0,
+                turn_id: None,
                 parts: vec![
                     NativePart::ToolCall {
                         tool_call_id: "call-1".into(),
@@ -1178,6 +1179,7 @@ fn native_history_page(session: &str) -> MessagesPage {
                 session_id: session.to_string(),
                 seq: 1,
                 created_ms: 0,
+                turn_id: None,
                 parts: vec![
                     NativePart::Text {
                         text: "hello".into(),
@@ -1250,6 +1252,7 @@ impl AcpBackend for HistoryBackend {
                         session_id: "huge".into(),
                         seq: seq as i64,
                         created_ms: 0,
+                        turn_id: None,
                         parts: vec![NativePart::Text {
                             text: format!("m{seq}"),
                         }],
@@ -1271,6 +1274,7 @@ impl AcpBackend for HistoryBackend {
                         session_id: "manyframes".into(),
                         seq: seq as i64,
                         created_ms: 0,
+                        turn_id: None,
                         parts: parts.clone(),
                     })
                     .collect();

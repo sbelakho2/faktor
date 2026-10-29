@@ -1,9 +1,52 @@
 //! `runtime::turn::drive_phases_tests`: out-of-line tests for the phase split
 //! of the logical-turn loop (the extracted `AgentState` phase bodies).
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 
 use super::*;
 use crate::runtime::tests::*;
 use crate::*;
+
+/// The documented `ask_instructions` precedence (audit item 4 wiring): a
+/// non-empty configured profile REPLACES the built-in conversational
+/// profile on ask turns, empty keeps it byte-identical, and the TASK profile
+/// (`instructions`) never receives `ask_instructions` — this is the exact
+/// contract the daemon builder's `set_ask_instructions` install relies on.
+#[test]
+fn ask_instructions_precedence_replaces_the_builtin_conversational_profile() {
+    use faktor_protocol::ExecutionKind;
+    let task_base = "TASK INSTRUCTIONS BASE";
+    let configured = "OPERATOR CONVERSATIONAL PROFILE";
+    // Empty config → the built-in profile, byte-identical.
+    for execution in [ExecutionKind::Ask, ExecutionKind::Task] {
+        assert_eq!(
+            ask_or_task_instructions(task_base, execution, ""),
+            if execution == ExecutionKind::Ask {
+                super::drive_phases::ASK_CONVERSATIONAL_PROFILE
+            } else {
+                task_base
+            },
+            "an empty ask_instructions changes nothing ({execution:?})"
+        );
+    }
+    // Non-empty config → REPLACED conversational profile (the config field
+    // doc's contract); the task profile still ignores it.
+    assert_eq!(
+        ask_or_task_instructions(task_base, ExecutionKind::Ask, configured),
+        configured,
+        "a configured ask_instructions IS the conversational profile"
+    );
+    assert_eq!(
+        ask_or_task_instructions(task_base, ExecutionKind::Task, configured),
+        task_base,
+        "ask_instructions never rides the task profile"
+    );
+    // Whitespace-only counts as empty (documented `.trim()` rule).
+    assert_eq!(
+        ask_or_task_instructions(task_base, ExecutionKind::Ask, "   \n"),
+        super::drive_phases::ASK_CONVERSATIONAL_PROFILE,
+        "a whitespace-only profile falls back to the built-in"
+    );
+}
 
 /// Adversarial: a drive whose cancellation token is ALREADY fired must end at
 /// the boundary phase as `Cancelled` without ever reaching the provider. The

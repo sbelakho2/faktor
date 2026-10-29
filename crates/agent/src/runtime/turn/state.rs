@@ -900,6 +900,14 @@ pub struct AgentRuntime {
     /// Production receipt sink, installable after construction (the daemon
     /// opens foundation after building the agent graph).
     pub(crate) receipt_sink: std::sync::RwLock<Option<Arc<dyn CallReceiptSink>>>,
+    /// The configured conversational instruction profile (`config
+    /// [ask_instructions]`, audit item 4 wiring): installed by the daemon
+    /// builder after construction (the same additive-installer pattern as
+    /// [`AgentRuntime::set_receipt_sink`]), so the 30+ literal `AgentDeps`
+    /// construction sites stay untouched. Empty (the default) = the
+    /// built-in conversational profile alone; a non-empty value REPLACES it
+    /// (documented precedence in `ask_or_task_instructions`).
+    pub(crate) ask_instructions: std::sync::RwLock<String>,
 }
 
 /// Hard bound of in-flight internal-context blocks (bounded everything): a
@@ -2313,7 +2321,26 @@ impl AgentRuntime {
             value_gate: std::sync::Mutex::new(faktor_core::entitlement::ValueGate::absent()),
             internal_context: std::sync::Mutex::new(std::collections::HashMap::new()),
             receipt_sink: std::sync::RwLock::new(receipt_sink),
+            ask_instructions: std::sync::RwLock::new(String::new()),
         }))
+    }
+
+    /// Install the daemon's configured conversational instruction profile
+    /// (`config [ask_instructions]`). Additive: hosts/tests that never
+    /// install one keep the built-in conversational profile byte-identical.
+    pub fn set_ask_instructions(&self, instructions: String) {
+        *self
+            .ask_instructions
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner()) = instructions;
+    }
+
+    /// The installed conversational instruction profile (empty when none).
+    pub(crate) fn ask_instructions(&self) -> String {
+        self.ask_instructions
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
     }
 
     /// Install the production call-receipt sink (the daemon's foundation
