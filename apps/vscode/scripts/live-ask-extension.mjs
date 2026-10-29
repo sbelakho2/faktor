@@ -29,7 +29,33 @@ const outDir = resolve(process.argv[2] || join(repoRoot, 'docs/specs/live-eviden
 const liveHome = process.env.FAKTOR_LIVE_HOME || join(homedir(), '.faktor-live');
 const codeBin = process.env.VSCODE_CLI || '/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code';
 const extensionsDir = process.env.FAKTOR_VSCODE_EXTENSIONS_DIR || join(homedir(), '.vscode', 'extensions');
-const installedExtension = join(extensionsDir, 'faktor.faktor-0.1.0');
+// Resolve the NEWEST installed faktor.faktor-* build (the packaged version
+// directory must match its package.json version) instead of pinning a stale
+// version — a hardcoded pin tested a tree that no longer exists.
+function newestInstalledExtension(dir) {
+  if (!existsSync(dir)) return null;
+  const candidates = readdirSync(dir)
+    .map((name) => {
+      const match = /^faktor\.faktor-(\d+\.\d+\.\d+)$/.exec(name);
+      return match ? { path: join(dir, name), version: match[1] } : null;
+    })
+    .filter((entry) => entry !== null)
+    .sort((a, b) => {
+      const [aMaj, aMin, aPat] = a.version.split('.').map(Number);
+      const [bMaj, bMin, bPat] = b.version.split('.').map(Number);
+      return bMaj - aMaj || bMin - aMin || bPat - aPat;
+    });
+  for (const entry of candidates) {
+    try {
+      const pkg = JSON.parse(readFileSync(join(entry.path, 'package.json'), 'utf8'));
+      if (pkg.version === entry.version) return entry.path;
+    } catch {
+      /* unreadable candidate: keep looking */
+    }
+  }
+  return null;
+}
+const installedExtension = newestInstalledExtension(extensionsDir);
 const timeoutMs = Number(process.env.FAKTOR_LIVE_TIMEOUT_MS || '240000');
 const marker = process.env.FAKTOR_LIVE_MARKER || `ASK-LIVE-${randomUUID().slice(0, 8).toUpperCase()}`;
 const prompt = `Reply with exactly this token and nothing else: ${marker}`;
@@ -188,7 +214,10 @@ function sha256(file) {
 }
 
 mkdirSync(outDir, { recursive: true });
-assert(existsSync(installedExtension), `installed extension missing: ${installedExtension}`);
+assert(
+  typeof installedExtension === 'string' && existsSync(installedExtension),
+  `no packaged faktor.faktor-<version> extension directory under ${extensionsDir}`,
+);
 const installedPackage = JSON.parse(readFileSync(join(installedExtension, 'package.json'), 'utf8'));
 assert(installedPackage.name === 'faktor', 'the installed extension is faktor');
 assert(existsSync(join(installedExtension, 'out', 'askRecovery.js')), 'installed extension carries askRecovery.js');
