@@ -1271,7 +1271,7 @@ object FrontendSmoke {
         step("run-state copy: T06-T26 exact labels render only under their served conditions") {
             // Verbatim transcription guards: the state-matrix copy is exact.
             assertEquals("Ready", RunStateCopy.READY_LABEL)
-            assertEquals("Ask a question, or choose Task for an isolated run.", RunStateCopy.READY_COPY)
+            assertEquals("Describe a task or ask a question.", RunStateCopy.READY_COPY)
             assertEquals("Send", RunStateCopy.READY_ACTION)
             assertEquals("Starting the run", RunStateCopy.STARTING_LABEL)
             assertEquals("Your captured draft is being admitted once.", RunStateCopy.STARTING_COPY)
@@ -1500,14 +1500,15 @@ object FrontendSmoke {
             val panel = FaktorChatPanel(service)
             try {
                 // T06: the real composer empty state renders the exact
-                // guidance and hides it as soon as a draft exists; the
-                // Task/Ask mode control and the options sheet stay intact.
+                // guidance and hides it as soon as a draft exists; the ONE
+                // Send action and the options sheet stay intact.
                 val ready = panel.composerReadyForTest()
                     ?: fail("the empty composer must render its ready guidance")
                 assertEquals(RunStateCopy.READY_LABEL, ready.first)
                 assertEquals(RunStateCopy.READY_COPY, ready.second)
                 val controls = panel.actionControlsForTest()
-                assertEquals(RunStateCopy.READY_ACTION, controls["runTask"])
+                assertEquals(RunStateCopy.READY_ACTION, controls["send"])
+                assertEquals("Start task", controls["startTask"])
                 assertEquals("Cancel run", controls["stopRun"])
                 assertEquals("Inspect", controls["inspect"])
                 assertEquals("New session", controls["newSession"])
@@ -1519,18 +1520,14 @@ object FrontendSmoke {
                     panel.composerReadyForTest()?.second,
                     "clearing the draft restores the ready state"
                 )
-                assertEquals(true, panel.askModeSelected(), "Ask is the default intent")
+                // The unified composer: ONE Send, no mode switch, and the
+                // options disclosure always reachable (Start task inside).
                 assertEquals("Send", panel.submitLabelForTest(), "the ONE submit action is Send")
-                assertEquals(false, panel.taskOptionsVisibleForTest(), "Ask hides Task options")
-                panel.selectModeForTest(false)
-                assertEquals(false, panel.askModeSelected())
-                assertEquals("Send", panel.submitLabelForTest())
-                assertEquals(true, panel.taskOptionsVisibleForTest(), "Task exposes ONE disclosure")
+                assertEquals(true, panel.taskOptionsVisibleForTest(), "options stay reachable")
                 panel.openTaskOptionsForTest()
                 assertEquals(true, panel.taskOptionsOpenForTest())
                 panel.backTaskOptionsForTest()
                 assertEquals(false, panel.taskOptionsOpenForTest())
-                panel.selectModeForTest(true)
 
                 // The strip renders each served run state with its exact
                 // label+copy; states that are not served never bleed through.
@@ -4542,7 +4539,7 @@ object FrontendSmoke {
             }
         }
 
-        step("Task options sheet: bounded scrollable surface, trigger and Back preserve the draft") {
+        step("Task options sheet: bounded scrollable surface, Start task escalation, draft preserved") {
             val service = FaktorFrontendService(
                 Paths.get("unused-binary"),
                 Files.createTempDirectory("faktor-task-options-smoke-")
@@ -4552,17 +4549,25 @@ object FrontendSmoke {
                 assertEquals(false, panel.taskOptionsOpenForTest())
                 panel.setTaskFieldsForTest("draft goal", "c1")
                 panel.setBudgetFieldsForTest("", "")
-                assertEquals(true, panel.askModeSelected(), "Ask is the default intent")
-                assertEquals(false, panel.taskOptionsVisibleForTest())
-                assertEquals(false, panel.taskOptionsOpenForTest(), "Ask never opens Task options")
-                panel.selectModeForTest(ask = false)
+                // The unified composer: no mode switch — the disclosure is
+                // always reachable and never gates the ONE Send action.
+                assertEquals(true, panel.taskOptionsVisibleForTest())
+                assertEquals(false, panel.taskOptionsOpenForTest())
+                assertEquals("Send", panel.submitLabelForTest())
                 assertEquals("Task options ▾", panel.toggleTaskOptionsForTest())
                 assertEquals(true, panel.taskOptionsOpenForTest())
-                // The sheet body is the scrollable column inside a scroll pane.
+                // The sheet body is the scrollable column inside a scroll pane
+                // and carries the SOLE Start task escalation.
                 val sheet = panel.taskOptionsSheetForTest() ?: fail("the sheet must exist")
                 assertTrue(
                     sheet.components.any { it is javax.swing.JScrollPane },
                     "the sheet must carry a bounded scrollable body"
+                )
+                val sheetButtons = ArrayList<String>()
+                collectButtonTexts(sheet, sheetButtons)
+                assertTrue(
+                    sheetButtons.contains("Start task"),
+                    "the sheet must carry the Start task escalation: $sheetButtons"
                 )
                 assertEquals("draft goal", panel.goalTextForTest())
                 assertEquals("Task options ▸", panel.toggleTaskOptionsForTest())
@@ -4574,9 +4579,6 @@ object FrontendSmoke {
                 panel.triggerEscapeForTest()
                 assertEquals(false, panel.taskOptionsOpenForTest(), "Escape closes the sheet")
                 assertEquals("draft goal", panel.goalTextForTest())
-                assertEquals(false, panel.askModeSelected(), "Task intent remains selectable")
-                panel.selectModeForTest(ask = true)
-                assertEquals(true, panel.askModeSelected())
                 assertEquals("Send", panel.submitLabelForTest())
             } finally {
                 panel.shutdown()

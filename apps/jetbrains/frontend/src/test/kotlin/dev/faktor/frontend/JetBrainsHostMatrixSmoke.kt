@@ -119,7 +119,6 @@ object JetBrainsHostMatrixSmoke {
         )
         val panel = FaktorChatPanel(service)
         taskPanels.add(panel)
-        panel.selectModeForTest(ask = false)
         panel.setContractFieldsForTest("stay valid", "always true", "drift", "proof")
         panel.setBudgetFieldsForTest("5000", "250000")
         panel.openTaskOptionsForTest()
@@ -350,7 +349,6 @@ object JetBrainsHostMatrixSmoke {
             )
             val chat = FaktorChatPanel(service)
             taskPanels.add(chat)
-            chat.selectModeForTest(ask = false)
             chat.openTaskOptionsForTest()
             ParityAwt.layout(chat, 240, 600)
             val sheet = chat.taskOptionsSheetForTest()
@@ -1298,20 +1296,22 @@ object JetBrainsHostMatrixSmoke {
                 chat.attachmentsCountForTest() == 0,
                 "the empty composer must carry no attachments"
             )
-            requireTrue(chat.askModeSelected(), "Ask must be the default intent")
             requireTrue(
                 textLines(chat).contains("Send"),
                 "the empty composer must render its ONE Send action: ${textLines(chat)}"
             )
             requireTrue(
-                !chat.taskOptionsVisibleForTest(),
-                "Ask must keep Task options behind the Task intent"
+                !textLines(chat).contains("Ask") && !textLines(chat).contains("Intent"),
+                "the unified composer carries no Ask/Task mode switch: ${textLines(chat)}"
+            )
+            requireTrue(
+                chat.taskOptionsVisibleForTest(),
+                "the options disclosure must stay reachable without a mode switch"
             )
             requirePanelRenders("empty task composer", chat)
         }
         check("state/empty/task-options") {
             val chat = newChatPanel("task-options-empty")
-            chat.selectModeForTest(ask = false)
             chat.openTaskOptionsForTest()
             requireTrue(chat.taskOptionsOpenForTest(), "the Task options sheet must open")
             requireTrue(
@@ -1329,6 +1329,10 @@ object JetBrainsHostMatrixSmoke {
             val texts = textLines(sheet)
             requireTrue(texts.contains("Task options"), "the sheet must be headed: $texts")
             requireTrue(texts.contains("Back"), "the sheet must offer Back: $texts")
+            requireTrue(
+                texts.contains("Start task"),
+                "the sheet must carry the Start task escalation: $texts"
+            )
             requirePanelRenders("empty task options sheet", sheet)
         }
         check("state/empty/work-approval") {

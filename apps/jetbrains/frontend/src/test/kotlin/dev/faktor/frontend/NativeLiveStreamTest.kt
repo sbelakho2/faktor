@@ -46,6 +46,17 @@ class NativeLiveStreamTest {
     fun queuedFollowUpRendersQueued() = NativeLiveStreamSmoke.queuedFollowUpRendersQueued()
 
     @Test
+    fun readyAfterSuccessForEveryTurn() = NativeLiveStreamSmoke.readyAfterSuccessForEveryTurn()
+
+    @Test
+    fun stopIsVisibleOnlyWhileALiveTurnExists() =
+        NativeLiveStreamSmoke.stopIsVisibleOnlyWhileALiveTurnExists()
+
+    @Test
+    fun queuedRemoveAbortsOnlyThatOperation() =
+        NativeLiveStreamSmoke.queuedRemoveAbortsOnlyThatOperation()
+
+    @Test
     fun orderedToolRowSitsBetweenTextRows() =
         NativeLiveStreamSmoke.orderedToolRowSitsBetweenTextRows()
 

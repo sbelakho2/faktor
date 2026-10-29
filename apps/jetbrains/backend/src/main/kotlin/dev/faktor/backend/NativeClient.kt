@@ -272,6 +272,14 @@ class NativeClient(
     fun modelCatalog(): List<NativeModelInfo> =
         parseNativeModelCatalog(request("GET", "/models"))
 
+    /**
+     * Posts ONE ordinary conversational turn (`POST
+     * /native/session/{id}/prompt`). The body carries `execution: "ask"`
+     * explicitly: an absent execution field decodes to the legacy `task`
+     * default on the daemon, which would admit a chat turn as an
+     * engineering task. Engineering runs never ride this route — they are
+     * the explicit [startTaskRun] escalation.
+     */
     fun prompt(
         sessionId: String,
         prompt: String,

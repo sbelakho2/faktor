@@ -1,28 +1,11 @@
-// The shared Ask-first UX state model (identical product vocabulary to the
-// VS Code client): one intent (Ask | Task), one submit action, and
-// cause-specific run states. The model is pure so the panel, the status
+// The shared unified-composer UX state model (identical product vocabulary
+// to the VS Code client): ONE composer with one submit action (no Ask/Task
+// mode switch — engineering runs ride the explicit Start task escalation),
+// and cause-specific run states. The model is pure so the panel, the status
 // strip and the tests all render the same mapping. Wire ids are stable;
 // labels/copy are the only user-facing strings. Durable vocabulary
 // (recovery, resend, contract, proof) stays behind Advanced/Verification.
 package dev.faktor.frontend
-
-/** The ONE composer intent. Ask is the default. */
-internal enum class ComposerIntent(val wireId: String) {
-    ASK("ask"),
-    TASK("task");
-
-    fun label(): String = when (this) {
-        ASK -> "Ask"
-        TASK -> "Task"
-    }
-
-    /** The ONE action label, identical in both intents. */
-    fun submitLabel(): String = "Send"
-
-    companion object {
-        fun default(): ComposerIntent = ASK
-    }
-}
 
 /** The shared Task presentation (same exact ids as the VS Code model). */
 internal enum class TaskPresentation(val wireId: String) {
@@ -122,7 +105,7 @@ internal object UxStates {
     val READY = UxState(
         UxStateKind.READY,
         "Ready",
-        "Ask a question, or choose Task for an isolated run.",
+        "Describe a task or ask a question.",
         UxActionKind.NONE,
         SemanticState.DIM
     )

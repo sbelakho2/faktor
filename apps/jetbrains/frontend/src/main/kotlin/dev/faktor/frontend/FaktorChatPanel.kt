@@ -49,6 +49,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import javax.swing.BorderFactory
+import javax.swing.BoxLayout
 import javax.swing.ButtonGroup
 import javax.swing.DefaultComboBoxModel
 import javax.swing.JButton
@@ -227,6 +228,12 @@ class FaktorChatPanel(
     internal var taskStartObserver: ((String, String) -> Unit)? = null
 
     /**
+     * Host-journey seam for the ONE conversational send (submission id +
+     * draft text), mirroring [taskStartObserver] on the prompt path.
+     */
+    internal var promptObserver: ((String, String) -> Unit)? = null
+
+    /**
      * The component transcript: stable You/Faktor identities, real styled
      * Markdown blocks (headings/lists/emphasis/code/links/tables), a Copy
      * action on every code block, and turn-grouped assistant parts. Row
@@ -313,9 +320,11 @@ class FaktorChatPanel(
 
     private val refreshButton = secondaryButton("Refresh")
 
-    // ONE submit action for the ONE composer. Its label follows the intent;
-    // there is no second Ask/Run-task button beside it.
-    private val submitButton = primaryButton(ComposerIntent.default().submitLabel())
+    // ONE submit action for the ONE composer (unified no-mode chat): it
+    // always sends the conversational turn. The engineering escalation is
+    // the explicit Start task button inside the options sheet — there is
+    // no Ask/Task mode switch beside it.
+    private val submitButton = primaryButton("Send")
 
     private val abortButton = secondaryButton("Abort")
 
@@ -335,10 +344,11 @@ class FaktorChatPanel(
 
     private val attachments = AttachmentsPanel(workspaceRoot)
 
-    // The per-run budget of the options sheet (Task mode only): empty uses
-    // the machine/run defaults; a served value must parse exactly like the
-    // agent budget controls (positive decimal integer, no larger than the
-    // money domain), else the start refuses loudly.
+    // The per-run budget of the options sheet (carried only by the Start
+    // task escalation): empty uses the machine/run defaults; a served value
+    // must parse exactly like the agent budget controls (positive decimal
+    // integer, no larger than the money domain), else the start refuses
+    // loudly.
     private val budgetTokensField = JTextField(24)
 
     private val budgetCostField = JTextField(24)
@@ -362,20 +372,17 @@ class FaktorChatPanel(
 
     private var submittedCompletion: NativeCompletionContract? = null
 
-    // The ONE disclosure for the Task-only options (criteria, finish level,
-    // contract rows, per-run budget, attachments). It is only reachable in
-    // Task intent; Ask never shows or sends any of it.
+    // The ONE disclosure for the engineering options (criteria, finish
+    // level, contract rows, per-run budget, attachments). It is always
+    // reachable — Send never attaches any of it; the sheet's explicit
+    // Start task button is the SOLE escalation that does.
     private val taskOptionsButton = FaktorToggleButton("Task options")
 
-    // Task/Ask mode (design addition, named for the two paths the ONE
-    // composer already has): Task sends the contract/criteria/attachments/
-    // budget with the goal; Ask sends the plain prompt and NEVER attaches a
-    // completion contract or finish actions.
-    private val taskModeButton = FaktorToggleButton("Task")
-
-    private val askModeButton = FaktorToggleButton("Ask")
-
-    private val modeGroup = ButtonGroup()
+    // The sole engineering-run escalation (the Advanced disclosure's
+    // Start task of the VS Code client): it captures the draft plus the
+    // options sheet (contract/rows/budget/attachments) into ONE native
+    // task-run request. Never a mode switch.
+    private val startTaskButton = primaryButton("Start task")
 
     private val runSummaryArea = JTextArea(3, 24)
 
@@ -385,7 +392,7 @@ class FaktorChatPanel(
 
     // The cause-specific supporting copy and its ONE action (Settings/Retry/
     // Resume/Diagnostics/Reply). Hidden while the state has no action.
-    private val workStateCopy = wrappedMutedLabel("Ask a question, or choose Task for an isolated run.")
+    private val workStateCopy = wrappedMutedLabel(RunStateCopy.READY_COPY)
 
     private val workStateAction = secondaryButton("Wait")
 
@@ -398,6 +405,15 @@ class FaktorChatPanel(
     private val workDetailsButton = secondaryButton("Details")
 
     private val workStopButton = secondaryButton("Stop")
+
+    // The QUEUED follow-ups list (universal lifecycle parity): each row
+    // renders Queued + Remove, and Remove aborts ONLY that op id through
+    // the EXISTING typed abort route — revalidated against the tracked
+    // lifecycle before it leaves the panel (a forged/stale id or the active
+    // Stop target is refused locally and never reaches the daemon).
+    private val queuedListPanel = JPanel()
+
+    private val queuedRowOps = LinkedHashMap<String, JButton>()
 
     // T06: the composer's ready/empty state — the exact design label+copy
     // render while the composer holds no draft; the existing Run task control
@@ -853,19 +869,20 @@ class FaktorChatPanel(
         input.font = uiPanelFont()
         input.a11y(
             "Message to Faktor",
-            "Describe a goal or ask a question. Ctrl+Enter runs the task; Escape closes Task options."
+            "Describe a task or ask a question. Ctrl+Enter sends; Escape closes Task options."
         )
-        // Ctrl+Enter in the composer is the keyboard twin of Run task.
+        // Ctrl+Enter in the composer is the keyboard twin of Send (the ONE
+        // conversational submit action).
         input.inputMap.put(
             javax.swing.KeyStroke.getKeyStroke(
                 java.awt.event.KeyEvent.VK_ENTER,
                 java.awt.event.InputEvent.CTRL_DOWN_MASK
             ),
-            "faktor.runTask"
+            "faktor.send"
         )
-        input.actionMap.put("faktor.runTask", object : javax.swing.AbstractAction() {
+        input.actionMap.put("faktor.send", object : javax.swing.AbstractAction() {
             override fun actionPerformed(event: java.awt.event.ActionEvent?) {
-                startTaskFromControls()
+                sendPrompt()
             }
         })
         // macOS hosts expect the platform menu shortcut (Cmd+Enter). Bind it
@@ -880,7 +897,7 @@ class FaktorChatPanel(
         if (menuMask != java.awt.event.InputEvent.CTRL_DOWN_MASK) {
             input.inputMap.put(
                 javax.swing.KeyStroke.getKeyStroke(java.awt.event.KeyEvent.VK_ENTER, menuMask),
-                "faktor.runTask"
+                "faktor.send"
             )
         }
         // Escape closes the Task options sheet (returning focus to the exact
@@ -1056,10 +1073,10 @@ class FaktorChatPanel(
 
     /**
      * The Work surface: conversation (or the Task options sheet) + the run
-     * summary strip + ONE composer. The composer carries the goal and the
-     * Task/Ask mode; the bounded options sheet carries the acceptance
+     * summary strip + ONE composer. The composer carries the draft and the
+     * ONE Send action; the bounded options sheet carries the acceptance
      * criteria, the finish level, the engineering-contract rows, the per-run
-     * budget and the attachments.
+     * budget and the attachments, all sent only by its Start task button.
      */
     private fun buildWorkPlane() {
         // The Work status row is the whole persistent chrome above the
@@ -1151,32 +1168,33 @@ class FaktorChatPanel(
         // and the per-id reply gate.
         south.add(workApprovalCard)
 
-        // The composer: ONE input, ONE Ask|Task intent control, ONE submit
-        // action. Task options live behind the single disclosure and are
-        // reachable only in Task intent. Ask is the default and uses the
-        // real plain-prompt path (no contract, criteria, budget, attachments
-        // or task-run request).
+        // The QUEUED follow-ups list (hidden while nothing is queued): one
+        // row per queued op with its Remove affordance, rebuilt from the
+        // ONE turn reducer's projected queue.
+        queuedListPanel.isOpaque = false
+        queuedListPanel.layout = BoxLayout(queuedListPanel, BoxLayout.Y_AXIS)
+        queuedListPanel.isVisible = false
+        queuedListPanel.a11y(
+            "Queued messages",
+            "Follow-up messages waiting behind the live turn; Remove cancels one."
+        )
+        south.add(queuedListPanel)
+
+        // The composer: ONE input, ONE Send action, ONE engineering-options
+        // disclosure. Send always posts the conversational turn (the plain
+        // prompt path, no contract, criteria, budget, attachments or
+        // task-run request); the sheet's explicit Start task button is the
+        // SOLE escalation that carries them.
         taskOptionsButton.addActionListener { toggleTaskOptionsSheet() }
-        modeGroup.add(taskModeButton)
-        modeGroup.add(askModeButton)
-        askModeButton.isSelected = ComposerIntent.default() == ComposerIntent.ASK
-        taskModeButton.isSelected = ComposerIntent.default() == ComposerIntent.TASK
-        taskModeButton.toolTipText =
-            "Task: Run task sends the goal with criteria, contract, finish actions and attachments"
-        askModeButton.toolTipText =
-            "Ask: sends the plain prompt with no contract or task run"
-        taskModeButton.a11y("Task intent", "Run task sends the goal with its Task options.")
-        askModeButton.a11y("Ask intent", "Sends the plain prompt without a contract or task run.")
-        submitButton.a11y("Send", "Sends the composer with the selected intent.")
+        taskOptionsButton.toolTipText =
+            "Engineering options: acceptance criteria, contract rows, per-run budget and " +
+                "attachments, carried only by the explicit Start task escalation"
+        taskOptionsButton.a11y(
+            "Engineering options",
+            "Opens the bounded options sheet; only Start task sends any of it."
+        )
+        submitButton.a11y("Send", "Sends the composer as a conversational turn.")
         abortButton.a11y("Abort", "Requests abort of the active local operation.")
-        askModeButton.addActionListener { applyIntentPresentation() }
-        taskModeButton.addActionListener { applyIntentPresentation() }
-        val modeRow = JPanel(FlowLayout(FlowLayout.LEFT, Spacing.XS, 0))
-        modeRow.isOpaque = false
-        modeRow.add(sectionHeader("Intent", muted = true))
-        modeRow.add(askModeButton)
-        modeRow.add(taskModeButton)
-        applyIntentPresentation()
         val actions = actionRow(submitButton, abortButton, taskOptionsButton)
         val composerBody = pageColumn(gap = Spacing.S, padding = 0)
         composerBody.add(focusAccentScroll(input))
@@ -1214,7 +1232,6 @@ class FaktorChatPanel(
                 edition5Attention
             )
         )
-        composerBody.add(modeRow)
         composerBody.add(actions)
         south.add(card("Ask Faktor", composerBody))
         workPlane.add(south, BorderLayout.SOUTH)
@@ -1275,11 +1292,19 @@ class FaktorChatPanel(
     }
 
     /**
-     * The one options body (reused by the sheet): acceptance criteria, the
-     * four-level finish selector, the contract rows, the per-run budget and
-     * the attachments.
+     * The one options body (reused by the sheet): the Start task escalation
+     * first (the ONLY affordance that sends any of this), then the acceptance
+     * criteria, the four-level finish selector, the contract rows, the
+     * per-run budget and the attachments.
      */
     private fun taskOptionsBody(): JPanel {
+        startTaskButton.toolTipText =
+            "Escalate the current draft to an engineering run carrying these options"
+        startTaskButton.a11y(
+            "Start task",
+            "Escalates the current draft to an engineering run with these options."
+        )
+        startTaskButton.addActionListener { startTaskFromControls() }
         criteriaField.toolTipText = "Optional: acceptance criteria, comma separated"
         criteriaField.a11y("Acceptance criteria", "Comma-separated acceptance criteria for this task.")
         val finishBox = JPanel(GridLayout(FinishLevel.values().size, 1, Spacing.XS, Spacing.XS))
@@ -1304,6 +1329,16 @@ class FaktorChatPanel(
         budgetGrid.row("max tokens", budgetTokensField)
         budgetGrid.row("max cost (microUSD)", budgetCostField)
         val optionsBody = pageColumn(gap = Spacing.S, padding = Spacing.S)
+        // The escalation banner: Send is always the conversational turn;
+        // Start task is the ONLY affordance that sends any of this sheet.
+        optionsBody.add(
+            wrappedMutedLabel(
+                "Send always starts a conversational turn and never attaches these. " +
+                    "Start task escalates the current draft to an engineering run " +
+                    "that carries them."
+            )
+        )
+        optionsBody.add(actionRow(startTaskButton))
         optionsBody.add(FormGrid().row("Acceptance criteria (comma separated)", criteriaField).build())
         optionsBody.add(sectionHeader("Finish when done", muted = true))
         optionsBody.add(finishBox)
@@ -1329,7 +1364,6 @@ class FaktorChatPanel(
     private var optionsSheetReturnFocus: java.awt.Component? = null
 
     private fun toggleTaskOptionsSheet() {
-        if (askModeSelected()) return
         if (taskOptionsSheetOpen()) {
             closeTaskOptionsSheet()
         } else {
@@ -1849,67 +1883,22 @@ class FaktorChatPanel(
     }
 
     /**
-     * The Task composer's start path (also reachable from tests without an
-     * EDT click): criteria, attachments, the settings mutation default and
-     * the checked completion contract are captured into ONE immutable
+     * The Start task escalation (also reachable from tests without an EDT
+     * click): criteria, attachments, the settings mutation default and the
+     * checked completion contract are captured into ONE immutable
      * submission at click time, then ride ONE native task-run request.
+     * This is the ONLY path that sends the options sheet; the ONE Send
+     * action never does.
      *
      * Single-flight: the in-flight flag is claimed BEFORE the job reaches the
-     * worker queue, so a double click / Enter race / burst of submits can
+     * worker queue, so a double click / burst of Start task clicks can
      * never enqueue a second start. The ONE per-submission id is the durable
      * idempotency identity the daemon replays after a lost response.
      */
-    /** The selected composer intent (Ask is the default). */
-    internal fun askModeSelected(): Boolean = askModeButton.isSelected
-
-    internal fun intentForTest(): ComposerIntent =
-        if (askModeSelected()) ComposerIntent.ASK else ComposerIntent.TASK
-
-    /**
-     * Clicks the Ask|Task intent toggle like the operator. The selection goes
-     * through the ButtonGroup model (a headless test cannot fire the real
-     * ActionEvent), then the ONE submit label/disclosure follows.
-     */
-    internal fun selectModeForTest(ask: Boolean) {
-        val button = if (ask) askModeButton else taskModeButton
-        button.isSelected = true
-        button.actionListeners.forEach { listener ->
-            listener.actionPerformed(
-                java.awt.event.ActionEvent(
-                    button,
-                    java.awt.event.ActionEvent.ACTION_PERFORMED,
-                    button.actionCommand
-                )
-            )
-        }
-        applyIntentPresentation()
-    }
-
-    /** The one submit label and the single Task-options disclosure. */
-    private fun applyIntentPresentation() {
-        val intent = if (askModeSelected()) ComposerIntent.ASK else ComposerIntent.TASK
-        submitButton.text = intent.submitLabel()
-        submitButton.a11y("Send", "Sends the composer with the ${intent.label()} intent.")
-        val task = intent == ComposerIntent.TASK
-        taskOptionsButton.isVisible = task
-        taskOptionsButton.isEnabled = task && !startInFlight.get()
-        if (!task && taskOptionsSheetOpen()) closeTaskOptionsSheet()
-        taskOptionsButton.revalidate()
-        taskOptionsButton.repaint()
-    }
-
-    /** The Run task / Ctrl+Enter dispatch, selected mode included. */
     private fun startTaskFromControls() {
         val goal = input.text.trim()
         if (goal.isEmpty()) {
             appendSystem("the composer is empty; describe what Faktor should do")
-            return
-        }
-        if (askModeSelected()) {
-            // Ask mode: the plain prompt only. The completion contract, the
-            // contract rows, the finish level, the criteria, the per-run
-            // budget and the attachments are NEVER attached.
-            sendPrompt()
             return
         }
         // The authored contract rows are captured (and bounded) BEFORE the
@@ -2364,7 +2353,7 @@ class FaktorChatPanel(
             runAsync("refresh") { refreshAllBlocking() }
         }
         abortButton.addActionListener { stopActiveTurn() }
-        submitButton.addActionListener { startTaskFromControls() }
+        submitButton.addActionListener { sendPrompt() }
         cancelRunButton.addActionListener {
             val run = runsCombo.selectedItem as? NativeTaskRun
             if (run == null) {
@@ -3214,6 +3203,9 @@ class FaktorChatPanel(
             text
         ) { UUID.randomUUID().toString() }
         pendingPromptSubmission = pending
+        // Host-journey observable: the logical send is captured before the
+        // job reaches the worker queue, exactly like a Send click.
+        promptObserver?.invoke(pending.submissionId, pending.text)
         // HTTP 2xx is admission, never completion: the reducer owns the phase
         // (and Stop) from here until durable authority settles the turn.
         dispatchTurn(TurnEvent.Submit(TurnSource.ASK))
@@ -3752,9 +3744,18 @@ class FaktorChatPanel(
         val ux = currentUxState()
         // The ONE turn reducer's display phase owns the live/settled label
         // (Sending/Queued/Starting/Generating/Working/Needs approval and the
-        // settled Completed/Stopped/Failed outcomes); idle falls back to the
-        // cause-specific UX state.
-        val turnLabel = turnPhaseLabel(turnDisplayPhase(turnLifecycle))
+        // settled Stopped/Failed outcomes); idle falls back to the
+        // cause-specific UX state. Universal chat lifecycle: a successful
+        // turn of ANY kind falls back to Ready — the product's resting state
+        // after success is the same for a conversational reply and a
+        // finished engineering run (the run itself still reports its outcome
+        // on its own surfaces). Abnormal settled states stay labelled.
+        val phase = turnDisplayPhase(turnLifecycle)
+        val turnLabel = if (phase == TurnPhase.COMPLETED) {
+            null
+        } else {
+            turnPhaseLabel(phase)
+        }
         workStateChip.text = turnLabel ?: ux.label
         workStateChip.foreground = if (turnLabel == null) {
             semanticForeground(ux.tone)
@@ -3767,9 +3768,16 @@ class FaktorChatPanel(
         val action = ux.actionLabel()
         workStateAction.text = action ?: "Wait"
         workStateAction.isVisible = action != null
+        // Stop is visible while ANY turn is live (it targets the accepted op
+        // the reducer tracks) or the served task-run row is non-terminal; a
+        // settled/idle strip never offers a Stop control.
+        val tagRunning = currentRunStateTag.equals("Running", ignoreCase = true)
+        val tagBlocked = currentRunStateTag.equals("Blocked", ignoreCase = true)
+        workStopButton.isVisible =
+            turnLifecycleIsLive(turnLifecycle) || tagRunning || tagBlocked
         val tag = currentRunStateTag
-        val phase = currentRunView?.phase?.takeIf { it.isNotBlank() }
-        workRunLabel.text = phase ?: tag?.takeIf { it.isNotBlank() } ?: "No active run"
+        val phaseLabel = currentRunView?.phase?.takeIf { it.isNotBlank() }
+        workRunLabel.text = phaseLabel ?: tag?.takeIf { it.isNotBlank() } ?: "No active run"
         workTokensLabel.text = tokenStatusText(currentRunView)
         updateApprovalStatus()
     }
@@ -4772,11 +4780,72 @@ class FaktorChatPanel(
             lastPostedTurnKey = key
             updateWorkStatus()
         }
+        refreshQueuedList()
+    }
+
+    /**
+     * Rebuild the QUEUED follow-ups rows from the ONE reducer's projected
+     * queue: one Queued label + Remove affordance per queued op id, in
+     * submission order. A row's Remove aborts ONLY that op id through the
+     * EXISTING typed abort route.
+     */
+    private fun refreshQueuedList() {
+        val queued = turnQueuedOpIds(turnLifecycle)
+        val same = queuedRowOps.keys.toList() == queued
+        if (same) return
+        queuedListPanel.removeAll()
+        queuedRowOps.clear()
+        for (opId in queued) {
+            val row = JPanel(BorderLayout(Spacing.XS, 0))
+            row.isOpaque = false
+            val label = mutedLabel("Queued")
+            label.a11y("Queued message", "A follow-up waiting behind the live turn.")
+            val remove = secondaryButton("Remove")
+            remove.toolTipText = "Cancel this queued message (operation $opId)"
+            remove.a11y(
+                "Remove queued message",
+                "Cancels only this queued message's durable row."
+            )
+            remove.addActionListener { removeQueuedTurn(opId) }
+            row.add(label, BorderLayout.CENTER)
+            row.add(remove, BorderLayout.EAST)
+            queuedListPanel.add(row)
+            queuedRowOps[opId] = remove
+        }
+        queuedListPanel.isVisible = queued.isNotEmpty()
+        queuedListPanel.revalidate()
+        queuedListPanel.repaint()
+    }
+
+    /**
+     * Remove ONE queued follow-up without disturbing the operation ahead of
+     * it: the id is revalidated against the projected queue (a forged or
+     * stale id is refused locally and never reaches the daemon), then the
+     * typed abort's `op_id` cancels exactly that queued prompt's durable
+     * row.
+     */
+    private fun removeQueuedTurn(opId: String) {
+        if (turnQueuedOpIds(turnLifecycle).none { it == opId }) {
+            appendSystem("that message is no longer queued; the conversation state was refreshed")
+            return
+        }
+        runControl("abort queued turn") {
+            val ack = service.abort(opId)
+            onEdt {
+                if (ack.aborted.contains(opId)) {
+                    dispatchTurn(TurnEvent.Stopped(opId))
+                    appendSystem("queued message removed")
+                } else {
+                    appendSystem("the queued message was not cancelled: ${ack.aborted}")
+                }
+            }
+        }
     }
 
     private fun resetTurnLifecycle() {
         turnLifecycle = TurnLifecycle.empty()
         lastPostedTurnKey = null
+        refreshQueuedList()
         updateWorkStatus()
     }
 
@@ -5114,6 +5183,19 @@ class FaktorChatPanel(
 
     internal fun workStateChipTextForTest(): String = onEdtValue { workStateChip.text }
 
+    /** The queued follow-up op ids the list currently renders rows for. */
+    internal fun queuedOpsForTest(): List<String> = onEdtValue { queuedRowOps.keys.toList() }
+
+    /** Clicks a queued row's Remove affordance exactly like the operator. */
+    internal fun removeQueuedForTest(opId: String): Boolean = onEdtValue {
+        val button = queuedRowOps[opId] ?: return@onEdtValue false
+        button.doClick()
+        true
+    }
+
+    /** The Stop affordance visibility the strip currently renders. */
+    internal fun workStopVisibleForTest(): Boolean = onEdtValue { workStopButton.isVisible }
+
     /** Invoke the Stop/Abort action exactly as a host gesture would. */
     internal fun triggerAbortForTest() {
         onEdtValue { stopActiveTurn() }
@@ -5140,13 +5222,12 @@ class FaktorChatPanel(
     // without a display. Every hook calls the same code path as its control.
 
     internal fun submitTaskForTest() {
-        // The seam is explicitly the Task intent; Ask has its own seam.
-        if (askModeSelected()) selectModeForTest(ask = false)
+        // The Start task escalation path (the ONLY task-run carrier).
         startTaskFromControls()
     }
 
     internal fun submitAskForTest() {
-        if (!askModeSelected()) selectModeForTest(ask = true)
+        // The ONE conversational Send path.
         sendPrompt()
     }
 
@@ -5194,10 +5275,9 @@ class FaktorChatPanel(
     /** The composer's accessible names (never color/shape-only controls). */
     internal fun composerA11yNamesForTest(): List<String> = listOf(
         input.accessibleContext.accessibleName ?: "",
-        askModeButton.accessibleContext.accessibleName ?: "",
-        taskModeButton.accessibleContext.accessibleName ?: "",
         submitButton.accessibleContext.accessibleName ?: "",
-        taskOptionsButton.accessibleContext.accessibleName ?: ""
+        taskOptionsButton.accessibleContext.accessibleName ?: "",
+        startTaskButton.accessibleContext.accessibleName ?: ""
     )
 
     /** The shared coarse presentation currently derived from the signals. */
@@ -5216,9 +5296,13 @@ class FaktorChatPanel(
     /** The Work center surface that owns the transcript and the anchored composer. */
     internal fun workCenterForTest(): JComponent = workPlane.getComponent(1) as JComponent
 
-    /** The keyboard twin of Run task (Ctrl+Enter in the composer). */
-    internal fun submitTaskViaEnterForTest() {
-        startTaskFromControls()
+    /** The keyboard twin of Send (Ctrl+Enter in the composer). */
+    internal fun submitViaEnterForTest() {
+        val action = input.actionMap.get("faktor.send")
+            ?: throw IllegalStateException("the composer has no faktor.send action")
+        action.actionPerformed(
+            java.awt.event.ActionEvent(input, java.awt.event.ActionEvent.ACTION_PERFORMED, "")
+        )
     }
 
     /**
@@ -5258,9 +5342,9 @@ class FaktorChatPanel(
      * the composer (the same actionMap entry the keystroke resolves to, so no
      * synthetic key event is fabricated).
      */
-    internal fun triggerRunTaskActionForTest() {
-        val action = input.actionMap.get("faktor.runTask")
-            ?: throw IllegalStateException("the composer has no faktor.runTask action")
+    internal fun triggerSendActionForTest() {
+        val action = input.actionMap.get("faktor.send")
+            ?: throw IllegalStateException("the composer has no faktor.send action")
         action.actionPerformed(
             java.awt.event.ActionEvent(input, java.awt.event.ActionEvent.ACTION_PERFORMED, "")
         )
@@ -5498,7 +5582,8 @@ class FaktorChatPanel(
      * rendered). No design action ever mints a new button.
      */
     internal fun actionControlsForTest(): Map<String, String> = mapOf(
-        "runTask" to submitButton.text,
+        "send" to submitButton.text,
+        "startTask" to startTaskButton.text,
         "stopRun" to cancelRunButton.text,
         "inspect" to inspectRunsButton.text,
         "newSession" to newSessionButton.text
@@ -5587,20 +5672,22 @@ class FaktorChatPanel(
     }
 
     /**
-     * The start-surface controls (Start task, New session, the completion
-     * level, the Task/Ask mode): disabled while a start is in flight, so a
+     * The start-surface controls (Send, New session, Start task, the
+     * completion levels): disabled while a start is in flight, so a
      * pending submission cannot be mutated or duplicated from the UI.
-     * Attachment/goal edits are additionally ignored by design: the in-flight
-     * request rides the immutable captured draft.
+     * Attachment/goal edits are additionally ignored by design: the
+     * in-flight request rides the immutable captured draft. The options
+     * DISCLOSURE stays enabled always — it only opens a view and sends
+     * nothing on its own.
      */
     private fun setStartControlsEnabled(enabled: Boolean) {
         val effective = enabled && service.isRunning() && !startInFlight.get()
         submitButton.isEnabled = effective
         newSessionButton.isEnabled = effective
         for (button in completionLevels) button.isEnabled = effective
-        taskModeButton.isEnabled = effective
-        askModeButton.isEnabled = effective
-        applyIntentPresentation()
+        startTaskButton.isEnabled = effective
+        startTaskButton.revalidate()
+        startTaskButton.repaint()
     }
 
     /**

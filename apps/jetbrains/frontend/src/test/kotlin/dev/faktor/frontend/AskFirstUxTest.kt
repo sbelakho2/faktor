@@ -1,8 +1,9 @@
 // TEST-SEPARATION: oracle=external-fixture isolation=separate-process, read-only-artifacts
-// The Ask-first product model: ONE composer intent (Ask default), ONE submit
-// action, Task options behind one disclosure, cause-specific run states, a
-// lazy Account surface, a concise Overview and developer-only diagnostics.
-// Every test is scoped to the changed frontend surfaces.
+// The unified composer product model: ONE composer with ONE Send action
+// (no Ask/Task mode switch), the engineering options behind one disclosure
+// whose Start task button is the SOLE escalation, cause-specific run
+// states, a lazy Account surface, a concise Overview and developer-only
+// diagnostics. Every test is scoped to the changed frontend surfaces.
 package dev.faktor.frontend
 
 import dev.faktor.shared.NativeMilestones
@@ -11,7 +12,6 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
-import javax.swing.SwingUtilities
 import java.nio.file.Files
 import java.nio.file.Paths
 
@@ -25,35 +25,56 @@ class AskFirstUxTest {
     )
 
     @Test
-    fun `default intent is Ask with one Send action and one Task options disclosure`() {
+    fun `unified composer has ONE Send, no mode switch, and one Start task escalation`() {
         val chat = panel()
         try {
-            assertEquals(ComposerIntent.ASK, chat.intentForTest())
-            assertTrue(chat.askModeSelected())
+            // The ONE submit action is Send; there is no Ask/Task intent
+            // control anywhere in the composer (the mode switch is deleted).
             assertEquals("Send", chat.submitLabelForTest())
             assertEquals(1, chat.submitActionCountForTest())
-            assertFalse("Ask hides Task options", chat.taskOptionsVisibleForTest())
+            val a11y = chat.composerA11yNamesForTest()
+            assertTrue(
+                "the composer must carry no Ask/Task intent controls: $a11y",
+                a11y.none { it.contains("intent", ignoreCase = true) }
+            )
+            // The engineering-options disclosure is always reachable (Send
+            // never attaches any of it).
+            assertTrue(
+                "the options disclosure must stay visible without a mode switch",
+                chat.taskOptionsVisibleForTest()
+            )
             assertEquals(false, chat.taskOptionsOpenForTest())
-
-            SwingUtilities.invokeAndWait {
-                chat.selectModeForTest(ask = false)
-            }
-            assertEquals(ComposerIntent.TASK, chat.intentForTest())
-            assertEquals("Send", chat.submitLabelForTest())
-            assertTrue("Task exposes ONE disclosure", chat.taskOptionsVisibleForTest())
             chat.openTaskOptionsForTest()
             assertTrue(chat.taskOptionsOpenForTest())
+            // The sheet carries the SOLE escalation: one Start task button.
+            val sheet = chat.taskOptionsSheetForTest()
+                ?: throw AssertionError("the Task options sheet must exist")
+            val texts = sheetComponents(sheet)
+            assertTrue(
+                "the sheet must carry the Start task escalation: $texts",
+                texts.contains("Start task")
+            )
             chat.backTaskOptionsForTest()
-            assertFalse(chat.taskOptionsOpenForTest())
-
-            SwingUtilities.invokeAndWait {
-                chat.selectModeForTest(ask = true)
-            }
-            assertFalse("Ask closes and hides Task options", chat.taskOptionsOpenForTest())
-            assertFalse(chat.taskOptionsVisibleForTest())
+            assertEquals(false, chat.taskOptionsOpenForTest())
+            // Escape closes the sheet exactly like Back (never starts).
+            chat.openTaskOptionsForTest()
+            chat.triggerEscapeForTest()
+            assertEquals(false, chat.taskOptionsOpenForTest())
         } finally {
             chat.shutdown()
         }
+    }
+
+    private fun sheetComponents(component: java.awt.Component): List<String> {
+        val out = ArrayList<String>()
+        fun walk(node: java.awt.Component) {
+            if (node is javax.swing.AbstractButton) out.add(node.text)
+            if (node is java.awt.Container) {
+                for (child in node.components) walk(child)
+            }
+        }
+        walk(component)
+        return out
     }
 
     @Test

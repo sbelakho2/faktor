@@ -427,8 +427,16 @@ private fun assertRequestBodies() {
     )
     assertEquals("{\"provider\":\"p\",\"model\":\"m\"}", NativeRequests.createSession("p", "m"))
     assertEquals(
-        "{\"session_id\":\"7\",\"prompt\":\"hi\",\"submission_id\":\"00000000-0000-4000-8000-000000000001\"}",
+        "{\"session_id\":\"7\",\"prompt\":\"hi\",\"submission_id\":\"00000000-0000-4000-8000-000000000001\"," +
+            "\"execution\":\"ask\"}",
         NativeRequests.prompt("7", "hi", null, "00000000-0000-4000-8000-000000000001")
+    )
+    // The conversational execution kind is EXPLICIT on every prompt body:
+    // an absent `execution` decodes to the daemon's legacy `task` default
+    // and would admit a chat turn as an engineering task.
+    assertTrue(
+        NativeRequests.prompt("7", "hi", null, "s").contains("\"execution\":\"ask\""),
+        "every chat turn must carry execution:ask on the wire"
     )
     assertEquals("{\"session_id\":\"7\"}", NativeRequests.abort("7"))
     assertEquals(
@@ -1411,7 +1419,9 @@ private fun assertClientRoutes() {
         )
         val prompt = daemon.requests.first { it.path == "/native/session/7/prompt" }
         assertEquals(
-            "{\"session_id\":\"7\",\"prompt\":\"hi\",\"submission_id\":\"00000000-0000-4000-8000-000000000002\"}",
+            "{\"session_id\":\"7\",\"prompt\":\"hi\"," +
+                "\"submission_id\":\"00000000-0000-4000-8000-000000000002\"," +
+                "\"execution\":\"ask\"}",
             prompt.body
         )
         val coverageRead = client.indexCoverage("7")

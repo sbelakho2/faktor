@@ -711,9 +711,18 @@ private fun assertNativeRequestShapes() {
         "full native create-session body"
     )
     assertEquals(
-        "{\"session_id\":\"7\",\"prompt\":\"hi\",\"submission_id\":\"00000000-0000-4000-8000-000000000001\",\"files\":[\"a.txt\"]}",
+        "{\"session_id\":\"7\",\"prompt\":\"hi\"," +
+            "\"submission_id\":\"00000000-0000-4000-8000-000000000001\"," +
+            "\"execution\":\"ask\",\"files\":[\"a.txt\"]}",
         NativeRequests.prompt("7", "hi", listOf("a.txt"), "00000000-0000-4000-8000-000000000001"),
-        "native prompt body"
+        "native prompt body carries execution:ask explicitly"
+    )
+    // The conversational execution kind is EXPLICIT on every prompt body:
+    // an absent `execution` decodes to the daemon's legacy `task` default
+    // and would admit a chat turn as an engineering task.
+    assertTrue(
+        NativeRequests.prompt("7", "hi", null, "s").contains("\"execution\":\"ask\""),
+        "every chat turn must carry execution:ask on the wire"
     )
 }
 

@@ -997,13 +997,13 @@ const UIUX_CONTRACT = [
   },
   {
     id: 'UIUX-MODE-JB',
-    spec: 'COPY-MODES [L107] "clear Task/Ask mode"; DEC-JB-COMPOSER "clear Task/Ask mode"',
+    spec: 'COPY-MODES [L107] "clear Task/Ask mode" re-pinned to the unified no-mode design (DEC-JB-COMPOSER superseded): the JetBrains composer has no Ask/Task mode switch; sendPrompt() submits an ordinary conversational turn (execution: ask on the wire); engineering options live behind the options sheet whose Start task button is the sole escalation (contract/rows/budget ride it); one Send, one Stop targeting the accepted op while live.',
     host: 'jetbrains',
     must: [
-      ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/FaktorChatPanel.kt', 'FaktorToggleButton("Task")'],
-      ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/FaktorChatPanel.kt', 'FaktorToggleButton("Ask")'],
+      ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/FaktorChatPanel.kt', 'private fun sendPrompt() {'],
+      ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/FaktorChatPanel.kt', 'private val startTaskButton = primaryButton("Start task")'],
     ],
-    tests: { jetbrains: ['Task/Ask mode'] },
+    tests: { jetbrains: ['Start task'] },
   },
   // ------------------------------------------------------------------ T00-T05 (VS renders the preflight matrix)
   {
@@ -1088,11 +1088,11 @@ const UIUX_CONTRACT = [
   },
   {
     id: 'UIUX-T06-JB',
-    spec: 'T06 [L1044-1045] "Ready" / "Describe a task or ask a question." / "Run task"; JB renders the composer empty-state hint (FaktorChatPanel composerReadyLabel/composerHint from RunStateCopy.READY_LABEL/READY_COPY; READY_COPY was rewritten for the Ask-first redesign); the useful action stays the EXISTING Run task control',
+    spec: 'T06 [L1044-1045] "Ready" / "Describe a task or ask a question." / "Run task"; JB renders the composer empty-state hint (FaktorChatPanel composerReadyLabel/composerHint from RunStateCopy.READY_LABEL/READY_COPY; READY_COPY carries the unified no-mode hint); the useful action stays the EXISTING Run task control',
     host: 'jetbrains',
     must: [
       ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/TaskTreeModel.kt', 'const val READY_LABEL = "Ready"'],
-      ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/TaskTreeModel.kt', 'const val READY_COPY = "Ask a question, or choose Task for an isolated run."'],
+      ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/TaskTreeModel.kt', 'const val READY_COPY = "Describe a task or ask a question."'],
       ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/FaktorChatPanel.kt', 'sectionHeader(RunStateCopy.READY_LABEL, muted = true)'],
       ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/FaktorChatPanel.kt', 'wrappedMutedLabel(RunStateCopy.READY_COPY)'],
     ],

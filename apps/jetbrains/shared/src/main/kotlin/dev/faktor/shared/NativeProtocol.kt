@@ -3211,6 +3211,12 @@ object NativeRequests {
             .put("session_id", sessionId)
             .put("prompt", prompt)
             .put("submission_id", submissionId)
+            // The conversational execution kind is EXPLICIT on every chat
+            // turn: an ABSENT `execution` decodes to the legacy `task`
+            // default on the daemon, which would admit an ordinary question
+            // as an engineering task. There is no mode switch — this route
+            // is always the conversational path.
+            .put("execution", "ask")
         if (files != null && files.isNotEmpty()) builder.putStrings("files", files)
         return builder.toJson()
     }

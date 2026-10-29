@@ -61,13 +61,13 @@ object JetBrainsParitySmoke {
         step("tree: Faktor-owned repository root, no vendored upstream UI corpus") {
             verifyFaktorOwnedTree()
         }
-        step("task mode: composer contract + strict request bodies") {
+        step("task start: composer contract + strict request bodies") {
             taskModeCanned()
         }
         step("finish levels: four-level selector maps exactly to the completion contract") {
             finishLevelsExact()
         }
-        step("Task/Ask mode: Ask never attaches a contract, Task always does") {
+        step("unified composer: Send never attaches a contract, Start task always does") {
             modeDispatchStep()
         }
         step("Task options sheet: bounded, scrollable, draft-preserving, Escape never starts") {
@@ -429,9 +429,11 @@ object JetBrainsParitySmoke {
     // ------------------------------------------------------- Task/Ask mode
 
     /**
-     * Task mode sends the goal with the contract; Ask mode sends the plain
-     * prompt and NEVER attaches a completion contract or finish action. Both
-     * are asserted on the request bodies the real start path emitted.
+     * The unified composer contract: Send ALWAYS routes the plain prompt
+     * (execution 'ask' on the wire, no contract/criteria/budget/attachments
+     * and no task run); the explicit Start task escalation ALWAYS attaches
+     * the selected finish level. Both are asserted on the request bodies the
+     * real paths emitted.
      */
     private fun modeDispatchStep() {
         val harness = startTaskHarness { _, response ->
@@ -442,11 +444,10 @@ object JetBrainsParitySmoke {
                 response.json(200, "{\"op_id\":\"op-1\",\"accepted\":true,\"queued\":false}")
             }
             val panel = harness.panel
-            panel.selectModeForTest(ask = false)
             panel.setTaskFieldsForTest("mode goal", "mode criterion")
             panel.selectFinishLevelForTest(FinishLevel.PR)
             panel.submitTaskForTest()
-            await("Task-mode start routed") {
+            await("Start task escalation routed") {
                 harness.daemon.requestCount("POST", "/native/session/7/task-runs") == 1
             }
             val taskBody = harness.daemon.lastRequest("POST", "/native/session/7/task-runs")!!.body
@@ -455,21 +456,26 @@ object JetBrainsParitySmoke {
                     "\"completion_contract\":{\"include_commit\":true,\"include_push\":true," +
                         "\"include_pr\":true}"
                 ),
-                "Task mode must attach the selected finish level: $taskBody"
+                "Start task must attach the selected finish level: $taskBody"
             )
-            await("Task-mode start completes") {
+            await("Start task escalation completes") {
                 panel.transcriptTextForTest().contains("run-9 started")
             }
-            // The mode selector is the explicit control (design addition).
-            val runsBeforeAsk = harness.daemon.requestCount("POST", "/native/session/7/task-runs")
-            val promptsBeforeAsk = harness.daemon.requestCount("POST", "/native/session/7/prompt")
-            panel.selectModeForTest(ask = true)
-            assertTrue(panel.askModeSelected(), "the Ask toggle must select Ask mode")
+            // The ONE Send action is the explicit conversational control.
+            val runsBeforeSend = harness.daemon.requestCount("POST", "/native/session/7/task-runs")
+            val promptsBeforeSend = harness.daemon.requestCount("POST", "/native/session/7/prompt")
             panel.submitAskForTest()
-            await("Ask-mode prompt routed") {
-                harness.daemon.requestCount("POST", "/native/session/7/prompt") > promptsBeforeAsk
+            await("Send routes the plain prompt") {
+                harness.daemon.requestCount("POST", "/native/session/7/prompt") > promptsBeforeSend
             }
             val promptBody = harness.daemon.lastRequest("POST", "/native/session/7/prompt")!!.body
+            // The WIRE contract: execution is EXPLICIT on every chat turn —
+            // an absent field decodes to the daemon's legacy `task` default
+            // and would admit the turn as an engineering task.
+            assertTrue(
+                promptBody.contains("\"execution\":\"ask\""),
+                "every Send must carry execution:ask on the wire: $promptBody"
+            )
             assertTrue(!promptBody.contains("completion_contract"), promptBody)
             assertTrue(!promptBody.contains("include_commit"), promptBody)
             assertTrue(!promptBody.contains("include_push"), promptBody)
@@ -478,13 +484,13 @@ object JetBrainsParitySmoke {
             assertTrue(!promptBody.contains("max_cost_micro"), promptBody)
             assertTrue(!promptBody.contains("criteria"), promptBody)
             assertEquals(
-                runsBeforeAsk,
+                runsBeforeSend,
                 harness.daemon.requestCount("POST", "/native/session/7/task-runs"),
-                "Ask mode must never start a task run"
+                "Send must never start a task run"
             )
-            // Adversarial: NO task start AFTER the Ask submission may carry a
-            // completion contract, no matter what level the Task-mode control
-            // held before (the Ask path must not inherit it).
+            // Adversarial: NO task start AFTER the Send submission may carry a
+            // completion contract, no matter what level the options sheet
+            // held before (the Send path must not inherit it).
             val askBodies = synchronized(harness.daemon.requests) {
                 harness.daemon.requests
                     .dropWhile { it.path != "/native/session/7/prompt" }
@@ -493,7 +499,7 @@ object JetBrainsParitySmoke {
             }
             assertTrue(
                 askBodies.isEmpty(),
-                "no task start may follow an Ask submission: $askBodies"
+                "no task start may follow a Send submission: $askBodies"
             )
             // The plain path causes NO task artifact/repo-scan/proof/
             // verification/task-run/billing/identity/upload read.
@@ -509,7 +515,7 @@ object JetBrainsParitySmoke {
             }
             assertTrue(
                 afterAskReads.none { path -> banned.any { path.contains(it) } },
-                "Ask must not cause task artifacts or billing reads: $afterAskReads"
+                "Send must not cause task artifacts or billing reads: $afterAskReads"
             )
         } finally {
             harness.close()
@@ -528,7 +534,6 @@ object JetBrainsParitySmoke {
         val harness = startTaskHarness()
         try {
             val panel = harness.panel
-            panel.selectModeForTest(ask = false)
             panel.setTaskFieldsForTest("options sheet goal", "one, two")
             panel.setContractFieldsForTest("stay valid", "", "", "")
             assertTrue(panel.taskOptionsOpenForTest(), "openTaskOptionsForTest must open the sheet")
@@ -1796,8 +1801,14 @@ object JetBrainsParitySmoke {
     private fun taskStartEnterClickStep() {
         val harness = startTaskHarness()
         try {
+            harness.daemon.on("POST", "/native/session/7/prompt") { _, response ->
+                response.json(200, "{\"op_id\":\"op-enter\",\"accepted\":true,\"queued\":false}")
+            }
             harness.panel.setTaskFieldsForTest("enter race goal", "")
-            harness.panel.submitTaskViaEnterForTest()
+            // The keyboard twin of Send + a Start task click are DIFFERENT
+            // paths under the unified composer: exactly ONE prompt and ONE
+            // task-run request, never a duplicated submission of either.
+            harness.panel.submitViaEnterForTest()
             harness.panel.submitTaskForTest()
             await("one start request after the Enter + click race") {
                 harness.daemon.requestCount("POST", "/native/session/7/task-runs") == 1
@@ -1808,7 +1819,12 @@ object JetBrainsParitySmoke {
             assertEquals(
                 1,
                 harness.daemon.requestCount("POST", "/native/session/7/task-runs"),
-                "Enter + click must enqueue exactly ONE start request"
+                "Enter + Start task click must enqueue exactly ONE start request"
+            )
+            assertEquals(
+                1,
+                harness.daemon.requestCount("POST", "/native/session/7/prompt"),
+                "Enter + Start task click must enqueue exactly ONE prompt"
             )
         } finally {
             harness.close()

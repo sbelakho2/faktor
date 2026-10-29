@@ -112,6 +112,21 @@ internal fun turnStopOpId(state: TurnLifecycle): String? {
 }
 
 /**
+ * The QUEUED follow-ups waiting behind the active turn, in submission
+ * order. Each is individually removable through the EXISTING typed abort
+ * route (its `op_id` cancels that queued prompt's durable row without
+ * touching the state machine or the operation Stop targets) — a queued
+ * follow-up is never the Stop target.
+ */
+internal fun turnQueuedOpIds(state: TurnLifecycle): List<String> {
+    val queued = ArrayList<String>()
+    for (entry in state.entries) {
+        if (entry.phase == TurnPhase.QUEUED && entry.opId != null) queued.add(entry.opId)
+    }
+    return queued
+}
+
+/**
  * The one display phase: the NEWEST submission's phase (a queued follow-up
  * therefore renders `Queued` while an earlier turn still streams), else the
  * newest live/terminal outcome, else idle.

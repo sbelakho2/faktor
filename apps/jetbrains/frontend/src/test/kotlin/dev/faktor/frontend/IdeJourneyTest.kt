@@ -114,12 +114,13 @@ class IdeJourneyTest : BasePlatformTestCase() {
         assertEquals(prompt, panel.goalTextForTest())
         step("composer typed: \"${panel.goalTextForTest()}\"")
 
-        // 6. Send through the exact action bound to Ctrl+Enter.
+        // 6. Send through the exact action bound to Ctrl+Enter (the ONE
+        // conversational send; the engineering escalation is Start task).
         val sent = AtomicReference<Pair<String, String>?>()
-        panel.taskStartObserver = { id, goal -> sent.set(id to goal) }
-        onEdt { panel.triggerRunTaskActionForTest() }
+        panel.promptObserver = { id, goal -> sent.set(id to goal) }
+        onEdt { panel.triggerSendActionForTest() }
         val observed = sent.get()
-            ?: error("the Ctrl+Enter action must reach the task-start path")
+            ?: error("the Ctrl+Enter action must reach the conversational send path")
         assertEquals(prompt, observed.second)
         step("send dispatched: submission=${observed.first} goal=\"${observed.second}\"")
 

@@ -68,12 +68,18 @@ object NativeLiveStreamSmoke {
         reconnectReconcilesAuthoritativeSnapshot()
         stopTargetsAcceptedOperation()
         queuedFollowUpRendersQueued()
+        readyAfterSuccessForEveryTurn()
+        stopIsVisibleOnlyWhileALiveTurnExists()
+        queuedRemoveAbortsOnlyThatOperation()
         orderedToolRowSitsBetweenTextRows()
         assistantMarkdownStaysPlainStructuralText()
         streamClientIsSnapshotFirstAndResyncs()
         streamClientNonRetryableRefusalIsUnavailable()
         subscribeBeforeSubmitOpensTheLiveHandshakeFirst()
-        println("  live: reducer matrix, UTF-8 offsets, overlay, resync, foreign, Stop, queued, tool order OK")
+        println(
+            "  live: reducer matrix, UTF-8 offsets, overlay, resync, foreign, Stop, " +
+                "queued, Ready-after-success, queued-remove, tool order OK"
+        )
     }
 
     // -------------------------------------------------------------- reducer
@@ -85,8 +91,10 @@ object NativeLiveStreamSmoke {
         check(turnDisplayPhase(state) == TurnPhase.SUBMITTING)
         state = turnReducer(state, TurnEvent.Receipt("op-1", null, queued = true))
         check(turnDisplayPhase(state) == TurnPhase.QUEUED)
+        check(turnQueuedOpIds(state) == listOf("op-1"), "a queued follow-up is projected")
         state = turnReducer(state, TurnEvent.Admitted("op-1"))
         check(turnDisplayPhase(state) == TurnPhase.STARTING)
+        check(turnQueuedOpIds(state).isEmpty(), "admission clears the queued row")
         state = turnReducer(state, TurnEvent.Machine("waiting_for_model", "op-1"))
         check(turnDisplayPhase(state) == TurnPhase.STREAMING)
         state = turnReducer(state, TurnEvent.Journal("tool_started", "op-1"))
@@ -345,6 +353,107 @@ object NativeLiveStreamSmoke {
             check(panel.workStateChipTextForTest() == "Queued")
             // Stop still targets the RUNNING turn ahead of the queued one.
             check(panel.turnStopOpForTest() == "op-1")
+            // The queued follow-up renders its own row with a Remove
+            // affordance (the existing abort-with-op_id route).
+            check(panel.queuedOpsForTest() == listOf("op-2"))
+        }
+    }
+
+    // -------------------------------------------------- Ready after success
+
+    /**
+     * Universal chat lifecycle: a successful turn of ANY kind settles the
+     * strip back to Ready — the resting state after success is the same for
+     * a conversational reply and a finished engineering run. Abnormal
+     * settled outcomes (Stopped / Failed) keep their labels.
+     */
+    fun readyAfterSuccessForEveryTurn() {
+        withLivePanel { panel, _ ->
+            panel.dispatchTurnForTest(TurnEvent.Submit(TurnSource.ASK))
+            panel.dispatchTurnForTest(TurnEvent.Receipt("op-1", null, queued = false))
+            panel.dispatchTurnForTest(TurnEvent.Machine("streaming", "op-1"))
+            check(panel.workStateChipTextForTest() == "Generating…")
+            panel.dispatchTurnForTest(TurnEvent.Journal("turn_completed", "op-1"))
+            check(panel.turnPhaseForTest() == "completed")
+            check(
+                panel.workStateChipTextForTest() == "Ready",
+                "a successful conversational turn must settle back to Ready, " +
+                    "never a job-like Completed label"
+            )
+            // An abnormal settled outcome keeps its own label.
+            panel.dispatchTurnForTest(TurnEvent.Submit(TurnSource.ASK))
+            panel.dispatchTurnForTest(TurnEvent.Receipt("op-2", null, queued = false))
+            panel.dispatchTurnForTest(TurnEvent.TurnStatus("op-2", "failed"))
+            check(panel.workStateChipTextForTest() == "Failed")
+        }
+    }
+
+    // ------------------------------------------------------- Stop visibility
+
+    /**
+     * Stop is visible while ANY turn is live (targeting its accepted op)
+     * and hidden on a settled/idle strip — a Stop control that never stops
+     * anything is not rendered.
+     */
+    fun stopIsVisibleOnlyWhileALiveTurnExists() {
+        withLivePanel { panel, _ ->
+            check(!panel.workStopVisibleForTest(), "no live turn: no Stop affordance")
+            panel.dispatchTurnForTest(TurnEvent.Submit(TurnSource.ASK))
+            check(
+                panel.workStopVisibleForTest(),
+                "a submitting turn must surface Stop before the receipt lands"
+            )
+            panel.dispatchTurnForTest(TurnEvent.Receipt("op-1", null, queued = false))
+            panel.dispatchTurnForTest(TurnEvent.Machine("streaming", "op-1"))
+            check(panel.workStopVisibleForTest(), "a streaming turn keeps Stop visible")
+            panel.dispatchTurnForTest(TurnEvent.TurnStatus("op-1", "completed"))
+            check(
+                !panel.workStopVisibleForTest(),
+                "a settled turn must hide Stop again"
+            )
+        }
+    }
+
+    // ------------------------------------------------------- queued removal
+
+    /**
+     * The queued Remove affordance aborts ONLY that queued op id through
+     * the existing typed abort route; the operation ahead of it is never
+     * touched, and a forged/stale id is refused locally (no request).
+     */
+    fun queuedRemoveAbortsOnlyThatOperation() {
+        withLivePanel { panel, daemon ->
+            panel.dispatchTurnForTest(TurnEvent.Submit(TurnSource.ASK))
+            panel.dispatchTurnForTest(TurnEvent.Receipt("op-1", null, queued = false))
+            panel.dispatchTurnForTest(TurnEvent.Machine("streaming", "op-1"))
+            panel.dispatchTurnForTest(TurnEvent.Submit(TurnSource.ASK))
+            panel.dispatchTurnForTest(TurnEvent.Receipt("op-2", null, queued = true))
+            panel.dispatchTurnForTest(TurnEvent.Submit(TurnSource.ASK))
+            panel.dispatchTurnForTest(TurnEvent.Receipt("op-3", null, queued = true))
+            check(panel.queuedOpsForTest() == listOf("op-2", "op-3"))
+            check(panel.removeQueuedForTest("op-2"))
+            await("the Remove abort carries ONLY the queued op id") {
+                daemon.abortBodies.any {
+                    it.contains("\"op_id\":\"op-2\"") && !it.contains("op-1")
+                }
+            }
+            await("the cancelled follow-up leaves the queued list") {
+                panel.queuedOpsForTest() == listOf("op-3")
+            }
+            // The streaming turn ahead of the queue is never the Stop target
+            // of a queued removal and stays live.
+            check(panel.turnStopOpForTest() == "op-1")
+            check(panel.workStopVisibleForTest(), "the live turn keeps Stop visible")
+            // A forged/stale id is refused locally: the row does not exist,
+            // so no abort request is emitted.
+            val abortsBefore = daemon.abortBodies.size
+            check(!panel.removeQueuedForTest("op-ghost"))
+            Thread.sleep(50)
+            check(
+                daemon.abortBodies.size == abortsBefore,
+                "a forged queued id must never reach the daemon"
+            )
+            check(!daemon.abortBodies.any { it.contains("op-ghost") })
         }
     }
 
@@ -655,7 +764,12 @@ object NativeLiveStreamSmoke {
         }
         daemon.on("POST", "/native/session/7/abort") { request, response ->
             capture.abortBodies.add(request.body)
-            response.json(200, "{\"aborted\":[\"op-1\"]}")
+            // The typed abort echoes the requested op id (the real daemon
+            // acks exactly the operations it cancelled).
+            val requested = Regex("\"op_id\":\"([^\"]+)\"").find(request.body)?.groupValues?.get(1)
+            val ack = requested?.let { "{\"aborted\":[\"$it\"]}" }
+                ?: "{\"aborted\":[\"op-1\"]}"
+            response.json(200, ack)
         }
         daemon.on("GET", "/native/session/7/live/snapshot") { _, response ->
             response.json(200, capture.snapshotJson)

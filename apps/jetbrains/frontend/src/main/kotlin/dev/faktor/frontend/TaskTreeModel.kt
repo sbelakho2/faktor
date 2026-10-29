@@ -248,9 +248,9 @@ data class VerificationSummary(
  * action has no affordance render label+copy only (no button is invented).
  */
 object RunStateCopy {
-    /** T06 — the composer ready/empty state. */
+    /** T06 — the composer ready/empty state (unified no-mode composer). */
     const val READY_LABEL = "Ready"
-    const val READY_COPY = "Ask a question, or choose Task for an isolated run."
+    const val READY_COPY = "Describe a task or ask a question."
     const val READY_ACTION = "Send"
 
     /** T07 — the captured draft is being admitted once. */
