@@ -1638,6 +1638,7 @@ dependencies = [
  "faktor-scm",
  "faktor-semantic",
  "faktor-session",
+ "faktor-storage",
  "faktor-store",
  "faktor-terminal",
  "futures",
