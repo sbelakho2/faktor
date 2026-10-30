@@ -225,6 +225,7 @@ pub fn history_page(session: &str) -> MessagesPage {
             NativeMessage {
                 id: "m2".into(),
                 role: "assistant".into(),
+                turn_id: None,
                 session_id: session.to_string(),
                 seq: 2,
                 created_ms: 0,
@@ -246,6 +247,7 @@ pub fn history_page(session: &str) -> MessagesPage {
             NativeMessage {
                 id: "m1".into(),
                 role: "user".into(),
+                turn_id: None,
                 session_id: session.to_string(),
                 seq: 1,
                 created_ms: 0,

@@ -130,6 +130,9 @@ fn full_request(model: &str, with_document: bool) -> GenericAgentRequest {
             name: "read_file".into(),
             description: "read".into(),
             input_schema: serde_json::json!({"type": "object"}),
+            // Conservative default (all axes true) — the wire lowering must
+            // carry the spec fields regardless of the authority metadata.
+            effects: Default::default(),
         }],
         max_output: Some(MAX_OUT),
         reasoning: None,
