@@ -723,6 +723,7 @@ async fn hard_budget_denies_the_request_before_the_provider() {
             description: "d".into(),
             input_schema: serde_json::json!({}),
             resource_class: faktor_core::resource::ResourceClass::Cpu,
+            effects: faktor_provider::ToolEffects::READ_ONLY,
             capability: None,
             recovery_hint: RecoveryHint::Idempotent,
             path_args: vec![],

@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! Tool definitions. Tools are stateless callables with declared metadata;
 //! they never touch session persistence (Commandment 1) and every invocation
 //! carries its workspace identity explicitly.
@@ -13,7 +14,7 @@ use faktor_core::id::{OpId, SessionId, TaskId, WorkspaceId, WorktreeId};
 use faktor_core::model::{ModelCapabilities, RouterPhase};
 use faktor_core::resource::ResourceClass;
 use faktor_core::WorkspaceIdentity;
-use faktor_provider::ToolSpec;
+use faktor_provider::{ToolEffects, ToolSpec};
 
 use crate::activation::{ToolActivationSet, ToolExposure};
 use crate::tool_json::{parse_tool_calls, ToolCallMode};
@@ -74,7 +75,19 @@ pub struct Tool {
     pub name: String,
     pub description: String,
     pub input_schema: serde_json::Value,
+    /// SCHEDULING / CONCURRENCY class ONLY (three-concept separation, audit
+    /// item 9): it decides scheduler limits and historical phase
+    /// VISIBILITY. It is NOT an effect system and grants NO authority — an
+    /// Ask (conversational) turn never consults it. Authority lives in
+    /// [`Tool::effects`]; permission lives in [`Tool::capability`].
     pub resource_class: ResourceClass,
+    /// AUTHORITY metadata (see [`ToolEffects`]): what this tool may affect,
+    /// seeded from the tool's ACTUAL implementation behavior at every
+    /// definition site. [`Tool::spec`] carries it into the advertised
+    /// [`ToolSpec`], and the Ask tool policy admits only tools that are
+    /// read-only on every mutating axis. An undeclared (default) value is
+    /// the CONSERVATIVE all-mutating shape: unknown ⇒ mutating.
+    pub effects: ToolEffects,
     pub capability: Option<Capability>,
     pub recovery_hint: RecoveryHint,
     /// Which arg names of this tool are filesystem paths. The scheduler's
@@ -114,6 +127,7 @@ impl Tool {
             name: self.name.clone(),
             description: self.description.clone(),
             input_schema: self.input_schema.clone(),
+            effects: self.effects,
         }
     }
 
@@ -373,6 +387,14 @@ fn canonical_json(value: &serde_json::Value) -> serde_json::Value {
 /// Registry-metadata phase policy: which tools a phase may show the model.
 /// `Implement` keeps the full registered set (including MCP tools) — today's
 /// wire behavior, now the explicit `implement` bundle.
+///
+/// NOTE (audit item 9): this is MODEL VISIBILITY policy over the historical
+/// scheduling classes — it is NOT authority. Execution authority (what an
+/// Ask may run) is decided exclusively by declared [`ToolEffects`]
+/// (`ToolSpec::effects`), enforced by the Ask tool policy and the
+/// membership guard in the tool loop. `ResourceClass` here means exactly
+/// what it always meant: a scheduling/concurrency class, never an effect
+/// system.
 fn phase_allows(phase: RouterPhase, tool: &Tool) -> bool {
     // Coordination tools are cross-cutting: a child may need to read or
     // post in any tool-bearing phase (a question during exploration is the
@@ -690,6 +712,19 @@ pub fn board_post_tool(gateway: Arc<dyn BoardToolGateway>) -> Tool {
         // Coordination is in-process durable bookkeeping, not disk work;
         // Cpu keeps it out of the disk-ownership sets.
         resource_class: ResourceClass::Cpu,
+        // AUTHORITY: a post is a durable append to the cross-agent board —
+        // an out-of-model durable mutation (the very reason recovery never
+        // silently replays it, see the hint below). An Ask may READ the
+        // board, never POST to it.
+        effects: ToolEffects {
+            workspace_read: false,
+            workspace_write: false,
+            process_exec: false,
+            network_read: false,
+            network_write: false,
+            external_mutation: true,
+            git_mutation: false,
+        },
         capability: None,
         // A post is a durable append: blind re-execution after a crash
         // would duplicate it, so recovery never silently replays it.
@@ -757,6 +792,9 @@ pub fn board_read_tool(gateway: Arc<dyn BoardToolGateway>) -> Tool {
             "additionalProperties": false
         }),
         resource_class: ResourceClass::DiskRead,
+        // AUTHORITY: one bounded, newest-first page of the run-family
+        // board — a read of durable coordination state, mutating nothing.
+        effects: ToolEffects::READ_ONLY,
         capability: None,
         recovery_hint: RecoveryHint::Idempotent,
         path_args: vec![],
@@ -822,6 +860,7 @@ mod tests {
             description: "d".into(),
             input_schema: serde_json::json!({"type": "object"}),
             resource_class: ResourceClass::DiskRead,
+            effects: ToolEffects::READ_ONLY,
             capability: None,
             recovery_hint: RecoveryHint::Idempotent,
             path_args: vec!["path".into()],
@@ -850,6 +889,7 @@ mod tests {
             description: "d".into(),
             input_schema: serde_json::json!({}),
             resource_class: ResourceClass::Cpu,
+            effects: ToolEffects::READ_ONLY,
             capability: None,
             recovery_hint: RecoveryHint::Idempotent,
             path_args: vec![],
@@ -928,6 +968,7 @@ mod tests {
             description: "d".into(),
             input_schema: serde_json::json!({}),
             resource_class: ResourceClass::DiskRead,
+            effects: ToolEffects::READ_ONLY,
             capability: None,
             recovery_hint: RecoveryHint::Idempotent,
             path_args: vec!["path".into()],
@@ -965,12 +1006,33 @@ mod tests {
 
     // ---- audit 47: tool bundles per phase -------------------------------
 
+    /// Test-fixture parity seeding (audit item 9): a fixture tool DECLARES
+    /// effects mirroring the historical class policy (read-ish scheduling
+    /// classes read-only, mutating classes conservative) so behavior tests
+    /// keep their old semantics. Production tools declare their own honest
+    /// shapes at their definition sites; fixtures are never authority
+    /// seeds for the real registry.
+    fn fixture_effects(class: ResourceClass) -> ToolEffects {
+        match class {
+            ResourceClass::DiskRead
+            | ResourceClass::Cpu
+            | ResourceClass::Network
+            | ResourceClass::Model
+            | ResourceClass::Indexing => ToolEffects::READ_ONLY,
+            ResourceClass::DiskWrite
+            | ResourceClass::Terminal
+            | ResourceClass::Git
+            | ResourceClass::Mcp => ToolEffects::CONSERVATIVE,
+        }
+    }
+
     fn bundle_tool(name: &str, class: ResourceClass, schema: serde_json::Value) -> Tool {
         Tool {
             name: name.into(),
             description: format!("{name} test description"),
             input_schema: schema,
             resource_class: class,
+            effects: fixture_effects(class),
             capability: None,
             recovery_hint: RecoveryHint::Idempotent,
             path_args: vec![],
@@ -1204,6 +1266,7 @@ mod tests {
             description: "d".into(),
             input_schema: serde_json::json!({"type": "object"}),
             resource_class: ResourceClass::DiskRead,
+            effects: ToolEffects::READ_ONLY,
             capability: None,
             recovery_hint: RecoveryHint::Idempotent,
             path_args: Vec::new(),
@@ -1225,6 +1288,31 @@ mod tests {
             let bundle = registry.bundle_for_phase(phase, &caps_semantic());
             assert!(bundle.tools.is_empty(), "{phase:?} exposes no tools");
         }
+    }
+
+    // ---- audit item 9: production effect seeds -------------------------
+
+    /// The agent-owned production seeds declare authority from ACTUAL
+    /// behavior: `board_post` is a durable cross-agent append
+    /// (external_mutation, never conversational), `board_read` is a
+    /// bounded read, and the semantic escape hatch is read-only — and
+    /// every seed travels verbatim into the advertised spec.
+    #[test]
+    fn board_and_semantic_effect_seeds_declare_authority_from_actual_behavior() {
+        let post = board_post_tool(Arc::new(FakeBoard::default()));
+        assert!(post.effects.external_mutation, "a board post mutates");
+        assert!(!post.effects.is_read_only(), "an Ask may never POST");
+        assert_eq!(post.spec().effects, post.effects, "spec carries the seed");
+
+        let read = board_read_tool(Arc::new(FakeBoard::default()));
+        assert!(read.effects.is_read_only(), "an Ask may READ the board");
+        assert!(read.spec().effects.is_read_only());
+
+        let semantic = crate::semantic_tool::spec();
+        assert!(
+            semantic.effects.is_read_only(),
+            "the context query is read-only authority"
+        );
     }
 
     // ---- coordination-board tools --------------------------------------

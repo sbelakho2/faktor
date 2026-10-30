@@ -92,6 +92,11 @@ pub fn mcp_tool(server: Arc<McpServer>, tool: &McpTool) -> Option<Tool> {
         description: desc,
         input_schema,
         resource_class: ResourceClass::Mcp,
+        // AUTHORITY (audit item 9): an arbitrary external MCP server —
+        // effects are UNKNOWN (the recovery hint says the same), so the
+        // tool declares the CONSERVATIVE all-mutating shape and never
+        // rides a conversational Ask.
+        effects: faktor_provider::ToolEffects::CONSERVATIVE,
         capability: Some(Capability::Mcp {
             server: server_name,
         }),
@@ -269,6 +274,13 @@ mod tests {
             tools.iter().find(|t| t.name == "mock_echo").unwrap(),
         )
         .expect("bounded MCP tool");
+        // Audit item 9: an arbitrary external MCP server's effects are
+        // UNKNOWN (the recovery hint says the same), so the seed is the
+        // conservative all-mutating shape — never
+        // conversational-authority-clean, whatever its scheduling class.
+        assert_eq!(tool.effects, faktor_provider::ToolEffects::CONSERVATIVE);
+        assert!(!tool.effects.is_read_only());
+        assert!(!tool.spec().effects.is_read_only());
         // Successful call.
         let out = (tool.execute)(ctx(), serde_json::json!({"text": "hello world"}))
             .await

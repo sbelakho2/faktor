@@ -368,6 +368,7 @@ fn test_agent(
         description: "d".into(),
         input_schema: serde_json::json!({}),
         resource_class: faktor_core::resource::ResourceClass::Cpu,
+        effects: faktor_provider::ToolEffects::READ_ONLY,
         capability: None,
         recovery_hint: faktor_agent::RecoveryHint::Idempotent,
         path_args: vec![],

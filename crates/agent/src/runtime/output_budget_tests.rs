@@ -24,6 +24,7 @@ fn counting_tool(executions: Arc<AtomicUsize>) -> Tool {
         description: "records execution".into(),
         input_schema: serde_json::json!({"type": "object"}),
         resource_class: faktor_core::resource::ResourceClass::Cpu,
+        effects: faktor_provider::ToolEffects::READ_ONLY,
         capability: None,
         recovery_hint: RecoveryHint::Idempotent,
         path_args: vec![],

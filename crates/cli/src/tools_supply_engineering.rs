@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! Daemon tools for the closed Engineering -> Supply loop.
 //!
 //! The tools are thin, bounded adapters over `faktor-supply-engineering`:
@@ -272,6 +273,9 @@ pub fn supply_decision_tool(
             .into(),
         input_schema: request_schema(),
         resource_class: ResourceClass::Cpu,
+        // AUTHORITY (audit item 9): deterministic in-process kernel;
+        // orders and messages are never sent. Read-only on every axis.
+        effects: faktor_provider::ToolEffects::READ_ONLY,
         capability: None,
         recovery_hint: RecoveryHint::Idempotent,
         path_args: vec![],
@@ -298,6 +302,9 @@ pub fn engineering_analyse_tool(
                 .into(),
         input_schema: request_schema(),
         resource_class: ResourceClass::Cpu,
+        // AUTHORITY (audit item 9): deterministic in-process kernel;
+        // orders and messages are never sent. Read-only on every axis.
+        effects: faktor_provider::ToolEffects::READ_ONLY,
         capability: None,
         recovery_hint: RecoveryHint::Idempotent,
         path_args: vec![],
@@ -319,6 +326,9 @@ pub fn engineering_verify_tool(verifier: Arc<engineering_core::ReceiptVerifier>)
             .into(),
         input_schema: outcome_schema(),
         resource_class: ResourceClass::Cpu,
+        // AUTHORITY (audit item 9): deterministic in-process kernel;
+        // orders and messages are never sent. Read-only on every axis.
+        effects: faktor_provider::ToolEffects::READ_ONLY,
         capability: None,
         recovery_hint: RecoveryHint::Idempotent,
         path_args: vec![],
@@ -364,6 +374,12 @@ pub fn approval_request_tool(approvals: Arc<ApprovalAuthority>) -> Tool {
             }
         }),
         resource_class: ResourceClass::Cpu,
+        // AUTHORITY (audit item 9): proposes a DURABLE human-approval
+        // request (an out-of-model store append). Never rides an Ask.
+        effects: faktor_provider::ToolEffects {
+            external_mutation: true,
+            ..faktor_provider::ToolEffects::READ_ONLY
+        },
         capability: None,
         recovery_hint: RecoveryHint::Idempotent,
         path_args: vec![],
@@ -438,6 +454,9 @@ pub fn approval_status_tool(approvals: Arc<ApprovalAuthority>) -> Tool {
             "properties": {"request_id": {"type": "string"}}
         }),
         resource_class: ResourceClass::Cpu,
+        // AUTHORITY (audit item 9): deterministic in-process kernel;
+        // orders and messages are never sent. Read-only on every axis.
+        effects: faktor_provider::ToolEffects::READ_ONLY,
         capability: None,
         recovery_hint: RecoveryHint::Idempotent,
         path_args: vec![],
@@ -474,6 +493,57 @@ mod tests {
         tools.register(crate::tools::search_tool());
         tools.register(crate::tools::run_command_tool());
         tools
+    }
+
+    /// Audit item 9: the loop/approval seeds declare authority from ACTUAL
+    /// behavior — the deterministic kernels and the read-only status read
+    /// as conversational-clean; the durable approval REQUEST (an
+    /// out-of-model store append) is mutating and never rides an Ask; the
+    /// builtin core follows the same rule as in `crate::tools`.
+    #[test]
+    fn loop_and_approval_effect_seeds_declare_authority_from_actual_behavior() {
+        let (registry, _dir) = loop_registry();
+        for name in [
+            SUPPLY_DECISION_TOOL,
+            ENGINEERING_ANALYSE_TOOL,
+            ENGINEERING_VERIFY_TOOL,
+            APPROVAL_STATUS_TOOL,
+        ] {
+            assert!(
+                registry
+                    .get(name)
+                    .expect("registered")
+                    .effects
+                    .is_read_only(),
+                "{name} must be seeded read-only"
+            );
+        }
+        let approval = registry.get(APPROVAL_REQUEST_TOOL).expect("registered");
+        assert!(
+            approval.effects.external_mutation,
+            "proposing a durable approval request mutates an out-of-model store"
+        );
+        assert!(
+            !approval.effects.is_read_only(),
+            "approval_request must never ride an Ask"
+        );
+        assert!(registry
+            .get(crate::tools::read_file_tool().name.as_str())
+            .expect("registered")
+            .effects
+            .is_read_only());
+        assert!(!registry
+            .get(crate::tools::write_file_tool().name.as_str())
+            .expect("registered")
+            .effects
+            .is_read_only());
+        assert!(
+            registry
+                .get(crate::tools::run_command_tool().name.as_str())
+                .expect("registered")
+                .effects
+                .process_exec
+        );
     }
 
     fn loop_registry() -> (ToolRegistry, tempfile::TempDir) {

@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! `source_market` — the ONE model-facing tool of Faktor Acquire
 //! (`docs/acquire.md` §5/§14) — plus the local commerce admin commands.
 //!
@@ -132,6 +133,12 @@ pub fn source_market_tool_with_secrets(
         input_schema: source_market_schema(),
         // Network-class acquisition: never a disk-ownership claim.
         resource_class: ResourceClass::Network,
+        // AUTHORITY (audit item 9): read-only discovery/pricing over the
+        // checked egress transport (search/product/quote/bom/job READ
+        // operations; the durable writes on this path are keyed cache
+        // upserts, never workspace/external mutation — see the recovery
+        // hint below). Network INGRESS only; an Ask may fetch prices.
+        effects: faktor_provider::ToolEffects::NETWORK_READ_ONLY,
         // The capability the runtime's permission hop resolves (Ask -> the
         // operator/UI decides). The destination is a parseable marker, never
         // a real endpoint: per-source destination policy is enforced by the
@@ -3238,6 +3245,24 @@ mod tests {
             .expect_err("disabled service must refuse");
         assert_eq!(error.kind, ErrorKind::Permission);
         assert!(error.to_string().contains("disabled"), "{error}");
+    }
+
+    /// Audit item 9: `source_market` seeds from its ACTUAL behavior —
+    /// read-only discovery/pricing (network INGRESS, keyed cache upserts
+    /// only), so the Network SCHEDULING class no longer decides anything:
+    /// the declared effects admit it to an Ask because every mutating axis
+    /// is false.
+    #[test]
+    fn source_market_effect_seed_is_network_ingress_read_only() {
+        let tool = source_market_tool(disabled());
+        assert_eq!(
+            tool.effects,
+            faktor_provider::ToolEffects::NETWORK_READ_ONLY,
+            "acquisition must be declared read-only on every mutating axis"
+        );
+        assert!(tool.effects.network_read, "it reads over the network");
+        assert!(tool.effects.is_read_only());
+        assert!(tool.spec().effects.is_read_only(), "the spec carries it");
     }
 
     #[test]

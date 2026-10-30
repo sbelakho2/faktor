@@ -35,6 +35,7 @@ fn shell_tool() -> Tool {
             "required": ["command"]
         }),
         resource_class: ResourceClass::Terminal,
+        effects: faktor_provider::ToolEffects::CONSERVATIVE,
         capability: Some(Capability::ExecuteShell {
             command: String::new(),
         }),

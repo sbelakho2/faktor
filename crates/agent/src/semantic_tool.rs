@@ -21,7 +21,7 @@ use faktor_semantic::{
 };
 
 use crate::tool::{RecoveryHint, Tool, ToolOutcome, ToolRunCtx, SEMANTIC_QUERY_TOOL};
-use faktor_provider::ToolSpec;
+use faktor_provider::{ToolEffects, ToolSpec};
 
 /// Byte bound of one rendered semantic-query result.
 pub const SEMANTIC_QUERY_RENDER_MAX_BYTES: usize = 8 * 1024;
@@ -49,6 +49,9 @@ pub fn spec() -> ToolSpec {
             },
             "required": ["query"]
         }),
+        // AUTHORITY (audit item 9): a bounded context query over workspace
+        // content — read-only on every mutating axis.
+        effects: ToolEffects::READ_ONLY,
     }
 }
 
@@ -136,6 +139,7 @@ pub fn tool(registry: Arc<SemanticProviderRegistry>) -> Arc<Tool> {
         description: spec().description,
         input_schema: spec().input_schema,
         resource_class: ResourceClass::DiskRead,
+        effects: spec().effects,
         capability: Some(Capability::ReadWorkspace { path: ".".into() }),
         recovery_hint: RecoveryHint::Idempotent,
         path_args: Vec::new(),

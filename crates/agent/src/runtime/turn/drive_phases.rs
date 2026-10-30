@@ -965,30 +965,29 @@ impl AgentRuntime {
         // every ordinary prompt.
         let mut tool_bundle = self.tools_bundle_for_turn(st.handle, &history, &st.effective_caps);
         if st.execution.is_ask() {
-            // ASK tool policy (audit P0-ASK): EXPLICITLY read-permitted
-            // classes only. The bundle is the EXISTING authority — the
-            // membership guard in `run_tool_calls` refuses any name
-            // outside it with a typed, journaled denial, so a hostile
-            // model that guesses `write_file`/a shell gets the same
-            // refusal, and the permission hop still gates every tool that
-            // remains. Workspace mutation (DiskWrite), arbitrary shell
-            // (Terminal) and the write-capable Git/Mcp surfaces never
-            // ride a conversational ask.
-            tool_bundle.tools.retain(|spec| {
-                matches!(
-                    self.deps
-                        .tools
-                        .get(&spec.name)
-                        .map(|tool| tool.resource_class),
-                    Some(
-                        faktor_core::resource::ResourceClass::Model
-                            | faktor_core::resource::ResourceClass::DiskRead
-                            | faktor_core::resource::ResourceClass::Cpu
-                            | faktor_core::resource::ResourceClass::Network
-                            | faktor_core::resource::ResourceClass::Indexing
-                    )
-                )
-            });
+            // ASK tool policy (audit P0-ASK, migrated by audit item 9):
+            // EXPLICITLY READ-ONLY effects only. The bundle is the EXISTING
+            // authority — the membership guard in `run_tool_calls` refuses
+            // any name outside it with a typed, journaled denial
+            // (NotInActiveBundle), so a hostile model that guesses
+            // `write_file`/a shell gets the same refusal, and the
+            // permission hop still gates every tool that remains.
+            //
+            // The filter is [`ToolEffects`] AUTHORITY, never a
+            // `ResourceClass` membership test (the audit's
+            // type-architecture trap: `ResourceClass` is a
+            // scheduling/concurrency class, not an effect system — a
+            // Network-class tool that mutates the external world used to
+            // sail through). A tool must now be declared read-only on
+            // EVERY mutating axis (`workspace_write`, `process_exec`,
+            // `network_write`, `external_mutation`, `git_mutation` all
+            // false) to ride a conversational ask; workspace write,
+            // arbitrary shell, network egress, external-world mutation and
+            // git mutation never do. Specs without declared effects (old
+            // serialized JSON) decode conservatively and are refused.
+            tool_bundle
+                .tools
+                .retain(crate::runtime::tool_loop::ask_may_run);
         }
         // Audit 68 production hook: the failure-aware prior is applied
         // ONLY when `failure_learning` is on AND a handle was installed

@@ -89,6 +89,7 @@ pub(crate) fn acp_write_tool() -> faktor_agent::Tool {
         description: "writes a real file".into(),
         input_schema: serde_json::json!({"type": "object"}),
         resource_class: ResourceClass::DiskWrite,
+        effects: faktor_provider::ToolEffects::CONSERVATIVE,
         capability: None,
         recovery_hint: RecoveryHint::WorkspaceWrite,
         path_args: vec!["path".into()],

@@ -1182,6 +1182,7 @@ mod tests {
 
     fn tool(name: &str) -> ToolSpec {
         ToolSpec {
+            effects: faktor_provider::ToolEffects::READ_ONLY,
             name: name.into(),
             description: format!("{name} description"),
             input_schema: serde_json::json!({
@@ -2221,6 +2222,20 @@ mod tests {
             description: format!("{name} description"),
             input_schema: schema,
             resource_class: class,
+            // Fixture parity (audit item 9): read-ish scheduling classes
+            // declare read-only effects, mutating classes declare the
+            // conservative shape.
+            effects: match class {
+                ResourceClass::DiskRead
+                | ResourceClass::Cpu
+                | ResourceClass::Network
+                | ResourceClass::Model
+                | ResourceClass::Indexing => faktor_provider::ToolEffects::READ_ONLY,
+                ResourceClass::DiskWrite
+                | ResourceClass::Terminal
+                | ResourceClass::Git
+                | ResourceClass::Mcp => faktor_provider::ToolEffects::CONSERVATIVE,
+            },
             capability: None,
             recovery_hint: RecoveryHint::Idempotent,
             path_args: vec![],

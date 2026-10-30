@@ -1454,6 +1454,7 @@ mod tests {
 
     fn tool(name: &str) -> ToolSpec {
         ToolSpec {
+            effects: faktor_provider::ToolEffects::READ_ONLY,
             name: name.into(),
             description: format!("{name} description"),
             input_schema: serde_json::json!({
@@ -1913,6 +1914,7 @@ mod tests {
                 "",
                 "",
                 &[ToolSpec {
+                    effects: faktor_provider::ToolEffects::READ_ONLY,
                     name: "t".into(),
                     description: "d".repeat(10_000),
                     input_schema: serde_json::json!({}),
@@ -2096,6 +2098,7 @@ mod tests {
             });
         }
         let tools = vec![ToolSpec {
+            effects: faktor_provider::ToolEffects::READ_ONLY,
             name: "t".into(),
             description: "d".into(),
             input_schema: {
@@ -3352,6 +3355,7 @@ mod tests {
     fn tool_bundle_digest_is_byte_identical_to_full_bundle_serialization() {
         let specs: Vec<ToolSpec> = (0..3)
             .map(|i| ToolSpec {
+                effects: faktor_provider::ToolEffects::READ_ONLY,
                 name: format!("tool_{i}_汉"),
                 description: format!("desc {i} \u{1F600}"),
                 input_schema: serde_json::json!({

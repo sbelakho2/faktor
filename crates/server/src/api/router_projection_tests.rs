@@ -141,6 +141,7 @@ async fn native_projection_after_driven_turn_reports_ledger_files() {
             "required": ["path"],
         }),
         resource_class: faktor_core::resource::ResourceClass::DiskWrite,
+        effects: faktor_provider::ToolEffects::CONSERVATIVE,
         capability: None,
         recovery_hint: faktor_agent::RecoveryHint::WorkspaceWrite,
         path_args: vec!["path".into()],

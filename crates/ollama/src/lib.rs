@@ -1612,6 +1612,7 @@ mod tests {
                 content: vec![ContentPart::text("hi")],
             }],
             tools: vec![ToolSpec {
+                effects: faktor_provider::ToolEffects::READ_ONLY,
                 name: "read_file".into(),
                 description: "read".into(),
                 input_schema: serde_json::json!({"type": "object"}),

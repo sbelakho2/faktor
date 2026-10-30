@@ -1,4 +1,5 @@
 //! `runtime::tool_loop_tests`: out-of-line tests.
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 
 use super::*;
 use crate::runtime::fixtures_tests::*;
@@ -274,6 +275,7 @@ async fn tool_ctx_identity_reads_the_session_row_not_hardcoded_ids() {
             description: "records ctx identity".into(),
             input_schema: serde_json::json!({"type": "object"}),
             resource_class: faktor_core::resource::ResourceClass::Cpu,
+            effects: faktor_provider::ToolEffects::READ_ONLY,
             capability: None,
             recovery_hint: RecoveryHint::Idempotent,
             path_args: vec![],
@@ -896,6 +898,7 @@ fn run_tool_calls_fills_reads_writes_from_tool_ownership() {
         description: "w".into(),
         input_schema: serde_json::json!({}),
         resource_class: faktor_core::resource::ResourceClass::DiskWrite,
+        effects: faktor_provider::ToolEffects::CONSERVATIVE,
         capability: None,
         recovery_hint: RecoveryHint::WorkspaceWrite,
         path_args: vec!["path".into()],
@@ -921,6 +924,7 @@ fn run_tool_calls_fills_reads_writes_from_tool_ownership() {
         &Arc::new(Tool {
             path_args: vec!["path".into()],
             resource_class: faktor_core::resource::ResourceClass::DiskRead,
+            effects: faktor_provider::ToolEffects::READ_ONLY,
             ..(write_file.as_ref()).clone()
         }),
         &serde_json::json!({"path": "src/main.rs"}),
@@ -1031,6 +1035,7 @@ fn alias_write_tool(name: &str, barrier: Arc<AliasBarrier>) -> Tool {
             "required": ["path"]
         }),
         resource_class: faktor_core::resource::ResourceClass::DiskWrite,
+        effects: faktor_provider::ToolEffects::CONSERVATIVE,
         capability: None,
         recovery_hint: RecoveryHint::WorkspaceWrite,
         path_args: vec!["path".into()],
@@ -1072,6 +1077,7 @@ fn alias_shell_tool(barrier: Arc<AliasBarrier>) -> Tool {
         description: "generic shell".into(),
         input_schema: serde_json::json!({"type": "object"}),
         resource_class: faktor_core::resource::ResourceClass::Terminal,
+        effects: faktor_provider::ToolEffects::CONSERVATIVE,
         capability: Some(faktor_core::capability::Capability::ExecuteShell {
             command: "alias-shell".into(),
         }),
@@ -1289,6 +1295,7 @@ async fn a_failed_mutation_gets_a_bounded_argument_retry_instead_of_ending_the_t
         description: "always conflicts".into(),
         input_schema: serde_json::json!({"type": "object"}),
         resource_class: faktor_core::resource::ResourceClass::DiskWrite,
+        effects: faktor_provider::ToolEffects::CONSERVATIVE,
         capability: None,
         recovery_hint: RecoveryHint::WorkspaceWrite,
         path_args: vec![],
@@ -1551,6 +1558,7 @@ async fn tool_input_carrying_a_secret_is_denied_before_execution() {
         description: "writes a file".into(),
         input_schema: serde_json::json!({"type": "object"}),
         resource_class: faktor_core::resource::ResourceClass::DiskWrite,
+        effects: faktor_provider::ToolEffects::CONSERVATIVE,
         capability: None,
         recovery_hint: RecoveryHint::WorkspaceWrite,
         path_args: vec!["path".into()],
@@ -1621,6 +1629,7 @@ async fn tool_results_echoing_secrets_are_redacted_benign_outputs_byte_identical
         description: "runs a command".into(),
         input_schema: serde_json::json!({"type": "object"}),
         resource_class: faktor_core::resource::ResourceClass::Cpu,
+        effects: faktor_provider::ToolEffects::READ_ONLY,
         capability: None,
         recovery_hint: RecoveryHint::UnknownEffect,
         path_args: vec![],
@@ -1778,6 +1787,7 @@ async fn configured_secret_echoed_by_a_tool_is_redacted_and_never_blocks_the_nex
         description: "runs a command".into(),
         input_schema: serde_json::json!({"type": "object"}),
         resource_class: faktor_core::resource::ResourceClass::Cpu,
+        effects: faktor_provider::ToolEffects::READ_ONLY,
         capability: None,
         recovery_hint: RecoveryHint::UnknownEffect,
         path_args: vec![],
@@ -1973,6 +1983,7 @@ async fn hostile_tool_inputs_whole_payload_scan_catches_deep_secrets_and_boundar
             description: "writes".into(),
             input_schema: serde_json::json!({"type": "object"}),
             resource_class: faktor_core::resource::ResourceClass::DiskWrite,
+            effects: faktor_provider::ToolEffects::CONSERVATIVE,
             capability: None,
             recovery_hint: RecoveryHint::WorkspaceWrite,
             path_args: vec!["path".into()],
@@ -3255,6 +3266,14 @@ async fn durable_tool_enablement_removes_disabled_tools_from_the_bundle_and_disp
             } else {
                 faktor_core::resource::ResourceClass::DiskRead
             },
+            // Fixture parity (audit item 9): the write-shaped fixture
+            // declares the conservative mutating shape, the read-shaped
+            // one declares read-only.
+            effects: if name == "write_file" {
+                faktor_provider::ToolEffects::CONSERVATIVE
+            } else {
+                faktor_provider::ToolEffects::READ_ONLY
+            },
             capability: None,
             recovery_hint: RecoveryHint::Idempotent,
             path_args: vec![],
@@ -3338,6 +3357,7 @@ async fn corrupt_tool_enablement_fact_offers_no_tools() {
             description: "read".into(),
             input_schema: serde_json::json!({"type": "object"}),
             resource_class: faktor_core::resource::ResourceClass::DiskRead,
+            effects: faktor_provider::ToolEffects::READ_ONLY,
             capability: None,
             recovery_hint: RecoveryHint::Idempotent,
             path_args: vec![],
@@ -3458,4 +3478,443 @@ fn unchanged_read_marker_is_digest_keyed_bounded_and_fresh_bypassable() {
             .is_none(),
         "only the read tool uses the read cache"
     );
+}
+
+/// The ask-turn twin of `assert_refusal_answered`: EVERY leg except the
+/// engineering-TaskLedger one. An Ask turn deliberately never writes the
+/// task ledger (pinned by `media_tests`), so the durable-history legs of a
+/// conversational refusal are the journaled PermissionDenied event and the
+/// answered, typed, bounded tool_result — both asserted here exactly as in
+/// the task-turn helper. (The shared helper's TaskLedger leg is absent on
+/// purpose: the tool-batch path persists the working ledger for ANY turn
+/// that reaches `run_tool_calls` — a pre-existing, ask/task-agnostic
+/// behavior this change does not alter; the zero-ledger ask pin in
+/// `media_tests` covers the tool-free conversational turn.)
+fn assert_ask_refusal_answered(
+    runtime: &AgentRuntime,
+    session: SessionId,
+    call_id: &str,
+    kind_tag: &str,
+    reason_fragment: &str,
+    executions: &Arc<std::sync::atomic::AtomicUsize>,
+) {
+    assert_eq!(
+        executions.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a refused call must never execute"
+    );
+    let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+    assert!(handle.pending_tool_runs().unwrap().is_empty());
+    let events = handle.events_range(1, None).unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.kind == faktor_core::event::EventKind::ToolStarted),
+        "no run may start for a refused call"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == faktor_core::event::EventKind::PermissionDenied),
+        "the refusal must be journaled"
+    );
+    let (excerpt, exit) =
+        tool_result_for(&handle, call_id).unwrap_or_else(|| panic!("{call_id} unanswered"));
+    assert_eq!(exit, Some(1), "a denial is an error result: {excerpt}");
+    assert!(
+        excerpt.contains(&format!("tool call denied ({kind_tag})")),
+        "typed denial tag missing: {excerpt}"
+    );
+    assert!(
+        excerpt.contains(reason_fragment),
+        "the refusal reason must reach the model: {excerpt}"
+    );
+    assert!(excerpt.len() <= 2000, "bounded excerpt: {}", excerpt.len());
+    assert!(
+        dangling_tool_calls(&handle).is_empty(),
+        "the refusal must answer the call, never dangle"
+    );
+}
+
+// ===================== audit item 9: ToolEffects authority ================
+
+/// THE audit trap, end to end: a Network-CLASS tool (the historical
+/// class-membership Ask filter explicitly ALLOWED `ResourceClass::Network`)
+/// whose declared effects mutate the external world must be REFUSED on a
+/// conversational turn. The class says "yes", the effect system says "no" —
+/// and authority is the effect system. The refusal happens at bundle
+/// construction, so dispatch answers the call through the SAME typed
+/// NotInActiveBundle path, before any permission hop or execution.
+#[tokio::test]
+async fn network_class_tool_with_external_mutation_is_refused_on_an_ask_even_though_its_class_would_have_passed(
+) {
+    let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let trap = Tool {
+        name: "webhook_deliver".into(),
+        description: "CANARY description must never leak in the refusal".into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": { "payload": { "type": "string" } },
+            "required": ["payload"],
+            "description": "CANARY schema must never leak in the refusal"
+        }),
+        resource_class: faktor_core::resource::ResourceClass::Network,
+        // The trap in one line: scheduling class Network (old filter: PASS),
+        // declared external-world mutation (authority: REFUSE).
+        effects: faktor_provider::ToolEffects {
+            workspace_read: false,
+            workspace_write: false,
+            process_exec: false,
+            network_read: true,
+            network_write: false,
+            external_mutation: true,
+            git_mutation: false,
+        },
+        capability: None,
+        recovery_hint: RecoveryHint::UnknownEffect,
+        path_args: vec![],
+        execute: Arc::new({
+            let executions = executions.clone();
+            move |_ctx, _args| {
+                let executions = executions.clone();
+                Box::pin(async move {
+                    executions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(ToolOutcome::default())
+                })
+            }
+        }),
+    };
+    // The pre-migration filter admitted this class (audit baseline: the
+    // exact membership that made the trap real) …
+    let old_class_filter_admits = matches!(
+        trap.resource_class,
+        faktor_core::resource::ResourceClass::Model
+            | faktor_core::resource::ResourceClass::DiskRead
+            | faktor_core::resource::ResourceClass::Cpu
+            | faktor_core::resource::ResourceClass::Network
+            | faktor_core::resource::ResourceClass::Indexing
+    );
+    assert!(
+        old_class_filter_admits,
+        "the fixture must reproduce the trap: class policy admits Network"
+    );
+    // … and the effects authority refuses it.
+    assert!(trap.effects.external_mutation, "fixture sanity");
+    assert!(
+        !crate::runtime::tool_loop::ask_may_run(&trap.spec()),
+        "external_mutation must break conversational authority"
+    );
+
+    let (deps, _dir) = deps(
+        scripted_provider(vec![
+            ScriptedResponse::ToolCall {
+                id: "post".into(),
+                name: "webhook_deliver".into(),
+                input: serde_json::json!({"payload": "steal"}),
+            },
+            ScriptedResponse::End,
+        ]),
+        vec![trap],
+    );
+    let runtime = AgentRuntime::new(deps).unwrap();
+    let session = new_session(runtime.deps());
+    let receipt = runtime
+        .submit(session, "post this payload", &[])
+        .expect("ask admission");
+    let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+    let row = faktor_protocol::TurnExecution {
+        execution: faktor_protocol::ExecutionKind::Ask,
+        attachments: Vec::new(),
+    };
+    handle
+        .upsert_memory_fact(
+            faktor_protocol::TURN_EXECUTION_ROW_KIND,
+            &faktor_protocol::turn_execution_row_key(receipt.op_id.raw()),
+            &row.encode().unwrap(),
+        )
+        .unwrap();
+    let outcome = runtime.drive_receipt(&handle, receipt, None).await.unwrap();
+    assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+    assert_ask_refusal_answered(
+        &runtime,
+        session,
+        "post",
+        "not_in_active_bundle",
+        "webhook_deliver",
+        &executions,
+    );
+    // Zero executions and no permission hop: the trap dies at bundle
+    // construction, before anything touches the model-visible permission
+    // surface or the external world.
+    assert_eq!(
+        executions.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the external-mutating tool must never execute on an ask"
+    );
+    let events = handle.events_range(1, None).unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.kind == faktor_core::event::EventKind::ToolRequested),
+        "the refused call must never reach the permission hop"
+    );
+    let (excerpt, _exit) = tool_result_for(&handle, "post").expect("answered");
+    assert!(
+        !excerpt.contains("CANARY"),
+        "the refusal must not leak schema/description: {excerpt}"
+    );
+}
+
+/// Workspace-write and process-exec tools are refused on an ask: both
+/// mutating axes break read-only-on-every-axis authority even though both
+/// tools are registered, visible and would pass a scheduling-class check
+/// the old filter happened to make for some of them.
+#[tokio::test]
+async fn workspace_write_and_process_exec_tools_are_refused_on_asks_before_any_execution() {
+    let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let write_tool = Tool {
+        name: "write_file".into(),
+        description: "d".into(),
+        input_schema: serde_json::json!({"type": "object"}),
+        resource_class: faktor_core::resource::ResourceClass::DiskWrite,
+        effects: faktor_provider::ToolEffects {
+            workspace_write: true,
+            ..faktor_provider::ToolEffects::READ_ONLY
+        },
+        capability: None,
+        recovery_hint: RecoveryHint::WorkspaceWrite,
+        path_args: vec![],
+        execute: Arc::new({
+            let executions = executions.clone();
+            move |_ctx, _args| {
+                let executions = executions.clone();
+                Box::pin(async move {
+                    executions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(ToolOutcome::default())
+                })
+            }
+        }),
+    };
+    let shell_tool = Tool {
+        name: "run_command".into(),
+        description: "d".into(),
+        input_schema: serde_json::json!({"type": "object"}),
+        resource_class: faktor_core::resource::ResourceClass::Terminal,
+        // The production shell seed: every mutating axis, including
+        // process_exec, is declared.
+        effects: faktor_provider::ToolEffects::CONSERVATIVE,
+        capability: None,
+        recovery_hint: RecoveryHint::UnknownEffect,
+        path_args: vec![],
+        execute: Arc::new({
+            let executions = executions.clone();
+            move |_ctx, _args| {
+                let executions = executions.clone();
+                Box::pin(async move {
+                    executions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(ToolOutcome::default())
+                })
+            }
+        }),
+    };
+    assert!(!crate::runtime::tool_loop::ask_may_run(&write_tool.spec()));
+    assert!(!crate::runtime::tool_loop::ask_may_run(&shell_tool.spec()));
+
+    let (deps, _dir) = deps(
+        scripted_provider(vec![
+            ScriptedResponse::ToolCall {
+                id: "w".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({"path": "pwn.txt", "content": "x"}),
+            },
+            ScriptedResponse::ToolCall {
+                id: "s".into(),
+                name: "run_command".into(),
+                input: serde_json::json!({"command": "rm -rf /"}),
+            },
+            ScriptedResponse::End,
+        ]),
+        vec![write_tool, shell_tool],
+    );
+    let runtime = AgentRuntime::new(deps).unwrap();
+    let session = new_session(runtime.deps());
+    let receipt = runtime
+        .submit(session, "quick question about this repo", &[])
+        .expect("ask admission");
+    let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+    let row = faktor_protocol::TurnExecution {
+        execution: faktor_protocol::ExecutionKind::Ask,
+        attachments: Vec::new(),
+    };
+    handle
+        .upsert_memory_fact(
+            faktor_protocol::TURN_EXECUTION_ROW_KIND,
+            &faktor_protocol::turn_execution_row_key(receipt.op_id.raw()),
+            &row.encode().unwrap(),
+        )
+        .unwrap();
+    let outcome = runtime.drive_receipt(&handle, receipt, None).await.unwrap();
+    assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+    for (call, tool) in [("w", "write_file"), ("s", "run_command")] {
+        assert_ask_refusal_answered(
+            &runtime,
+            session,
+            call,
+            "not_in_active_bundle",
+            tool,
+            &executions,
+        );
+    }
+    assert_eq!(
+        executions.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "neither the workspace write nor the shell may execute on an ask"
+    );
+}
+
+/// Every tool DECLARED read-only on every mutating axis rides the
+/// conversational turn and executes: workspace reads (read_file, search)
+/// and network INGRESS (a fetch-shaped tool with `network_read` only) are
+/// permitted read axes — read axes never veto conversational authority.
+#[tokio::test]
+async fn declared_read_only_tools_execute_on_an_ask() {
+    let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seeded = |name: &'static str, effects: faktor_provider::ToolEffects| {
+        let executions = executions.clone();
+        Tool {
+            name: name.into(),
+            description: "d".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            resource_class: match name {
+                "search" | "read_file" => faktor_core::resource::ResourceClass::DiskRead,
+                _ => faktor_core::resource::ResourceClass::Network,
+            },
+            effects,
+            capability: None,
+            recovery_hint: RecoveryHint::Idempotent,
+            path_args: vec![],
+            execute: Arc::new(move |_ctx, _args| {
+                let executions = executions.clone();
+                Box::pin(async move {
+                    executions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(ToolOutcome {
+                        text: format!("{name} output"),
+                        exit_code: Some(0),
+                        ..Default::default()
+                    })
+                })
+            }),
+        }
+    };
+    let tools = vec![
+        seeded("read_file", faktor_provider::ToolEffects::READ_ONLY),
+        seeded("search", faktor_provider::ToolEffects::READ_ONLY),
+        seeded("web_fetch", faktor_provider::ToolEffects::NETWORK_READ_ONLY),
+    ];
+    for tool in &tools {
+        assert!(
+            crate::runtime::tool_loop::ask_may_run(&tool.spec()),
+            "{} must be conversational-authority-clean",
+            tool.name
+        );
+    }
+    let (deps, _dir) = deps(
+        scripted_provider(vec![
+            ScriptedResponse::ToolCall {
+                id: "r".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({"path": "src/lib.rs"}),
+            },
+            ScriptedResponse::ToolCall {
+                id: "q".into(),
+                name: "search".into(),
+                input: serde_json::json!({"pattern": "fn main"}),
+            },
+            ScriptedResponse::ToolCall {
+                id: "f".into(),
+                name: "web_fetch".into(),
+                input: serde_json::json!({"url": "https://docs.example/api"}),
+            },
+            ScriptedResponse::Text("here is the answer".into()),
+            ScriptedResponse::End,
+        ]),
+        tools,
+    );
+    let runtime = AgentRuntime::new(deps).unwrap();
+    let session = new_session(runtime.deps());
+    let receipt = runtime
+        .submit(session, "what does the docs page say?", &[])
+        .expect("ask admission");
+    let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+    let row = faktor_protocol::TurnExecution {
+        execution: faktor_protocol::ExecutionKind::Ask,
+        attachments: Vec::new(),
+    };
+    handle
+        .upsert_memory_fact(
+            faktor_protocol::TURN_EXECUTION_ROW_KIND,
+            &faktor_protocol::turn_execution_row_key(receipt.op_id.raw()),
+            &row.encode().unwrap(),
+        )
+        .unwrap();
+    let outcome = runtime.drive_receipt(&handle, receipt, None).await.unwrap();
+    assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+    assert_eq!(
+        executions.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "every declared read-only tool must execute on the ask"
+    );
+    for call in ["r", "q", "f"] {
+        let (_excerpt, exit) = tool_result_for(&handle, call).expect("answered");
+        assert_eq!(exit, Some(0), "{call} must succeed");
+    }
+}
+
+/// THE serde/default rule for authority (documented choice): an OLD
+/// serialized ToolSpec JSON without `effects` still DECODES (wire
+/// compatibility) but lands on the conservative all-mutating shape, and the
+/// ask predicate REFUSES it. It is accepted only when explicit read-only
+/// evidence exists — every mutating axis declared false.
+#[test]
+fn legacy_tool_spec_json_without_effects_is_refused_by_the_ask_predicate_unless_read_only_is_declared(
+) {
+    let legacy = serde_json::json!({
+        "name": "read_file",
+        "description": "d",
+        "input_schema": { "type": "object" }
+    });
+    let spec: faktor_provider::ToolSpec =
+        serde_json::from_value(legacy).expect("old specs must still decode");
+    assert_eq!(spec.effects, faktor_provider::ToolEffects::CONSERVATIVE);
+    assert!(
+        !crate::runtime::tool_loop::ask_may_run(&spec),
+        "RULE: a spec without declared effects decodes conservative and is refused"
+    );
+    // Partial evidence is still fail-closed: undeclared mutating axes
+    // default to true.
+    let partial: faktor_provider::ToolSpec = serde_json::from_value(serde_json::json!({
+        "name": "search",
+        "description": "d",
+        "input_schema": {},
+        "effects": { "workspace_read": true }
+    }))
+    .unwrap();
+    assert!(!crate::runtime::tool_loop::ask_may_run(&partial));
+    // Explicit read-only evidence on every mutating axis is accepted.
+    let declared: faktor_provider::ToolSpec = serde_json::from_value(serde_json::json!({
+        "name": "search",
+        "description": "d",
+        "input_schema": {},
+        "effects": {
+            "workspace_read": true,
+            "workspace_write": false,
+            "process_exec": false,
+            "network_read": true,
+            "network_write": false,
+            "external_mutation": false,
+            "git_mutation": false
+        }
+    }))
+    .unwrap();
+    assert!(crate::runtime::tool_loop::ask_may_run(&declared));
 }

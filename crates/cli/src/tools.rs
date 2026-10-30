@@ -127,6 +127,8 @@ pub fn read_file_tool() -> Tool {
             "required": ["path"]
         }),
         resource_class: ResourceClass::DiskRead,
+        // AUTHORITY (audit item 9): bounded workspace read; mutates nothing.
+        effects: faktor_provider::ToolEffects::READ_ONLY,
         capability: Some(Capability::ReadWorkspace { path: ".".into() }),
         recovery_hint: RecoveryHint::Idempotent,
         path_args: vec!["path".into()],
@@ -207,6 +209,11 @@ pub fn write_file_tool() -> Tool {
             "required": ["path", "content"]
         }),
         resource_class: ResourceClass::DiskWrite,
+        // AUTHORITY (audit item 9): creates/replaces a workspace file.
+        effects: faktor_provider::ToolEffects {
+            workspace_write: true,
+            ..faktor_provider::ToolEffects::READ_ONLY
+        },
         capability: Some(Capability::WriteWorkspace { path: ".".into() }),
         recovery_hint: RecoveryHint::WorkspaceWrite,
         path_args: vec!["path".into()],
@@ -746,6 +753,11 @@ pub fn edit_file_tool() -> Tool {
             "required": ["path", "operations"]
         }),
         resource_class: ResourceClass::DiskWrite,
+        // AUTHORITY (audit item 9): transactionally edits a workspace file.
+        effects: faktor_provider::ToolEffects {
+            workspace_write: true,
+            ..faktor_provider::ToolEffects::READ_ONLY
+        },
         capability: Some(Capability::WriteWorkspace { path: ".".into() }),
         recovery_hint: RecoveryHint::WorkspaceWrite,
         path_args: vec!["path".into()],
@@ -897,6 +909,9 @@ pub fn list_dir_tool() -> Tool {
             }
         }),
         resource_class: ResourceClass::DiskRead,
+        // AUTHORITY (audit item 9): bounded directory listing; mutates
+        // nothing.
+        effects: faktor_provider::ToolEffects::READ_ONLY,
         capability: Some(Capability::ReadWorkspace { path: ".".into() }),
         recovery_hint: RecoveryHint::Idempotent,
         path_args: vec!["path".into()],
@@ -968,6 +983,9 @@ pub fn search_tool() -> Tool {
             "required": ["pattern"]
         }),
         resource_class: ResourceClass::DiskRead,
+        // AUTHORITY (audit item 9): bounded workspace content search;
+        // mutates nothing.
+        effects: faktor_provider::ToolEffects::READ_ONLY,
         capability: Some(Capability::ReadWorkspace { path: ".".into() }),
         recovery_hint: RecoveryHint::Idempotent,
         path_args: vec!["path".into()],
@@ -1273,6 +1291,13 @@ pub fn run_command_tool() -> Tool {
             "required": ["command"]
         }),
         resource_class: ResourceClass::Terminal,
+        // AUTHORITY (audit item 9): an arbitrary shell command can do
+        // ANYTHING the session user can — even `read_only: true` only adds
+        // a kernel write-denial on top, and the command still execs
+        // processes, writes outside the workspace, talks to the network
+        // and runs git. Every mutating axis is declared; an Ask never runs
+        // it (the historical class filter refused Terminal on asks too).
+        effects: faktor_provider::ToolEffects::CONSERVATIVE,
         capability: Some(Capability::ExecuteShell {
             command: String::new(),
         }),
@@ -1524,6 +1549,40 @@ mod tests {
     use faktor_session::SessionManager;
     use faktor_terminal::ProcessSupervisor;
     use std::path::PathBuf;
+
+    /// The six builtin seeds declare authority from ACTUAL behavior
+    /// (audit item 9): reads are conversational-clean; workspace writes
+    /// and the arbitrary shell are not. `ResourceClass` is never
+    /// consulted — scheduling grants no authority.
+    #[test]
+    fn builtin_tool_effects_seed_from_actual_behavior() {
+        use faktor_provider::ToolEffects;
+        for tool in [read_file_tool(), list_dir_tool(), search_tool()] {
+            assert_eq!(
+                tool.effects,
+                ToolEffects::READ_ONLY,
+                "{} must be seeded read-only",
+                tool.name
+            );
+            assert!(tool.spec().effects.is_read_only(), "{}", tool.name);
+        }
+        for tool in [write_file_tool(), edit_file_tool()] {
+            assert!(tool.effects.workspace_write, "{}", tool.name);
+            assert!(
+                !tool.effects.is_read_only(),
+                "{} must never ride an Ask",
+                tool.name
+            );
+        }
+        let shell = run_command_tool();
+        assert!(shell.effects.process_exec, "the shell spawns processes");
+        assert_eq!(
+            shell.effects,
+            ToolEffects::CONSERVATIVE,
+            "an arbitrary shell declares every mutating axis"
+        );
+        assert!(!shell.effects.is_read_only());
+    }
 
     struct ToolFixture {
         _dir: tempfile::TempDir,

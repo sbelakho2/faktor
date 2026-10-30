@@ -784,11 +784,134 @@ pub struct RequestMessage {
     pub content: Vec<ContentPart>,
 }
 
+/// Serde default for every [`ToolEffects`] axis: TRUE. A missing axis (or a
+/// whole missing `effects` object on an old serialized [`ToolSpec`]) decodes
+/// as MUTATING — unknown effects grant no conversational authority.
+fn default_effect_true() -> bool {
+    true
+}
+
+/// Explicit EFFECT metadata for a tool — the AUTHORITY axis of the
+/// three-concept separation (audit item 9):
+///
+/// - `faktor_core::resource::ResourceClass` is a SCHEDULING / CONCURRENCY
+///   class only: it decides how many operations of a kind may run at once.
+///   It is NOT an effect system and grants NO authority. A `Network`-class
+///   tool that mutates the external world must never pass an authority
+///   filter by virtue of its scheduling class.
+/// - [`ToolEffects`] (this type) is AUTHORITY: what an Ask (conversational)
+///   turn may run. Every axis a tool can affect is DECLARED from the tool's
+///   actual implementation behavior; anything not explicitly declared
+///   read-only is treated as mutating.
+/// - Capabilities (`CapabilitySet` / the permission hop) are PERMISSION:
+///   the session/sandbox envelope that gates every executed call.
+///
+/// The serde default is deliberately CONSERVATIVE on every axis: old
+/// serialized tool specs (JSON without `effects`) decode as all-mutating
+/// and are refused on conversational turns — unknown ⇒ mutating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolEffects {
+    /// Reads workspace files/state. Read axes never disqualify a tool from
+    /// conversational authority.
+    #[serde(default = "default_effect_true")]
+    pub workspace_read: bool,
+    /// Creates, updates or deletes workspace files.
+    #[serde(default = "default_effect_true")]
+    pub workspace_write: bool,
+    /// Spawns an arbitrary child process or shell.
+    #[serde(default = "default_effect_true")]
+    pub process_exec: bool,
+    /// Reads from the network (ingress). Read axes never disqualify a tool
+    /// from conversational authority.
+    #[serde(default = "default_effect_true")]
+    pub network_read: bool,
+    /// Sends data or requests out over the network (egress).
+    #[serde(default = "default_effect_true")]
+    pub network_write: bool,
+    /// Mutates durable state outside the workspace/git/network axes —
+    /// external services, marketplaces, approval queues, coordination
+    /// boards and any other out-of-model store.
+    #[serde(default = "default_effect_true")]
+    pub external_mutation: bool,
+    /// Mutates git state (commits, branches, index, history).
+    #[serde(default = "default_effect_true")]
+    pub git_mutation: bool,
+}
+
+impl ToolEffects {
+    /// Every axis declared mutating/unknown. This is both the serde decode
+    /// default for absent axes and the shape old serialized specs decode
+    /// to; an effects-free tool is NEVER conversational-authority-clean.
+    pub const CONSERVATIVE: Self = Self {
+        workspace_read: true,
+        workspace_write: true,
+        process_exec: true,
+        network_read: true,
+        network_write: true,
+        external_mutation: true,
+        git_mutation: true,
+    };
+
+    /// Declared read-only: reads the workspace, mutates nothing on any
+    /// mutating axis.
+    pub const READ_ONLY: Self = Self {
+        workspace_read: true,
+        workspace_write: false,
+        process_exec: false,
+        network_read: false,
+        network_write: false,
+        external_mutation: false,
+        git_mutation: false,
+    };
+
+    /// Declared read-only with network INGRESS only (e.g. a fetch /
+    /// read-only acquisition tool): no workspace access, no mutation on any
+    /// mutating axis.
+    pub const NETWORK_READ_ONLY: Self = Self {
+        workspace_read: false,
+        workspace_write: false,
+        process_exec: false,
+        network_read: true,
+        network_write: false,
+        external_mutation: false,
+        git_mutation: false,
+    };
+
+    /// The AUTHORITY predicate: TRUE only when the tool is declared
+    /// read-only on EVERY mutating axis (`workspace_write`, `process_exec`,
+    /// `network_write`, `external_mutation`, `git_mutation` all false).
+    /// Read axes (`workspace_read`, `network_read`) never disqualify a
+    /// tool: a conversational turn may read the workspace or fetch
+    /// read-only data. Anything undeclared decays to `true` per axis via
+    /// the serde default, so it fails this predicate.
+    pub fn is_read_only(&self) -> bool {
+        !(self.workspace_write
+            || self.process_exec
+            || self.network_write
+            || self.external_mutation
+            || self.git_mutation)
+    }
+}
+
+impl Default for ToolEffects {
+    fn default() -> Self {
+        Self::CONSERVATIVE
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolSpec {
     pub name: String,
     pub description: String,
     pub input_schema: serde_json::Value,
+    /// The tool's AUTHORITY metadata (see [`ToolEffects`]): what an Ask may
+    /// run, decided from declared effects — never from the scheduling
+    /// `ResourceClass`. The serde default is the CONSERVATIVE shape, so old
+    /// serialized specs (JSON without `effects`) decode as mutating and are
+    /// refused on conversational turns.
+    #[serde(default)]
+    pub effects: ToolEffects,
 }
 
 /// Metadata attached to every request. The wire serializer never sees these
@@ -2803,6 +2926,7 @@ mod tests {
             name: "read_file".into(),
             description: "d".into(),
             input_schema: serde_json::json!({}),
+            effects: ToolEffects::CONSERVATIVE,
         });
         let err = CapabilityValidator::validate(&r, &caps).unwrap_err();
         assert_eq!(err.kind, ErrorKind::Malformed);
@@ -3873,5 +3997,131 @@ mod tests {
             provider.capability_resolution("missing").authority,
             provider.capability_resolution("m1").authority
         );
+    }
+
+    // ---- audit item 9: ToolEffects authority, not ResourceClass ----------
+
+    /// Adversarial authority seed: `is_read_only` is a conjunction over the
+    /// FIVE mutating axes. Flipping ANY one of them false→true must break
+    /// read-only authority; the read axes must never do so.
+    #[test]
+    fn read_only_requires_every_mutating_axis_false_and_read_axes_never_veto() {
+        for veto in [
+            |e: &mut ToolEffects| e.workspace_write = true,
+            |e: &mut ToolEffects| e.process_exec = true,
+            |e: &mut ToolEffects| e.network_write = true,
+            |e: &mut ToolEffects| e.external_mutation = true,
+            |e: &mut ToolEffects| e.git_mutation = true,
+        ] {
+            let mut effects = ToolEffects::READ_ONLY;
+            assert!(effects.is_read_only());
+            veto(&mut effects);
+            assert!(
+                !effects.is_read_only(),
+                "a single mutating axis must break conversational authority: {effects:?}"
+            );
+        }
+        for read_veto in [
+            |e: &mut ToolEffects| e.workspace_read = false,
+            |e: &mut ToolEffects| e.network_read = false,
+        ] {
+            let mut effects = ToolEffects::READ_ONLY;
+            read_veto(&mut effects);
+            assert!(
+                effects.is_read_only(),
+                "a read axis never disqualifies conversational authority: {effects:?}"
+            );
+        }
+        // The exact audit trap: a Network-class-shaped effects value that
+        // mutates the external world is NOT read-only, whatever its
+        // scheduling class claims elsewhere.
+        let mut network_mutating = ToolEffects::NETWORK_READ_ONLY;
+        network_mutating.external_mutation = true;
+        assert!(!network_mutating.is_read_only());
+    }
+
+    /// Old serialized ToolSpec JSON (no `effects` key) must decode — the
+    /// wire shape is backward-compatible — and MUST land on the
+    /// conservative all-mutating shape: unknown ⇒ mutating for authority.
+    #[test]
+    fn old_serialized_tool_spec_without_effects_decodes_conservative_and_not_read_only() {
+        let old = serde_json::json!({
+            "name": "read_file",
+            "description": "d",
+            "input_schema": { "type": "object" }
+        });
+        let spec: ToolSpec = serde_json::from_value(old).expect("old specs must still decode");
+        assert_eq!(spec.effects, ToolEffects::CONSERVATIVE);
+        assert!(
+            !spec.effects.is_read_only(),
+            "an effects-free legacy spec must never be conversational-authority-clean"
+        );
+        // A PARTIAL effects object is also fail-closed per axis: every
+        // undeclared axis decays to true (mutating).
+        let partial: ToolSpec = serde_json::from_value(serde_json::json!({
+            "name": "t",
+            "description": "d",
+            "input_schema": {},
+            "effects": { "workspace_read": true, "network_read": true }
+        }))
+        .expect("partial effects decode");
+        assert!(!partial.effects.is_read_only());
+        assert!(partial.effects.workspace_write);
+        assert!(partial.effects.external_mutation);
+        // A future UNDECLARED axis in the JSON is a hard decode error
+        // (deny_unknown_fields): authority metadata never silently
+        // under-declares under an old binary.
+        let unknown_axis = serde_json::json!({
+            "name": "t",
+            "description": "d",
+            "input_schema": {},
+            "effects": {
+                "workspace_read": true, "workspace_write": false,
+                "process_exec": false, "network_read": false,
+                "network_write": false, "external_mutation": false,
+                "git_mutation": false, "hypothetical_future_axis": true
+            }
+        });
+        assert!(serde_json::from_value::<ToolSpec>(unknown_axis).is_err());
+    }
+
+    /// An explicit read-only declaration round-trips byte-exactly and is
+    /// the ONLY shape that is conversational-authority-clean; the
+    /// conservative shape serializes its mutating axes as `true`, never as
+    /// an absent (implicitly-false) key.
+    #[test]
+    fn explicit_effects_round_trip_and_conservative_serializes_axes_true() {
+        let spec = ToolSpec {
+            name: "search".into(),
+            description: "d".into(),
+            input_schema: serde_json::json!({}),
+            effects: ToolEffects::READ_ONLY,
+        };
+        let bytes = serde_json::to_vec(&spec).unwrap();
+        let back: ToolSpec = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back, spec);
+        assert!(back.effects.is_read_only());
+        let conservative = serde_json::to_value(ToolSpec {
+            name: "t".into(),
+            description: "d".into(),
+            input_schema: serde_json::json!({}),
+            effects: ToolEffects::CONSERVATIVE,
+        })
+        .unwrap();
+        for axis in [
+            "workspace_read",
+            "workspace_write",
+            "process_exec",
+            "network_read",
+            "network_write",
+            "external_mutation",
+            "git_mutation",
+        ] {
+            assert_eq!(
+                conservative["effects"][axis],
+                serde_json::Value::Bool(true),
+                "the conservative shape must serialize `{axis}` as an explicit true"
+            );
+        }
     }
 }

@@ -1277,6 +1277,7 @@ async fn provider_reported_cost_over_the_cap_stops_the_turn_before_the_next_call
             description: "e".into(),
             input_schema: serde_json::json!({}),
             resource_class: faktor_core::resource::ResourceClass::Cpu,
+            effects: faktor_provider::ToolEffects::READ_ONLY,
             capability: None,
             recovery_hint: RecoveryHint::Idempotent,
             path_args: vec![],

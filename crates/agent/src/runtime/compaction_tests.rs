@@ -1808,6 +1808,7 @@ async fn large_tool_output_is_archived_through_the_durable_evidence_store() {
         description: "run".into(),
         input_schema: serde_json::json!({"type": "object"}),
         resource_class: faktor_core::resource::ResourceClass::Terminal,
+        effects: faktor_provider::ToolEffects::CONSERVATIVE,
         capability: None,
         recovery_hint: RecoveryHint::Idempotent,
         path_args: vec![],

@@ -297,6 +297,7 @@ mod shell_ownership_tests {
             description: "w".into(),
             input_schema: serde_json::json!({}),
             resource_class: faktor_core::resource::ResourceClass::DiskWrite,
+            effects: faktor_provider::ToolEffects::CONSERVATIVE,
             capability: None,
             recovery_hint: RecoveryHint::WorkspaceWrite,
             path_args: vec!["path".into()],
@@ -342,7 +343,13 @@ pub(crate) enum ToolDenialKind {
     ChangeBudgetRefused,
     /// The model named a registered tool that is not in the active tool
     /// bundle the request it answered actually carried (a lazy tool that
-    /// was never activated this session).
+    /// was never activated this session, or a mutating tool the Ask
+    /// tool policy dropped from a conversational bundle — see
+    /// [`ask_may_run`]). Same typed refusal class by design: dispatch's
+    /// contract is "membership in the bundle the request carried", and the
+    /// Ask effects filter is a bundle-CONSTRUCTION policy, so a tool it
+    /// drops is genuinely not in the active bundle. No separate denial
+    /// kind exists for it.
     NotInActiveBundle,
 }
 
@@ -397,6 +404,34 @@ impl DeniedToolCall {
             400,
         )
     }
+}
+
+/// The Ask (conversational) tool-policy predicate — AUTHORITY over the
+/// explicit effect system (audit item 9). A conversational turn may carry
+/// (and therefore dispatch may execute) only tools that are read-only on
+/// EVERY mutating axis of their declared [`faktor_provider::ToolEffects`]:
+/// `workspace_write`, `process_exec`, `network_write`, `external_mutation`
+/// and `git_mutation` must all be false. Read axes (`workspace_read`,
+/// `network_read`) never disqualify a tool.
+///
+/// Three-concept separation, enforced here:
+/// - `ResourceClass` is SCHEDULING/concurrency ONLY and is deliberately
+///   NOT consulted: a `Network`-class tool with `external_mutation: true`
+///   is refused even though its class used to pass the historical filter —
+///   that class-membership trust was the audit's type-architecture trap.
+/// - [`faktor_provider::ToolEffects`] decides AUTHORITY (this predicate).
+/// - Capabilities stay PERMISSION (the hop below still gates every tool
+///   that remains).
+///
+/// Fail-closed default: a spec whose `effects` are absent (old serialized
+/// JSON) decodes to the conservative all-mutating shape and is refused —
+/// unknown ⇒ mutating. The Ask bundle is CONSTRUCTED with this predicate
+/// (drive_phases); a mutating tool the filter drops is then refused at
+/// dispatch by the membership guard with the SAME typed
+/// [`ToolDenialKind::NotInActiveBundle`] refusal (documented choice: the
+/// guard's contract is bundle membership, so no second denial kind).
+pub(crate) fn ask_may_run(spec: &faktor_provider::ToolSpec) -> bool {
+    spec.effects.is_read_only()
 }
 
 /// Re-validate stored invocation args against the tool's input schema
