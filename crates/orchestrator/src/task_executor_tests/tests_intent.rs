@@ -25,7 +25,9 @@ use faktor_protocol::{
     turn_intent_row_key, ExecutionKind, TurnIntent, TurnIntentRow, TURN_INTENT_ROW_KIND,
 };
 
-use crate::runtime::task_executor::intent::{classify_turn_intent, CLASSIFY_WINDOW_BYTES};
+use crate::runtime::task_executor::intent::{
+    classify_turn_intent, materially_same_objective, utf8_prefix, CLASSIFY_WINDOW_BYTES,
+};
 
 // ------------------------------------------------------------------ classifier
 
@@ -172,6 +174,232 @@ fn classifier_is_bounded_total_and_unsmugglable() {
     );
 }
 
+/// P0 UTF-8 totality (the audit's panic matrix): the byte-bounded window
+/// MUST be UTF-8-safe ([`utf8_prefix`]) — `&s[..512]` panics when byte 512
+/// splits a multi-byte character. Every row of the audit's matrix is
+/// classified (no panic for ANY valid UTF-8) and the verdict is provably a
+/// pure function of the UTF-8-safe window.
+#[test]
+fn classifier_utf8_window_is_total_never_panics() {
+    let window_verdict_eq = |s: &str| {
+        assert_eq!(
+            classify_turn_intent(s, false),
+            classify_turn_intent(utf8_prefix(s, CLASSIFY_WINDOW_BYTES), false),
+            "the verdict must be a pure function of the UTF-8-safe window for {s:?}"
+        );
+    };
+    // 511 ASCII + a 2-byte char (the audit's exact panic shape: byte 512
+    // lands inside 'é').
+    let mut s = "a".repeat(511);
+    s.push('é');
+    assert_eq!(s.len(), 513);
+    classify_turn_intent(&s, false);
+    window_verdict_eq(&s);
+    // 510 ASCII + a 3-byte char (€ = U+20AC).
+    let mut s = "a".repeat(510);
+    s.push('€');
+    classify_turn_intent(&s, false);
+    window_verdict_eq(&s);
+    // 509 ASCII + a 4-byte char (🚀 = U+1F680).
+    let mut s = "a".repeat(509);
+    s.push('🚀');
+    classify_turn_intent(&s, false);
+    window_verdict_eq(&s);
+    // Exact boundary at byte 512 (pure ASCII — the prefix is exactly 512).
+    let s = "fix the thing ".repeat(40);
+    assert!(s.len() >= CLASSIFY_WINDOW_BYTES);
+    assert_eq!(
+        utf8_prefix(&s, CLASSIFY_WINDOW_BYTES).len(),
+        CLASSIFY_WINDOW_BYTES
+    );
+    assert_eq!(
+        classify_turn_intent(&s, false),
+        TurnIntent::EstablishContract,
+        "an exact-boundary imperative still leads with the verb"
+    );
+    // Long Arabic (right-to-left, multi-byte throughout).
+    let s = "ما هو القفل mutex ولماذا يتعطل إعادة المحاولة في الواجهة البرمجية؟ ".repeat(40);
+    classify_turn_intent(&s, false);
+    window_verdict_eq(&s);
+    assert_eq!(
+        classify_turn_intent(&s, false),
+        TurnIntent::Conversational,
+        "a non-English question degrades to conversational (documented limitation)"
+    );
+    // Long French with accents (multi-byte chars straddling the cut).
+    let s = "Explique-moi la politique de relance du paiement et les réglages \
+             de temporisation, s'il vous plaît, avec précision "
+        .repeat(20);
+    classify_turn_intent(&s, false);
+    window_verdict_eq(&s);
+    // Long CJK.
+    let s = "解释一下重试策略以及结算流程的细节".repeat(60);
+    classify_turn_intent(&s, false);
+    window_verdict_eq(&s);
+    // Emoji straddling the cut (byte 512 inside the first 🚀).
+    let mut s = "a".repeat(508);
+    s.push_str("🚀🚀🚀");
+    classify_turn_intent(&s, false);
+    window_verdict_eq(&s);
+    // Combining sequences: the cut lands inside a combining mark (U+0301).
+    let mut s = "a".repeat(510);
+    s.push_str("e\u{0301}");
+    classify_turn_intent(&s, false);
+    window_verdict_eq(&s);
+    let s = "e\u{0301}".repeat(400);
+    classify_turn_intent(&s, false);
+    window_verdict_eq(&s);
+    // An imperative lead whose tail is multi-byte still establishes (the
+    // verb survives the window; the classifier stays TOTAL, not weakened).
+    let mut s = "fix the parser ".to_string();
+    s.push_str(&"é".repeat(600));
+    assert_eq!(
+        classify_turn_intent(&s, false),
+        TurnIntent::EstablishContract,
+        "the leading verb establishes even when the window cuts non-ASCII tail"
+    );
+    window_verdict_eq(&s);
+}
+
+/// Class (a) precedence: a leading CONVERSATIONAL pattern wins over every
+/// engineering verb class — teaching/explanation/comparison/question
+/// leads stay chat even when they contain ambiguous verbs.
+#[test]
+fn classifier_conversational_patterns_win_over_engineering_verbs() {
+    for prompt in [
+        "explain the retry policy",
+        "summarize the incident report",
+        "tell me about the schema",
+        "run me through the deployment steps", // "run" is ambiguous, but (a) wins
+        "walk me through the parser",
+        "talk me through the settlement flow",
+        "test my understanding of the contract", // "test" is ambiguous, but (a) wins
+        "check my understanding of re-goal semantics",
+        "what is a mutex?",
+        "what's the plan?",
+        "why does the build fail on ci?", // question lead: never an imperative
+        "how does the scheduler decide?",
+        "compare sqlite and postgres for this workload",
+        "describe the admission path",
+        "write an explanation of the settlement flow", // "write" is ambiguous
+        "build a mental model of the daemon",          // "build" is ambiguous
+    ] {
+        assert_eq!(
+            classify_turn_intent(prompt, false),
+            TurnIntent::Conversational,
+            "{prompt:?} is a conversational-pattern lead (class (a) wins first)"
+        );
+    }
+}
+
+/// Class (b): a leading STRONG engineering verb establishes immediately —
+/// no object pattern required.
+#[test]
+fn classifier_strong_verbs_establish_immediately() {
+    for prompt in [
+        "fix the login redirect",
+        "implement the nightly indexer",
+        "patch the flaky test",
+        "refactor this api",
+        "rename the trait",
+        "delete the dead module",
+        "remove the legacy gate",
+        "migrate the store",
+        "upgrade the dependency",
+        "replace the scheduler",
+        "modify the parser",
+        "edit the config",
+        "Please fix the parser handling", // politeness prologue stripped
+    ] {
+        assert_eq!(
+            classify_turn_intent(prompt, false),
+            TurnIntent::EstablishContract,
+            "{prompt:?} leads with a strong engineering verb (class (b))"
+        );
+    }
+}
+
+/// Class (c): a leading AMBIGUOUS verb establishes ONLY with an
+/// engineering object/pattern in the same window; the audit's
+/// object-pattern-required forms (make X, set the timeout to N, extend the
+/// config, rework this API) establish, while the teaching forms stay chat.
+#[test]
+fn classifier_ambiguous_verbs_require_engineering_objects() {
+    for prompt in [
+        "run tests",
+        "run cargo check",
+        "run the build",
+        "write src/orchestrator/intent.rs",
+        "write a test for the parser",
+        "build the endpoint",
+        "create a pr",
+        "make the parser faster",
+        "set the timeout to 30",
+        "extend the config schema",
+        "add a metric to the health endpoint",
+        "rework this api",
+        "fixing the parser", // inflection fold: "fixing" → strong "fix"
+    ] {
+        assert_eq!(
+            classify_turn_intent(prompt, false),
+            TurnIntent::EstablishContract,
+            "{prompt:?} is an ambiguous verb with an engineering object (class (c))"
+        );
+    }
+    for prompt in [
+        "run me through the deploy",  // (a) pattern, not an object
+        "write an explanation",       // no engineering object
+        "test my understanding",      // (a) pattern
+        "build a mental model",       // (a) pattern
+        "run a quick errand for me",  // "errand" is no engineering object
+        "create something beautiful", // no engineering object
+        "make it nice",               // no engineering object
+        "test everything",            // no engineering object
+        "set it and forget it",       // no engineering object
+    ] {
+        assert_eq!(
+            classify_turn_intent(prompt, false),
+            TurnIntent::Conversational,
+            "{prompt:?} is an ambiguous verb WITHOUT an engineering object — chat"
+        );
+    }
+}
+
+/// P2 relatedness (pure): the deterministic keyword seam that decides
+/// same-identity re-goal vs fresh-TaskId minting.
+#[test]
+fn materially_same_objective_is_deterministic_keyword_relatedness() {
+    // Equal goals (any case) are the same objective.
+    assert!(materially_same_objective(
+        "restore the alpha parser",
+        "Restore the Alpha Parser"
+    ));
+    // A shared non-noise content token keeps the identity (modification of
+    // the CURRENT task).
+    assert!(materially_same_objective(
+        "restore the alpha parser",
+        "fix the parser flakiness in the nightly job"
+    ));
+    // No shared content token = materially NEW objective.
+    assert!(!materially_same_objective(
+        "restore the alpha parser",
+        "build the beta indexer for nightly reports"
+    ));
+    // Verbs/function words are noise: a shared verb alone never proves
+    // relatedness.
+    assert!(!materially_same_objective(
+        "fix the login redirect",
+        "fix the logout banner"
+    ));
+    // An empty/vague side cannot prove relatedness and conservatively
+    // keeps the identity (never strands a vague steering on a new id).
+    assert!(materially_same_objective(
+        "restore the alpha parser",
+        "fix it more"
+    ));
+    assert!(materially_same_objective("", "anything at all"));
+}
+
 // ------------------------------------------------------------------ admission
 
 /// An imperative engineering ask PROMOTES through the SAME executor
@@ -313,6 +541,165 @@ async fn continue_resolves_against_the_active_objective_and_never_mints_one() {
         .expect("the continuation persists its intent row");
     let intent_row = TurnIntentRow::decode(&intent_value).expect("typed");
     assert_eq!(intent_row.intent, TurnIntent::ContinueObjective);
+}
+
+/// P2 task identity (the audit's semantic issue): a materially NEW
+/// establishing ask NEVER re-goals an unrelated ACTIVE non-terminal
+/// objective onto the same identity — it mints a FRESH TaskId, so the old
+/// objective keeps its own row (history/verification/evidence/cost
+/// attribution stay separated per objective).
+#[tokio::test]
+async fn materially_new_establishing_ask_mints_a_fresh_task_identity() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_env(&dir.path().join("fresh-id"), done_script());
+    let handle = |env: &Env| env.manager.get_session(env.parent).unwrap().unwrap();
+
+    // Task A: an ACTIVE non-terminal objective.
+    env.executor
+        .start_task(
+            env.parent,
+            request(
+                "restore the alpha parser",
+                vec![wi("a1", WorkKind::Implementation, &[])],
+                &env,
+            ),
+        )
+        .expect("task start");
+    wait_until(
+        || state_of(&env, env.parent) == faktor_core::state::AgentState::ReadyForNextTurn,
+        240,
+    )
+    .await;
+    let goal_a = handle(&env)
+        .get_task(TaskId::new(1))
+        .unwrap()
+        .expect("task A row")
+        .goal;
+
+    // A materially NEW establishing ask (unrelated objective): "build" is
+    // an ambiguous verb, "indexer" is the engineering object →
+    // EstablishContract; the content tokens share nothing with A.
+    let receipt = env
+        .executor
+        .start_task(
+            env.parent,
+            ask_request("build the beta indexer for nightly reports", &env),
+        )
+        .expect("the establishing ask is admitted");
+    wait_turn_done(&env, receipt.op_id.expect("op")).await;
+
+    let row_a = handle(&env)
+        .get_task(TaskId::new(1))
+        .unwrap()
+        .expect("task A's row survives untouched");
+    assert_eq!(
+        row_a.goal, goal_a,
+        "the OLD objective keeps its own row — never re-goaled by the new ask"
+    );
+    let row_b = handle(&env)
+        .get_task(TaskId::new(2))
+        .unwrap()
+        .expect("the unrelated objective mints a FRESH task row");
+    assert!(
+        row_b.goal.contains("beta indexer"),
+        "the new identity carries the new objective: {}",
+        row_b.goal
+    );
+    assert_eq!(
+        handle(&env).task_id().unwrap(),
+        TaskId::new(2),
+        "the session identity advanced to the fresh task"
+    );
+    let head = handle(&env).ledger_view().unwrap();
+    assert_eq!(
+        head.head.goal_task_id,
+        Some(2),
+        "the goal projection rebinds to the new identity"
+    );
+    assert!(
+        head.head.goal.contains("beta"),
+        "the bound head goal is the NEW objective: {}",
+        head.head.goal
+    );
+}
+
+/// P2 task identity: an establishing ask that MODIFIES the CURRENT
+/// objective (shared content token — "parser") is admitted with TASK
+/// semantics but NEVER mints a new identity: the same TaskId stays
+/// current, no row 2 exists, and the goal projection keeps its binding to
+/// task 1 (the recorded objective never rotates under a same-identity
+/// turn — the pinned steering invariant; the identity seam this test
+/// guards is the mint-vs-keep decision).
+#[tokio::test]
+async fn modifying_establishing_ask_keeps_the_current_task_identity() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_env(&dir.path().join("same-id"), done_script());
+    let handle = |env: &Env| env.manager.get_session(env.parent).unwrap().unwrap();
+
+    env.executor
+        .start_task(
+            env.parent,
+            request(
+                "restore the alpha parser",
+                vec![wi("a1", WorkKind::Implementation, &[])],
+                &env,
+            ),
+        )
+        .expect("task start");
+    wait_until(
+        || state_of(&env, env.parent) == faktor_core::state::AgentState::ReadyForNextTurn,
+        240,
+    )
+    .await;
+
+    // A modification of the CURRENT task ("parser" is the shared content
+    // token): same identity, engineering semantics, NO fresh row.
+    let receipt = env
+        .executor
+        .start_task(
+            env.parent,
+            ask_request("fix the parser flakiness in the nightly job", &env),
+        )
+        .expect("the modifying ask is admitted");
+    let op2 = receipt.op_id.expect("op");
+    wait_turn_done(&env, op2).await;
+
+    assert!(
+        handle(&env).get_task(TaskId::new(2)).unwrap().is_none(),
+        "a modification of the current objective never mints a new identity"
+    );
+    assert_eq!(
+        handle(&env).task_id().unwrap(),
+        TaskId::new(1),
+        "the session stays on the current task"
+    );
+    let row = handle(&env)
+        .get_task(TaskId::new(1))
+        .unwrap()
+        .expect("the SAME task row survives the modification");
+    assert!(
+        row.goal.contains("alpha parser"),
+        "the recorded objective of a same-identity turn never rotates: {}",
+        row.goal
+    );
+    let head = handle(&env).ledger_view().unwrap();
+    assert_eq!(
+        head.head.goal_task_id,
+        Some(1),
+        "the goal projection keeps its binding to the current identity"
+    );
+    // The turn DID establish with engineering semantics (rule: strong verb
+    // lead) on the SAME identity — promotion is real, only the identity
+    // decision differs from the fresh-mint case.
+    let intent_value = handle(&env)
+        .memory_fact_get(TURN_INTENT_ROW_KIND, &turn_intent_row_key(op2.raw()))
+        .unwrap()
+        .expect("the modifying turn persists its intent row");
+    let intent_row = TurnIntentRow::decode(&intent_value).expect("typed");
+    assert_eq!(intent_row.intent, TurnIntent::EstablishContract);
+    assert_eq!(intent_row.execution, ExecutionKind::Task);
 }
 
 // ------------------------------------------------- the poison-sentinel regression

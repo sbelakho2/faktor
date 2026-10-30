@@ -188,6 +188,7 @@ fn echo_tool() -> Tool {
         description: "echo its input".into(),
         input_schema: serde_json::json!({"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}),
         resource_class: faktor_core::resource::ResourceClass::Cpu,
+        effects: faktor_provider::ToolEffects::READ_ONLY,
         capability: None,
         recovery_hint: ToolRecovery::UnknownEffect,
         path_args: vec![],
@@ -223,6 +224,7 @@ fn owned_root_write_tool() -> Tool {
         description: "write out.rs under a dir named after the workspace root".into(),
         input_schema: serde_json::json!({"type": "object", "properties": {}}),
         resource_class: faktor_core::resource::ResourceClass::DiskWrite,
+        effects: faktor_provider::ToolEffects::CONSERVATIVE,
         capability: None,
         recovery_hint: ToolRecovery::WorkspaceWrite,
         path_args: vec![],
@@ -267,6 +269,7 @@ fn write_tool() -> Tool {
             "required": ["path"]
         }),
         resource_class: faktor_core::resource::ResourceClass::DiskWrite,
+        effects: faktor_provider::ToolEffects::CONSERVATIVE,
         capability: None,
         recovery_hint: ToolRecovery::WorkspaceWrite,
         path_args: vec!["path".into()],

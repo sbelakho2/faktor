@@ -2755,6 +2755,34 @@ impl TaskExecutor {
                 task_id = next;
                 existing = None;
             }
+            // P2 task identity (audit): a materially NEW establishing ASK
+            // never re-goals an unrelated ACTIVE non-terminal objective onto
+            // the SAME identity — it advances the session to a FRESH
+            // TaskId, so the previous objective keeps its history,
+            // verification, evidence and cost attribution SEPARATE
+            // (`intent::establishing_ask_mints_new_identity`). An
+            // establishing ask that MODIFIES the current objective (shared
+            // content tokens) keeps the historical same-identity re-goal,
+            // and every legacy `task` start (no ask decision) re-goals in
+            // place exactly as before (FIX 3).
+            let continuation = ask_decision.is_some_and(|d| d.suppress_regal);
+            if !continuation
+                && intent::establishing_ask_mints_new_identity(
+                    ask_decision,
+                    existing.as_ref().map(|t| t.goal.as_str()).unwrap_or(""),
+                    &goal,
+                )
+            {
+                let next = faktor_core::id::TaskId::new(task_id.raw() + 1);
+                let worktree = handle
+                    .worktree_id()
+                    .map_err(|e| ExecError::Internal(format!("session worktree id: {e}")))?;
+                self.session
+                    .adopt_identity(parent, worktree, next)
+                    .map_err(|e| ExecError::Internal(format!("task identity advance: {e}")))?;
+                task_id = next;
+                existing = None;
+            }
             match existing {
                 Some(t) if t.state.is_terminal() => {
                     return Err(ExecError::Conflict(format!(
@@ -2774,14 +2802,17 @@ impl TaskExecutor {
                     // conversation would strand an in-flight run's settlement on
                     // the wrong task row. A distinctly new goal instead lands a
                     // new CONTRACT (fresh criteria/attachments + a revision bump
-                    // that invalidates prior proofs) on that identity.
+                    // that invalidates prior proofs) on that identity. (A
+                    // materially NEW establishing ask never reaches this arm —
+                    // it advanced to a fresh identity above; the same-identity
+                    // re-goal here is therefore only ever a modification of the
+                    // current objective or a legacy `task` start.)
                     //
                     // Lazy-contract CONTINUATION (audit item 4): a follow-up
                     // that resolved against the ACTIVE objective never
                     // re-goals it — "continue" is conversation, never a new
                     // recorded goal — so the row (goal included) is kept
                     // verbatim and no patch is applied.
-                    let continuation = ask_decision.is_some_and(|d| d.suppress_regal);
                     if !continuation {
                         handle
                             .update_task(
