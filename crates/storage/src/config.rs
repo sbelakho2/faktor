@@ -36,6 +36,43 @@ pub const DEFAULT_MIN_INSTALL_ALLOWANCE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const MIN_INSTALL_ALLOWANCE_BYTES: u64 = 32 * 1024 * 1024;
 pub const MAX_INSTALL_ALLOWANCE_BYTES: u64 = 256 * 1024 * 1024 * 1024;
 
+/// Recovery-only reserve bands over the EFFECTIVE aggregate budget.
+///
+/// The aggregate budget is split into three admission bands (documented
+/// defaults, permille):
+///
+/// - **normal** `0..=850‰`: ordinary class admissions (CAS publishes,
+///   caches, logs, evidence, shadow copies). Normal admission is refused
+///   typed once aggregate usage (durable + pending) would cross this
+///   ceiling, so it can never consume the bytes below.
+/// - **emergency/critical metadata** `851‰..=900‰`: growth the daemon
+///   itself must be able to record to stay recoverable (SQLite/WAL growth
+///   of the governor's own and the session ledgers).
+/// - **RECOVERY-ONLY reserve** `901‰..=1000‰`: rollback/finalize/repair
+///   bytes only, admitted through the explicit recovery-purpose API. No
+///   OS-level quota is enforced (none is portable cross-platform); the
+///   reserve is an admission policy, held by refusing normal and emergency
+///   admission before it and by measuring physical usage at every
+///   admission.
+///
+/// Safe clamps: normal `500..=950‰`, emergency pulled into
+/// `normal+1..=1000‰` so the bands can never invert or vanish.
+pub const DEFAULT_NORMAL_ADMISSION_CEILING_PERMILLE: u16 = 850;
+pub const MIN_NORMAL_ADMISSION_CEILING_PERMILLE: u16 = 500;
+pub const MAX_NORMAL_ADMISSION_CEILING_PERMILLE: u16 = 950;
+pub const DEFAULT_EMERGENCY_CEILING_PERMILLE: u16 = 900;
+pub const MIN_EMERGENCY_CEILING_PERMILLE: u16 = 100;
+pub const MAX_EMERGENCY_CEILING_PERMILLE: u16 = 1000;
+
+/// Default per-shadow hard ceiling: one shadow directory (its base copy
+/// PLUS every physical byte a run produces inside it) may never hold more
+/// than this, independent of the aggregate shadow class quota. Matches the
+/// shadow base-copy byte cap so a single run can never pin the whole
+/// shadow-class share.
+pub const DEFAULT_SHADOW_MAX_BYTES_PER_SHADOW: u64 = 1024 * 1024 * 1024;
+pub const MIN_SHADOW_MAX_BYTES_PER_SHADOW: u64 = 1024 * 1024;
+pub const MAX_SHADOW_MAX_BYTES_PER_SHADOW: u64 = 64 * 1024 * 1024 * 1024;
+
 fn default_capacity_permille() -> u16 {
     DEFAULT_CAPACITY_PERMILLE
 }
@@ -47,6 +84,15 @@ fn default_reserve_bytes() -> u64 {
 }
 fn default_min_install_allowance_bytes() -> u64 {
     DEFAULT_MIN_INSTALL_ALLOWANCE_BYTES
+}
+fn default_normal_admission_ceiling_permille() -> u16 {
+    DEFAULT_NORMAL_ADMISSION_CEILING_PERMILLE
+}
+fn default_emergency_ceiling_permille() -> u16 {
+    DEFAULT_EMERGENCY_CEILING_PERMILLE
+}
+fn default_shadow_max_bytes_per_shadow() -> u64 {
+    DEFAULT_SHADOW_MAX_BYTES_PER_SHADOW
 }
 
 /// The one hard aggregate budget plus per-class quotas.
@@ -67,6 +113,20 @@ pub struct StorageGovernorConfig {
     pub reserve_bytes: u64,
     #[serde(default = "default_min_install_allowance_bytes")]
     pub min_install_allowance_bytes: u64,
+    /// Upper bound (permille of the effective budget) of the NORMAL
+    /// admission band; see the recovery-band constants for the documented
+    /// three-band split.
+    #[serde(default = "default_normal_admission_ceiling_permille")]
+    pub normal_admission_ceiling_permille: u16,
+    /// Upper bound (permille) of the emergency/critical-metadata band; the
+    /// remaining band above it is RECOVERY-ONLY.
+    #[serde(default = "default_emergency_ceiling_permille")]
+    pub emergency_ceiling_permille: u16,
+    /// Hard ceiling of ONE shadow directory (base copy plus physical
+    /// growth), enforced by the governor independently of the aggregate
+    /// shadow class quota.
+    #[serde(default = "default_shadow_max_bytes_per_shadow")]
+    pub shadow_max_bytes_per_shadow: u64,
     /// Explicit per-class quotas. Classes absent here use their documented
     /// share of the EFFECTIVE (capacity-aware) budget, so defaults shrink
     /// with the disk instead of staying pinned to a fixed total.
@@ -83,6 +143,9 @@ impl Default for StorageGovernorConfig {
             reserve_permille: DEFAULT_RESERVE_PERMILLE,
             reserve_bytes: DEFAULT_RESERVE_BYTES,
             min_install_allowance_bytes: DEFAULT_MIN_INSTALL_ALLOWANCE_BYTES,
+            normal_admission_ceiling_permille: DEFAULT_NORMAL_ADMISSION_CEILING_PERMILLE,
+            emergency_ceiling_permille: DEFAULT_EMERGENCY_CEILING_PERMILLE,
+            shadow_max_bytes_per_shadow: DEFAULT_SHADOW_MAX_BYTES_PER_SHADOW,
             quotas: BTreeMap::new(),
         }
     }
@@ -113,6 +176,22 @@ impl StorageGovernorConfig {
         self.min_install_allowance_bytes = self
             .min_install_allowance_bytes
             .clamp(MIN_INSTALL_ALLOWANCE_BYTES, MAX_INSTALL_ALLOWANCE_BYTES);
+        // Band clamps: a bad number can never invert the three-band split or
+        // zero the recovery reserve; both bands are pulled into the
+        // documented safe range with emergency strictly above normal.
+        self.normal_admission_ceiling_permille = self.normal_admission_ceiling_permille.clamp(
+            MIN_NORMAL_ADMISSION_CEILING_PERMILLE,
+            MAX_NORMAL_ADMISSION_CEILING_PERMILLE,
+        );
+        let emergency_floor = self.normal_admission_ceiling_permille.saturating_add(1);
+        self.emergency_ceiling_permille = self.emergency_ceiling_permille.clamp(
+            emergency_floor.min(MAX_EMERGENCY_CEILING_PERMILLE),
+            MAX_EMERGENCY_CEILING_PERMILLE,
+        );
+        self.shadow_max_bytes_per_shadow = self.shadow_max_bytes_per_shadow.clamp(
+            MIN_SHADOW_MAX_BYTES_PER_SHADOW,
+            MAX_SHADOW_MAX_BYTES_PER_SHADOW,
+        );
         // Migrate a persisted pre-capacity configuration: quotas that are
         // exactly the documented shares of the old fixed total are DEFAULT
         // shares, so let them follow the effective budget instead of pinning
@@ -161,6 +240,20 @@ impl StorageGovernorConfig {
     /// the capacity-aware effective budget.
     pub fn quota(&self, class: StorageClass) -> u64 {
         self.quota_for(class, self.total_budget_bytes)
+    }
+
+    /// The NORMAL admission band ceiling in bytes over one effective budget
+    /// (default 85%): normal admissions may never push durable+pending
+    /// aggregate usage above it.
+    pub fn normal_admission_ceiling_bytes(&self, effective_budget: u64) -> u64 {
+        effective_budget.saturating_mul(self.normal_admission_ceiling_permille as u64) / 1000
+    }
+
+    /// The EMERGENCY/critical-metadata band ceiling in bytes (default 90%):
+    /// ledger/self-metadata growth may proceed up to here; everything above
+    /// is the RECOVERY-ONLY reserve.
+    pub fn emergency_ceiling_bytes(&self, effective_budget: u64) -> u64 {
+        effective_budget.saturating_mul(self.emergency_ceiling_permille as u64) / 1000
     }
 
     /// A budget/cli-level constructor with optional per-class overrides.

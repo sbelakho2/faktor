@@ -34,6 +34,10 @@ faktor-scm.workspace = true
 # Admission recovery classifies pending claims against the store's durable
 # IDs (`PendingAdmission`, `AdmissionResolution`) and resolves them there.
 faktor-store.workspace = true
+# Physical storage governance: the shadow service reserves, measures and
+# releases shadow workspace bytes against the always-on storage governor
+# (class `ShadowWorkspace`), and the shadow task boundary accounts growth.
+faktor-storage.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

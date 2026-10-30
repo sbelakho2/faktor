@@ -238,7 +238,7 @@ fn poisoned_copy_seam_recovers_and_begin_still_succeeds() {
 
 /// Run the preflight directly with a deterministic enumeration->metadata
 /// vanish seam: `rel` is deleted the first time the walk observes it.
-fn preflight_with_vanish(fix: &Fix, rel: &str) -> Result<(), crate::runtime::ExecError> {
+fn preflight_with_vanish(fix: &Fix, rel: &str) -> Result<u64, crate::runtime::ExecError> {
     let target = fix.user.join(rel);
     let mut removed = 0usize;
     let mut seam = |path: &Path| {
@@ -358,7 +358,7 @@ fn preflight_permission_failure_stays_typed() {
         Err(crate::runtime::ExecError::WorkspaceDrift(message)) => {
             assert!(message.contains("locked"), "{message}");
         }
-        Ok(()) => eprintln!("running with permission bypass; permission-failure case skipped"),
+        Ok(_) => eprintln!("running with permission bypass; permission-failure case skipped"),
         other => panic!("a permission failure must stay typed drift, got {other:?}"),
     }
 }
@@ -1647,4 +1647,182 @@ fn selected_hunks_land_alone_and_change_the_candidate_identity() {
         "partial acceptance is a NEW candidate identity"
     );
     assert_eq!(outcome.candidate_files, 1);
+}
+
+// ------------------------------------- shadow storage governance (audit)
+
+fn governed_storage_config() -> faktor_storage::StorageGovernorConfig {
+    use faktor_storage::StorageClass;
+    let quotas = StorageClass::ALL
+        .into_iter()
+        .map(|class| (class, 10_000_000u64))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    faktor_storage::StorageGovernorConfig {
+        total_budget_bytes: 10_000_000,
+        watermark_permille: 1000,
+        reservation_lease_ms: 60_000,
+        quotas,
+        ..Default::default()
+    }
+    .validated()
+    .unwrap()
+}
+
+/// A fix whose data directory already carries an OPEN storage governor, so
+/// `ShadowRoots::new` discovers it and every shadow begins under physical
+/// governance (the production daemon order: governor first, shadows second).
+fn open_governed_fix(
+    limits: ShadowCopyLimits,
+    config: faktor_storage::StorageGovernorConfig,
+) -> Fix {
+    let dir = tempfile::tempdir().unwrap();
+    let user = dir.path().join("user");
+    fs::create_dir_all(&user).unwrap();
+    seed_user(&user);
+    // Open (creating) the governor for this data dir, then release the
+    // handle: the shadow service rediscovers it through the same durable
+    // `storage-governor/governor.db` marker production uses.
+    drop(faktor_storage::StorageGovernor::open(dir.path(), config).unwrap());
+    let manager =
+        SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+    let ws = manager.create_workspace(user.to_str().unwrap()).unwrap();
+    let session = manager
+        .create_session(ws, "shadow-service", "fake", "m")
+        .unwrap()
+        .id();
+    let shadows =
+        ShadowRoots::new_with_limits(manager.clone(), dir.path().join("shadows"), limits).unwrap();
+    assert!(
+        shadows.governor().is_some(),
+        "the shadow service discovered the data dir's governor"
+    );
+    Fix {
+        _dir: dir,
+        manager,
+        shadows,
+        user,
+        session,
+    }
+}
+
+fn governor_of(fix: &Fix) -> faktor_storage::StorageGovernor {
+    faktor_storage::StorageGovernor::open_existing(fix._dir.path())
+        .expect("the governed data dir carries a governor")
+}
+
+#[test]
+fn governed_begin_counts_shadow_bytes_and_discard_releases_them_immediately() {
+    let fix = open_governed_fix(default_limits(), governed_storage_config());
+    let shadow = fix.shadows.begin_shadow(fix.session, &fix.user).unwrap();
+    let governor = governor_of(&fix);
+
+    // The base copy is charged from its first instant: pending is settled
+    // (commit + immediate class refresh), and the class holds the per-file
+    // physical truth — without any reconcile tick.
+    assert_eq!(governor.pending_reservations().unwrap(), 0);
+    let shadow_key = format!("{}/{}", fix.session.raw(), shadow.shadow_id);
+    let shadow_bytes = governor.shadow_usage(&shadow_key).unwrap();
+    assert!(shadow_bytes > 0, "the copied bytes are counted");
+    assert_eq!(
+        governor.metrics().unwrap().per_class["shadow_workspace"].bytes,
+        shadow_bytes
+    );
+
+    // (d) A blocked integration RETAINS the directory — and keeps counting
+    // every byte until an explicit retire.
+    fix.shadows.mark_integration_blocked(fix.session).unwrap();
+    assert_eq!(
+        governor.shadow_usage(&shadow_key).unwrap(),
+        shadow_bytes,
+        "an IntegrationBlocked shadow stays counted"
+    );
+
+    // (e) Discard releases the accounting the moment the directory goes.
+    fix.shadows.discard(fix.session).unwrap();
+    assert_eq!(governor.shadow_usage(&shadow_key).unwrap(), 0);
+    assert_eq!(
+        governor.metrics().unwrap().per_class["shadow_workspace"].bytes,
+        0,
+        "discard frees the shadow class room immediately"
+    );
+}
+
+#[test]
+fn execution_boundary_refuses_growth_over_the_per_shadow_ceiling() {
+    let mut config = governed_storage_config();
+    // Per-shadow hard ceiling at the clamped floor (1 MiB): a build output
+    // larger than it breaches at the boundary.
+    config.shadow_max_bytes_per_shadow = faktor_storage::MIN_SHADOW_MAX_BYTES_PER_SHADOW;
+    let fix = open_governed_fix(default_limits(), config);
+    let shadow = fix.shadows.begin_shadow(fix.session, &fix.user).unwrap();
+
+    // PRE measure, then the "drive" produces physical growth the source
+    // manifests never see (build output under target/).
+    fix.shadows.execution_begin(fix.session).unwrap();
+    let big = PathBuf::from(&shadow.root).join("target/debug/app.bin");
+    fs::create_dir_all(big.parent().unwrap()).unwrap();
+    fs::write(&big, vec![b'x'; 2 * 1024 * 1024]).unwrap();
+
+    // POST measure: the breach is TYPED (Oversized → the executor kills or
+    // refuses the run per policy), durably refused in the governor, and
+    // the bytes stay on disk — no OS quota exists, so detection + refusal
+    // is the enforcement.
+    let err = fix
+        .shadows
+        .execution_end(fix.session)
+        .expect_err("growth past the per-shadow ceiling is a typed breach");
+    match err {
+        crate::runtime::ExecError::Oversized(message) => {
+            assert!(
+                message.contains("hard ceiling") && message.contains("no OS quota"),
+                "the typed breach names the ceiling and the missing OS quota: {message}"
+            );
+        }
+        other => panic!("expected a typed Oversized breach, got {other:?}"),
+    }
+    assert!(big.exists(), "a breach is never enforced by deleting bytes");
+    let governor = governor_of(&fix);
+    assert!(governor.counters().unwrap().refusals >= 1);
+    let degraded = governor
+        .health()
+        .unwrap()
+        .expect("the growth breach degrades health durably");
+    assert!(
+        degraded.code.contains("shadow_ceiling"),
+        "degraded health names the shadow ceiling: {}",
+        degraded.code
+    );
+}
+
+#[test]
+fn shadow_ceiling_refuses_begin_before_any_shadow_byte_is_written() {
+    let mut config = governed_storage_config();
+    config.shadow_max_bytes_per_shadow = faktor_storage::MIN_SHADOW_MAX_BYTES_PER_SHADOW;
+    let fix = open_governed_fix(default_limits(), config);
+    // A checkout whose base copy (2 MiB, within the copy caps) exceeds the
+    // per-shadow ceiling: admission refuses BEFORE the directory exists.
+    fs::write(fix.user.join("big.bin"), vec![b'y'; 2 * 1024 * 1024]).unwrap();
+    let err = fix
+        .shadows
+        .begin_shadow(fix.session, &fix.user)
+        .expect_err("the per-shadow ceiling refuses the begin");
+    match err {
+        crate::runtime::ExecError::Oversized(message) => {
+            assert!(
+                message.contains("per-shadow hard ceiling"),
+                "the refusal names the ceiling: {message}"
+            );
+        }
+        other => panic!("expected a typed Oversized refusal, got {other:?}"),
+    }
+    let session_dir = fix
+        ._dir
+        .path()
+        .join("shadows")
+        .join(fix.session.raw().to_string());
+    assert!(
+        !session_dir.exists(),
+        "the refused admission wrote no shadow directory"
+    );
+    assert_eq!(governor_of(&fix).pending_reservations().unwrap(), 0);
 }

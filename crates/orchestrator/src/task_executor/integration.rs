@@ -744,6 +744,26 @@ impl TaskExecutor {
         parent: SessionId,
         task_id: Option<TaskId>,
     ) {
+        // Shadow task boundary POST-measure: the drive may have produced
+        // physical growth inside the shadow (build outputs are excluded
+        // from source manifests but always counted). On a ceiling breach
+        // the governor has durably refused every NEW admission and this
+        // typed refusal KILLS the settlement per policy — nothing integrates
+        // a run that broke its physical ceiling; the live shadow stays
+        // counted until discard/reconcile releases it.
+        if let Some(shadows) = self.shadows() {
+            if let Err(e) = shadows.execution_end(parent) {
+                tracing::error!(
+                    target: "faktor::shadow",
+                    session = %parent,
+                    error = %e,
+                    "shadow growth accounting refused at the task boundary; settlement killed \
+                     per policy (new storage admissions are durably refused; discard the shadow \
+                     or resolve the ceiling)"
+                );
+                return;
+            }
+        }
         let run_id = format!("tx-session-{}", parent.raw());
         match self
             .settle_run(RunSettlement::InSession {

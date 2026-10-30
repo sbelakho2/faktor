@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! Durable governor ledger: usage, reservations, object index, pins, loss
 //! markers, eviction index and refusal counters.
 //!
@@ -93,7 +94,35 @@ CREATE TABLE IF NOT EXISTS refusal (
     detail TEXT NOT NULL,
     created_ms INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS history_aggregate (
+    kind TEXT NOT NULL,
+    bucket_ms INTEGER NOT NULL,
+    class TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    events INTEGER NOT NULL,
+    bytes INTEGER NOT NULL,
+    PRIMARY KEY (kind, bucket_ms, class, reason)
+);
+CREATE TABLE IF NOT EXISTS loss_tombstone (
+    class TEXT NOT NULL,
+    key TEXT NOT NULL,
+    digest TEXT,
+    bytes INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    compacted_ms INTEGER NOT NULL,
+    PRIMARY KEY (class, key, reason)
+);
 ";
+
+/// Retention of the append-only history detail rows (`loss_marker`,
+/// `eviction`, `refusal`): the newest N rows of EACH table stay as detail;
+/// older rows are compacted into hourly `history_aggregate` rows (count,
+/// bytes, reason, class) and — for loss markers — durable per-key
+/// tombstones. 32,768 sits in the documented 32k–64k band: bounded detail
+/// reads without starving an operator investigating recent losses.
+pub const HISTORY_DETAIL_KEEP: u64 = 32_768;
+/// Hourly compaction bucket of the history aggregates (ms).
+pub const HISTORY_AGGREGATE_BUCKET_MS: i64 = 60 * 60 * 1000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectRow {
@@ -149,6 +178,11 @@ pub struct AdmitRow {
     pub total_used: u64,
     pub class_deficit: u64,
     pub total_deficit: u64,
+    /// Deficit against the FULL effective budget (100%), independent of the
+    /// admission-purpose band ceiling. Zero while `total_deficit > 0` means
+    /// the write fits the hard budget but not its band (a typed
+    /// `normal_admission_ceiling` refusal, never an aggregate-budget one).
+    pub budget_deficit: u64,
     /// Set when the destination-volume free-space rule denied the write
     /// (reserve breach or unmeasurable volume), regardless of the quota and
     /// aggregate outcomes.
@@ -198,6 +232,12 @@ pub struct VolumeRule<'a> {
     /// only when the volume under check IS the ledger volume, so materialized
     /// bytes (already in measured free space) are never double-charged.
     pub unsettled_inflight: u64,
+    /// Admission-purpose band ceiling in bytes: the maximum durable+pending
+    /// aggregate usage this write may reach. Normal admissions pass the
+    /// configured normal ceiling (default 85%), emergency/metadata growth
+    /// the emergency ceiling (default 90%), and explicit recovery-path
+    /// writes the full effective budget. Never above `total`.
+    pub admission_ceiling: u64,
     pub config: &'a StorageGovernorConfig,
 }
 
@@ -252,19 +292,100 @@ fn from_i64(value: i64) -> u64 {
 }
 
 impl Ledger {
+    /// Raw connection access for in-crate test/verification queries (row
+    /// counts, page stats) — never a production mutation seam.
+    #[cfg(test)]
+    pub(crate) fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// Test-only bulk seeding of the append-only history tables in ONE
+    /// transaction (a single fsync): retention tests need N+M rows without
+    /// turning into a per-row fsync storm that perturbs every other test's
+    /// timing.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn seed_history_for_test(
+        &mut self,
+        refusals: u64,
+        refusal_bytes: u64,
+        evictions: u64,
+        eviction_bytes: u64,
+        losses: u64,
+        loss_bytes: u64,
+    ) -> GovernorResult<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        {
+            let mut refusal = tx.prepare_cached(
+                "INSERT INTO refusal(class, requested, available, reason, detail, created_ms)
+                 VALUES (?1, ?2, 0, 'class_quota', 'seeded', ?3)",
+            )?;
+            for index in 0..refusals {
+                refusal.execute(params![
+                    StorageClass::MainCas.as_str(),
+                    to_i64(refusal_bytes),
+                    now_ms() + index.min(1_000) as i64
+                ])?;
+            }
+            let mut eviction = tx.prepare_cached(
+                "INSERT INTO eviction(class, key, digest, bytes, verified, reason, created_ms)
+                 VALUES (?1, ?2, NULL, ?3, 1, 'governed_eviction', ?4)",
+            )?;
+            for index in 0..evictions {
+                eviction.execute(params![
+                    StorageClass::MainCas.as_str(),
+                    format!("evicted-{index}"),
+                    to_i64(eviction_bytes),
+                    now_ms()
+                ])?;
+            }
+            let mut loss = tx.prepare_cached(
+                "INSERT INTO loss_marker(class, key, digest, bytes, reason, created_ms)
+                 VALUES (?1, ?2, NULL, ?3, 'archive_evicted', ?4)",
+            )?;
+            for index in 0..losses {
+                loss.execute(params![
+                    StorageClass::CompactionArchive.as_str(),
+                    format!("lost-{index}"),
+                    to_i64(loss_bytes),
+                    now_ms()
+                ])?;
+                bump_counter_on(&tx, "loss_markers")?;
+            }
+        }
+        // The refusal/eviction lifetime counters move with the seed so the
+        // retention test can prove pruning never touches them.
+        for _ in 0..refusals {
+            bump_counter_on(&tx, "refusals")?;
+        }
+        for _ in 0..evictions {
+            bump_counter_on(&tx, "evictions")?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn open(path: &Path) -> GovernorResult<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
-        conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
+        // The busy handler must be armed BEFORE any statement that can
+        // collide with a concurrently-opening instance: the WAL conversion
+        // of a brand-new database file has no busy retry of its own, and two
+        // instances opening the SAME fresh ledger race it (adversarial:
+        // concurrent open). Bounded busy retry on top — the same patient
+        // lock-wait posture as every other contention seam.
+        conn.execute_batch("PRAGMA busy_timeout = 5000;")?;
+        let initial_pragmas = "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = FULL;
-             PRAGMA busy_timeout = 5000;
              PRAGMA foreign_keys = ON;
              PRAGMA wal_autocheckpoint = 1000;
-             PRAGMA journal_size_limit = 16777216;",
-        )?;
+             PRAGMA journal_size_limit = 16777216;
+             PRAGMA auto_vacuum = INCREMENTAL;";
+        execute_batch_with_busy_retry(&conn, initial_pragmas, 12)?;
         conn.execute_batch(SCHEMA)?;
         // Same-root digest uniqueness (main CAS logical classes) while the
         // evidence CAS keeps its own physical digest namespace. The ALTER is
@@ -290,6 +411,7 @@ impl Ledger {
              CREATE UNIQUE INDEX IF NOT EXISTS idx_object_digest_family
                  ON object_index(family, digest) WHERE digest IS NOT NULL;",
         )?;
+        ensure_incremental_autovacuum(&conn)?;
         Ok(Self { conn })
     }
 
@@ -561,7 +683,16 @@ impl Ledger {
         let class_used = snapshot.class_bytes.saturating_add(snapshot.class_pending);
         let total_used = snapshot.total_bytes.saturating_add(snapshot.total_pending);
         let class_deficit = class_used.saturating_add(bytes).saturating_sub(quota);
-        let total_deficit = total_used.saturating_add(bytes).saturating_sub(total);
+        // The aggregate admission comparison runs against the PURPOSE band
+        // ceiling (normal ≤85%, emergency ≤90%, recovery ≤100%), so normal
+        // admissions can never consume the emergency or recovery-only
+        // reserve; `budget_deficit` keeps the true hard-budget deficit
+        // visible for typed refusal classification.
+        let admission_ceiling = volume_rule.admission_ceiling.min(total);
+        let total_deficit = total_used
+            .saturating_add(bytes)
+            .saturating_sub(admission_ceiling);
+        let budget_deficit = total_used.saturating_add(bytes).saturating_sub(total);
         let reservation_id = if class_deficit == 0 && total_deficit == 0 && bytes <= total {
             if volume_denial.is_none() {
                 let id = uuid::Uuid::new_v4().simple().to_string();
@@ -598,6 +729,7 @@ impl Ledger {
             total_used,
             class_deficit,
             total_deficit,
+            budget_deficit,
             volume_denial,
             volume: volume_id,
         })
@@ -1140,13 +1272,25 @@ impl Ledger {
         &self,
         class: Option<StorageClass>,
     ) -> GovernorResult<Vec<(String, u64, String)>> {
+        // Live detail rows UNION their durable compacted tombstones: an
+        // archive loss stays visible (and deduplicated) after retention
+        // moved its detail row into the aggregate/tombstone tables.
         let (sql, filter) = match class {
             Some(class) => (
-                "SELECT key, bytes, reason FROM loss_marker WHERE class = ?1 ORDER BY id DESC LIMIT 65536",
+                "SELECT key, bytes, reason, created_ms FROM (
+                     SELECT key, bytes, reason, created_ms FROM loss_marker WHERE class = ?1
+                     UNION ALL
+                     SELECT key, bytes, reason, compacted_ms AS created_ms
+                         FROM loss_tombstone WHERE class = ?1
+                 ) ORDER BY created_ms DESC LIMIT 65536",
                 Some(class.as_str()),
             ),
             None => (
-                "SELECT key, bytes, reason FROM loss_marker ORDER BY id DESC LIMIT 65536",
+                "SELECT key, bytes, reason, created_ms FROM (
+                     SELECT key, bytes, reason, created_ms FROM loss_marker
+                     UNION ALL
+                     SELECT key, bytes, reason, compacted_ms AS created_ms FROM loss_tombstone
+                 ) ORDER BY created_ms DESC LIMIT 65536",
                 None,
             ),
         };
@@ -1561,6 +1705,230 @@ impl Ledger {
             |row| row.get(0),
         )?))
     }
+
+    /// Durable usage of one key prefix of one class (the physical bytes of
+    /// ONE shadow directory: its key plus everything under `<key>/`).
+    pub fn usage_prefix(&self, class: StorageClass, prefix: &str) -> GovernorResult<u64> {
+        Ok(from_i64(self.conn.query_row(
+            "SELECT COALESCE(SUM(bytes), 0) FROM object_index
+             WHERE class = ?1 AND (key = ?2 OR substr(key, 1, ?3) = ?2 || '/')",
+            params![class.as_str(), prefix, prefix.len() as i64 + 1],
+            |row| row.get(0),
+        )?))
+    }
+
+    /// Release every indexed object of `class` whose key equals `prefix` or
+    /// lives under it (`<prefix>/...`), pins included, in ONE transaction.
+    /// Used when a governed directory (a retired/discarded shadow) is
+    /// removed: its accounting room returns immediately instead of waiting
+    /// for the next full inventory scan. Returns the released bytes.
+    pub fn remove_objects_with_prefix(
+        &mut self,
+        class: StorageClass,
+        prefix: &str,
+    ) -> GovernorResult<u64> {
+        let keys: Vec<String> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT key FROM object_index WHERE class = ?1
+                   AND (key = ?2 OR substr(key, 1, ?3) = ?2 || '/')",
+            )?;
+            let rows = stmt.query_map(
+                params![class.as_str(), prefix, prefix.len() as i64 + 1],
+                |row| row.get::<_, String>(0),
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            out
+        };
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut released = 0u64;
+        for key in &keys {
+            if let Some(row) = remove_object_on(&tx, class, key)? {
+                released = released.saturating_add(row.bytes);
+            }
+        }
+        tx.commit()?;
+        Ok(released)
+    }
+
+    /// One hourly aggregate row of the compacted history.
+    pub fn history_aggregates(&self, kind: &str) -> GovernorResult<Vec<HistoryAggregateRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT kind, bucket_ms, class, reason, events, bytes FROM history_aggregate
+             WHERE kind = ?1 ORDER BY bucket_ms, class, reason",
+        )?;
+        let rows = stmt.query_map(params![kind], |row| {
+            Ok(HistoryAggregateRow {
+                kind: row.get(0)?,
+                bucket_ms: row.get(1)?,
+                class: row.get(2)?,
+                reason: row.get(3)?,
+                events: from_i64(row.get(4)?),
+                bytes: from_i64(row.get(5)?),
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Number of durable per-key archive-loss tombstones (compacted detail).
+    pub fn loss_tombstone_count(&self) -> GovernorResult<u64> {
+        Ok(from_i64(self.conn.query_row(
+            "SELECT COUNT(*) FROM loss_tombstone",
+            [],
+            |row| row.get(0),
+        )?))
+    }
+
+    /// `(page_count, freelist_count)` of the ledger database — the physical
+    /// page truth a pruning test asserts against (deletion must actually
+    /// reclaim pages, not only logical rows).
+    pub fn db_page_stats(&self) -> GovernorResult<(u64, u64)> {
+        let pages: i64 = self
+            .conn
+            .query_row("PRAGMA page_count", [], |row| row.get(0))?;
+        let free: i64 = self
+            .conn
+            .query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+        Ok((from_i64(pages), from_i64(free)))
+    }
+
+    /// Retention lifecycle of the append-only history tables: keep the
+    /// newest `detail_keep` rows of `loss_marker`/`eviction`/`refusal` as
+    /// detail, compact everything older into hourly
+    /// [`HistoryAggregateRow`]s (count, bytes, reason, class), and move
+    /// compacted loss markers additionally into durable per-key tombstones
+    /// so archive-loss semantics (visibility + dedup) survive compaction.
+    /// Deletion runs in bounded transactions and is followed by an
+    /// incremental vacuum so freed pages are actually returned to the
+    /// filesystem. Returns the compaction report.
+    pub fn prune_history(&mut self, detail_keep: u64) -> GovernorResult<HistoryPruneReport> {
+        let mut report = HistoryPruneReport::default();
+        for kind in ["loss_marker", "eviction", "refusal"] {
+            report.compacted += self.prune_history_kind(kind, detail_keep)?;
+        }
+        let (pages_before, free_before) = self.db_page_stats()?;
+        // Bounded incremental vacuum calls (SQLite best practice: never one
+        // unbounded VACUUM on a live daemon ledger). Each call reclaims at
+        // most one bound of freelist pages; four calls bound one prune tick.
+        for _ in 0..4 {
+            let free_now: i64 = self
+                .conn
+                .query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+            if free_now <= 0 {
+                break;
+            }
+            self.conn
+                .execute_batch("PRAGMA incremental_vacuum(2048);")?;
+        }
+        let (pages_after, free_after) = self.db_page_stats()?;
+        report.pages_before = pages_before;
+        report.pages_after = pages_after;
+        report.freelist_before = free_before;
+        report.freelist_after = free_after;
+        report.pages_reclaimed = free_before.saturating_sub(free_after);
+        self.set_meta("last_history_prune_ms", &now_ms().to_string())?;
+        Ok(report)
+    }
+
+    fn prune_history_kind(&mut self, kind: &str, detail_keep: u64) -> GovernorResult<u64> {
+        const PRUNE_BATCH_ROWS: i64 = 4096;
+        let keep = i64::try_from(detail_keep).unwrap_or(i64::MAX);
+        let mut compacted = 0u64;
+        loop {
+            let (max_id, count): (i64, i64) = self.conn.query_row(
+                &format!("SELECT COALESCE(MAX(id), 0), COUNT(*) FROM {kind}"),
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if max_id == 0 || count <= keep {
+                return Ok(compacted);
+            }
+            let cutoff = max_id.saturating_sub(keep);
+            let batch_max: Option<i64> = self.conn.query_row(
+                &format!("SELECT MAX(id) FROM (SELECT id FROM {kind} WHERE id <= ?1 ORDER BY id LIMIT {PRUNE_BATCH_ROWS})"),
+                params![cutoff],
+                |row| row.get(0),
+            )?;
+            let Some(batch_max) = batch_max else {
+                return Ok(compacted);
+            };
+            let tx = self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            match kind {
+                "loss_marker" => {
+                    tx.execute(
+                        "INSERT INTO history_aggregate(kind, bucket_ms, class, reason, events, bytes)
+                         SELECT 'loss_marker', (created_ms / ?2) * ?2, class, reason,
+                                COUNT(*), COALESCE(SUM(bytes), 0)
+                         FROM loss_marker WHERE id <= ?1
+                         GROUP BY class, reason, (created_ms / ?2)
+                         ON CONFLICT(kind, bucket_ms, class, reason) DO UPDATE SET
+                            events = history_aggregate.events + excluded.events,
+                            bytes = history_aggregate.bytes + excluded.bytes",
+                        params![batch_max, HISTORY_AGGREGATE_BUCKET_MS],
+                    )?;
+                    tx.execute(
+                        "INSERT OR IGNORE INTO loss_tombstone(class, key, digest, bytes, reason, compacted_ms)
+                         SELECT class, key, digest, bytes, reason, ?2
+                         FROM loss_marker WHERE id <= ?1",
+                        params![batch_max, now_ms()],
+                    )?;
+                }
+                "eviction" => {
+                    tx.execute(
+                        "INSERT INTO history_aggregate(kind, bucket_ms, class, reason, events, bytes)
+                         SELECT 'eviction', (created_ms / ?2) * ?2, class, reason,
+                                COUNT(*), COALESCE(SUM(bytes), 0)
+                         FROM eviction WHERE id <= ?1
+                         GROUP BY class, reason, (created_ms / ?2)
+                         ON CONFLICT(kind, bucket_ms, class, reason) DO UPDATE SET
+                            events = history_aggregate.events + excluded.events,
+                            bytes = history_aggregate.bytes + excluded.bytes",
+                        params![batch_max, HISTORY_AGGREGATE_BUCKET_MS],
+                    )?;
+                }
+                "refusal" => {
+                    tx.execute(
+                        "INSERT INTO history_aggregate(kind, bucket_ms, class, reason, events, bytes)
+                         SELECT 'refusal', (created_ms / ?2) * ?2, class, reason,
+                                COUNT(*), COALESCE(SUM(requested), 0)
+                         FROM refusal WHERE id <= ?1
+                         GROUP BY class, reason, (created_ms / ?2)
+                         ON CONFLICT(kind, bucket_ms, class, reason) DO UPDATE SET
+                            events = history_aggregate.events + excluded.events,
+                            bytes = history_aggregate.bytes + excluded.bytes",
+                        params![batch_max, HISTORY_AGGREGATE_BUCKET_MS],
+                    )?;
+                }
+                other => {
+                    return Err(GovernorError::Corrupt(format!(
+                        "unknown history kind {other:?}"
+                    )));
+                }
+            }
+            let deleted = tx.execute(
+                &format!("DELETE FROM {kind} WHERE id <= ?1"),
+                params![batch_max],
+            )?;
+            tx.commit()?;
+            compacted = compacted.saturating_add(deleted as u64);
+            if deleted == 0 {
+                return Ok(compacted);
+            }
+        }
+    }
 }
 
 struct ExistingRow {
@@ -1569,6 +1937,92 @@ struct ExistingRow {
     digest: Option<String>,
     family: String,
     last_used_ms: i64,
+}
+
+/// One hourly aggregate of compacted history detail (count, bytes, reason,
+/// class — the loss/eviction/refusal facts an operator still needs after
+/// retention moved the per-event rows out of the detail tables).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryAggregateRow {
+    pub kind: String,
+    pub bucket_ms: i64,
+    pub class: String,
+    pub reason: String,
+    pub events: u64,
+    pub bytes: u64,
+}
+
+/// What one history-pruning pass did: rows compacted per kind plus the
+/// physical page movement (deletion must actually reclaim pages).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HistoryPruneReport {
+    pub compacted: u64,
+    pub pages_before: u64,
+    pub pages_after: u64,
+    pub freelist_before: u64,
+    pub freelist_after: u64,
+    pub pages_reclaimed: u64,
+}
+
+/// `PRAGMA auto_vacuum = INCREMENTAL` sticks per-connection on an empty
+/// ledger but its HEADER flag only lands with a full `VACUUM` once tables
+/// exist — so a legacy (or concurrently-initialized) database gets its
+/// one-time migration here. The VACUUM is best-effort under contention:
+/// a persistent SQLITE_BUSY never fails the open (another instance may
+/// legitimately hold the ledger); it retries boundedly and is simply
+/// retried by a later open, while this connection's own pragma attempt
+/// already keeps pruning functional where SQLite accepts it.
+fn ensure_incremental_autovacuum(conn: &Connection) -> GovernorResult<()> {
+    let mode: i64 = conn
+        .query_row("PRAGMA auto_vacuum", [], |row| row.get(0))
+        .unwrap_or(0);
+    if mode == 2 {
+        return Ok(());
+    }
+    match execute_batch_with_busy_retry(conn, "PRAGMA auto_vacuum = INCREMENTAL; VACUUM;", 8) {
+        Ok(()) => Ok(()),
+        Err(e) if is_sqlite_busy(&e) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+fn is_sqlite_busy(error: &GovernorError) -> bool {
+    matches!(
+        error,
+        GovernorError::Sqlite(rusqlite::Error::SqliteFailure(err, _))
+            if err.code == rusqlite::ErrorCode::DatabaseBusy
+                || err.code == rusqlite::ErrorCode::DatabaseLocked
+    )
+}
+
+/// Run one batch, retrying boundedly on SQLITE_BUSY/LOCKED (short sleeps,
+/// never an unbounded wait): concurrent ledger opens must converge instead
+/// of failing one instance's startup.
+fn execute_batch_with_busy_retry(
+    conn: &Connection,
+    batch: &str,
+    retries: u32,
+) -> GovernorResult<()> {
+    let mut attempt = 0;
+    loop {
+        match conn.execute_batch(batch) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let busy = matches!(
+                    &e,
+                    rusqlite::Error::SqliteFailure(err, _)
+                        if err.code == rusqlite::ErrorCode::DatabaseBusy
+                            || err.code == rusqlite::ErrorCode::DatabaseLocked
+                );
+                if busy && attempt < retries {
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                    continue;
+                }
+                return Err(GovernorError::Sqlite(e));
+            }
+        }
+    }
 }
 
 /// Durable directory-root registry for one governed class.
@@ -1945,9 +2399,16 @@ fn record_loss_marker_on(
     bytes: u64,
     reason: &str,
 ) -> rusqlite::Result<()> {
+    // Dedup against BOTH live detail rows and compacted tombstones: a loss
+    // whose detail was pruned into the retention tables can never be
+    // re-recorded (and re-counted) by a later eviction of the same key.
     let exists: bool = conn
         .query_row(
-            "SELECT 1 FROM loss_marker WHERE class = ?1 AND key = ?2 AND reason = ?3 LIMIT 1",
+            "SELECT 1 WHERE EXISTS (
+                 SELECT 1 FROM loss_marker WHERE class = ?1 AND key = ?2 AND reason = ?3
+             ) OR EXISTS (
+                 SELECT 1 FROM loss_tombstone WHERE class = ?1 AND key = ?2 AND reason = ?3
+             ) LIMIT 1",
             params![class.as_str(), key, reason],
             |_| Ok(()),
         )

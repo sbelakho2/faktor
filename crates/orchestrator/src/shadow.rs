@@ -55,6 +55,7 @@ use faktor_core::id::SessionId;
 use faktor_session::{SessionManager, ShadowRow, ShadowRowState};
 
 use faktor_fs::entry_state::EntryState;
+use faktor_storage::{GovernorError, ShadowGrowth, StorageClass, StorageGovernor};
 
 use crate::runtime::merge::{
     apply_manifest_entry, base_id_of, base_map_digest, compute_change_entries,
@@ -456,6 +457,20 @@ pub struct ShadowRoots {
     manager: Arc<SessionManager>,
     shadows_root: PathBuf,
     limits: ShadowCopyLimits,
+    /// The always-on storage governor discovered from the daemon data
+    /// directory (`<data>/storage-governor/governor.db`): every shadow
+    /// reserves its base copy against the ACTUAL destination filesystem,
+    /// is counted in class `ShadowWorkspace`, and has its post-execution
+    /// growth measured at the task boundary. `None` only when no governor
+    /// has been opened for this data dir yet (tests/bare directories); a
+    /// production daemon always opens the governor first, and the invariant
+    /// "all Faktor-owned physical bytes ≤ the aggregate hard budget" holds
+    /// exactly when this is `Some`.
+    governor: Option<StorageGovernor>,
+    /// Per-execution measurement seam: shadow id → physical bytes at the
+    /// task boundary BEFORE the drive ran (the `before` half of
+    /// pre/post growth accounting). Bounded by one live shadow per session.
+    execution_marks: Mutex<std::collections::BTreeMap<String, u64>>,
     /// Serializes per-file acceptance for this daemon generation: two
     /// concurrent replays must observe the same decision, never interleave
     /// a partial landing with a retirement.
@@ -466,6 +481,19 @@ pub struct ShadowRoots {
     preflight_seam: Arc<Mutex<Option<PreflightSeam>>>,
     #[cfg(test)]
     retire_fault: Arc<Mutex<Option<ShadowRetireFault>>>,
+}
+
+/// Growth accounting of ONE shadow execution boundary: the shadow's
+/// physical bytes before and after the drive, and the governor's verdict
+/// (per-shadow ceiling, shadow class quota and aggregate budget).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShadowExecutionGrowth {
+    pub before_bytes: u64,
+    pub after_bytes: u64,
+    pub growth_bytes: u64,
+    /// The governor's post-refresh view; `None` when no governor is open
+    /// (ungoverned test/bare-directory construction).
+    pub admitted: Option<ShadowGrowth>,
 }
 
 impl std::fmt::Debug for ShadowRoots {
@@ -524,11 +552,54 @@ impl ShadowRoots {
                 constraint: "must not exceed MAX_BASE_ENTRIES (the base-map cap)",
             });
         }
+        // Physical governance: discover the always-on storage governor from
+        // the data directory this shadow root lives under (ancestor walk for
+        // `storage-governor/governor.db`). A bare directory without a
+        // governor stays ungoverned (`None`) — tests and the owner-direct
+        // seam — while a production daemon, which opens the governor before
+        // the shadow service, always governs.
+        let governor = StorageGovernor::discover(&shadows_root);
+        Self::new_governed(manager, shadows_root, limits, governor)
+    }
+
+    /// [`ShadowRoots::new_with_limits`] with an EXPLICIT storage governor
+    /// (production wiring that already holds the handle; tests that need a
+    /// deterministic injected probe). Same root validation — no construction
+    /// path bypasses the degenerate-root refusal.
+    pub fn new_governed(
+        manager: Arc<SessionManager>,
+        shadows_root: PathBuf,
+        limits: ShadowCopyLimits,
+        governor: Option<StorageGovernor>,
+    ) -> Result<Arc<Self>, ShadowRootError> {
+        if limits.max_entries == 0 {
+            return Err(ShadowRootError::InvalidLimits {
+                field: "max_entries",
+                value: 0,
+                constraint: "must be >= 1",
+            });
+        }
+        if limits.max_total_bytes == 0 {
+            return Err(ShadowRootError::InvalidLimits {
+                field: "max_total_bytes",
+                value: 0,
+                constraint: "must be >= 1",
+            });
+        }
+        if limits.max_entries > MAX_BASE_ENTRIES {
+            return Err(ShadowRootError::InvalidLimits {
+                field: "max_entries",
+                value: limits.max_entries as u128,
+                constraint: "must not exceed MAX_BASE_ENTRIES (the base-map cap)",
+            });
+        }
         validate_shadows_root(&shadows_root)?;
         Ok(Arc::new(Self {
             manager,
             shadows_root,
             limits,
+            governor,
+            execution_marks: Mutex::new(std::collections::BTreeMap::new()),
             accept_lock: Mutex::new(()),
             #[cfg(test)]
             copy_seam: Arc::new(Mutex::new(None)),
@@ -537,6 +608,12 @@ impl ShadowRoots {
             #[cfg(test)]
             retire_fault: Arc::new(Mutex::new(None)),
         }))
+    }
+
+    /// The storage governor this service governs shadows with (`None` only
+    /// in ungoverned bare-directory/test constructions).
+    pub fn governor(&self) -> Option<&StorageGovernor> {
+        self.governor.as_ref()
     }
 
     pub fn manager(&self) -> Arc<SessionManager> {
@@ -619,9 +696,11 @@ impl ShadowRoots {
         // checkout beyond the caps (the smoke's repo root: tens of GiB of
         // build artifacts) refuses typed here in bounded time instead of
         // hashing the whole tree — the historic unbounded phase that stalled
-        // the frozen prompt.
+        // the frozen prompt. The measured byte total is ALSO the initial
+        // storage admission: it is reserved against the actual shadow
+        // destination filesystem below, before any copy byte is written.
         let mut preflight_seam = self.preflight_observer();
-        bounded_base_preflight(&base, &self.limits, &mut preflight_seam)?;
+        let preflight_bytes = bounded_base_preflight(&base, &self.limits, &mut preflight_seam)?;
         let shadow_id = format!(
             "sh-{:016x}",
             self.manager
@@ -632,6 +711,25 @@ impl ShadowRoots {
         let dir = shadows_root
             .join(session.raw().to_string())
             .join(&shadow_id);
+        // (a) Physical reservation BEFORE the copy writes: the base-copy
+        // bytes are admitted against the shadow class quota, the admission
+        // band and — decisively — the ACTUAL destination volume's
+        // free-space reserve, inside the governor's atomic admission
+        // transaction. The per-shadow hard ceiling is checked first (typed).
+        // The hold covers the whole copy window and is released on ANY
+        // failure (Drop/abort) or converted to charged usage the moment the
+        // durable rows exist. Without a governor (bare test directory) this
+        // is the historical ungoverned path.
+        let shadow_key = format!("{}/{}", session.raw(), shadow_id);
+        let admission = match &self.governor {
+            Some(governor) => ShadowAdmission::reserved(
+                governor
+                    .shadow_admission(&shadow_key, preflight_bytes, &dir)
+                    .map_err(|e| shadow_storage_error("shadow base admission", e))?,
+                governor.clone(),
+            ),
+            None => ShadowAdmission::ungoverned(),
+        };
         let digest = |root: &Path| -> Result<String, ExecError> {
             super::task_executor::root_manifest_digest(root)
         };
@@ -752,12 +850,115 @@ impl ShadowRoots {
             let _ = std::fs::remove_dir_all(&dir);
             return Err(e);
         }
+        // The copy's bytes become charged usage the instant its durable rows
+        // exist (commit the full admission hold), then the class inventory
+        // is refreshed from disk truth so the summary hold is replaced by
+        // per-file accounting — including files the canonical manifest
+        // skips. Every error path above dropped this guard, which aborts the
+        // reservation instead of leaking budget for a removed directory.
+        admission.commit_charge(preflight_bytes);
         Ok(Shadow {
             session_id: session,
             shadow_id,
             base_root: base,
             root: dir,
         })
+    }
+
+    // ------------------------------------------- execution accounting
+
+    /// PRE-execution half of the shadow task-boundary growth accounting:
+    /// measure the shadow's physical bytes right before the drive starts
+    /// and remember them (one mark per shadow id). Called by the executor
+    /// immediately after [`Self::begin_shadow`], so every byte the run
+    /// produces — build outputs such as `target/`/`node_modules`, caches,
+    /// dependency trees — has a durable-counted `before` to be measured
+    /// against at the boundary end. No OS quota is enforced (none is
+    /// portable cross-platform): enforcement is this measurement plus the
+    /// governor's typed refusals.
+    pub fn execution_begin(&self, session: SessionId) -> Result<(), ExecError> {
+        let row = self.live_row(session)?;
+        let root = PathBuf::from(&row.root);
+        let before = StorageGovernor::measure_directory_bytes(&root).map_err(|e| {
+            ExecError::Internal(format!(
+                "shadow execution pre-measure {}: {e}",
+                root.display()
+            ))
+        })?;
+        self.execution_marks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(row.shadow_id.clone(), before);
+        Ok(())
+    }
+
+    /// POST-execution half of the shadow task-boundary growth accounting:
+    /// re-measure the shadow, ask the governor to admit the growth against
+    /// the per-shadow hard ceiling, the shadow class quota (aggregate
+    /// class ceiling in the durable ledger) and the aggregate budget. On a
+    /// breach the governor records a TYPED DURABLE refusal and degrades
+    /// health — every NEW admission (any class) is refused from then on —
+    /// and this returns `Oversized` so the caller kills/refuses the run per
+    /// policy; the live shadow and its bytes stay counted until discard,
+    /// integrate or reconcile releases them. Without a governor (bare test
+    /// directory) the boundary still measures but admits nothing.
+    ///
+    /// A missing `before` mark (crash restart between begin and end) is not
+    /// fabricated: growth is reported as 0 while the ceilings are still
+    /// checked against the governor's durable inventory.
+    pub fn execution_end(&self, session: SessionId) -> Result<ShadowExecutionGrowth, ExecError> {
+        let row = self.live_row(session)?;
+        let root = PathBuf::from(&row.root);
+        let after = StorageGovernor::measure_directory_bytes(&root).map_err(|e| {
+            ExecError::Internal(format!(
+                "shadow execution post-measure {}: {e}",
+                root.display()
+            ))
+        })?;
+        let before = self
+            .execution_marks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&row.shadow_id)
+            .unwrap_or(after);
+        let admitted = match &self.governor {
+            Some(governor) => {
+                let shadow_key = format!("{}/{}", session.raw(), row.shadow_id);
+                Some(
+                    governor
+                        .admit_shadow_growth(&shadow_key, &root)
+                        .map_err(|e| shadow_storage_error("shadow growth admission", e))?,
+                )
+            }
+            None => None,
+        };
+        Ok(ShadowExecutionGrowth {
+            before_bytes: before,
+            after_bytes: after,
+            growth_bytes: after.saturating_sub(before),
+            admitted,
+        })
+    }
+
+    /// Accounting release for ONE removed shadow directory: durable room
+    /// returns immediately (retire/discard/sweep), never one maintenance
+    /// tick later.
+    fn release_accounting(&self, session: SessionId, shadow_id: &str) {
+        if let Some(governor) = &self.governor {
+            let shadow_key = format!("{}/{}", session.raw(), shadow_id);
+            if let Err(e) = governor.release_shadow(&shadow_key) {
+                tracing::warn!(
+                    target: "faktor::shadow",
+                    shadow = %shadow_key,
+                    error = %e,
+                    "shadow accounting release failed; the next class refresh reclaims the room"
+                );
+            }
+        }
+        self.execution_marks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(shadow_id);
     }
 
     // ------------------------------------------------------------ staging
@@ -1074,6 +1275,9 @@ impl ShadowRoots {
         if dir.exists() {
             let _ = std::fs::remove_dir_all(&dir);
         }
+        // Release accounting on retire: the retired shadow's bytes leave the
+        // shadow class budget the moment its directory is gone.
+        self.release_accounting(session, &row.shadow_id);
         Ok(())
     }
 
@@ -1112,6 +1316,10 @@ impl ShadowRoots {
                 ExecError::Internal(format!("shadow removal {}: {e}", dir.display()))
             })?;
         }
+        // Release accounting on discard: the discarded shadow's bytes leave
+        // the shadow class budget immediately (a removal failure above kept
+        // the directory — and its accounting — intact).
+        self.release_accounting(session, &row.shadow_id);
         Ok(())
     }
 
@@ -1157,6 +1365,9 @@ impl ShadowRoots {
             if row.state.is_live() && !dir.is_dir() {
                 // Shadow directory gone: integration is impossible.
                 self.mark_state(session, ShadowRowState::Discarded)?;
+                // Accounting release: any stale index rows for the vanished
+                // directory leave the shadow class budget now.
+                self.release_accounting(session, &row.shadow_id);
                 actions.push(format!(
                     "session {session}: shadow {} directory gone; marked discarded",
                     row.shadow_id
@@ -1171,6 +1382,7 @@ impl ShadowRoots {
                 if dir.is_dir() {
                     let _ = std::fs::remove_dir_all(&dir);
                 }
+                self.release_accounting(session, &row.shadow_id);
                 actions.push(format!(
                     "session {session}: closed with a live shadow {}; discarded",
                     row.shadow_id
@@ -1179,6 +1391,7 @@ impl ShadowRoots {
             }
             if !row.state.is_live() && dir.is_dir() {
                 let _ = std::fs::remove_dir_all(&dir);
+                self.release_accounting(session, &row.shadow_id);
                 actions.push(format!(
                     "session {session}: retired shadow {} directory removed",
                     row.shadow_id
@@ -1202,12 +1415,41 @@ impl ShadowRoots {
                     let dir = e2.path();
                     if dir.is_dir() && !rowed_dirs.contains(&dir) {
                         let _ = std::fs::remove_dir_all(&dir);
+                        // ABANDONED shadow directory after a crash: the
+                        // startup sweep removes it AND releases its durable
+                        // accounting immediately (the governor's crash
+                        // pattern — a dead process's reservation/bytes are
+                        // reclaimed from durable state, never trusted from
+                        // RAM).
+                        if let Some(governor) = &self.governor {
+                            if let Ok(rel) = dir.strip_prefix(&scan_root) {
+                                let key = rel
+                                    .components()
+                                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                                    .collect::<Vec<_>>()
+                                    .join("/");
+                                if !key.is_empty() {
+                                    let _ = governor.release_shadow(&key);
+                                }
+                            }
+                        }
                         actions.push(format!(
                             "row-less shadow directory {} removed",
                             dir.display()
                         ));
                     }
                 }
+            }
+        }
+        // Startup-sweep disk truth: after every removal, the shadow class
+        // inventory reflects the filesystem exactly (live shadows keep
+        // counting — including IntegrationBlocked and pinned/recovery
+        // shadows; only deleted directories leave the budget).
+        if let Some(governor) = &self.governor {
+            if let Err(e) = governor.refresh_class_inventory(StorageClass::ShadowWorkspace) {
+                actions.push(format!(
+                    "shadow class inventory refresh deferred ({e}); reconcile retries"
+                ));
             }
         }
         Ok(actions)
@@ -1266,8 +1508,13 @@ impl ShadowRoots {
                     );
                     tracing::warn!(target: "faktor::shadow", "{message}");
                     report.push(message);
+                    continue;
                 }
             }
+            // Graceful retirement also releases the durable accounting (the
+            // bytes are gone from disk); a failed removal above kept both
+            // the directory and its counted room for the next reconcile.
+            self.release_accounting(session, &row.shadow_id);
         }
         report
     }
@@ -1480,6 +1727,76 @@ fn validate_shadows_root(root: &Path) -> Result<(), ShadowRootError> {
     }
 }
 
+/// Map a storage-governor refusal of the shadow base admission onto the
+/// typed orchestrator error space: a bounded-capacity refusal (per-shadow
+/// ceiling, class quota, admission band, destination free-space reserve) is
+/// `Oversized` — the SAME typed isolation refusal the copy caps produce, so
+/// the executor admits the run's failure honestly through the existing
+/// refusal path instead of crashing the drive. Any other governor failure
+/// is an internal typed error.
+fn shadow_storage_error(what: &str, e: GovernorError) -> ExecError {
+    match e {
+        GovernorError::Refused(refusal) => ExecError::Oversized(format!(
+            "{what}: storage refused for {}: requested {} bytes, {} bytes available ({}: {})",
+            refusal.class.as_str(),
+            refusal.requested_bytes,
+            refusal.available_bytes,
+            refusal.reason.as_str(),
+            refusal.detail
+        )),
+        other => ExecError::Internal(format!("{what}: {other}")),
+    }
+}
+
+/// The initial base-copy admission of ONE shadow begin. RAII: while held it
+/// keeps the reservation (budget + destination-volume free space) covering
+/// the in-flight copy; dropping it on ANY failure path of `begin_shadow`
+/// aborts the reservation immediately (never a leaked hold until lease
+/// expiry); committing it at the durable-row boundary charges the physical
+/// bytes and refreshes the shadow class inventory from disk truth.
+struct ShadowAdmission {
+    reservation: Option<faktor_storage::Reservation>,
+    governor: Option<StorageGovernor>,
+}
+
+impl ShadowAdmission {
+    fn reserved(reservation: faktor_storage::Reservation, governor: StorageGovernor) -> Self {
+        Self {
+            reservation: Some(reservation),
+            governor: Some(governor),
+        }
+    }
+
+    fn ungoverned() -> Self {
+        Self {
+            reservation: None,
+            governor: None,
+        }
+    }
+
+    /// Consume the hold on success: charge the copied bytes, then replace
+    /// the summary row with the per-file disk-truth inventory.
+    fn commit_charge(mut self, bytes: u64) {
+        if let Some(reservation) = self.reservation.take() {
+            // A commit failure leaves the bytes physical: the immediate
+            // class refresh (and, failing that, the next reconcile) indexes
+            // them — accounting never silently loses physical shadow bytes.
+            let _ = reservation.commit(bytes, None);
+            if let Some(governor) = &self.governor {
+                let _ = governor.refresh_class_inventory(StorageClass::ShadowWorkspace);
+            }
+        }
+    }
+}
+
+impl Drop for ShadowAdmission {
+    fn drop(&mut self) {
+        if let Some(reservation) = self.reservation.take() {
+            reservation.abort();
+        }
+    }
+}
+
 /// Map a canonical tree-manifest refusal of the shadow copy onto the typed
 /// orchestrator error space: an oversize stays `Oversized` (a refused cap,
 /// never corruption), an unavailable base stays `NotFound`, and every other
@@ -1525,11 +1842,15 @@ fn shadow_copy_error(what: &str, e: faktor_fs::tree_manifest::TreeManifestError)
 /// Failures that are genuine drift stay typed: the BASE ROOT itself missing
 /// or unreadable (including a root that vanishes mid-walk), a persistent
 /// metadata failure, and any permission or i/o error.
+///
+/// Returns the admitted byte total (the same sum the caps enforced): the
+/// caller reserves exactly those bytes against the ACTUAL shadow
+/// destination filesystem before the copy writes.
 fn bounded_base_preflight(
     base: &Path,
     limits: &ShadowCopyLimits,
     on_enumerated: &mut dyn FnMut(&Path),
-) -> Result<(), ExecError> {
+) -> Result<u64, ExecError> {
     use faktor_fs::tree_manifest::MAX_TREE_MANIFEST_DEPTH;
     let oversized = |what: &str| {
         ExecError::Oversized(format!(
@@ -1623,7 +1944,7 @@ fn bounded_base_preflight(
         bytes,
         "shadow phase preflight admitted"
     );
-    Ok(())
+    Ok(bytes)
 }
 
 /// One preflight directory enumeration with concurrent-churn tolerance.

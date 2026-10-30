@@ -30,10 +30,18 @@ pub enum StorageClass {
     UpdateRemnant,
     /// Rebuildable index/search/embedding caches.
     RebuildableCache,
+    /// Daemon-owned shadow mutation workspaces
+    /// (`<data-dir>/shadows/<session>/<shadow-id>`): bounded base copies plus
+    /// every PHYSICAL byte a shadowed run produces inside them (build
+    /// outputs such as `target/`/`node_modules` are excluded from source
+    /// manifests but always counted here). Never LRU-evicted — an active
+    /// shadow is a live workspace, so class pressure is a typed refusal, not
+    /// silent data destruction.
+    ShadowWorkspace,
 }
 
 impl StorageClass {
-    pub const ALL: [StorageClass; 9] = [
+    pub const ALL: [StorageClass; 10] = [
         StorageClass::MainCas,
         StorageClass::EvidenceCas,
         StorageClass::CompactionArchive,
@@ -43,6 +51,7 @@ impl StorageClass {
         StorageClass::SqliteWal,
         StorageClass::UpdateRemnant,
         StorageClass::RebuildableCache,
+        StorageClass::ShadowWorkspace,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -56,6 +65,7 @@ impl StorageClass {
             StorageClass::SqliteWal => "sqlite_wal",
             StorageClass::UpdateRemnant => "update_remnant",
             StorageClass::RebuildableCache => "rebuildable_cache",
+            StorageClass::ShadowWorkspace => "shadow_workspace",
         }
     }
 
@@ -64,9 +74,13 @@ impl StorageClass {
     }
 
     /// Default share of the aggregate budget, in permille (sums to 1000).
+    /// `ShadowWorkspace` takes 80‰ from the main CAS share: a shadow is a
+    /// bounded copy of one checkout (capped by the per-shadow ceiling) plus
+    /// its build outputs, and it must never crowd out durable evidence,
+    /// archives or checkpoints.
     pub const fn default_share_permille(self) -> u64 {
         match self {
-            StorageClass::MainCas => 350,
+            StorageClass::MainCas => 270,
             StorageClass::EvidenceCas => 150,
             StorageClass::CompactionArchive => 100,
             StorageClass::TerminalCapture => 100,
@@ -75,6 +89,7 @@ impl StorageClass {
             StorageClass::SqliteWal => 100,
             StorageClass::UpdateRemnant => 20,
             StorageClass::RebuildableCache => 30,
+            StorageClass::ShadowWorkspace => 80,
         }
     }
 
@@ -106,6 +121,15 @@ impl StorageClass {
     /// durable loss marker naming the object, its digest and its bytes.
     pub const fn requires_loss_marker(self) -> bool {
         matches!(self, StorageClass::CompactionArchive)
+    }
+
+    /// Whether LRU eviction may ever delete bytes of this class to make
+    /// budget room. Shadow workspaces are LIVE run workspaces: deleting
+    /// files from under an in-flight drive would silently corrupt the run,
+    /// so shadow class pressure resolves to a typed refusal (and a degraded
+    /// health naming the class) — never silent destruction.
+    pub const fn is_evictable(self) -> bool {
+        !matches!(self, StorageClass::ShadowWorkspace)
     }
 
     /// Retention strength of one logical class sharing a physical CAS root.

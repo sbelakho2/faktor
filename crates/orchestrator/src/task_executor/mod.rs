@@ -2711,7 +2711,11 @@ impl TaskExecutor {
                 let refusal = ExecError::from_shadow("shadow begin for session", e);
                 if matches!(refusal, ExecError::Oversized(_)) {
                     // The BOUNDED caps refused an un-isolatable checkout
-                    // (shadow settle phase 1). The turn can never run
+                    // (shadow settle phase 1), or the storage governor
+                    // refused the base-copy admission (per-shadow ceiling,
+                    // class quota, admission band, destination free-space
+                    // reserve) — both typed `Oversized` isolation refusals.
+                    // The turn can never run
                     // isolated, so it is admitted honestly and landed as a
                     // recoverable failure — never a hang, and never a
                     // promptable-but-idle machine. Protocol adapters project
@@ -2722,6 +2726,12 @@ impl TaskExecutor {
                 }
                 return Err(refusal);
             }
+            // Shadow task boundary PRE-measure: physical bytes before the
+            // drive (build outputs included) are recorded so the post-drive
+            // accounting can measure GROWTH against the per-shadow ceiling
+            // and the shadow class quota. A failed measurement refuses the
+            // run typed — an unaccounted execution never starts.
+            shadows.execution_begin(parent)?;
         }
         let now = handle.now_ms();
         // allowed-task-id-read: admission-time identity binding. TASK runs

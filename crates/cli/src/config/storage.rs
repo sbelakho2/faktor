@@ -10,8 +10,10 @@ use std::sync::Arc;
 
 use faktor_storage::{
     StorageClass, StorageGovernor, StorageGovernorConfig, DEFAULT_CAPACITY_PERMILLE,
-    DEFAULT_MIN_INSTALL_ALLOWANCE_BYTES, DEFAULT_RESERVATION_LEASE_MS, DEFAULT_RESERVE_BYTES,
-    DEFAULT_RESERVE_PERMILLE, DEFAULT_TOTAL_BUDGET_BYTES, DEFAULT_WATERMARK_PERMILLE,
+    DEFAULT_EMERGENCY_CEILING_PERMILLE, DEFAULT_MIN_INSTALL_ALLOWANCE_BYTES,
+    DEFAULT_NORMAL_ADMISSION_CEILING_PERMILLE, DEFAULT_RESERVATION_LEASE_MS, DEFAULT_RESERVE_BYTES,
+    DEFAULT_RESERVE_PERMILLE, DEFAULT_SHADOW_MAX_BYTES_PER_SHADOW, DEFAULT_TOTAL_BUDGET_BYTES,
+    DEFAULT_WATERMARK_PERMILLE,
 };
 
 /// Default age after which updater staging files are removed as remnants.
@@ -34,6 +36,15 @@ pub struct StorageCfg {
     pub reserve_bytes: u64,
     /// Minimum installation allowance for the capacity-relative cap.
     pub min_install_allowance_bytes: u64,
+    /// Normal admission band ceiling (permille of the effective budget).
+    /// Normal writes are refused typed above it; 850 = 85% (default).
+    pub normal_admission_ceiling_permille: u16,
+    /// Emergency/critical-metadata band ceiling (permille); the band above
+    /// it is recovery-only. 900 = 90% (default).
+    pub emergency_ceiling_permille: u16,
+    /// Hard ceiling of ONE shadow workspace (base copy plus physical
+    /// growth), independent of the aggregate shadow-class quota.
+    pub shadow_max_bytes_per_shadow: u64,
     pub main_cas_bytes: Option<u64>,
     pub evidence_cas_bytes: Option<u64>,
     pub compaction_archive_bytes: Option<u64>,
@@ -58,6 +69,9 @@ impl Default for StorageCfg {
             reserve_permille: DEFAULT_RESERVE_PERMILLE,
             reserve_bytes: DEFAULT_RESERVE_BYTES,
             min_install_allowance_bytes: DEFAULT_MIN_INSTALL_ALLOWANCE_BYTES,
+            normal_admission_ceiling_permille: DEFAULT_NORMAL_ADMISSION_CEILING_PERMILLE,
+            emergency_ceiling_permille: DEFAULT_EMERGENCY_CEILING_PERMILLE,
+            shadow_max_bytes_per_shadow: DEFAULT_SHADOW_MAX_BYTES_PER_SHADOW,
             main_cas_bytes: None,
             evidence_cas_bytes: None,
             compaction_archive_bytes: None,
@@ -102,6 +116,9 @@ impl StorageCfg {
             reserve_permille: self.reserve_permille,
             reserve_bytes: self.reserve_bytes,
             min_install_allowance_bytes: self.min_install_allowance_bytes,
+            normal_admission_ceiling_permille: self.normal_admission_ceiling_permille,
+            emergency_ceiling_permille: self.emergency_ceiling_permille,
+            shadow_max_bytes_per_shadow: self.shadow_max_bytes_per_shadow,
             quotas: std::collections::BTreeMap::new(),
         };
         for (class, bytes) in self.overrides() {

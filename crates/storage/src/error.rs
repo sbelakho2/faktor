@@ -30,6 +30,15 @@ pub enum RefusalReason {
     BackendRefused,
     /// The request itself is malformed (zero length, invalid key, ...).
     InvalidRequest,
+    /// A NORMAL admission would push aggregate usage (durable + pending)
+    /// into the emergency or RECOVERY-ONLY band of the aggregate budget.
+    /// The bytes may still be admissible through the explicit recovery
+    /// path; ordinary caches/logs/evidence can never consume the reserve.
+    NormalAdmissionCeiling,
+    /// A single shadow directory would exceed its per-shadow hard ceiling
+    /// (base copy plus physical growth), independent of the aggregate
+    /// shadow-class quota.
+    ShadowCeiling,
 }
 
 impl RefusalReason {
@@ -44,6 +53,8 @@ impl RefusalReason {
             RefusalReason::CapacityUnmeasured => "capacity_unmeasured",
             RefusalReason::BackendRefused => "backend_refused",
             RefusalReason::InvalidRequest => "invalid_request",
+            RefusalReason::NormalAdmissionCeiling => "normal_admission_ceiling",
+            RefusalReason::ShadowCeiling => "shadow_ceiling",
         }
     }
 }

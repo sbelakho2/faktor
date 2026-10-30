@@ -49,6 +49,17 @@ pub struct StorageMetrics {
     pub watermark_permille: u16,
     /// True when total usage is at or above the configured watermark.
     pub above_watermark: bool,
+    /// NORMAL admission band ceiling (default 85% of the effective budget).
+    pub normal_admission_ceiling_bytes: u64,
+    /// Emergency/critical-metadata band ceiling (default 90%); the band
+    /// above it is RECOVERY-ONLY.
+    pub emergency_ceiling_bytes: u64,
+    /// Bytes of the effective budget reserved for recovery-path writes only
+    /// (`effective_budget - emergency_ceiling_bytes`).
+    pub recovery_reserve_bytes: u64,
+    /// Which band the current aggregate usage (durable + pending) falls in:
+    /// `"normal"`, `"emergency"`, `"recovery_reserve"` or `"over_budget"`.
+    pub admission_band: String,
     pub per_class: BTreeMap<String, ClassUsage>,
     pub evictions: u64,
     pub refusals: u64,

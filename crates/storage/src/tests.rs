@@ -24,6 +24,13 @@ fn config(total: u64, class: u64, lease_ms: i64) -> StorageGovernorConfig {
         total_budget_bytes: total,
         watermark_permille: 900,
         reservation_lease_ms: lease_ms,
+        // The legacy aggregate/reserve/LRU tests exercise the FULL budget
+        // (their invariants predate the band split), so they run with the
+        // band widened to 950‰/975‰. The DEFAULT 850‰/900‰ bands and the
+        // recovery-only reserve are asserted by their own tests in
+        // `band_tests.rs`.
+        normal_admission_ceiling_permille: 950,
+        emergency_ceiling_permille: 975,
         quotas,
         ..Default::default()
     }
@@ -223,7 +230,12 @@ fn restart_reconciles_accounting_from_disk() {
 #[test]
 fn crash_safe_reservation_survives_reopen_and_then_expires() {
     let fixture = Fixture::new(&[StorageClass::MainCas]);
-    let config = config(1_000_000, 500_000, 50);
+    // A one-second lease: long enough that the reserve→count and
+    // reopen-count windows never expire on a loaded build machine (the
+    // post-admission path measures real volumes — tens of statfs can
+    // exceed a 50ms lease under disk contention), short enough that the
+    // expiry below is still an immediate, deterministic assertion.
+    let config = config(1_000_000, 500_000, 1_000);
     {
         let governor = fixture.governor(config.clone());
         let reservation = governor
@@ -240,7 +252,7 @@ fn crash_safe_reservation_survives_reopen_and_then_expires() {
         1,
         "the durable reservation row outlives the crashed process"
     );
-    std::thread::sleep(Duration::from_millis(70));
+    std::thread::sleep(Duration::from_millis(1_400));
     let report = governor.reconcile().unwrap();
     assert!(
         report.expired_reservations >= 1,
@@ -1456,6 +1468,10 @@ fn capacity_config(total: u64) -> StorageGovernorConfig {
         .collect::<BTreeMap<_, _>>();
     StorageGovernorConfig {
         total_budget_bytes: total,
+        // Full-budget semantics for the capacity/reserve suite; the default
+        // 850‰/900‰ bands are covered by `band_tests.rs`.
+        normal_admission_ceiling_permille: 950,
+        emergency_ceiling_permille: 975,
         quotas,
         ..Default::default()
     }
@@ -2246,4 +2262,325 @@ fn crash_at_reserve_publish_or_commit_reconciles_conservatively_without_double_c
             )
             .expect_err("never over-admit past the volume's remaining room");
     }
+}
+
+// ------------------------------------- shadow workspace physical governance
+//
+// The shadow class (`<data-dir>/shadows/<session>/<shadow-id>`) is governed
+// end-to-end: admission reserves against the ACTUAL destination volume
+// before the copy writes, physical bytes (build outputs included) count
+// against the per-shadow ceiling, the class quota and the aggregate band,
+// breach is a typed refusal (never silent eviction of live run state), and
+// retire/sweep releases accounting immediately. No OS quota is enforced
+// cross-platform — measurement + typed admission refusal is the mechanism.
+
+const MIB: u64 = 1024 * 1024;
+
+fn seed_shadow(root: &Path, files: &[(PathBuf, u64)]) {
+    for (rel, len) in files {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, vec![b's'; *len as usize]).unwrap();
+    }
+}
+
+#[test]
+fn shadow_admission_reserves_the_destination_volume_and_ceiling_before_any_copy_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = Arc::new(SimProbe::new());
+    // Free space above the 3.2 GiB reserve: exactly 100 MiB of headroom.
+    probe.mount(dir.path(), 41, 64 * GIB, 64 * GIB * 50 / 1000 + 100 * MIB);
+    let governor = StorageGovernor::open_with_capacity_probe(
+        dir.path(),
+        capacity_config(u64::MAX),
+        probe.clone(),
+    )
+    .unwrap();
+    let dest = dir.path().join("shadows").join("sess-1").join("sh-a");
+
+    // (b) The per-shadow hard ceiling refuses BEFORE anything is written.
+    let refusal = governor
+        .shadow_admission("sess-1/sh-a", 2 * GIB, &dest)
+        .expect_err("a shadow larger than the per-shadow ceiling never begins")
+        .refusal()
+        .cloned()
+        .expect("typed refusal");
+    assert_eq!(refusal.reason, RefusalReason::ShadowCeiling);
+    assert!(!dest.exists(), "the refusal wrote nothing");
+
+    // (a) The destination volume's own free-space reserve refuses the base
+    // copy before any byte is written: 200 MiB does not fit 100 MiB of
+    // headroom above the reserve.
+    let refusal = governor
+        .shadow_admission("sess-1/sh-a", 200 * MIB, &dest)
+        .expect_err("the destination reserve wins before the copy starts")
+        .refusal()
+        .cloned()
+        .expect("typed refusal");
+    assert_eq!(refusal.reason, RefusalReason::FreeSpaceReserve);
+    assert!(!dest.exists(), "no directory was created before admission");
+
+    // An admitted base copy holds its bytes against the ACTUAL destination
+    // volume for the whole copy window.
+    let admission = governor
+        .shadow_admission("sess-1/sh-a", 50 * MIB, &dest)
+        .expect("50 MiB fits the headroom");
+    assert_eq!(governor.pending_reservations().unwrap(), 1);
+    // While the copy is in flight, a second write on the SAME volume is
+    // refused: unmaterialized shadow bytes can never double-spend free
+    // space (or break the reserve).
+    let second = governor
+        .reserve_into(
+            StorageClass::MainCas,
+            "second-write",
+            60 * MIB,
+            dir.path().join("elsewhere"),
+        )
+        .expect_err("the in-flight shadow hold charges the volume");
+    assert_eq!(
+        second.refusal().map(|r| r.reason.clone()),
+        Some(RefusalReason::FreeSpaceReserve)
+    );
+
+    // The copy writes; commit charges its bytes; the immediate class
+    // refresh replaces the summary hold with per-file disk truth.
+    seed_shadow(
+        &dest,
+        &[(PathBuf::from("a.txt"), 10), (PathBuf::from("b.txt"), 10)],
+    );
+    admission.commit(50 * MIB, None).unwrap();
+    assert_eq!(governor.pending_reservations().unwrap(), 0);
+    let class_bytes = governor
+        .refresh_class_inventory(StorageClass::ShadowWorkspace)
+        .unwrap();
+    assert_eq!(class_bytes, 20, "per-file truth replaces the summary hold");
+    let metrics = governor.metrics().unwrap();
+    assert_eq!(metrics.per_class["shadow_workspace"].bytes, 20);
+    assert!(metrics.total_bytes <= metrics.total_budget_bytes);
+}
+
+#[test]
+fn shadow_growth_counts_physically_refuses_typed_on_breach_and_is_never_evicted() {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = Arc::new(SimProbe::new());
+    probe.mount(dir.path(), 42, 64 * GIB, 16 * GIB);
+    let mut config = capacity_config(u64::MAX);
+    // Per-shadow hard ceiling of exactly 1 MiB (clamped floor), shadow
+    // class quota of 1.5 MiB — two ceilings the growth must hit in order.
+    config.shadow_max_bytes_per_shadow = MIB;
+    config
+        .quotas
+        .insert(StorageClass::ShadowWorkspace, MIB + MIB / 2);
+    let config = config.validated().unwrap();
+    let governor =
+        StorageGovernor::open_with_capacity_probe(dir.path(), config, probe.clone()).unwrap();
+
+    // Two shadows whose SUM exceeds the class quota while each stays under
+    // its own ceiling.
+    let root_a = dir.path().join("shadows").join("s").join("sh-a");
+    let root_b = dir.path().join("shadows").join("s").join("sh-b");
+    seed_shadow(&root_a, &[(PathBuf::from("src/main.rs"), 900 * 1024 - 64)]);
+    seed_shadow(&root_b, &[(PathBuf::from("src/main.rs"), 900 * 1024 - 64)]);
+    let class_bytes = governor
+        .refresh_class_inventory(StorageClass::ShadowWorkspace)
+        .unwrap();
+    assert!(class_bytes > MIB + MIB / 2, "class over its quota");
+    let usage_a = governor.shadow_usage("s/sh-a").unwrap();
+    assert!(usage_a <= MIB, "shadow a alone fits its ceiling");
+
+    // Aggregate growth breach (class quota): typed refusal + durable
+    // degraded health, and NOTHING on disk is deleted — a shadow is live
+    // run state, never an eviction candidate.
+    let refusal = governor
+        .admit_shadow_growth("s/sh-a", &root_a)
+        .expect_err("the shadow class quota refuses the grown bytes")
+        .refusal()
+        .cloned()
+        .expect("typed refusal");
+    assert_eq!(refusal.reason, RefusalReason::ClassQuota);
+    let degraded = governor
+        .health()
+        .unwrap()
+        .expect("the growth breach degrades health");
+    assert!(
+        degraded.code.contains("class_quota_exceeded")
+            && degraded.class == Some(StorageClass::ShadowWorkspace),
+        "the degraded state names the shadow class: {:?}",
+        degraded
+    );
+    governor.enforce().unwrap();
+    assert!(
+        root_a.join("src/main.rs").exists() && root_b.join("src/main.rs").exists(),
+        "enforcement never deletes shadow files (no OS quota; eviction is forbidden here)"
+    );
+
+    // Per-shadow hard ceiling: growth of ONE shadow past 1 MiB is refused
+    // typed with the ceiling in the detail.
+    seed_shadow(&root_a, &[(PathBuf::from("target/debug/big.bin"), 2 * MIB)]);
+    let refusal = governor
+        .admit_shadow_growth("s/sh-a", &root_a)
+        .expect_err("the per-shadow ceiling refuses the grown shadow")
+        .refusal()
+        .cloned()
+        .expect("typed refusal");
+    assert_eq!(refusal.reason, RefusalReason::ShadowCeiling);
+    assert!(
+        refusal.detail.contains("no OS quota"),
+        "the refusal documents that no cross-platform OS quota exists: {}",
+        refusal.detail
+    );
+    assert!(
+        root_a.join("target/debug/big.bin").exists(),
+        "the breach is detected, never enforced by deleting the run's outputs"
+    );
+    // While the breach stands, NEW shadow admissions are refused: the class
+    // quota is already exceeded and shadow bytes are never evictable.
+    let dest = dir.path().join("shadows").join("s").join("sh-c");
+    governor
+        .shadow_admission("s/sh-c", MIB, &dest)
+        .expect_err("a breached shadow class refuses every new admission");
+    assert!(
+        governor.counters().unwrap().refusals >= 3,
+        "per-shadow, class and admission refusals are all durable"
+    );
+}
+
+#[test]
+fn retire_and_abandoned_sweep_release_shadow_accounting_immediately() {
+    let dir = tempfile::tempdir().unwrap();
+    let governor = StorageGovernor::open(dir.path(), capacity_config(u64::MAX)).unwrap();
+
+    // One live shadow indexed from disk truth.
+    let root = dir.path().join("shadows").join("sess").join("sh-live");
+    seed_shadow(
+        &root,
+        &[
+            (PathBuf::from("a.txt"), 100),
+            (PathBuf::from("b/c.txt"), 50),
+        ],
+    );
+    let class_bytes = governor
+        .refresh_class_inventory(StorageClass::ShadowWorkspace)
+        .unwrap();
+    assert_eq!(class_bytes, 150);
+
+    // (e) Retire/discard: directory removed, accounting released at once —
+    // no reconcile tick in between.
+    std::fs::remove_dir_all(&root).unwrap();
+    let released = governor.release_shadow("sess/sh-live").unwrap();
+    assert_eq!(
+        released, 150,
+        "the removed shadow's bytes return exactly once"
+    );
+    assert_eq!(governor.shadow_usage("sess/sh-live").unwrap(), 0);
+    assert_eq!(
+        governor.metrics().unwrap().per_class["shadow_workspace"].bytes,
+        0,
+        "release is durable without waiting for the next scan"
+    );
+
+    // (f) ABANDONED directory after a crash: disk truth first (it counts,
+    // even with no live row — never silently uncounted), then the sweep
+    // removes it and the accounting is released.
+    let abandoned = dir.path().join("shadows").join("sess").join("sh-dead");
+    seed_shadow(&abandoned, &[(PathBuf::from("partial.txt"), 70)]);
+    let counted = governor
+        .refresh_class_inventory(StorageClass::ShadowWorkspace)
+        .unwrap();
+    assert_eq!(
+        counted, 70,
+        "an abandoned directory is counted while it exists"
+    );
+    std::fs::remove_dir_all(&abandoned).unwrap();
+    governor.release_shadow("sess/sh-dead").unwrap();
+    assert_eq!(
+        governor.metrics().unwrap().per_class["shadow_workspace"].bytes,
+        0,
+        "the startup sweep's release reclaims the abandoned bytes"
+    );
+}
+
+#[test]
+fn shadow_bytes_count_against_the_aggregate_band_invariant() {
+    let dir = tempfile::tempdir().unwrap();
+    // Default 850 permille normal band over a 100k budget → 85k ceiling.
+    let config = StorageGovernorConfig {
+        total_budget_bytes: 100_000,
+        watermark_permille: 1000,
+        reservation_lease_ms: 60_000,
+        quotas: StorageClass::ALL
+            .into_iter()
+            .map(|class| (class, 100_000u64))
+            .collect(),
+        ..Default::default()
+    }
+    .validated()
+    .unwrap();
+    assert_eq!(
+        config.normal_admission_ceiling_bytes(100_000),
+        85_000,
+        "the test runs on the documented default band"
+    );
+    let governor = StorageGovernor::open(dir.path(), config).unwrap();
+
+    // 80k of ordinary class bytes…
+    governor
+        .reserve(StorageClass::MainCas, "fill", 80_000)
+        .unwrap()
+        .commit(80_000, None)
+        .unwrap();
+    // …plus 6k of PHYSICAL shadow bytes (build output the manifest skips).
+    let root = dir.path().join("shadows").join("sess").join("sh-1");
+    seed_shadow(&root, &[(PathBuf::from("target/debug/app"), 6_000)]);
+    governor
+        .refresh_class_inventory(StorageClass::ShadowWorkspace)
+        .unwrap();
+    let metrics = governor.metrics().unwrap();
+    assert_eq!(metrics.total_bytes, 86_000, "shadows are inside the total");
+    assert_eq!(metrics.admission_band, "emergency");
+
+    // A 5k NORMAL admission fits ONLY if shadow bytes were uncounted
+    // (80k + 5k = 85k exactly). Shadows count → 91k > 85k → typed refusal.
+    let refusal = governor
+        .reserve(StorageClass::MainCas, "would-fit-without-shadows", 5_000)
+        .expect_err("ALL Faktor-owned physical bytes — shadows included — bound admission")
+        .refusal()
+        .cloned()
+        .expect("typed refusal");
+    assert_eq!(refusal.reason, RefusalReason::NormalAdmissionCeiling);
+
+    // Control: retire the shadow, release the accounting, and the same 5k
+    // admission now fits exactly at the ceiling — the shadow bytes were the
+    // deciding factor, and releasing them restored exactly that room.
+    std::fs::remove_dir_all(&root).unwrap();
+    governor.release_shadow("sess/sh-1").unwrap();
+    governor
+        .reserve(StorageClass::MainCas, "after-release", 5_000)
+        .expect("released shadow bytes restore exactly their room")
+        .abort();
+    let metrics = governor.metrics().unwrap();
+    assert!(metrics.total_bytes <= metrics.total_budget_bytes);
+    assert_eq!(metrics.admission_band, "normal");
+}
+
+#[test]
+fn shadow_databases_count_once_as_shadow_bytes_never_as_sqlite_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let governor = StorageGovernor::open(dir.path(), capacity_config(u64::MAX)).unwrap();
+    // A project database inside a shadow: physically shadow bytes ONCE.
+    let root = dir.path().join("shadows").join("sess").join("sh-1");
+    seed_shadow(&root, &[(PathBuf::from("data/app.db"), 1_000)]);
+    governor
+        .refresh_class_inventory(StorageClass::ShadowWorkspace)
+        .unwrap();
+    governor.sqlite_maintenance().unwrap();
+    let metrics = governor.metrics().unwrap();
+    assert_eq!(
+        metrics.per_class["shadow_workspace"].bytes, 1_000,
+        "the shadow class counts the database"
+    );
+    assert_eq!(
+        metrics.per_class["sqlite_wal"].bytes, 0,
+        "the SQLite backend never double-counts shadow databases"
+    );
 }

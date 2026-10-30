@@ -20,6 +20,12 @@ pub mod ledger;
 pub mod object;
 
 #[cfg(test)]
+#[path = "band_tests.rs"]
+mod band_tests;
+#[cfg(test)]
+#[path = "history_tests.rs"]
+mod history_tests;
+#[cfg(test)]
 mod tests;
 
 pub use capacity::{
@@ -27,17 +33,22 @@ pub use capacity::{
 };
 pub use class::StorageClass;
 pub use config::{
-    StorageGovernorConfig, DEFAULT_CAPACITY_PERMILLE, DEFAULT_MIN_INSTALL_ALLOWANCE_BYTES,
+    StorageGovernorConfig, DEFAULT_CAPACITY_PERMILLE, DEFAULT_EMERGENCY_CEILING_PERMILLE,
+    DEFAULT_MIN_INSTALL_ALLOWANCE_BYTES, DEFAULT_NORMAL_ADMISSION_CEILING_PERMILLE,
     DEFAULT_RESERVATION_LEASE_MS, DEFAULT_RESERVE_BYTES, DEFAULT_RESERVE_PERMILLE,
-    DEFAULT_TOTAL_BUDGET_BYTES, DEFAULT_WATERMARK_PERMILLE, MAX_CAPACITY_PERMILLE,
-    MAX_INSTALL_ALLOWANCE_BYTES, MAX_RESERVE_BYTES, MAX_RESERVE_PERMILLE, MIN_CAPACITY_PERMILLE,
-    MIN_INSTALL_ALLOWANCE_BYTES, MIN_RESERVE_BYTES, MIN_RESERVE_PERMILLE,
+    DEFAULT_SHADOW_MAX_BYTES_PER_SHADOW, DEFAULT_TOTAL_BUDGET_BYTES, DEFAULT_WATERMARK_PERMILLE,
+    MAX_CAPACITY_PERMILLE, MAX_INSTALL_ALLOWANCE_BYTES, MAX_RESERVE_BYTES, MAX_RESERVE_PERMILLE,
+    MAX_SHADOW_MAX_BYTES_PER_SHADOW, MIN_CAPACITY_PERMILLE, MIN_INSTALL_ALLOWANCE_BYTES,
+    MIN_RESERVE_BYTES, MIN_RESERVE_PERMILLE, MIN_SHADOW_MAX_BYTES_PER_SHADOW,
 };
 pub use directory::{DirectoryBackend, SqliteBackend};
 pub use error::{GovernorError, GovernorResult, RefusalReason, StorageRefusal};
 pub use governor::{
-    GovernorRoots, ReconcileReport, Reservation, SqliteAdmission, StorageGovernor,
-    GOVERNOR_DB_NAME, GOVERNOR_DIR_NAME,
+    AdmissionPurpose, GovernorRoots, ReconcileReport, Reservation, ShadowGrowth, SqliteAdmission,
+    StorageGovernor, GOVERNOR_DB_NAME, GOVERNOR_DIR_NAME,
 };
 pub use health::{ClassUsage, DegradedHealth, StorageMetrics};
+pub use ledger::{
+    HistoryAggregateRow, HistoryPruneReport, HISTORY_AGGREGATE_BUCKET_MS, HISTORY_DETAIL_KEEP,
+};
 pub use object::{EvictionOutcome, StorageBackend, StorageObject};

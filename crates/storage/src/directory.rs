@@ -277,6 +277,10 @@ const SQLITE_SKIP_DIRS: &[&str] = &[
     "backups",
     "commercial-backups",
     "target",
+    // Shadow workspaces are their own governed physical class; a project
+    // database inside a shadow is counted once under `shadow_workspace`,
+    // never additionally as required SQLite bytes.
+    "shadows",
 ];
 
 impl SqliteBackend {

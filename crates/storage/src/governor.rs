@@ -17,7 +17,8 @@ use crate::directory::{object_row, DirectoryBackend, SqliteBackend};
 use crate::error::{GovernorError, GovernorResult, RefusalReason, StorageRefusal};
 use crate::health::{ClassUsage, DegradedHealth, StorageMetrics};
 use crate::ledger::{
-    now_ms, Counters, DirectoryRootsMeta, Ledger, ObjectRow, UsageRow, VolumeDenial, VolumeRule,
+    now_ms, Counters, DirectoryRootsMeta, HistoryPruneReport, Ledger, ObjectRow, UsageRow,
+    VolumeDenial, VolumeRule, HISTORY_DETAIL_KEEP,
 };
 use crate::object::{EvictionOutcome, StorageBackend, StorageObject};
 
@@ -70,6 +71,9 @@ pub struct GovernorRoots {
     pub terminal_agent_home: PathBuf,
     pub update_staging: Vec<PathBuf>,
     pub rebuildable_caches: Vec<PathBuf>,
+    /// Daemon-owned shadow mutation workspaces (`<data-dir>/shadows`): one
+    /// governed directory class covering every `<session>/<shadow-id>`.
+    pub shadows_root: PathBuf,
 }
 
 impl GovernorRoots {
@@ -102,6 +106,7 @@ impl GovernorRoots {
                 data_dir.join("store").join("cache"),
                 data_dir.join("cache"),
             ],
+            shadows_root: data_dir.join("shadows"),
             data_dir,
         }
     }
@@ -189,6 +194,44 @@ fn settle_inflight(inflight: &AtomicU64, charged: u64) {
     let _ = inflight.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
         Some(current.saturating_sub(charged))
     });
+}
+
+/// WHY bytes are being admitted: which aggregate-band ceiling the admission
+/// competes under. See [`crate::config`] for the documented three-band
+/// split (normal ≤85%, emergency/critical metadata ≤90%, recovery-only
+/// above). No OS quota is enforced for any band — none is portable
+/// cross-platform; the bands are an admission policy over measured
+/// physical usage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionPurpose {
+    /// Ordinary class admissions (CAS publishes, caches, logs, evidence,
+    /// shadow copies, normal task mutations).
+    Normal,
+    /// Growth the daemon itself must record to stay recoverable:
+    /// SQLite/WAL growth of the governed ledgers.
+    EmergencyMetadata,
+    /// Explicit recovery-path writes (rollback/finalize/repair): the only
+    /// admissions allowed into the 90–100% recovery reserve.
+    Recovery,
+}
+
+impl AdmissionPurpose {
+    /// The aggregate-band ceiling in bytes this purpose may reach.
+    pub fn ceiling_bytes(self, config: &StorageGovernorConfig, effective_budget: u64) -> u64 {
+        match self {
+            AdmissionPurpose::Normal => config.normal_admission_ceiling_bytes(effective_budget),
+            AdmissionPurpose::EmergencyMetadata => config.emergency_ceiling_bytes(effective_budget),
+            AdmissionPurpose::Recovery => effective_budget,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            AdmissionPurpose::Normal => "normal",
+            AdmissionPurpose::EmergencyMetadata => "emergency_metadata",
+            AdmissionPurpose::Recovery => "recovery",
+        }
+    }
 }
 
 /// One shared governor handle (clone is cheap).
@@ -371,6 +414,15 @@ impl StorageGovernor {
             StorageClass::RebuildableCache,
             roots.rebuildable_caches.clone(),
         )));
+        // Shadow workspaces are governed from their FIRST byte: the scan
+        // counts every physical file under the shadow root (build outputs
+        // included — they are excluded from source manifests, never from the
+        // physical budget). The class is non-evictable (live run workspaces;
+        // see [`StorageClass::is_evictable`]).
+        let _ = self.register_backend(Arc::new(DirectoryBackend::with_roots(
+            StorageClass::ShadowWorkspace,
+            vec![roots.shadows_root.clone()],
+        )));
         let _ = self.register_backend(Arc::new(SqliteBackend::new(roots.data_dir.clone())));
     }
 
@@ -508,6 +560,7 @@ impl StorageGovernor {
             StorageClass::BrowserStorage,
             StorageClass::UpdateRemnant,
             StorageClass::RebuildableCache,
+            StorageClass::ShadowWorkspace,
         ] {
             let mut roots = Vec::new();
             let mut age = 0i64;
@@ -679,7 +732,7 @@ impl StorageGovernor {
         key: &str,
         bytes: u64,
     ) -> GovernorResult<Reservation> {
-        self.reserve_inner(class, key, bytes, None)
+        self.reserve_inner(class, key, bytes, None, AdmissionPurpose::Normal)
     }
 
     /// Reserve `bytes` for a write that will land at `destination` (an
@@ -695,7 +748,46 @@ impl StorageGovernor {
         bytes: u64,
         destination: impl AsRef<Path>,
     ) -> GovernorResult<Reservation> {
-        self.reserve_inner(class, key, bytes, Some(destination.as_ref()))
+        self.reserve_inner(
+            class,
+            key,
+            bytes,
+            Some(destination.as_ref()),
+            AdmissionPurpose::Normal,
+        )
+    }
+
+    /// RECOVERY-PATH admission: the same atomic checks as [`Self::reserve`]
+    /// but under the recovery band, i.e. against the FULL effective budget
+    /// instead of the normal ceiling. This is the only way rollback,
+    /// finalize and repair bytes may enter the 90–100% reserve; ordinary
+    /// callers never reach it, and it still enforces class quotas and the
+    /// destination volume's free-space reserve.
+    pub fn reserve_recovery(
+        &self,
+        class: StorageClass,
+        key: &str,
+        bytes: u64,
+    ) -> GovernorResult<Reservation> {
+        self.reserve_inner(class, key, bytes, None, AdmissionPurpose::Recovery)
+    }
+
+    /// [`Self::reserve_recovery`] with an explicit destination path (same
+    /// volume rule as [`Self::reserve_into`]).
+    pub fn reserve_recovery_into(
+        &self,
+        class: StorageClass,
+        key: &str,
+        bytes: u64,
+        destination: impl AsRef<Path>,
+    ) -> GovernorResult<Reservation> {
+        self.reserve_inner(
+            class,
+            key,
+            bytes,
+            Some(destination.as_ref()),
+            AdmissionPurpose::Recovery,
+        )
     }
 
     fn reserve_inner(
@@ -704,6 +796,7 @@ impl StorageGovernor {
         key: &str,
         bytes: u64,
         destination: Option<&Path>,
+        purpose: AdmissionPurpose,
     ) -> GovernorResult<Reservation> {
         if key.is_empty() {
             return Err(GovernorError::Malformed(
@@ -745,6 +838,7 @@ impl StorageGovernor {
                 );
             }
             let total = capacity.effective_budget_bytes;
+            let admission_ceiling = purpose.ceiling_bytes(&self.inner.config, total).min(total);
             let quota = self.inner.config.quota_for(class, total);
             if bytes > quota {
                 return self.refuse(
@@ -766,7 +860,16 @@ impl StorageGovernor {
                     format!("object alone exceeds the {total} byte effective aggregate budget"),
                 );
             }
-            match self.try_reserve(class, key, bytes, quota, total, &destinations, write_bound)? {
+            match self.try_reserve(
+                class,
+                key,
+                bytes,
+                quota,
+                total,
+                admission_ceiling,
+                &destinations,
+                write_bound,
+            )? {
                 Admit::Reserved(reservation) => {
                     self.maintain_watermark()?;
                     self.clear_degraded_if_healthy()?;
@@ -879,6 +982,7 @@ impl StorageGovernor {
         bytes: u64,
         quota: u64,
         total: u64,
+        admission_ceiling: u64,
         destinations: &[PathBuf],
         write_bound: u64,
     ) -> GovernorResult<Admit> {
@@ -899,6 +1003,7 @@ impl StorageGovernor {
             write_bound,
             ledger_volume_id,
             unsettled_inflight: self.inner.wal_debt.inflight.load(Ordering::Acquire),
+            admission_ceiling,
             config: &self.inner.config,
         };
         let row = {
@@ -927,6 +1032,7 @@ impl StorageGovernor {
             return Ok(Admit::Need(Need {
                 class_deficit: row.class_deficit,
                 total_deficit: row.total_deficit,
+                budget_deficit: row.budget_deficit,
                 volume_deficit: match &row.volume_denial {
                     Some(VolumeDenial::Reserve { deficit, .. }) => *deficit,
                     _ => 0,
@@ -1095,6 +1201,14 @@ impl StorageGovernor {
 
     fn evict_row(&self, object: &ObjectRow) -> GovernorResult<u64> {
         if object.required || self.is_pinned(object.class, &object.key)? {
+            return Ok(0);
+        }
+        // Live run workspaces (shadow roots) are counted but never deleted
+        // by LRU pressure: class pressure resolves to a typed refusal and a
+        // degraded health naming the class, never silent destruction of an
+        // in-flight run's files. The cursor in the eviction loops still
+        // advances past these rows, so the pass stays bounded.
+        if !object.class.is_evictable() {
             return Ok(0);
         }
         let Some(backend) = self.backend(object.class) else {
@@ -1316,6 +1430,15 @@ impl StorageGovernor {
             .lock()
             .unwrap()
             .set_meta("last_reconcile_ms", &now.to_string());
+        // History retention on the heavy tick: the append-only loss/eviction/
+        // refusal tables keep their newest HISTORY_DETAIL_KEEP detail rows;
+        // older rows are compacted into hourly aggregates + durable loss
+        // tombstones and their pages reclaimed. Bounded and non-blocking to
+        // admissions (this is the reconcile path, never the hot write path).
+        {
+            let mut ledger = self.inner.ledger.lock().unwrap();
+            let _ = ledger.prune_history(HISTORY_DETAIL_KEEP);
+        }
         self.clear_degraded_if_healthy()?;
         self.evaluate_degraded()?;
         Ok(report)
@@ -1352,6 +1475,29 @@ impl StorageGovernor {
         }
         let watermark_floor =
             effective_budget.saturating_mul(self.inner.config.watermark_permille as u64) / 1000;
+        let normal_ceiling = self
+            .inner
+            .config
+            .normal_admission_ceiling_bytes(effective_budget);
+        let emergency_ceiling = self.inner.config.emergency_ceiling_bytes(effective_budget);
+        let pending_total = pending
+            .values()
+            .copied()
+            .fold(0u64, |sum, bytes| sum.saturating_add(bytes));
+        let band_usage = total.saturating_add(pending_total);
+        let admission_band = if total > effective_budget {
+            "over_budget"
+        } else if band_usage > effective_budget {
+            // Durable usage is inside the budget but live reservations push
+            // the admitted view past it.
+            "over_budget"
+        } else if band_usage > emergency_ceiling {
+            "recovery_reserve"
+        } else if band_usage > normal_ceiling {
+            "emergency"
+        } else {
+            "normal"
+        };
         Ok(StorageMetrics {
             total_bytes: total,
             total_budget_bytes: effective_budget,
@@ -1370,6 +1516,10 @@ impl StorageGovernor {
                 .unwrap_or(0),
             watermark_permille: self.inner.config.watermark_permille,
             above_watermark: total >= watermark_floor,
+            normal_admission_ceiling_bytes: normal_ceiling,
+            emergency_ceiling_bytes: emergency_ceiling,
+            recovery_reserve_bytes: effective_budget.saturating_sub(emergency_ceiling),
+            admission_band: admission_band.to_string(),
             per_class,
             evictions: counters.evictions,
             refusals: counters.refusals,
@@ -1882,8 +2032,17 @@ impl StorageGovernor {
             // path reports the typed `capacity_unmeasured` state.
             return Ok(None);
         }
-        let total = capacity.effective_budget_bytes;
-        let quota = self.inner.config.quota_for(StorageClass::SqliteWal, total);
+        let budget = capacity.effective_budget_bytes;
+        let quota = self.inner.config.quota_for(StorageClass::SqliteWal, budget);
+        // Emergency/critical-metadata band: ledger/WAL growth may consume
+        // up to the emergency ceiling (default 90% of the effective
+        // budget); the RECOVERY-ONLY reserve above it is never spent by
+        // ongoing metadata growth — only explicit recovery admissions.
+        let total = self
+            .inner
+            .config
+            .emergency_ceiling_bytes(budget)
+            .min(budget);
         loop {
             let mut stop = false;
             let mut admitted: Option<SqliteAdmission> = None;
@@ -2032,8 +2191,15 @@ impl StorageGovernor {
             .unwrap()
             .budget_snapshot(StorageClass::SqliteWal, now)?;
         let capacity = self.capacity_snapshot();
-        let total = capacity.effective_budget_bytes;
-        let quota = self.inner.config.quota_for(StorageClass::SqliteWal, total);
+        let budget = capacity.effective_budget_bytes;
+        let quota = self.inner.config.quota_for(StorageClass::SqliteWal, budget);
+        // The admission comparison runs against the emergency band; the
+        // health report below still names the FULL effective budget.
+        let total = self
+            .inner
+            .config
+            .emergency_ceiling_bytes(budget)
+            .min(budget);
         let debt = self.inner.wal_debt.admitted.load(Ordering::Acquire);
         let class_used = snapshot
             .class_bytes
@@ -2070,7 +2236,10 @@ impl StorageGovernor {
         let detail = match &volume_room {
             SqliteVolumeRoom::Unmeasured { detail } => detail.clone(),
             SqliteVolumeRoom::Reserve { detail, .. } => detail.clone(),
-            SqliteVolumeRoom::Ok => "SQLite/WAL growth refused before the append".to_string(),
+            SqliteVolumeRoom::Ok => format!(
+                "SQLite/WAL growth refused before the append ({class_used} used of {quota} \
+                 quota, emergency ceiling {total} of {budget} byte budget)"
+            ),
         };
         let available = quota
             .saturating_sub(class_used)
@@ -2090,10 +2259,10 @@ impl StorageGovernor {
             code: format!("storage_{}", reason.as_str()),
             detail: format!(
                 "SQLite growth of {incoming_bytes} bytes refused ({detail}; {class_used} used of \
-                 {quota} quota, pinned {pinned})"
+                 {quota} quota, emergency ceiling {total}, pinned {pinned})"
             ),
             total_bytes: total_used,
-            total_budget_bytes: total,
+            total_budget_bytes: budget,
             required_bytes: pinned,
             class: Some(StorageClass::SqliteWal),
             at_ms: now_ms(),
@@ -2152,6 +2321,265 @@ impl StorageGovernor {
     pub fn pending_reservations(&self) -> GovernorResult<u64> {
         self.inner.ledger.lock().unwrap().pending_count()
     }
+
+    // ------------------------------------------------------------- shadows
+
+    /// Physical bytes under one directory: every regular file, bounded by
+    /// the same walk limit as directory scans. Unlike the canonical tree
+    /// manifest this NEVER skips build outputs (`target/`, `node_modules`,
+    /// caches): they are excluded from source identity but always count
+    /// against the physical budget.
+    pub fn measure_directory_bytes(root: &Path) -> GovernorResult<u64> {
+        use crate::directory::MAX_WALK_ENTRIES;
+        let mut stack = vec![root.to_path_buf()];
+        let mut total = 0u64;
+        let mut visited = 0usize;
+        while let Some(dir) = stack.pop() {
+            let read = match std::fs::read_dir(&dir) {
+                Ok(read) => read,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(GovernorError::Backend(format!(
+                        "measure {}: {e}",
+                        dir.display()
+                    )));
+                }
+            };
+            for entry in read {
+                visited += 1;
+                if visited > MAX_WALK_ENTRIES {
+                    return Err(GovernorError::Backend(format!(
+                        "directory measurement exceeded the {MAX_WALK_ENTRIES}-entry bound under {}",
+                        root.display()
+                    )));
+                }
+                let entry = entry.map_err(|e| {
+                    GovernorError::Backend(format!("measure entry under {}: {e}", dir.display()))
+                })?;
+                let file_type = entry.file_type().map_err(|e| {
+                    GovernorError::Backend(format!(
+                        "measure entry type under {}: {e}",
+                        dir.display()
+                    ))
+                })?;
+                if file_type.is_symlink() {
+                    continue;
+                }
+                let path = entry.path();
+                if file_type.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if !file_type.is_file() {
+                    continue;
+                }
+                let meta = match std::fs::metadata(&path) {
+                    Ok(meta) => meta,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => {
+                        return Err(GovernorError::Backend(format!(
+                            "measure metadata {}: {e}",
+                            path.display()
+                        )));
+                    }
+                };
+                total = total.saturating_add(meta.len());
+            }
+        }
+        Ok(total)
+    }
+
+    /// Shadow admission BEFORE any copy byte is written: the per-shadow
+    /// hard ceiling is checked first (typed [`RefusalReason::ShadowCeiling`]),
+    /// then the base-copy bytes are reserved against the ACTUAL shadow
+    /// destination filesystem — class quota, admission band and that
+    /// volume's free-space reserve, inside the atomic admission transaction.
+    /// The caller commits with the copied bytes once the copy is durable, so
+    /// the shadow's accounting is charged from its first instant and can
+    /// never break the destination volume's reserve.
+    pub fn shadow_admission(
+        &self,
+        shadow_key: &str,
+        preflight_bytes: u64,
+        destination: impl AsRef<Path>,
+    ) -> GovernorResult<Reservation> {
+        let ceiling = self.inner.config.shadow_max_bytes_per_shadow;
+        if preflight_bytes > ceiling {
+            return self.refuse(
+                StorageClass::ShadowWorkspace,
+                shadow_key,
+                preflight_bytes,
+                0,
+                RefusalReason::ShadowCeiling,
+                format!(
+                    "shadow {shadow_key} base copy of {preflight_bytes} bytes exceeds the {ceiling} \
+                     byte per-shadow hard ceiling (base copy plus physical growth must fit it)"
+                ),
+            );
+        }
+        self.reserve_into(
+            StorageClass::ShadowWorkspace,
+            shadow_key,
+            preflight_bytes,
+            destination,
+        )
+    }
+
+    /// Re-scan one class's backend and replace its durable inventory with
+    /// disk truth (the scan-start guard preserves rows committed after the
+    /// scan began). Used at the shadow begin/retire boundaries so shadow
+    /// accounting is exact immediately — not one maintenance tick later.
+    /// Returns the class's durable bytes after the refresh.
+    pub fn refresh_class_inventory(&self, class: StorageClass) -> GovernorResult<u64> {
+        let Some(backend) = self.backend(class) else {
+            return Err(GovernorError::Unavailable(format!(
+                "no backend registered for {}",
+                class.as_str()
+            )));
+        };
+        let scan_started_ms = now_ms();
+        let objects = backend.scan(self)?;
+        let rows: Vec<ObjectRow> = objects
+            .iter()
+            .map(|object| object_row(class, object))
+            .collect();
+        let mut ledger = self.inner.ledger.lock().unwrap();
+        ledger.set_inventory_scanned_at(class, &rows, scan_started_ms)?;
+        let bytes = ledger
+            .usage()?
+            .get(&class)
+            .map(|row| row.bytes)
+            .unwrap_or(0);
+        Ok(bytes)
+    }
+
+    /// Durable usage of ONE shadow directory (its key plus everything under
+    /// `<key>/` in the shadow class inventory).
+    pub fn shadow_usage(&self, shadow_key: &str) -> GovernorResult<u64> {
+        self.inner
+            .ledger
+            .lock()
+            .unwrap()
+            .usage_prefix(StorageClass::ShadowWorkspace, shadow_key)
+    }
+
+    /// Post-execution growth accounting at the shadow task boundary: refresh
+    /// the class inventory from disk truth (build outputs included), then
+    /// check the per-shadow hard ceiling, the shadow class quota and the
+    /// aggregate budget. On breach a typed refusal is recorded durably,
+    /// health degrades naming the shadow class, and the caller must kill or
+    /// refuse the run per policy — the bytes are already physical, so the
+    /// refusal gates every NEW admission instead of pretending the write
+    /// never happened. No OS quota is enforced (none is portable
+    /// cross-platform); this measurement is the enforcement.
+    pub fn admit_shadow_growth(
+        &self,
+        shadow_key: &str,
+        root: &Path,
+    ) -> GovernorResult<ShadowGrowth> {
+        let measured = Self::measure_directory_bytes(root)?;
+        let class_bytes = self.refresh_class_inventory(StorageClass::ShadowWorkspace)?;
+        let shadow_bytes = self.shadow_usage(shadow_key)?;
+        let capacity = self.capacity_snapshot();
+        let total = self.inner.ledger.lock().unwrap().sum_usage()?;
+        let effective_budget = capacity.effective_budget_bytes;
+        let per_shadow_ceiling = self.inner.config.shadow_max_bytes_per_shadow;
+        let class_quota = self
+            .inner
+            .config
+            .quota_for(StorageClass::ShadowWorkspace, effective_budget);
+        let growth = ShadowGrowth {
+            shadow_bytes,
+            class_bytes,
+            total_bytes: total,
+            per_shadow_ceiling_bytes: per_shadow_ceiling,
+        };
+        if shadow_bytes > per_shadow_ceiling {
+            return self.refuse(
+                StorageClass::ShadowWorkspace,
+                shadow_key,
+                shadow_bytes.saturating_sub(per_shadow_ceiling),
+                0,
+                RefusalReason::ShadowCeiling,
+                format!(
+                    "shadow {shadow_key} holds {shadow_bytes} physical bytes (measured {measured} \
+                     at the task boundary) over its {per_shadow_ceiling} byte hard ceiling; no OS \
+                     quota is enforced cross-platform, so the breach refuses every new admission \
+                     and the run must be killed/refused per policy"
+                ),
+            );
+        }
+        if class_bytes > class_quota {
+            return self.refuse(
+                StorageClass::ShadowWorkspace,
+                shadow_key,
+                class_bytes.saturating_sub(class_quota),
+                0,
+                RefusalReason::ClassQuota,
+                format!(
+                    "shadow class holds {class_bytes} physical bytes over its {class_quota} byte \
+                     quota; shadow workspaces are never LRU-evicted (live run state), so class \
+                     pressure is a typed refusal and new admissions stop"
+                ),
+            );
+        }
+        if total > effective_budget {
+            return self.refuse(
+                StorageClass::ShadowWorkspace,
+                shadow_key,
+                total.saturating_sub(effective_budget),
+                0,
+                RefusalReason::AggregateBudget,
+                format!(
+                    "total governed usage {total} exceeds the {effective_budget} byte hard \
+                     aggregate budget with shadow {shadow_key} at {shadow_bytes} bytes"
+                ),
+            );
+        }
+        Ok(growth)
+    }
+
+    /// Release the durable accounting of one REMOVED shadow directory (its
+    /// key plus its whole prefix) in one transaction: retire/discard and
+    /// the crash sweep free budget room immediately instead of waiting for
+    /// the next full scan. Returns the released bytes.
+    pub fn release_shadow(&self, shadow_key: &str) -> GovernorResult<u64> {
+        self.inner
+            .ledger
+            .lock()
+            .unwrap()
+            .remove_objects_with_prefix(StorageClass::ShadowWorkspace, shadow_key)
+    }
+
+    /// Explicit history-retention pass over the append-only tables (keep the
+    /// newest `detail_keep` rows, compact the rest into hourly aggregates +
+    /// durable loss tombstones, reclaim pages incrementally). Runs on every
+    /// full reconcile with [`HISTORY_DETAIL_KEEP`]; operators and tests may
+    /// force it here.
+    pub fn prune_history(&self, detail_keep: u64) -> GovernorResult<HistoryPruneReport> {
+        self.inner.ledger.lock().unwrap().prune_history(detail_keep)
+    }
+
+    /// The documented default retention pass ([`HISTORY_DETAIL_KEEP`]).
+    pub fn prune_history_default(&self) -> GovernorResult<HistoryPruneReport> {
+        self.prune_history(HISTORY_DETAIL_KEEP)
+    }
+
+    /// The compacted hourly aggregate rows of one history kind
+    /// (`loss_marker`/`eviction`/`refusal`): the durable, bounded view an
+    /// operator reads after retention moved detail rows out.
+    pub fn history_aggregates(
+        &self,
+        kind: &str,
+    ) -> GovernorResult<Vec<crate::HistoryAggregateRow>> {
+        self.inner.ledger.lock().unwrap().history_aggregates(kind)
+    }
+
+    /// Durable per-key archive-loss tombstones kept by retention (each is
+    /// one compacted loss that stays visible and deduplicated).
+    pub fn loss_tombstone_count(&self) -> GovernorResult<u64> {
+        self.inner.ledger.lock().unwrap().loss_tombstone_count()
+    }
 }
 
 enum Admit {
@@ -2176,6 +2604,10 @@ enum SqliteVolumeRoom {
 struct Need {
     class_deficit: u64,
     total_deficit: u64,
+    /// Deficit against the FULL effective budget. Zero with a positive
+    /// `total_deficit` means the write fits the hard budget but not its
+    /// admission band (the recovery reserve held).
+    budget_deficit: u64,
     /// Bytes the destination volume is short of preserving its own reserve,
     /// once unmaterialized reservations and the write bound are charged.
     volume_deficit: u64,
@@ -2210,6 +2642,17 @@ impl Need {
         }
         if self.volume_deficit > 0 {
             return RefusalReason::FreeSpaceReserve;
+        }
+        if self.total_deficit > 0 && self.budget_deficit == 0 {
+            // The write fits the hard aggregate budget but not its admission
+            // band: the recovery reserve (or the emergency band for a normal
+            // admission) held. Typed distinctly from a true budget refusal.
+            return RefusalReason::NormalAdmissionCeiling;
+        }
+        if self.budget_deficit > 0 {
+            // The write exceeds the hard aggregate budget itself (100%): a
+            // true budget exhaustion, never a band artifact.
+            return RefusalReason::AggregateBudget;
         }
         if self.class_deficit > 0 && !self.has_backend {
             return RefusalReason::NoBackend;
@@ -2373,4 +2816,16 @@ pub struct ReconcileReport {
     pub expired_reservations: u64,
     pub missing_loss_markers: u64,
     pub total_bytes: u64,
+}
+
+/// One shadow boundary measurement after a class-inventory refresh: the
+/// shadow's durable bytes, the whole shadow class and the aggregate total,
+/// against which the per-shadow ceiling / class quota / hard budget were
+/// checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShadowGrowth {
+    pub shadow_bytes: u64,
+    pub class_bytes: u64,
+    pub total_bytes: u64,
+    pub per_shadow_ceiling_bytes: u64,
 }
