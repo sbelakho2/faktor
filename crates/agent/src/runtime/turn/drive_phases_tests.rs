@@ -160,3 +160,33 @@ async fn phase_pipeline_drives_a_text_turn_to_its_genuine_end() {
         "the assistant text is durable exactly once: {texts:?}"
     );
 }
+
+/// Audit item 10 wiring witness: the focused-plan pre-gate consults the
+/// mathematically safe upper-bound pretest on the ALREADY-BUILT baseline
+/// plan BEFORE the second `plan_wire_turn_with_prior` call, as a NEGATED
+/// guard (the pretest may only skip a build, never accept one — adoption
+/// stays with the real final-token gate in `choose_design_focus_plan`).
+#[test]
+fn the_focused_plan_build_is_guarded_by_the_upper_bound_pretest() {
+    const SOURCE: &str = include_str!("drive_phases.rs");
+    let flat = SOURCE.split_whitespace().collect::<Vec<_>>().join(" ");
+    let pretest = flat
+        .find(
+            "&& !faktor_context::wire_plan::design_focus_pretest_cannot_qualify( &baseline_plan, )",
+        )
+        .expect("the focused-plan match guard must consult the pretest on the baseline plan");
+    let build = flat
+        .find("let focused_plan = plan_wire_turn_with_prior")
+        .expect("the focused-plan build must exist");
+    assert!(
+        pretest < build,
+        "the pretest must run before the second plan is constructed"
+    );
+    let gate = flat
+        .find("crate::wire_plan::choose_design_focus_plan(baseline_plan, evidence, focused)")
+        .expect("the real dividend gate must still decide");
+    assert!(
+        build < gate,
+        "every surviving case still flows into the real final-token gate"
+    );
+}

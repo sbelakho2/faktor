@@ -1,0 +1,74 @@
+# Faktor CI — OPTIONAL emulated-HIL lane (audit row HAR-18).
+#
+# WHAT THIS PROVES: a real bare-metal firmware image (in-repo source,
+# tests/hil/firmware, built here into target/hil/fw/) booting inside a real
+# system emulator (qemu-system-arm, lm3s6965evb / Cortex-M3) with the
+# harness adapter driving the emulated UART end-to-end, plus the fault
+# matrix: adapter disconnect mid-scenario, corrupted image (digest gate +
+# typed boot failure, never a hang), emulator SIGKILL mid-run with typed
+# reconciliation + deterministic reboot, and the no-orphan / bounded-time
+# invariants. Evidence lands in target/certification/hil/emulated-hil.json
+# (schema faktor-hil-emulated/v1).
+#
+# WHY OPTIONAL: HAR-18's full row also demands a physical HIL rig
+# (scripts/programme/hil.mjs stays the typed refusal gate for that). This
+# lane covers the emulator half only and is operator-triggered (manual
+# event); it is NOT a branch-protection gate and NOT part of the trusted
+# certificate aggregate (check-workflow-graph.mjs only evaluates
+# trusted.yaml).
+#
+# EMULATOR AVAILABILITY (typed refusal, never a fake pass): none of the
+# digest-pinned CI images ship qemu-system-arm, so on those agents the
+# harness exits 2 with `emulator-unavailable` and this lane goes red with
+# the honest reason. Unblock paths (either):
+#   1. run manually on an agent/host that provides qemu-system-arm
+#      (e.g. a self-hosted linux agent with qemu installed), or
+#   2. add `qemu-system-arm` to docker/faktor-ci/Dockerfile and re-record
+#      docker/faktor-ci/image-digest.txt + the digest pin below (image
+#      owner action — the lane below then switches its second step to the
+#      rebuilt faktor-ci image).
+# The lane is deliberately manual-only so the nightly campaign never
+# inherits a red it cannot fix.
+#
+# STORAGE: no volumes (ephemeral). Two steps because no single pinned
+# image carries both the Rust toolchain and Node; the workspace directory
+# persists between steps of one workflow run, which is how the firmware
+# ELF crosses from build to run (same sharing law as the nightly
+# scale-build -> scale pair, without the shared-cache volume).
+#
+# Commit-status context (default format): ci/woodpecker/manual/hil
+
+labels:
+  platform: linux/amd64
+
+when:
+  - event: manual
+
+steps:
+  # ---------------------------------------------------------- hil-build --
+  # Build the in-repo firmware image: bare-metal thumbv7m, no deps, its
+  # Cargo.toml detaches from the root workspace ([workspace] table) so
+  # root cargo commands never resolve it.
+  - name: hil-build
+    image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
+    commands:
+      # cargo discovers .cargo/config.toml (default target + linker args),
+      # and lld resolves -Tlink.x, relative to the working directory — so
+      # build inside the firmware dir, never via --manifest-path from root.
+      - rustup target add thumbv7m-none-eabi
+      - (cd tests/hil/firmware && cargo build --release)
+      - mkdir -p target/hil/fw
+      - cp tests/hil/firmware/target/thumbv7m-none-eabi/release/faktor-hil-fw target/hil/fw/faktor-hil-fw
+      - sha256sum target/hil/fw/faktor-hil-fw
+
+  # ------------------------------------------------------- emulated-hil --
+  # Drive the emulator scenarios. `--kernel` consumes the ELF built by the
+  # previous step. A missing emulator is a TYPED REFUSAL (exit 2), never a
+  # skipped green; scenario failures are exit 1. Total runtime budget:
+  # seconds (each scenario carries internal deadlines and a 25s ceiling).
+  - name: emulated-hil
+    image: node:24-trixie@sha256:016f604a11c4c725f0a4c62e29ff11adab153d297bf97046c9bf2ddb9f1011d3 # node:24-trixie @ 2026-10-24 (same digest-pinned baseline as the nightly scale lane)
+    commands:
+      - node --version
+      - node tests/hil/emulated-hil.mjs --scenario all --kernel target/hil/fw/faktor-hil-fw
+      - cat target/certification/hil/emulated-hil.json

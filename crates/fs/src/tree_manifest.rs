@@ -675,6 +675,7 @@ fn copy_open_file_rooted(
             .map_err(|e| crate::Error::internal(format!("flush {}: {e}", tmp_rel.display())))?;
         out.sync_all()
             .map_err(|e| crate::Error::internal(format!("fsync {}: {e}", tmp_rel.display())))?;
+        crate::fault::trip("manifest_stage.fsynced");
         drop(out);
         dst.atomic_publish(&tmp_rel, dst_rel)?;
         Ok((copied, crate::FileHash::from(hasher.finalize().into())))

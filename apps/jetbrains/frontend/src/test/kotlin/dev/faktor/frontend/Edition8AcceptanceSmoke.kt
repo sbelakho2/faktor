@@ -85,7 +85,12 @@ object Edition8AcceptanceSmoke {
         }
         val root = File(repoRoot(), "target/certification/edition8")
         root.mkdirs()
-        File(root, "acceptance-jetbrains.overlays.json").writeText(
+        // HAR-16: per-version overlay file so a second-IDE-version leg never
+        // clobbers the pinned-release acceptance evidence.
+        val overlaysPath = ParityPath.versionedCertPath(
+            "target/certification/edition8/acceptance-jetbrains.overlays.json"
+        )
+        File(root, overlaysPath.substringAfterLast('/')).writeText(
             JsonCodec.write(
                 JsonValue.Obj(
                     linkedMapOf(
@@ -233,7 +238,13 @@ object Edition8AcceptanceSmoke {
             }
             requireHost(compactOk, "A39", failures)
             "240px + 200%: primary reachable and no horizontal scroll on S58/S70$compactDetail" +
-                (if (File(repoRoot(), HOST_MATRIX_PATH).isFile) "; host matrix artifact present" else "")
+                (
+                    if (File(repoRoot(), ParityPath.versionedCertPath(HOST_MATRIX_PATH)).isFile) {
+                        "; host matrix artifact present"
+                    } else {
+                        ""
+                    }
+                )
         }
         "A40" -> {
             val page = parseNativeEventPage(

@@ -1,0 +1,144 @@
+{
+  "description": "Planted violation: the escalation turn completes without a task ledger entry or task profile.",
+  "recorded": {
+    "max_requests": 20,
+    "escalation_index": 3,
+    "turns": [
+      {
+        "id": "greeting",
+        "kind": "ask",
+        "status": "completed",
+        "user_prompt": "Hello! Who are you, and what can you help me with?",
+        "assistant_text": "I am Faktor, a durable agent runtime. I journal every operation so crash recovery is exact and predictable.",
+        "tasks_before": 0,
+        "tasks_after": 0,
+        "verification_before": {
+          "owed": [],
+          "failedChecks": []
+        },
+        "requests": [
+          {
+            "messages": [
+              {
+                "role": "user",
+                "content": "Hello! Who are you, and what can you help me with?"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "conceptual-explanation",
+        "kind": "ask",
+        "status": "completed",
+        "user_prompt": "Explain in two paragraphs how a content-addressable store works.",
+        "assistant_text": "Content addressing derives identity from payload bytes, so identical blobs deduplicate. An agent runtime journals these digests for replayable recovery.",
+        "tasks_before": 0,
+        "tasks_after": 0,
+        "verification_before": {
+          "owed": [],
+          "failedChecks": []
+        },
+        "requests": [
+          {
+            "messages": [
+              {
+                "role": "user",
+                "content": "Explain in two paragraphs how a content-addressable store works."
+              },
+              {
+                "role": "assistant",
+                "content": "I am Faktor, a durable agent runtime. I journal every operation so crash recovery is exact and predictable."
+              },
+              {
+                "role": "user",
+                "content": "Explain in two paragraphs how a content-addressable store works."
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "repository-lookup",
+        "kind": "ask",
+        "status": "completed",
+        "user_prompt": "Where is compute_checksum defined? Give exact paths.",
+        "assistant_text": "compute_checksum lives in rust/telemetry_core/src/lib.rs and deduplicates telemetry envelopes by digest.",
+        "tasks_before": 0,
+        "tasks_after": 0,
+        "verification_before": {
+          "owed": [],
+          "failedChecks": []
+        },
+        "requests": [
+          {
+            "messages": [
+              {
+                "role": "user",
+                "content": "Where is compute_checksum defined? Give exact paths."
+              },
+              {
+                "role": "assistant",
+                "content": "Content addressing derives identity from payload bytes, so identical blobs deduplicate. An agent runtime journals these digests for replayable recovery."
+              },
+              {
+                "role": "user",
+                "content": "Where is compute_checksum defined? Give exact paths."
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "escalation",
+        "kind": "task",
+        "status": "completed",
+        "user_prompt": "Now implement it: add a one-line doc comment to compute_checksum.",
+        "assistant_text": "Added the doc comment to compute_checksum in rust/telemetry_core/src/lib.rs; no verification command was needed for a comment.",
+        "tasks_before": 0,
+        "tasks_after": 0,
+        "verification_before": {
+          "owed": [],
+          "failedChecks": []
+        },
+        "requests": [
+          {
+            "messages": [
+              {
+                "role": "system",
+                "content": "You are Faktor, a careful senior assistant."
+              },
+              {
+                "role": "user",
+                "content": "Explain in two paragraphs how a content-addressable store works."
+              },
+              {
+                "role": "assistant",
+                "content": "Content addressing derives identity from payload bytes, so identical blobs deduplicate. An agent runtime journals these digests for replayable recovery."
+              },
+              {
+                "role": "user",
+                "content": "Where is compute_checksum defined? Give exact paths."
+              },
+              {
+                "role": "assistant",
+                "content": "compute_checksum lives in rust/telemetry_core/src/lib.rs and deduplicates telemetry envelopes by digest."
+              },
+              {
+                "role": "user",
+                "content": "Now implement it: add a one-line doc comment to compute_checksum."
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "expect": {
+    "fail": [
+      "escalation-established@3"
+    ],
+    "review": [],
+    "review_items_min": 4
+  }
+}

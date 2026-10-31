@@ -3490,7 +3490,7 @@ fn unchanged_read_marker_is_digest_keyed_bounded_and_fresh_bypassable() {
 /// that reaches `run_tool_calls` — a pre-existing, ask/task-agnostic
 /// behavior this change does not alter; the zero-ledger ask pin in
 /// `media_tests` covers the tool-free conversational turn.)
-fn assert_ask_refusal_answered(
+pub(super) fn assert_ask_refusal_answered(
     runtime: &AgentRuntime,
     session: SessionId,
     call_id: &str,

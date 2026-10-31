@@ -351,6 +351,26 @@ pub(crate) enum ToolDenialKind {
     /// drops is genuinely not in the active bundle. No separate denial
     /// kind exists for it.
     NotInActiveBundle,
+    /// The deferred promotion signal of the conversational turn (the ONE
+    /// non-read tool an ask may name — see [`ask_may_run`]): the typed
+    /// `promotion_deferred` refusal that simultaneously ARMED the durable
+    /// pending marker for the NEXT submission. Never executed, no
+    /// permission hop, no run row; the signal's entire authority is that
+    /// arm write.
+    PromotionDeferred,
+    /// The promotion signal of THIS turn already armed its marker (one
+    /// promotion per conversational turn): the earlier objective stands.
+    PromotionAlreadyRequested,
+    /// The promotion signal's payload failed the strict protocol DTO (wrong
+    /// shape/type/size). Refused before any durable effect — an armed
+    /// marker from an earlier valid call in the same turn is never
+    /// clobbered by a malformed one.
+    PromotionInvalid,
+    /// The promotion signal was answered with engineering semantics
+    /// `promotion_not_applicable`: the durable turn-execution row says this
+    /// turn already runs TaskExecutor engineering authority (a stale or
+    /// registry-provided call on an engineering turn). Never armed.
+    PromotionNotApplicable,
 }
 
 impl ToolDenialKind {
@@ -363,7 +383,31 @@ impl ToolDenialKind {
             ToolDenialKind::SecretDetected => "secret_detected",
             ToolDenialKind::ChangeBudgetRefused => "change_budget_refused",
             ToolDenialKind::NotInActiveBundle => "not_in_active_bundle",
+            ToolDenialKind::PromotionDeferred => faktor_protocol::PROMOTION_DEFERRED_TAG,
+            ToolDenialKind::PromotionAlreadyRequested => {
+                faktor_protocol::PROMOTION_ALREADY_REQUESTED_TAG
+            }
+            ToolDenialKind::PromotionInvalid => faktor_protocol::PROMOTION_INVALID_TAG,
+            ToolDenialKind::PromotionNotApplicable => "promotion_not_applicable",
         }
+    }
+
+    /// TRUE for the promotion-signal outcomes: a CONTROL-PLANE signal, not
+    /// a task-tool failure. It is durable turn history (the typed
+    /// `tool_result` is written for every denial) but it is deliberately
+    /// EXCLUDED from `TurnSummary.failures`: durable cross-turn loop
+    /// detection must never punish a later turn's legitimate promotion, and
+    /// a deferral is an honest capability answer, not a failing tool call.
+    /// The per-turn [`LoopDetector`] still counts the denial reason, so a
+    /// model grinding the same refused call still hits the bounded trip.
+    pub(crate) fn is_promotion_signal(self) -> bool {
+        matches!(
+            self,
+            ToolDenialKind::PromotionDeferred
+                | ToolDenialKind::PromotionAlreadyRequested
+                | ToolDenialKind::PromotionInvalid
+                | ToolDenialKind::PromotionNotApplicable
+        )
     }
 }
 
@@ -430,8 +474,17 @@ impl DeniedToolCall {
 /// dispatch by the membership guard with the SAME typed
 /// [`ToolDenialKind::NotInActiveBundle`] refusal (documented choice: the
 /// guard's contract is bundle membership, so no second denial kind).
+///
+/// The ONE named exception: [`faktor_protocol::PROMOTION_REQUEST_TOOL`],
+/// the reserved deferred-promotion signal. It is deliberately NOT
+/// read-only in the effect system (it arms a durable session fact —
+/// `external_mutation`), and it is deliberately the ONLY non-read tool an
+/// ask may name: it is put in the ask bundle explicitly here, and at
+/// dispatch it is intercepted BEFORE the permission hop and any execution
+/// (see [`AgentRuntime::intercept_promotion_signal`]), so it can never run
+/// as a provider tool.
 pub(crate) fn ask_may_run(spec: &faktor_provider::ToolSpec) -> bool {
-    spec.effects.is_read_only()
+    spec.name == faktor_protocol::PROMOTION_REQUEST_TOOL || spec.effects.is_read_only()
 }
 
 /// Re-validate stored invocation args against the tool's input schema
@@ -1037,6 +1090,126 @@ impl AgentRuntime {
         Ok(())
     }
 
+    /// The reserved promotion signal refusal path, split out of
+    /// [`Self::run_tool_calls`]: intercepted BY NAME before any registry
+    /// lookup, permission hop, scheduler or execution (when intercepted it
+    /// NEVER executes as a provider tool — there is no executable behind
+    /// the spec anywhere). Bundle membership still governs the OFFER (an
+    /// enablement deny lands here with the ordinary typed membership
+    /// refusal), every outcome is a durable typed refusal journal event,
+    /// and a marker-arm failure is a LOUD typed error — a deferral is never
+    /// claimed without its durable row. Returns after journaling + pushing
+    /// the denial (the caller always `continue`s).
+    // 8 params: the bundle-membership branch mirrors the batch loop
+    // refusal surface and must not collapse its named fields.
+    #[allow(clippy::too_many_arguments)]
+    async fn refuse_promotion_call(
+        self: &Arc<Self>,
+        handle: &faktor_session::SessionHandle,
+        turn_op: OpId,
+        call_id: &str,
+        name: &str,
+        input: &serde_json::Value,
+        active_bundle: &ToolBundle,
+        denied: &mut Vec<DeniedToolCall>,
+    ) -> faktor_core::Result<()> {
+        let denial = if !active_bundle.tools.iter().any(|spec| spec.name == name) {
+            DeniedToolCall {
+                call_id: call_id.to_string(),
+                name: name.to_string(),
+                kind: ToolDenialKind::NotInActiveBundle,
+                reason: format!("tool {name} is not part of the active tool bundle for this turn"),
+            }
+        } else {
+            self.promotion_signal_denial(handle, turn_op, call_id, name, input)?
+        };
+        handle
+            .append_journal_event(
+                faktor_core::event::EventKind::PermissionDenied,
+                handle.state()?,
+                Some(turn_op),
+                Some(serde_json::json!({
+                    "tool": name,
+                    "reason": denial.reason.clone()
+                })),
+            )
+            .await?;
+        denied.push(denial);
+        Ok(())
+    }
+
+    /// The unknown-tool refusal path, split out of
+    /// [`Self::run_tool_calls`] (audit Tangerine-10/P1-UX semantics live
+    /// in the caller's lookup): recorded on the loop detector, then the
+    /// SAME durable journal outcome every other refusal path journals —
+    /// never a silent skip (the self-transition is legal from the
+    /// batch-entry state). The refusal reason names ONLY the tool the
+    /// model itself used.
+    async fn refuse_unknown_tool(
+        handle: &faktor_session::SessionHandle,
+        turn_op: OpId,
+        detector: &mut LoopDetector,
+        call_id: &str,
+        name: &str,
+        denied: &mut Vec<DeniedToolCall>,
+    ) -> faktor_core::Result<()> {
+        let reason = format!("unknown tool: {name}");
+        detector.record_error(&format!("unknown tool {name}"));
+        handle
+            .append_journal_event(
+                faktor_core::event::EventKind::PermissionDenied,
+                handle.state()?,
+                Some(turn_op),
+                Some(serde_json::json!({ "tool": name, "reason": reason })),
+            )
+            .await?;
+        denied.push(DeniedToolCall {
+            call_id: call_id.to_string(),
+            name: name.to_string(),
+            kind: ToolDenialKind::UnknownTool,
+            reason,
+        });
+        Ok(())
+    }
+
+    /// The active-bundle membership refusal, split out of
+    /// [`Self::run_tool_calls`] (docs/acquire.md §4 hardening): the model
+    /// may only invoke tools the request it is answering actually carried.
+    /// A REGISTERED tool that is not in the turn's constructed bundle —
+    /// today the lazy `source_market` before its activation — is refused
+    /// with a typed denial BEFORE the permission hop and before any
+    /// execution, so no permission prompt, no run row and no tool/service
+    /// call can happen. The refusal reason names ONLY the tool the model
+    /// itself used: schema and description never leak. The refusal is
+    /// durable audit (journal), exactly like every other refusal path —
+    /// never a silent skip.
+    async fn refuse_inactive_bundle_tool(
+        handle: &faktor_session::SessionHandle,
+        turn_op: OpId,
+        detector: &mut LoopDetector,
+        call_id: &str,
+        name: &str,
+        denied: &mut Vec<DeniedToolCall>,
+    ) -> faktor_core::Result<()> {
+        let reason = format!("tool {name} is not part of the active tool bundle for this turn");
+        detector.record_error(&format!("inactive tool {name} refused"));
+        handle
+            .append_journal_event(
+                faktor_core::event::EventKind::PermissionDenied,
+                handle.state()?,
+                Some(turn_op),
+                Some(serde_json::json!({ "tool": name, "reason": reason })),
+            )
+            .await?;
+        denied.push(DeniedToolCall {
+            call_id: call_id.to_string(),
+            name: name.to_string(),
+            kind: ToolDenialKind::NotInActiveBundle,
+            reason,
+        });
+        Ok(())
+    }
+
     /// Execute tool calls in parallel via the scheduler, feeding results
     /// back. Returns the number of tools actually executed. Every call must
     /// be a MEMBER of `active_bundle` — the exact bundle the answered
@@ -1102,6 +1275,23 @@ impl AgentRuntime {
                 return Ok(executed); // drive_turn stops the turn
             }
 
+            // The reserved promotion signal, intercepted BY NAME before any
+            // registry lookup, permission hop, scheduler or execution — see
+            // [`Self::refuse_promotion_call`].
+            if name == faktor_protocol::PROMOTION_REQUEST_TOOL {
+                self.refuse_promotion_call(
+                    handle,
+                    turn_op,
+                    &call_id,
+                    &name,
+                    &input,
+                    active_bundle,
+                    &mut denied,
+                )
+                .await?;
+                continue;
+            }
+
             let tool = match self.deps.tools.get(&name) {
                 Some(t) => t,
                 // The real semantic escape hatch (audit Tangerine-10): when a
@@ -1119,61 +1309,31 @@ impl AgentRuntime {
                     crate::semantic_tool::tool(self.deps.semantic.clone())
                 }
                 None => {
-                    let reason = format!("unknown tool: {name}");
-                    detector.record_error(&format!("unknown tool {name}"));
-                    // Uniform journal outcome: every other refusal path
-                    // journals PermissionDenied, so the unknown-tool refusal
-                    // is durable audit too — never a silent skip (the
-                    // self-transition is legal from the batch-entry state).
-                    handle
-                        .append_journal_event(
-                            faktor_core::event::EventKind::PermissionDenied,
-                            handle.state()?,
-                            Some(turn_op),
-                            Some(serde_json::json!({ "tool": name, "reason": reason })),
-                        )
-                        .await?;
-                    denied.push(DeniedToolCall {
-                        call_id: call_id.clone(),
-                        name: name.clone(),
-                        kind: ToolDenialKind::UnknownTool,
-                        reason,
-                    });
+                    Self::refuse_unknown_tool(
+                        handle,
+                        turn_op,
+                        detector,
+                        &call_id,
+                        &name,
+                        &mut denied,
+                    )
+                    .await?;
                     continue;
                 }
             };
 
-            // Active-bundle membership guard (docs/acquire.md §4 hardening):
-            // the model may only invoke tools the request it is answering
-            // actually carried. A REGISTERED tool that is not in the turn's
-            // constructed bundle — today the lazy `source_market` before its
-            // activation — is refused here with a typed denial BEFORE the
-            // permission hop and before any execution, so no permission
-            // prompt, no run row and no tool/service call can happen. The
-            // refusal reason names ONLY the tool the model itself used:
-            // schema and description never leak.
+            // Active-bundle membership guard (docs/acquire.md §4 hardening)
+            // — see [`Self::refuse_inactive_bundle_tool`].
             if !active_bundle.tools.iter().any(|spec| spec.name == name) {
-                let reason =
-                    format!("tool {name} is not part of the active tool bundle for this turn");
-                detector.record_error(&format!("inactive tool {name} refused"));
-                // Uniform journal outcome, exactly like the unknown-tool
-                // refusal: every refusal is durable audit, never a silent
-                // skip (the self-transition is legal from the batch-entry
-                // state).
-                handle
-                    .append_journal_event(
-                        faktor_core::event::EventKind::PermissionDenied,
-                        handle.state()?,
-                        Some(turn_op),
-                        Some(serde_json::json!({ "tool": name, "reason": reason })),
-                    )
-                    .await?;
-                denied.push(DeniedToolCall {
-                    call_id: call_id.clone(),
-                    name: name.clone(),
-                    kind: ToolDenialKind::NotInActiveBundle,
-                    reason,
-                });
+                Self::refuse_inactive_bundle_tool(
+                    handle,
+                    turn_op,
+                    detector,
+                    &call_id,
+                    &name,
+                    &mut denied,
+                )
+                .await?;
                 continue;
             }
 
@@ -1845,6 +2005,15 @@ impl AgentRuntime {
                 }
             }
             let line = self.redact_configured_secrets(&denial.ledger_line());
+            // A promotion-signal outcome is a control-plane answer, not a
+            // task-tool failure: it is durable turn history (the typed
+            // tool_result above) but stays OUT of `failures`, so the
+            // durable cross-turn loop window never punishes a later
+            // turn's legitimate promotion. The per-turn detector below
+            // still counts it (bounded within the turn).
+            if denial.kind.is_promotion_signal() {
+                continue;
+            }
             if !turn_summary.failures.iter().any(|f| f == &line) {
                 turn_summary.failures.push(line);
             }
@@ -1860,6 +2029,134 @@ impl AgentRuntime {
         }
         handle.put_task_ledger(serde_json::to_value(ledger)?)?;
         Ok(executed)
+    }
+
+    /// The typed interception of ONE `promotion_request` call of a
+    /// conversational turn — the ONE deterministic mid-turn escalation
+    /// seam. It NEVER executes: no permission hop, no run row, no tool
+    /// body. Every outcome is a durable typed refusal; the only durable
+    /// EFFECT it can produce is arming the session's pending-promotion
+    /// marker.
+    ///
+    /// Bounds and honesty rules (each adversarially pinned):
+    /// - strict DTO FIRST: a malformed/empty/oversized/extra-member payload
+    ///   answers `promotion_invalid` and never touches an armed marker;
+    /// - conversational-only defense in depth: bundle construction already
+    ///   gates the offer (the signal is stripped from engineering bundles);
+    ///   this re-check answers `promotion_not_applicable` if a stale or
+    ///   registry-provided name arrives on an engineering turn;
+    /// - ONE promotion per turn: a marker armed by THIS turn op answers
+    ///   `promotion_already_requested` (the earlier objective stands); a
+    ///   marker from an earlier, never-consumed turn is replaced by this
+    ///   arm (the newest request wins — still exactly one row);
+    /// - `promotion_deferred` is claimed ONLY after the arm write
+    ///   succeeded: a store failure propagates as a loud typed error, never
+    ///   as a deferral the durable row does not back;
+    /// - DOCUMENTED allowed point: the signal is accepted at ANY point of
+    ///   its conversational turn (deferral changes no mid-turn authority,
+    ///   so there is no pre-first-tool restriction); the bound is the
+    ///   one-per-turn marker, and the turn's durable history is only ever
+    ///   APPENDED to (the refusal's own tool_result), never rewritten.
+    fn promotion_signal_denial(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        turn_op: OpId,
+        call_id: &str,
+        name: &str,
+        input: &serde_json::Value,
+    ) -> faktor_core::Result<DeniedToolCall> {
+        let refusal = |kind: ToolDenialKind, reason: String| DeniedToolCall {
+            call_id: call_id.to_string(),
+            name: name.to_string(),
+            kind,
+            reason,
+        };
+        // 1) strict protocol DTO (shape + trim + byte bound), refused before
+        //    ANY durable effect.
+        let request = match faktor_protocol::PromotionRequest::from_value(input.clone()) {
+            Ok(request) => request,
+            Err(err) => {
+                return Ok(refusal(
+                    ToolDenialKind::PromotionInvalid,
+                    format!("promotion request refused: strict payload required ({err})"),
+                ));
+            }
+        };
+        let objective = match request.validated_objective() {
+            Ok(objective) => objective,
+            Err(err) => {
+                return Ok(refusal(
+                    ToolDenialKind::PromotionInvalid,
+                    format!("promotion request refused: {err}"),
+                ));
+            }
+        };
+        // 2) conversational turns only (defense in depth; see the doc above).
+        if !Self::turn_is_conversational_ask(handle) {
+            return Ok(refusal(
+                ToolDenialKind::PromotionNotApplicable,
+                "this turn already runs engineering authority; there is nothing to promote"
+                    .to_string(),
+            ));
+        }
+        // 3) the one-per-turn bound against the durable marker.
+        match handle.memory_fact_get(
+            faktor_protocol::PROMOTION_PENDING_ROW_KIND,
+            faktor_protocol::PROMOTION_PENDING_ROW_KEY,
+        ) {
+            Ok(Some(value)) => match faktor_protocol::TurnPromotionRow::decode(&value) {
+                Ok(row) if row.turn_op == turn_op.raw() => {
+                    return Ok(refusal(
+                        ToolDenialKind::PromotionAlreadyRequested,
+                        "a promotion is already armed for this turn: one promotion per turn, \
+                         the earlier objective stands"
+                            .to_string(),
+                    ));
+                }
+                Ok(_) => {
+                    // An earlier, never-consumed arm: this request replaces
+                    // it below (bounded: still exactly one marker row, the
+                    // newest objective).
+                }
+                Err(err) => {
+                    // Corrupt marker: LOUD, and the fresh valid arm below
+                    // heals the row — a corrupt row could never be consumed
+                    // anyway (admission skips it typed).
+                    tracing::error!(
+                        error = %err,
+                        "promotion signal: corrupt pending marker replaced by a fresh valid arm"
+                    );
+                }
+            },
+            Ok(None) => {
+                // No marker armed: this call arms the session's one slot.
+            }
+            Err(err) => return Err(err),
+        }
+        // 4) arm durably; ONLY a successful write earns promotion_deferred.
+        let row = faktor_protocol::TurnPromotionRow::new(
+            objective,
+            turn_op.raw(),
+            self.deps.clock.now_ms(),
+        )
+        .map_err(|err| Error::malformed(format!("promotion objective invalid: {err}")))?;
+        let encoded = row
+            .encode()
+            .map_err(|err| Error::malformed(format!("promotion marker encode: {err}")))?;
+        handle.upsert_memory_fact(
+            faktor_protocol::PROMOTION_PENDING_ROW_KIND,
+            faktor_protocol::PROMOTION_PENDING_ROW_KEY,
+            &encoded,
+        )?;
+        Ok(refusal(
+            ToolDenialKind::PromotionDeferred,
+            "promotion deferred: the objective is armed as this session's pending promotion — \
+             the NEXT submission is pre-marked EstablishContract and enters TaskExecutor \
+             admission with the same authority (shadow, contract, budget, verification). This \
+             turn continues conversational: no second agent, no re-run of this turn, one \
+             promotion per turn."
+                .to_string(),
+        ))
     }
 
     /// Append ONE refused call's durable typed result part (see
@@ -2029,8 +2326,117 @@ impl AgentRuntime {
                 .tools
                 .retain(|tool| tool.name != crate::tool::SEMANTIC_QUERY_TOOL);
         }
+        // The reserved promotion signal (deliverable: an ask turn may CALL
+        // it — put in the ASK bundle explicitly; see `ask_may_run`). The
+        // gate is the durable turn state PLUS a tool-capable model: the
+        // session's ONE active turn record (at most one active logical
+        // turn per session — the record IS this drive's turn) plus its
+        // op-keyed `TurnExecution` row. A non-tool model never receives
+        // the offer (its request carries no tools at all — the wire stays
+        // byte-identical to the historical shape). Absent record
+        // (direct/recordless drive, every unit test of the historical
+        // bundle) or absent row (the engineering task default) means NO
+        // signal is offered and any registry-provided spec under the
+        // reserved name is STRIPPED — the name never rides an engineering
+        // turn's wire, and a recordless bundle stays byte-identical to the
+        // historical one. A transient read failure FAILS CLOSED to "no
+        // signal" (loud log): signal availability is advisory and must
+        // never fail the turn; the interception path itself fails loud
+        // instead (it grounds a durable effect).
+        if capabilities.tools && Self::turn_is_conversational_ask(handle) {
+            bundle
+                .tools
+                .retain(|tool| tool.name != faktor_protocol::PROMOTION_REQUEST_TOOL);
+            bundle.tools.push(Self::promotion_spec());
+            bundle.tools.sort_by(|a, b| a.name.cmp(&b.name));
+        } else {
+            bundle
+                .tools
+                .retain(|tool| tool.name != faktor_protocol::PROMOTION_REQUEST_TOOL);
+        }
         self.apply_tool_enablement(&mut bundle, handle);
         bundle
+    }
+
+    /// The protocol-owned wire spec of the reserved promotion signal. It is
+    /// a SPEC ONLY — there is no registered executable behind it anywhere:
+    /// dispatch intercepts the name before any registry lookup, so the call
+    /// can never execute as a provider tool. The JSON `maxLength` is a
+    /// character-side hint; the strict byte bound lives in the protocol DTO
+    /// (`validate_promotion_objective`) and is enforced at interception.
+    /// Effects are honestly non-read-only (`external_mutation`: it arms a
+    /// durable session fact), which is exactly why the ask filter needs the
+    /// explicit name exception.
+    fn promotion_spec() -> faktor_provider::ToolSpec {
+        faktor_provider::ToolSpec {
+            name: faktor_protocol::PROMOTION_REQUEST_TOOL.to_string(),
+            description: "Request promotion of this conversational turn into an engineering task: \
+                 state the engineering objective. The runtime answers a typed \
+                 promotion_deferred result (one per turn) and pre-marks the session's NEXT \
+                 submission to establish the engineering contract through the same TaskExecutor \
+                 admission authority — no second agent, no re-run of this turn."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "objective": {
+                        "type": "string",
+                        "description": "The engineering objective to establish (bounded, at most 512 bytes after trim).",
+                        "minLength": 1,
+                        "maxLength": faktor_protocol::MAX_PROMOTION_OBJECTIVE_BYTES,
+                    }
+                },
+                "required": ["objective"],
+                "additionalProperties": false
+            }),
+            effects: faktor_provider::ToolEffects {
+                workspace_read: false,
+                network_read: false,
+                workspace_write: false,
+                process_exec: false,
+                network_write: false,
+                external_mutation: true,
+                git_mutation: false,
+            },
+        }
+    }
+
+    /// TRUE when the ACTIVE logical turn of this session is a
+    /// conversational ask (the promotion signal's ONLY legal surface).
+    ///
+    /// Reads the session's active `turn_record` (at most one active logical
+    /// turn per session — a queued prompt has NO record until its claim,
+    /// and `start_turn_record` finalizes any other active row, so during a
+    /// live drive the active record IS this drive's turn) and its op-keyed
+    /// [`faktor_protocol::TurnExecution`] row. Both reads are point lookups
+    /// on the bundle path; a transient failure fails closed to `false`
+    /// (loud log — the signal is simply not offered). A present-but-
+    /// corrupt execution row is the SAME loud typed refusal the drive start
+    /// already applied (`TurnDriveState::new`), surfaced here as `false`
+    /// with an error log rather than a panic — the turn itself has already
+    /// been validated by then.
+    fn turn_is_conversational_ask(handle: &faktor_session::SessionHandle) -> bool {
+        let record = match handle.active_turn_record() {
+            Ok(Some(record)) => record,
+            Ok(None) => return false,
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    "promotion signal: active turn record unreadable; offering no signal"
+                );
+                return false;
+            }
+        };
+        match read_turn_execution(handle, record.turn_op_id) {
+            Ok(row) => row.is_some_and(|row| row.execution.is_ask()),
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    "promotion signal: turn-execution row unreadable; offering no signal"
+                );
+                false
+            }
+        }
     }
 
     /// Runtime tool-enablement authority (F165): remove every disabled tool

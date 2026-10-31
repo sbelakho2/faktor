@@ -5225,28 +5225,6 @@ mod runtime_tests_collision;
 #[path = "runtime_tests_perf.rs"]
 mod runtime_tests_perf;
 
-/// The run-mirror lock is a projection of the durable rows: a poisoned guard
-/// (a panicking writer) must be recovered by the next read path instead of
-/// wedging child execution, and the poison flag must be cleared.
-#[test]
-fn poisoned_exec_mirror_recovers_and_serves_reads() {
-    let dir = tempfile::tempdir().unwrap();
-    let env = open_env(dir.path(), vec![], 0);
-    let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _guard = env.orchestrator.exec.lock().unwrap();
-        panic!("poison the exec mirror (test seam)");
-    }));
-    assert!(poisoned.is_err(), "the poisoner must unwind");
-    assert!(env.orchestrator.exec.is_poisoned());
-    // OWNERSHIP projection => reconciled recovery: the read path serves durable truth.
-    let err = env
-        .orchestrator
-        .locate_child("missing-child")
-        .expect_err("an unknown child is a typed NotFound, never a panic");
-    assert!(matches!(err, ExecError::NotFound(_)), "{err:?}");
-    assert!(!env.orchestrator.exec.is_poisoned());
-}
-
 // ------------------------------------------------- commercial admission gate
 // (Wave 3) The ONE gate hook is consulted at exactly three SAFE BOUNDARIES:
 // new task admission, new child spawn, new provider attempt BEFORE
@@ -5260,3 +5238,5 @@ fn poisoned_exec_mirror_recovers_and_serves_reads() {
 // `use super::*`.
 #[path = "runtime_tests_admission.rs"]
 mod runtime_tests_admission;
+#[path = "runtime_tests_tail.rs"]
+mod runtime_tests_tail;

@@ -155,7 +155,7 @@ fn doctor_on_a_fresh_dir_passes_without_creating_a_store_side_effect_first() {
 
 fn provider_config(port: u16) -> String {
     format!(
-        r#"{{"config_version":1,"model":"m","providers":[{{"kind":"open_ai","id":"p1","base_url":"http://127.0.0.1:{port}/v1","api_key_env":"MOCK_KEY","api":"chat","allow_loopback":true}}]}}"#
+        r#"{{"config_version":1,"model":"m","storage":{{"reserve_permille":1,"reserve_bytes":0}},"providers":[{{"kind":"open_ai","id":"p1","base_url":"http://127.0.0.1:{port}/v1","api_key_env":"MOCK_KEY","api":"chat","allow_loopback":true}}]}}"#
     )
 }
 
@@ -223,7 +223,7 @@ fn run_exits_nonzero_when_the_turn_fails() {
     let config = dir.path().join("cfg.json");
     std::fs::write(
         &config,
-        r#"{"config_version":1,"model":"m","providers":[{"kind":"open_ai","id":"p1","base_url":"http://127.0.0.1:9/v1","api_key_env":"MOCK_KEY","api":"chat","allow_loopback":true,"models":["m"],"pricing":{"pricing_ceiling_micro_usd_per_million_tokens":1000000}}]}"#,
+        r#"{"config_version":1,"model":"m","storage":{"reserve_permille":1,"reserve_bytes":0},"providers":[{"kind":"open_ai","id":"p1","base_url":"http://127.0.0.1:9/v1","api_key_env":"MOCK_KEY","api":"chat","allow_loopback":true,"models":["m"],"pricing":{"pricing_ceiling_micro_usd_per_million_tokens":1000000}}]}"#,
     )
     .unwrap();
     let out = cli()
@@ -295,7 +295,7 @@ fn serve_with_pinned_unregistered_provider_leaves_no_store_or_cas() {
     let config = dir.path().join("pinned.json");
     std::fs::write(
         &config,
-        r#"{"config_version":1,"model":"m","routing_mode":{"pinned":{"provider":"ghost","model":"m"}}}"#,
+        r#"{"config_version":1,"model":"m","storage":{"reserve_permille":1,"reserve_bytes":0},"routing_mode":{"pinned":{"provider":"ghost","model":"m"}}}"#,
     )
     .unwrap();
     let mut cmd = cli();

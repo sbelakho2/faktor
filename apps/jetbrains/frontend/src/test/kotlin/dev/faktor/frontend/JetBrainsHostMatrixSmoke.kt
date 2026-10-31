@@ -56,7 +56,10 @@ import javax.swing.text.JTextComponent
 
 object JetBrainsHostMatrixSmoke {
 
-    private const val HOST_MATRIX_PATH = "target/certification/jetbrains-host-matrix.json"
+    // HAR-16: the artifact path resolves through ParityPath — canonical
+    // target/certification/jetbrains-host-matrix.json for the pinned release,
+    // a per-version sibling when an IDE release is explicitly selected (this
+    // run never clobbers the canonical pin evidence).
     private const val MAX_ZIP_BYTES = 256L * 1024L * 1024L
     private const val SCREENSHOT_DIR = "apps/jetbrains/frontend/build/screenshots"
 
@@ -212,6 +215,18 @@ object JetBrainsHostMatrixSmoke {
             error.printStackTrace()
             kotlin.system.exitProcess(1)
         }
+        // HAR-16: refuse an unsafe per-version artifact name BEFORE any work
+        // (an explicitly selected IDE release must never path-traverse this
+        // run's certification output).
+        ParityPath.artifactNamingPolicySelfTest()
+        val artifactPath = ParityPath.hostMatrixArtifactPath()
+        val structuralOnly = ParityPath.visualCertStructuralOnly()
+        if (structuralOnly) {
+            println(
+                "HAR-16 VISUAL CERTIFICATION: structural-only for alternate IDE release " +
+                    "${ParityPath.selectedIdeaVersion()} (digest baselines certify the pinned release)"
+            )
+        }
         // The smoke harness passes the faktor-cli binary as a program
         // argument; only an explicit `*.zip` argument may select ZIP mode.
         val fromArgs = args.firstOrNull {
@@ -308,7 +323,7 @@ object JetBrainsHostMatrixSmoke {
             "JETBRAINS HOST MATRIX: $passed/${checks.size} checks passed " +
                 "against $sourceKind" +
                 (if (zipFile != null) " (${zipFile.name} sha256=$zipSha)" else "") +
-                "; artifact $HOST_MATRIX_PATH"
+                "; artifact $artifactPath"
         )
         if (failures > 0) {
             println("JETBRAINS HOST MATRIX FAIL ($failures)")
@@ -688,7 +703,18 @@ object JetBrainsHostMatrixSmoke {
                 }
             }
         }
-        edition5VisualBaselineChecks()
+        // HAR-16: the edition5/edition8 visual-baseline digests certify
+        // (platform × fonts × PINNED IDE release); an explicitly selected
+        // alternate release runs structural-only and never compares (or
+        // writes) digests against the pinned per-platform records.
+        if (ParityPath.visualCertStructuralOnly()) {
+            println(
+                "EDITION5 VISUAL BASELINE: skipped (structural-only alternate IDE release " +
+                    "${ParityPath.selectedIdeaVersion()}, HAR-16)"
+            )
+        } else {
+            edition5VisualBaselineChecks()
+        }
         check("edition5/catalog") {
             requireTrue(Edition5Catalog.controls.size == 200, "200 controls")
             requireTrue(Edition5Catalog.screens.size == 32, "32 screens")
@@ -794,7 +820,18 @@ object JetBrainsHostMatrixSmoke {
                 }
             }
         }
-        edition8VisualBaselineChecks()
+        // HAR-16: see the edition5 guard — pinned-release digest baselines are
+        // never compared under a different IDE release; the optical/contrast
+        // pass below stays (self-contained spec thresholds, no shared
+        // per-platform baseline file).
+        if (ParityPath.visualCertStructuralOnly()) {
+            println(
+                "EDITION8 VISUAL BASELINE: skipped (structural-only alternate IDE release " +
+                    "${ParityPath.selectedIdeaVersion()}, HAR-16)"
+            )
+        } else {
+            edition8VisualBaselineChecks()
+        }
         edition8OpticalAndContrastChecks()
         check("edition8/registry") {
             val errors = Edition8Registry.validate()
@@ -2494,41 +2531,53 @@ object JetBrainsHostMatrixSmoke {
                 "evidence" to JsonValue.Str(entry.evidence)
             )
         })
-        val artifact = obj(
-            "schema" to JsonValue.Str("faktor-jetbrains-host-matrix/v1"),
-            "commit" to JsonValue.Str(commit),
-            "status" to JsonValue.Str(status),
-            "source" to obj(
-                "kind" to JsonValue.Str(sourceKind),
-                "zip" to JsonValue.Str(zipFile?.path ?: ""),
-                "zip_sha256" to JsonValue.Str(if (zipSha.isEmpty()) "" else "sha256:$zipSha"),
-                "class_location" to JsonValue.Str(classLocation),
-                "ran_from_extracted_zip" to JsonValue.Str(
-                    if (sourceKind == "plugin-zip") "true" else "false"
+        val artifactFields = LinkedHashMap<String, JsonValue>()
+        artifactFields.putAll(
+            obj(
+                "schema" to JsonValue.Str("faktor-jetbrains-host-matrix/v1"),
+                "commit" to JsonValue.Str(commit),
+                "status" to JsonValue.Str(status),
+                "source" to obj(
+                    "kind" to JsonValue.Str(sourceKind),
+                    "zip" to JsonValue.Str(zipFile?.path ?: ""),
+                    "zip_sha256" to JsonValue.Str(if (zipSha.isEmpty()) "" else "sha256:$zipSha"),
+                    "class_location" to JsonValue.Str(classLocation),
+                    "ran_from_extracted_zip" to JsonValue.Str(
+                        if (sourceKind == "plugin-zip") "true" else "false"
+                    )
+                ),
+                "axes" to obj(
+                    "widths" to JsonValue.Arr(WIDTHS.map { JsonValue.Int64(it.toLong()) }),
+                    "zooms" to JsonValue.Arr(ZOOMS.map { JsonValue.Str("${zoomPct(it)}%") }),
+                    "themes" to JsonValue.Arr(THEMES.map { JsonValue.Str(it) }),
+                    "keyboard_only" to JsonValue.Str("TAB traversal + SPACE bindings; no MouseEvent")
+                ),
+                "checks" to checkArr,
+                "summary" to obj(
+                    "passed" to JsonValue.Int64(passed.toLong()),
+                    "total" to JsonValue.Int64(checks.size.toLong())
+                ),
+                "does_not_prove" to JsonValue.Arr(
+                    listOf(
+                        JsonValue.Str("a real IDE host install (the ZIP is extracted, not loaded by an IDE)"),
+                        JsonValue.Str("screenshot/pixel comparison against an IDE render"),
+                        JsonValue.Str("real daemon connectivity (covered by the parity smokes)")
+                    )
                 )
-            ),
-            "axes" to obj(
-                "widths" to JsonValue.Arr(WIDTHS.map { JsonValue.Int64(it.toLong()) }),
-                "zooms" to JsonValue.Arr(ZOOMS.map { JsonValue.Str("${zoomPct(it)}%") }),
-                "themes" to JsonValue.Arr(THEMES.map { JsonValue.Str(it) }),
-                "keyboard_only" to JsonValue.Str("TAB traversal + SPACE bindings; no MouseEvent")
-            ),
-            "checks" to checkArr,
-            "summary" to obj(
-                "passed" to JsonValue.Int64(passed.toLong()),
-                "total" to JsonValue.Int64(checks.size.toLong())
-            ),
-            "does_not_prove" to JsonValue.Arr(
-                listOf(
-                    JsonValue.Str("a real IDE host install (the ZIP is extracted, not loaded by an IDE)"),
-                    JsonValue.Str("screenshot/pixel comparison against an IDE render"),
-                    JsonValue.Str("real daemon connectivity (covered by the parity smokes)")
-                )
-            )
+            ).fields
         )
-        val file = File(ParityPath.repoRoot(), HOST_MATRIX_PATH)
+        // HAR-16: only an EXPLICITLY selected IDE release adds these fields —
+        // the pinned release's canonical artifact stays byte-identical.
+        val ideaVersion = ParityPath.selectedIdeaVersion()
+        if (ideaVersion != null) {
+            artifactFields["ideaVersion"] = JsonValue.Str(ideaVersion)
+            artifactFields["visualCertMode"] = JsonValue.Str(
+                if (ParityPath.visualCertStructuralOnly()) "structural" else "full"
+            )
+        }
+        val file = File(ParityPath.repoRoot(), ParityPath.hostMatrixArtifactPath())
         file.parentFile.mkdirs()
-        file.writeText(JsonCodec.write(artifact) + "\n", Charsets.UTF_8)
+        file.writeText(JsonCodec.write(JsonValue.Obj(artifactFields)) + "\n", Charsets.UTF_8)
     }
 
     private fun obj(vararg fields: Pair<String, JsonValue>): JsonValue.Obj =

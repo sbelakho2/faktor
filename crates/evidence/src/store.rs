@@ -314,7 +314,9 @@ impl EvidenceCrashSeam {
     }
 
     /// Trip the seam at `point`. Panics when the armed crossing is hit.
-    fn trip(&self, point: &'static str) {
+    /// `pub(crate)` so the aging pass (`crate::aging`) can carry the SAME
+    /// per-authority seam across its own durability boundaries.
+    pub(crate) fn trip(&self, point: &'static str) {
         let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
         let Some(arm) = s.armed else {
             return;
@@ -338,7 +340,7 @@ impl EvidenceCrashSeam {
 #[cfg(not(any(test, feature = "fault-injection")))]
 impl EvidenceCrashSeam {
     #[inline(always)]
-    fn trip(&self, _point: &'static str) {}
+    pub(crate) fn trip(&self, _point: &'static str) {}
 }
 
 /// In-memory [`EvidenceStore`] with a hard per-envelope backing cap.
@@ -1010,8 +1012,9 @@ fn hex(bytes: &[u8; 32]) -> String {
 }
 
 /// Strict 64-char lowercase-hex digest normalization (uppercase is folded —
-/// the same digest spelled differently is the same address).
-fn normalize_digest(raw: &str) -> Result<String, EvidenceError> {
+/// the same digest spelled differently is the same address). `pub(crate)` so
+/// `crate::aging` enforces the IDENTICAL rule before it ever touches a body.
+pub(crate) fn normalize_digest(raw: &str) -> Result<String, EvidenceError> {
     let folded = raw.to_ascii_lowercase();
     if folded.len() != 64 || !folded.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(EvidenceError::Malformed(format!(
@@ -1109,6 +1112,21 @@ pub struct DurableEvidenceAuthority {
     backing_cap: usize,
     /// Deterministic fault seam (inert unless armed; tests only).
     seam: std::sync::Arc<EvidenceCrashSeam>,
+    /// Replay-horizon aging policy for HEAVY BODIES (audit 12). Proof
+    /// identity — the SQL row itself — is permanent regardless of this
+    /// config; only the bulky CAS backing ages. Safe defaults, see
+    /// [`crate::aging::EvidenceAgingConfig`].
+    aging: crate::aging::EvidenceAgingConfig,
+    /// Unix ms of the last opportunistic aging pass (write-path cadence,
+    /// see [`DurableEvidenceAuthority::age_heavy_bodies_if_due`]). Shared
+    /// across clones: every clone of the authority is the SAME logical
+    /// authority, so they share ONE cadence, not one each.
+    pub(crate) aging_last_ms: std::sync::Arc<std::sync::atomic::AtomicI64>,
+    /// Non-blocking gate for the opportunistic aging pass: a pass already
+    /// running on another writer makes later writers skip (writes never
+    /// queue behind a sweep — same discipline as the storage governor's
+    /// maintenance gate). Shared across clones for the same reason.
+    pub(crate) aging_gate: std::sync::Arc<std::sync::Mutex<()>>,
 }
 
 impl std::fmt::Debug for DurableEvidenceAuthority {
@@ -1140,7 +1158,30 @@ impl DurableEvidenceAuthority {
             cas,
             backing_cap,
             seam: std::sync::Arc::new(EvidenceCrashSeam::default()),
+            aging: crate::aging::EvidenceAgingConfig::default(),
+            aging_last_ms: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            aging_gate: std::sync::Arc::new(std::sync::Mutex::new(())),
         }
+    }
+
+    /// Install an explicit heavy-body aging policy (serde-defaulted config;
+    /// validated by [`crate::aging::EvidenceAgingConfig::validated`] at every
+    /// aging/status call, never silently coerced). Returns `self` for
+    /// builder-style construction.
+    pub fn with_aging_config(mut self, config: crate::aging::EvidenceAgingConfig) -> Self {
+        self.aging = config;
+        self
+    }
+
+    /// The installed heavy-body aging policy.
+    pub const fn aging_config(&self) -> crate::aging::EvidenceAgingConfig {
+        self.aging
+    }
+
+    /// The per-authority deterministic crash seam, so `crate::aging` can
+    /// trip the SAME boundaries the insert path trips (fault campaigns).
+    pub(crate) fn crash_seam(&self) -> &EvidenceCrashSeam {
+        &self.seam
     }
 
     pub fn store(&self) -> &std::sync::Arc<faktor_store::Store> {
@@ -1176,11 +1217,19 @@ impl DurableEvidenceAuthority {
 
     /// Insert a NEW envelope, assigning a fresh durable id. Delegates to the
     /// borrowed view; the returned envelope is the durable truth.
+    ///
+    /// The insert path is also the always-on aging tick: heavy bodies past
+    /// the replay horizon are swept on a bounded, non-blocking cadence
+    /// (same opportunistic-maintenance discipline as the storage governor's
+    /// reserve path), so a long-lived installation's evidence quota cannot
+    /// be dominated by permanently-protected bulky bodies. A cadence
+    /// failure never refuses the insert.
     pub fn insert_new(
         &self,
         envelope: &EvidenceEnvelope,
         backing: Option<&[u8]>,
     ) -> Result<EvidenceEnvelope, EvidenceError> {
+        let _ = self.age_heavy_bodies_if_due(crate::aging::AGING_WRITE_CADENCE_MS);
         self.view().insert_new(envelope, backing)
     }
 
@@ -1883,6 +1932,11 @@ mod tests {
             total_budget_bytes: 1_000_000,
             watermark_permille: 900,
             reservation_lease_ms: 60_000,
+            // Hermetic against HOST free space (band_config precedent): the
+            // volume-reserve path still executes at the clamped minimum —
+            // this test pins admission ordering, not disk pressure.
+            reserve_permille: 1,
+            reserve_bytes: 0,
             quotas: StorageClass::ALL
                 .into_iter()
                 .map(|class| {

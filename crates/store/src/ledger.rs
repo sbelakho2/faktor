@@ -722,6 +722,61 @@ impl Store {
         payload: Option<serde_json::Value>,
         payload_ver: i64,
     ) -> StoreResult<EventSeq> {
+        self.append_event_v_with_purpose(
+            faktor_storage::AdmissionPurpose::EmergencyMetadata,
+            session_id,
+            op_id,
+            kind,
+            state,
+            ts_ms,
+            payload,
+            payload_ver,
+        )
+    }
+
+    /// RECOVERY-CLASS append: the crash-reconciliation sweep's own journal
+    /// event (`CrashDetected`) must land even when ordinary admission is
+    /// saturated, so it is admitted in the recovery band.
+    ///
+    /// AUTHORITY: this command is recovery-only by construction (the session
+    /// layer calls it from `recover_all`); the ordinary `append_event_v`
+    /// above keeps the emergency band byte-identically. The purpose is an
+    /// explicit per-call argument to the writer, never shared state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_event_v_recovery(
+        &self,
+        session_id: SessionId,
+        op_id: Option<OpId>,
+        kind: EventKind,
+        state: AgentState,
+        ts_ms: i64,
+        payload: Option<serde_json::Value>,
+        payload_ver: i64,
+    ) -> StoreResult<EventSeq> {
+        self.append_event_v_with_purpose(
+            faktor_storage::AdmissionPurpose::Recovery,
+            session_id,
+            op_id,
+            kind,
+            state,
+            ts_ms,
+            payload,
+            payload_ver,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_event_v_with_purpose(
+        &self,
+        purpose: faktor_storage::AdmissionPurpose,
+        session_id: SessionId,
+        op_id: Option<OpId>,
+        kind: EventKind,
+        state: AgentState,
+        ts_ms: i64,
+        payload: Option<serde_json::Value>,
+        payload_ver: i64,
+    ) -> StoreResult<EventSeq> {
         let seam = Arc::clone(&self.seam);
         // Preparation BEFORE enqueueing: the event payload and its landing
         // state JSON are serialized on the caller's thread.
@@ -730,7 +785,7 @@ impl Store {
         // Preparation BEFORE enqueueing: the journal diagnostic context.
         let seq_messages = EventSeqMessages::for_session(session_id);
         self.writer
-            .execute_retry_busy("append_event_v", move |conn| {
+            .execute_retry_busy_with_purpose(purpose, "append_event_v", move |conn| {
                 // The retry closure may run more than once: every captured
                 // prepared value is cloned per attempt, never moved. IMMEDIATE
                 // takes the write lock BEFORE the seq read, so a concurrent

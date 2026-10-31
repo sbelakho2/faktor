@@ -6725,7 +6725,7 @@
       "isolation": [
         "isolated-data-dir"
       ],
-      "tests": 108
+      "tests": 109
     },
     "tests/streams/src/lib.rs": {
       "oracle": "independent-reference",

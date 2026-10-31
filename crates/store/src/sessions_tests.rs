@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 use super::*;
 
 pub(crate) fn tmp_store() -> (tempfile::TempDir, Store) {
@@ -524,6 +525,93 @@ fn expire_pending_permissions_seams_reopen_old_or_new_only() {
             }
         }
     }
+}
+
+/// The recovery-purpose expiry sibling differs from the ordinary command
+/// ONLY in its admission band: on identical fixtures and clocks it produces
+/// byte-identical durable outcomes (same terminal rows, same event sequence,
+/// same journal payload, same landing state). This pins the ordinary
+/// command's behavior across the purpose plumbing (audit item 14).
+#[test]
+fn expire_pending_permissions_recovery_sibling_matches_ordinary_durable_outcome() {
+    type Outcome = (
+        Vec<(i64, OpId)>,
+        Option<u64>,
+        serde_json::Value,
+        String,
+        String,
+    );
+
+    fn outcome(recovery: bool) -> Outcome {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), true).unwrap();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        let (pid, _) = store
+            .insert_permission(s.id, OpId::new(41), "execute_shell")
+            .unwrap();
+        force_permission_deadline_past(&store, pid);
+        let now = now_ms() + 5;
+        let resolution = if recovery {
+            store
+                .expire_pending_permissions_for_session_recovery(
+                    s.id,
+                    now,
+                    AgentState::Idle,
+                    permission_expiry_event(),
+                )
+                .unwrap()
+        } else {
+            store
+                .expire_pending_permissions_for_session(
+                    s.id,
+                    now,
+                    AgentState::Idle,
+                    permission_expiry_event(),
+                )
+                .unwrap()
+        };
+        let event = store
+            .events_range(s.id, 1, None)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.kind == EventKind::PermissionExpired)
+            .expect("the sweep journaled its expiry");
+        let payload = event.payload.clone().unwrap();
+        let decision = store.permission_decision(pid).unwrap().unwrap();
+        let state: String = store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM session WHERE id = ?1",
+                params![s.id.raw() as i64],
+                |r| r.get(0),
+            )
+            .unwrap();
+        (
+            resolution.expired,
+            resolution.event_seq.map(|seq| seq.raw()),
+            payload,
+            decision,
+            state,
+        )
+    }
+
+    let ordinary = outcome(false);
+    let recovery = outcome(true);
+    assert_eq!(ordinary.0, vec![(1, OpId::new(41))]);
+    assert_eq!(
+        recovery, ordinary,
+        "the recovery sibling is admission-only: durable outcome must be identical"
+    );
+    // The event payload still names the rows the transaction changed, and no
+    // fake Deny is ever laundered through the recovery path.
+    assert_eq!(
+        ordinary.2["permission_ids"],
+        serde_json::json!([ordinary.0[0].0])
+    );
+    assert_eq!(ordinary.2["op_ids"], serde_json::json!([41]));
+    assert_eq!(ordinary.3, "expired");
 }
 
 #[test]

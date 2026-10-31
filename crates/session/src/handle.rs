@@ -158,6 +158,36 @@ impl SessionHandle {
         op_id: Option<OpId>,
         payload: Option<serde_json::Value>,
     ) -> faktor_core::Result<EventSeq> {
+        self.transition_locked_inner(false, kind, to_state, op_id, payload)
+    }
+
+    /// RECOVERY-CLASS sibling of [`Self::transition_locked`], used ONLY by
+    /// the crash-reconciliation sweep (`recover_all`) for its `CrashDetected`
+    /// journal event. The event is the sweep's own durable state
+    /// reconstruction and must land even when ordinary admission is
+    /// saturated, so it is admitted in the recovery band.
+    ///
+    /// AUTHORITY: the band is an explicit per-call choice (the boolean flag
+    /// below), never a global/thread-local mode; ordinary callers keep
+    /// `transition_locked` and its emergency-band behavior.
+    pub(crate) fn transition_locked_recovery(
+        &self,
+        kind: EventKind,
+        to_state: AgentState,
+        op_id: Option<OpId>,
+        payload: Option<serde_json::Value>,
+    ) -> faktor_core::Result<EventSeq> {
+        self.transition_locked_inner(true, kind, to_state, op_id, payload)
+    }
+
+    fn transition_locked_inner(
+        &self,
+        recovery: bool,
+        kind: EventKind,
+        to_state: AgentState,
+        op_id: Option<OpId>,
+        payload: Option<serde_json::Value>,
+    ) -> faktor_core::Result<EventSeq> {
         let current = self.state()?;
         crate::journal::validate_transition(current, kind, to_state)?;
         // Typed journal payloads (audits 71-72): every append goes through
@@ -166,10 +196,9 @@ impl SessionHandle {
         // persistence of an undecodable row. The append path validates only:
         // decoding would clone the payload into a value it immediately drops.
         crate::payload::validate_payload(kind, crate::payload::PAYLOAD_SCHEMA_V, payload.as_ref())?;
-        let seq = self
-            .manager
-            .store()
-            .append_event_v(
+        let store = self.manager.store();
+        let seq = if recovery {
+            store.append_event_v_recovery(
                 self.id,
                 op_id,
                 kind,
@@ -178,7 +207,18 @@ impl SessionHandle {
                 payload,
                 crate::payload::PAYLOAD_SCHEMA_V,
             )
-            .map_err(crate::map_store_err)?;
+        } else {
+            store.append_event_v(
+                self.id,
+                op_id,
+                kind,
+                to_state,
+                self.now_ms(),
+                payload,
+                crate::payload::PAYLOAD_SCHEMA_V,
+            )
+        }
+        .map_err(crate::map_store_err)?;
         self.manager.note_journal_append(&self.resources);
         Ok(seq)
     }

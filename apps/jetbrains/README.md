@@ -223,6 +223,76 @@ The legacy fingerprint-less `macos` record in this tree stays
 `unfingerprinted` (the canonical checker refuses it) until a real Mac host
 runs the command above; that is a recorded evidence gap, not a pass.
 
+### Two IDE versions (HAR-16)
+
+The IntelliJ Platform release the frontend resolves is a documented project
+property; the default is the committed pin and nothing changes without the
+property:
+
+| Property | Default | Meaning |
+| --- | --- | --- |
+| `faktor.ideaVersion.pin` (`gradle.properties`) | `2024.1.7` | The committed pin — single source of truth for the default release. |
+| `faktor.ideaVersion` (CLI `-P`) | *(unset = pin)* | Explicit release selection. The documented alternate is `2024.1`, the oldest stable release in the `241` line the plugin declares support for (`ideaVersion.sinceBuild = "241"`). |
+| `faktor.ideaVisual` (CLI `-P`) | *(unset = full)* | Only `structural`: runs an explicitly selected alternate release WITHOUT visual digest certification. Refused on the pin and refused without `faktor.ideaVersion` (fail-closed in `build.gradle.kts` and in `JetBrainsParityMatrix.visualCertStructuralOnly`). |
+
+```bash
+# Both legs sequentially (pin first, then the alternate release):
+bash apps/jetbrains/two-ide-matrix.sh
+# Single legs / plumbing proof (no execution, no IDE download):
+bash apps/jetbrains/two-ide-matrix.sh --only-pin
+bash apps/jetbrains/two-ide-matrix.sh --only-alt --alt 2024.1
+bash apps/jetbrains/two-ide-matrix.sh --dry-run --only-alt   # task wiring proof
+```
+
+Per-version artifact strategy (the canonical pinned-release files are never
+clobbered; anything a run writes is suffixed with its selected release):
+
+- `target/certification/jetbrains-host-matrix.json` →
+  `jetbrains-host-matrix-<release>.json`
+- `target/certification/jetbrains-parity.json` → `jetbrains-parity-<release>.json`
+- acceptance overlays (`edition5`/`edition8`) are suffixed the same way, and
+  each acceptance smoke reads the host-matrix file of ITS OWN run.
+- The release id is validated as a filename fragment before any write
+  (`ParityPath.requireIdeaVersionId`: `[A-Za-z0-9][A-Za-z0-9._-]*`, no `..`) —
+  path traversal is refused, and `ParityPath.artifactNamingPolicySelfTest`
+  (adversarial cases included) runs inside both smokes.
+- Only explicitly selected releases add `ideaVersion` / `visualCertMode`
+  fields to the artifacts: the pin's canonical JSON stays byte-identical.
+
+Visual-baseline honesty (why the alternate leg is structural-only): the
+per-platform visual baselines certify `(platform × resolved fonts × PINNED
+IDE release)` but the environment fingerprint
+(`<os>-<arch>-jvm<v>-f<fonts>`) carries no IDE release. A second release's
+digests therefore cannot honestly (a) compare against the pin's records —
+different render, identical fingerprint — nor (b) be written into the shared
+per-platform files — that would silently relabel them as the pin's certified
+claim. The alternate leg keeps every STRUCTURAL assertion (width/zoom/theme/
+keyboard/state/registry/catalog/optical thresholds, canned parity rows,
+behavioral parity matrix) and skips only digest certification
+(`visual.status = structural_only` in its parity artifact); re-pinning
+(`--write-baselines` / `writeBaselines`) under a structural leg is refused
+fail-closed. Extending certification to a second release would require its
+own per-platform baseline file plus real-host review — deliberately not
+invented by this change.
+
+Dependency integrity: the committed `gradle.lockfile` +
+`gradle/verification-metadata.xml` pin the default release. The pin leg runs
+with full locking, byte-identical to before. The alternate leg resolves a
+different IDE set, so `frontend/build.gradle.kts` deactivates locking for the
+frontend project's configurations only (backend/shared keep theirs; the
+integrity gate `scripts/check-gradle-integrity.sh` is unchanged), and the
+runner refreshes verification metadata with `--write-verification-metadata
+sha256` for the leg — the downloaded alternate distribution is checksummed as
+it is verified — then restores the committed file (trap-guarded).
+
+CI: the nightly `ui-smoke-jetbrains` lane runs the existing byte-identical
+pin leg first, then this runner's `--only-alt` leg
+(`FAKTOR_JETBRAINS_ALT_IDEA_VERSION`, default `2024.1`); a leg failure stops
+the lane before its marker, so the lane's `passed` marker always covers both
+legs. Cost: one extra IDE distribution download (~700-900 MB) into the
+project-local Gradle plugin cache per clean workspace (the `~/.gradle` volume
+only caches Maven artifacts) and roughly doubled frontend runtime.
+
 ### kotlinc + daemon smoke (fallback, no Gradle)
 
 ```bash

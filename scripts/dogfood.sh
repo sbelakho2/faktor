@@ -347,6 +347,23 @@ run_cmd "$NODE_BIN" tests/edition8/registry.mjs
 end_section
 
 # ===========================================================================
+# §7c Certification harnesses: surface-stub completeness/validation, provider
+# record/replay scrubbing, fake-vs-live contract equality (fake leg offline;
+# the live leg is operator-driven), the eval gate evaluator, and the
+# resource-census self-check. The REAL-provider eval and live equality legs
+# stay manual (`scripts/run-evals.mjs conversation`, `--live-env`).
+# ===========================================================================
+begin_section harnesses "Certification harnesses (stubs/record-replay/equality/evals/census)"
+run_cmd "$NODE_BIN" scripts/harness/surface-stubs.mjs gate
+run_cmd "$NODE_BIN" scripts/harness/surface-stubs.mjs selftest
+run_cmd "$NODE_BIN" scripts/harness/record-replay.mjs selftest
+run_cmd "$NODE_BIN" scripts/harness/fake-live-equality.mjs selftest
+run_cmd "$NODE_BIN" scripts/harness/fake-live-equality.mjs
+run_cmd "$NODE_BIN" scripts/run-evals.mjs --selftest
+run_cmd "$NODE_BIN" scripts/resource-census.mjs --selftest
+end_section
+
+# ===========================================================================
 # §8 dogfood coverage LAST so the manifest reflects every section above.
 # ===========================================================================
 begin_section coverage "dogfood surface coverage"

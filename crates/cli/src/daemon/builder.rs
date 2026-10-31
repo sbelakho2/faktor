@@ -750,6 +750,25 @@ impl faktor_terminal::ArtifactSecretFilter for RegistryArtifactFilter {
     }
 }
 
+/// The daemon's TWO egress transports: the external-only policy-checked
+/// client and the single loopback-exception client.
+pub(crate) type DaemonTransports = (Arc<dyn HttpTransport>, Arc<dyn HttpTransport>);
+
+/// The daemon's TWO egress transports, split out of [`build_daemon_core`]:
+/// the policy-checked + secret-scanned external-only transport every
+/// adapter executes through, plus a SECOND client object with the ONE
+/// explicit loopback exception, built ONLY for entries whose typed config
+/// asked for it (`allow_loopback`): every other entry keeps the
+/// external-only transport, and no address class is ever allowed globally.
+pub(crate) fn build_daemon_transports(
+    policy: &faktor_sandbox::SandboxPolicy,
+    egress: OutboundScanConfig,
+) -> Result<DaemonTransports, String> {
+    let transport = daemon_egress_transport(policy, egress.clone(), EgressAddressPolicy::EXTERNAL)?;
+    let loopback_transport = daemon_egress_transport(policy, egress, EgressAddressPolicy::LOCAL)?;
+    Ok((transport, loopback_transport))
+}
+
 /// The ONE egress transport every configured adapter executes through:
 /// policy-checked with the daemon's SandboxPolicy network gate installed
 /// (default-deny on any destination the allowlist does not match, BEFORE a
@@ -1338,17 +1357,10 @@ pub(crate) fn build_daemon_core(
     // The scan config is shared: the provider transport and the commerce
     // checked transport each install their own destination policy over the
     // SAME configured-secret registry (provider keys + commerce credentials).
-    let transport = daemon_egress_transport(
-        &sandbox_policy,
-        egress.clone(),
-        EgressAddressPolicy::EXTERNAL,
-    )?;
-    // A second client object with the ONE explicit loopback exception,
-    // built ONLY for entries whose typed config asked for it
-    // (`allow_loopback`): every other entry keeps the external-only
-    // transport, and no address class is ever allowed globally.
-    let loopback_transport =
-        daemon_egress_transport(&sandbox_policy, egress.clone(), EgressAddressPolicy::LOCAL)?;
+    // Step 4 transports — see [`build_daemon_transports`]: the ONE
+    // policy-checked + secret-scanned external transport plus the single
+    // loopback-exception client.
+    let (transport, loopback_transport) = build_daemon_transports(&sandbox_policy, egress.clone())?;
     // Steps 5-6 — provider registry + catalog/pricing: every configured
     // adapter is built through the checked transport its entry selected;
     // Ollama providers are kept CONCRETE for live probing (spec §10:

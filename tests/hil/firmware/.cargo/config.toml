@@ -1,0 +1,8 @@
+# Bare-metal build defaults for the HAR-18 emulated-HIL firmware image.
+# rust-lld is the target's default linker; --nmagic keeps the ELF load
+# segments page-unaligned so QEMU's -kernel loader maps them at vaddr == 0.
+[build]
+target = "thumbv7m-none-eabi"
+
+[target.thumbv7m-none-eabi]
+rustflags = ["-C", "link-arg=-Tlink.x", "-C", "link-arg=--nmagic"]

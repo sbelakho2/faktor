@@ -316,6 +316,18 @@ mod verification_scope_tests;
 mod query_plan_tests;
 
 #[cfg(test)]
+#[path = "query_plan_inventory_tests.rs"]
+mod query_plan_inventory_tests;
+
+#[cfg(test)]
+#[path = "store_fault_ops.rs"]
+mod store_fault_ops;
+
+#[cfg(test)]
+#[path = "store_fault_matrix_tests.rs"]
+mod store_fault_matrix_tests;
+
+#[cfg(test)]
 #[path = "hostile_corpus_tests.rs"]
 mod hostile_corpus_tests;
 

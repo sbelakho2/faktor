@@ -168,6 +168,8 @@ mod provider_loop_tests;
 mod output_budget_tests;
 
 #[cfg(test)]
+mod tool_loop_promotion_tests;
+#[cfg(test)]
 #[path = "tool_loop_tests.rs"]
 mod tool_loop_tests;
 

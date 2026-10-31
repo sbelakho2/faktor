@@ -101,7 +101,9 @@ internal data class VisualBaseline(
     val platforms: Map<String, VisualPlatformRecord>
 )
 
-private val PARITY_PATH = "target/certification/jetbrains-parity.json"
+// The canonical parity artifact path lives in ParityPath (HAR-16: an
+// explicitly selected IDE release writes jetbrains-parity-<release>.json and
+// never clobbers this one).
 private val PARITY_BASELINE_PATH =
     "apps/jetbrains/frontend/src/test/resources/parity/visual-baselines.json"
 
@@ -1008,6 +1010,15 @@ internal object ParityMatrix {
         val platform = visualPlatform()
         val baselineFile = File(ParityPath.repoRoot(), PARITY_BASELINE_PATH)
         if (System.getProperty("faktor.parity.writeBaselines") == "true") {
+            // HAR-16 fail-closed: an alternate-release run must never re-pin
+            // the shared per-platform baselines — the environment fingerprint
+            // carries no IDE release, so its digests would silently become
+            // the pinned release's certified claim.
+            assertTrue(
+                !ParityPath.visualCertStructuralOnly(),
+                "HAR-16: a structural-only alternate-release run must never re-pin the " +
+                    "shared visual baselines (re-pin only under the pinned IDE release)"
+            )
             assertTrue(
                 platform != "unknown",
                 "cannot pin a visual baseline on an unknown platform"
@@ -1272,60 +1283,80 @@ internal object ParityMatrix {
             )
         }
         val visualPassed = visual.count { it.passed }
+        // HAR-16: an explicitly selected alternate IDE release runs the
+        // structural matrix only — its artifact records visual
+        // `structural_only` (the panels still render as evidence) instead of
+        // claiming a certification the pin's baselines cannot give it.
+        val structuralOnly = ParityPath.visualCertStructuralOnly()
         val visualStatus = when {
+            structuralOnly -> "structural_only"
             visual.isEmpty() -> "unavailable"
             visual.any { it.drifted } -> "failed"
             visual.any { it.notCertified } -> "not_certified"
             else -> "passed"
         }
-        val visualComplete = visualStatus == "passed"
+        val visualComplete = visualStatus == "passed" || structuralOnly
         val visualPlatform = if (visual.isEmpty()) "unknown" else visual.first().platform
         val coverage = if (visualCoverage.isEmpty()) {
             visualCoverageOf(null)
         } else {
             visualCoverage
         }
-        val artifact = obj(
-            "schema" to JsonValue.Str("faktor-jetbrains-parity/v1"),
-            "commit" to JsonValue.Str(commit),
-            "generated_from" to JsonValue.Str(
-                "apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParityMatrix.kt"
-            ),
-            "status" to JsonValue.Str(
-                if (passed == rows.size && visualComplete) "passed" else "partial"
-            ),
-            "rows" to JsonValue.Arr(jsonRows),
-            "behavioral" to obj(
-                "passed" to JsonValue.Int64(passed.toLong()),
-                "total" to JsonValue.Int64(rows.size.toLong())
-            ),
-            "visual" to obj(
-                "status" to JsonValue.Str(visualStatus),
-                "passed" to JsonValue.Int64(visualPassed.toLong()),
-                "total" to JsonValue.Int64(visual.size.toLong()),
-                "method" to JsonValue.Str(VISUAL_METHOD),
-                "baseline" to JsonValue.Str(PARITY_BASELINE_PATH),
-                "platform" to JsonValue.Str(visualPlatform),
-                "platforms" to obj(
-                    *REQUIRED_VISUAL_PLATFORMS.map { platform ->
-                        platform to JsonValue.Str(coverage[platform] ?: "not_certified")
-                    }.toTypedArray()
+        val artifactFields = LinkedHashMap<String, JsonValue>()
+        artifactFields.putAll(
+            obj(
+                "schema" to JsonValue.Str("faktor-jetbrains-parity/v1"),
+                "commit" to JsonValue.Str(commit),
+                "generated_from" to JsonValue.Str(
+                    "apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParityMatrix.kt"
                 ),
-                "panels" to JsonValue.Arr(
-                    visual.map { result ->
-                        obj(
-                            "panel" to JsonValue.Str(result.panel),
-                            "status" to JsonValue.Str(result.status),
-                            "platform" to JsonValue.Str(result.platform),
-                            "digest" to JsonValue.Str(result.digest),
-                            "baseline" to (result.baseline?.let { JsonValue.Str(it) } ?: JsonValue.Null),
-                            "detail" to JsonValue.Str(result.detail)
-                        )
-                    }
+                "status" to JsonValue.Str(
+                    if (passed == rows.size && visualComplete) "passed" else "partial"
+                ),
+                "rows" to JsonValue.Arr(jsonRows),
+                "behavioral" to obj(
+                    "passed" to JsonValue.Int64(passed.toLong()),
+                    "total" to JsonValue.Int64(rows.size.toLong())
+                ),
+                "visual" to obj(
+                    "status" to JsonValue.Str(visualStatus),
+                    "passed" to JsonValue.Int64(visualPassed.toLong()),
+                    "total" to JsonValue.Int64(visual.size.toLong()),
+                    "method" to JsonValue.Str(VISUAL_METHOD),
+                    "baseline" to JsonValue.Str(PARITY_BASELINE_PATH),
+                    "platform" to JsonValue.Str(visualPlatform),
+                    "platforms" to obj(
+                        *REQUIRED_VISUAL_PLATFORMS.map { platform ->
+                            platform to JsonValue.Str(coverage[platform] ?: "not_certified")
+                        }.toTypedArray()
+                    ),
+                    "panels" to JsonValue.Arr(
+                        visual.map { result ->
+                            obj(
+                                "panel" to JsonValue.Str(result.panel),
+                                "status" to JsonValue.Str(result.status),
+                                "platform" to JsonValue.Str(result.platform),
+                                "digest" to JsonValue.Str(result.digest),
+                                "baseline" to (result.baseline?.let { JsonValue.Str(it) } ?: JsonValue.Null),
+                                "detail" to JsonValue.Str(result.detail)
+                            )
+                        }
+                    )
                 )
-            )
+            ).fields
         )
-        val file = File(ParityPath.repoRoot(), PARITY_PATH)
+        // HAR-16: only an EXPLICITLY selected IDE release adds these fields —
+        // the pinned release's canonical artifact stays byte-identical.
+        val ideaVersion = ParityPath.selectedIdeaVersion()
+        if (ideaVersion != null) {
+            artifactFields["ideaVersion"] = JsonValue.Str(ideaVersion)
+            artifactFields["visualCertMode"] = JsonValue.Str(
+                if (ParityPath.visualCertStructuralOnly()) "structural" else "full"
+            )
+        }
+        val artifact = JsonValue.Obj(artifactFields)
+        val artifactPath = ParityPath.parityArtifactPath()
+        val file = File(ParityPath.repoRoot(), artifactPath)
         file.parentFile.mkdirs()
         file.writeText(JsonCodec.write(artifact) + "\n", Charsets.UTF_8)
         println(
@@ -1335,7 +1366,7 @@ internal object ParityMatrix {
                 REQUIRED_VISUAL_PLATFORMS.joinToString(",") {
                     "$it=" + (coverage[it] ?: "not_certified")
                 } +
-                ", artifact $PARITY_PATH @ $commit"
+                ", artifact $artifactPath @ $commit"
         )
     }
 }
@@ -1413,6 +1444,128 @@ internal object ParityPath {
             sb.append(Character.forDigit(value and 0x0f, 16))
         }
         return sb.toString()
+    }
+
+    // --------------------------------------------- HAR-16 (two IDE versions)
+
+    /** The canonical (pinned-release) certification paths. */
+    private const val CANONICAL_HOST_MATRIX_PATH =
+        "target/certification/jetbrains-host-matrix.json"
+    private const val CANONICAL_PARITY_PATH =
+        "target/certification/jetbrains-parity.json"
+
+    /**
+     * The IDE release explicitly selected by the `faktor.ideaVersion` project
+     * property (threaded into the smoke JVM as `faktor.idea.version` by the
+     * Gradle smoke tasks), or null when this run uses the committed pin. An
+     * explicitly selected release writes per-version artifacts so the
+     * canonical pinned-release evidence is never clobbered (HAR-16).
+     */
+    fun selectedIdeaVersion(): String? {
+        val raw = System.getProperty("faktor.idea.version", "").trim()
+        return if (raw.isEmpty()) null else requireIdeaVersionId(raw)
+    }
+
+    /** A release id becomes a filename fragment: refuse anything that could
+     * traverse paths or hide behind whitespace (adversarial by construction). */
+    internal fun requireIdeaVersionId(raw: String): String {
+        assertTrue(
+            raw.matches(Regex("[A-Za-z0-9][A-Za-z0-9._-]*")) && !raw.contains(".."),
+            "faktor.idea.version is not a safe release id " +
+                "(expected [A-Za-z0-9][A-Za-z0-9._-]*): '$raw'"
+        )
+        return raw
+    }
+
+    /** The pure artifact-naming rule (self-tested; null keeps the canonical
+     * path byte-for-byte, every explicit release is suffixed before .json). */
+    internal fun versionedPathFor(canonical: String, version: String?): String {
+        if (version == null) return canonical
+        requireIdeaVersionId(version)
+        val slash = canonical.lastIndexOf('/')
+        assertTrue(slash > 0, "certification path must live in a directory: $canonical")
+        val name = canonical.substring(slash + 1)
+        assertTrue(name.endsWith(".json"), "certification path must end in .json: $canonical")
+        return canonical.substring(0, slash + 1) + name.removeSuffix(".json") + "-$version.json"
+    }
+
+    /** The host-matrix artifact this run writes: canonical on the pin, a
+     * per-version file (jetbrains-host-matrix-<release>.json) otherwise. */
+    fun hostMatrixArtifactPath(): String =
+        versionedPathFor(CANONICAL_HOST_MATRIX_PATH, selectedIdeaVersion())
+
+    /** The parity artifact this run writes, versioned the same way. */
+    fun parityArtifactPath(): String =
+        versionedPathFor(CANONICAL_PARITY_PATH, selectedIdeaVersion())
+
+    /** Any certification artifact path, versioned by the same rule (acceptance
+     * overlays, evidence copies, …) so per-version legs never clobber the
+     * canonical pinned-release files. */
+    fun versionedCertPath(canonical: String): String =
+        versionedPathFor(canonical, selectedIdeaVersion())
+
+    /**
+     * HAR-16 visual-certification policy: the pinned visual baselines certify
+     * (platform × resolved fonts × PINNED IDE release) — the environment
+     * fingerprint (`<os>-<arch>-jvm<v>-f<fonts>`) deliberately does NOT carry
+     * the IDE release, so digest claims rendered under a different IDE
+     * release can neither be honestly compared against the pin's baselines
+     * nor written into the shared per-platform files (identical fingerprint,
+     * different render). An explicitly selected ALTERNATE release therefore
+     * runs the structural matrix only, and structural mode is REFUSED without
+     * an explicit alternate selection — the pin always runs the full visual
+     * certification (fail-closed, never a silent downgrade).
+     */
+    fun visualCertStructuralOnly(): Boolean {
+        if (System.getProperty("faktor.parity.visualCertMode", "").trim() != "structural") {
+            return false
+        }
+        assertTrue(
+            selectedIdeaVersion() != null,
+            "faktor.parity.visualCertMode=structural requires an explicit faktor.idea.version " +
+                "(HAR-16 alternate-release leg); the pinned IDE always runs full visual certification"
+        )
+        return true
+    }
+
+    /**
+     * Adversarial self-test of the per-version artifact naming + structural
+     * mode policy (HAR-16), run by the parity and host-matrix smokes: no
+     * selection keeps the canonical path, a valid release id suffixes every
+     * certification path, and path-traversal / malformed release ids are
+     * refused before any write.
+     */
+    internal fun artifactNamingPolicySelfTest() {
+        assertEquals(
+            "target/certification/jetbrains-host-matrix.json",
+            versionedPathFor("target/certification/jetbrains-host-matrix.json", null),
+            "self-test: without a selection the canonical path is returned"
+        )
+        assertEquals(
+            "target/certification/jetbrains-host-matrix-2024.1.json",
+            versionedPathFor("target/certification/jetbrains-host-matrix.json", "2024.1"),
+            "self-test: an explicit release suffixes the artifact name"
+        )
+        assertEquals(
+            "target/certification/edition8/acceptance-jetbrains.overlays-241.14494.240.json",
+            versionedPathFor(
+                "target/certification/edition8/acceptance-jetbrains.overlays.json",
+                "241.14494.240"
+            ),
+            "self-test: dotted release ids and compound suffixes stay one filename"
+        )
+        for (unsafe in listOf("", " 2024.1", "../evil", "a/b", ".hidden", "2024.1/../../x")) {
+            var refused = false
+            try {
+                versionedPathFor("target/certification/jetbrains-host-matrix.json", unsafe)
+            } catch (expected: Throwable) {
+                refused = true
+            }
+            assertTrue(
+                refused,
+                "self-test: an unsafe release id must be refused, never written: '$unsafe'"
+            )
+        }
     }
 }
 

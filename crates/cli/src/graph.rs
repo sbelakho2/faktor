@@ -2491,7 +2491,11 @@ mod tests {
     /// the daemon entries, step 17 consumes). The list doubles as the marker
     /// ordering list the test asserts against the builder text.
     const CORE_STEP_TOKENS: &[(&str, &str)] = &[
-        ("transport", "daemon_egress_transport("),
+        // Step 4's in-core token is the TWO-transport builder call; the
+        // `daemon_egress_transport` pair itself lives in that helper (an
+        // out-of-span definition cannot smuggle a construction out of
+        // order — this scan only reads `build_daemon_core`'s body).
+        ("transport", "build_daemon_transports("),
         // Steps 5-6 are delegated to the ONE shared configured-provider
         // builder (also used by the pure boot preflight): the tokens are the
         // in-core call and the catalog-authority/ollama-concrete destructure.

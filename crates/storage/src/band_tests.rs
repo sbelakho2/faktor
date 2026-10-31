@@ -32,6 +32,14 @@ fn band_config() -> StorageGovernorConfig {
         watermark_permille: 1000,
         reservation_lease_ms: 60_000,
         quotas,
+        // Hermetic against HOST free space: the reserve path still executes
+        // (deficit math, typed FreeSpaceReserve refusals), but at the
+        // clamped minimum (1% of capacity, 2 GiB floor) instead of the
+        // production 5% — these tests probe PURPOSE bands, not the
+        // operator's volume pressure. The production default is exercised
+        // by the store/governor suites with their own configs.
+        reserve_permille: 1,
+        reserve_bytes: 0,
         ..Default::default()
     }
     .validated()
@@ -267,4 +275,186 @@ fn recovery_band_clamps_keep_the_three_bands_ordered_and_nonzero() {
     assert_eq!(reloaded, validated, "config round-trip is lossless");
     let dir = tempfile::tempdir().unwrap();
     assert!(StorageGovernor::open(dir.path(), reloaded).is_ok());
+}
+
+// ---------------------------------------------------------------------
+// Purpose-aware SQLite admission (audit item 14 follow-up).
+//
+// The store writer's SQLite/WAL growth used to be admitted ONLY in the
+// emergency band, so crash-reconciliation materialization could not commit
+// once aggregate usage was above the 90% emergency ceiling. These tests pin
+// the purpose-aware contract: an explicit RECOVERY purpose reaches the
+// 90-100% reserve with the same accounting/refusal semantics, ordinary
+// (emergency/normal) purposes still stop at their own ceilings, and the
+// hard budget still refuses beyond 100%.
+// ---------------------------------------------------------------------
+
+#[test]
+fn recovery_sqlite_admission_enters_the_recovery_band_and_ordinary_metadata_still_refuses() {
+    let dir = tempfile::tempdir().unwrap();
+    let governor = StorageGovernor::open(dir.path(), band_config()).unwrap();
+
+    // 95% pressure: inside the recovery-only reserve, above the emergency
+    // ceiling (900k).
+    fill(
+        &governor,
+        StorageClass::EvidenceCas,
+        "sqlite-band-pressure",
+        TOTAL * 95 / 100,
+    );
+    assert_eq!(
+        governor.metrics().unwrap().admission_band,
+        "recovery_reserve"
+    );
+
+    // Ordinary metadata growth keeps the historical emergency band: typed
+    // refusal naming the band, with no recovery powers.
+    let emergency = governor
+        .admit_sqlite_growth(100)
+        .expect_err("emergency metadata must never consume the recovery reserve")
+        .refusal()
+        .cloned()
+        .expect("typed refusal");
+    assert_eq!(emergency.reason, RefusalReason::AggregateBudget);
+    assert!(
+        emergency.detail.contains("emergency ceiling"),
+        "ordinary refusal names the emergency band: {}",
+        emergency.detail
+    );
+
+    // The explicit recovery path admits into the reserve.
+    assert_eq!(governor.sqlite_admitted_bytes(), 0);
+    let admission = governor
+        .admit_sqlite_recovery_growth_tracked(100)
+        .expect("recovery-class SQLite growth is admitted in the 90-100% band");
+    let charged = governor.sqlite_admitted_bytes();
+    assert!(charged > 0, "the recovery admission is tracked as debt");
+    // Explicit accounting release: dropping the guard clears the in-flight
+    // half; the next durable scan reconciles the completed half to disk
+    // truth. Nothing was written, so no usage may remain charged.
+    drop(admission);
+    assert_eq!(governor.pending_reservations().unwrap(), 0);
+    governor.sqlite_maintenance().unwrap();
+    assert_eq!(
+        governor.sqlite_admitted_bytes(),
+        0,
+        "dropped-before-commit admission is never charged as durable usage"
+    );
+    let sqlite_bytes = governor
+        .metrics()
+        .unwrap()
+        .per_class
+        .get("sqlite_wal")
+        .map(|row| row.bytes)
+        .unwrap_or(0);
+    assert_eq!(
+        sqlite_bytes, 0,
+        "an admission with no committed row must not become usage"
+    );
+
+    // Beyond 100% even RECOVERY refuses typed: no unbounded bypass.
+    let remaining = TOTAL - governor.metrics().unwrap().total_bytes;
+    if remaining > 0 {
+        fill(
+            &governor,
+            StorageClass::EvidenceCas,
+            "sqlite-band-full",
+            remaining,
+        );
+    }
+    assert_eq!(governor.metrics().unwrap().total_bytes, TOTAL);
+    let over = governor
+        .admit_sqlite_recovery_growth_tracked(100)
+        .expect_err("no purpose may exceed the hard aggregate budget")
+        .refusal()
+        .cloned()
+        .expect("typed refusal");
+    assert_eq!(over.reason, RefusalReason::AggregateBudget);
+    assert!(
+        over.detail.contains("recovery ceiling"),
+        "the recovery refusal names its band: {}",
+        over.detail
+    );
+}
+
+#[test]
+fn sqlite_purpose_is_per_call_and_a_concurrent_caller_cannot_flip_it() {
+    use crate::governor::AdmissionPurpose;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let governor = Arc::new(StorageGovernor::open(dir.path(), band_config()).unwrap());
+    fill(
+        &governor,
+        StorageClass::EvidenceCas,
+        "concurrent-pressure",
+        TOTAL * 95 / 100,
+    );
+
+    // Interleave ordinary (emergency/normal) and recovery admissions from
+    // many threads. The purpose is an explicit argument of EACH call, so the
+    // outcome is determined by the call itself, never by another thread's
+    // choice or a shared mode.
+    let mut handles = Vec::new();
+    let mut recovery_admitted = 0usize;
+    for index in 0..8 {
+        let governor = Arc::clone(&governor);
+        handles.push(std::thread::spawn(move || {
+            if index % 2 == 0 {
+                (
+                    true,
+                    governor
+                        .admit_sqlite_growth_tracked_for(AdmissionPurpose::EmergencyMetadata, 100)
+                        .map(|_| ())
+                        .map_err(|e| format!("{e:?}")),
+                )
+            } else {
+                (
+                    false,
+                    governor
+                        .admit_sqlite_recovery_growth_tracked(100)
+                        .map(|_| ())
+                        .map_err(|e| format!("{e:?}")),
+                )
+            }
+        }));
+    }
+    for handle in handles {
+        let (ordinary, outcome) = handle.join().unwrap();
+        if ordinary {
+            assert!(
+                outcome.is_err(),
+                "an ordinary SQLite call must refuse at recovery-band pressure"
+            );
+        } else {
+            // Every recovery outcome is either an admission or a TYPED
+            // refusal (never a panic, never silent). Under a 4-way storm at
+            // the band edge the room check conservatively counts a sibling
+            // thread's pre-marked in-flight bound alongside admitted debt,
+            // so an individual call can transiently refuse even though its
+            // purpose band allows it — safe-by-conservatism (never
+            // over-admits); the recovery sweep retries idempotently. The
+            // exact per-call semantics are pinned sequentially below.
+            match &outcome {
+                Ok(()) => {}
+                Err(detail) => assert!(
+                    detail.contains("recovery ceiling"),
+                    "a recovery refusal must name the recovery band: {detail}"
+                ),
+            }
+        }
+        if outcome.is_ok() {
+            recovery_admitted += 1;
+        }
+    }
+    assert!(
+        recovery_admitted >= 1,
+        "the recovery band must admit under recovery-band pressure (band difference exists)"
+    );
+    assert_eq!(governor.pending_reservations().unwrap(), 0);
+
+    // The same call sequence reversed stays honest: recovery still admits,
+    // ordinary still refuses (no leaked "last purpose" state).
+    assert!(governor.admit_sqlite_recovery_growth_tracked(100).is_ok());
+    assert!(governor.admit_sqlite_growth(100).is_err());
 }

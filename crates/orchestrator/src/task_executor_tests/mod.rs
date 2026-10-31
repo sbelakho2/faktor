@@ -603,4 +603,6 @@ mod tests_core;
 #[cfg(test)]
 mod tests_intent;
 #[cfg(test)]
+mod tests_promotion;
+#[cfg(test)]
 mod tests_verification;

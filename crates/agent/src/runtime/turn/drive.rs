@@ -730,6 +730,67 @@ impl AgentRuntime {
     /// never kills the session; the gate carries the non-completion. The
     /// turn's `cancel` token rides into the verification attempt so the
     /// typed checks inherit the turn's cancellation lineage (P0-9/10).
+    /// ASK (audit P0-ASK): the CONVERSATIONAL genuine end, split out of
+    /// [`Self::finish_logical_turn`]. Durable turn lifecycle ONLY — the
+    /// turn lands its ONE TurnCompleted and the shared loop-signal
+    /// machinery resets on real progress; NOTHING of the engineering tail
+    /// runs: no ledger fold or persistence (this turn never mutates the
+    /// working memory), no memory rows, NO verification, NO task-row sync,
+    /// NO completion/budget/criteria gate, NO engineering typed-ledger
+    /// tail and NO task-complete hook. Conversation history lives in the
+    /// message stream and is untouched.
+    async fn finish_ask_logical_turn(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        op_id: OpId,
+        outcome: &mut TurnOutcome,
+        turn_summary: &faktor_context::ledger::TurnSummary,
+        settled_calls: &mut Vec<(SettledCallOutcome, u8)>,
+    ) -> faktor_core::Result<()> {
+        if turn_made_progress(turn_summary) {
+            self.guarded_reset_loop_signals(handle, DW_SITE_END_LOOP_SIGNALS)?;
+        }
+        if handle.state()? != AgentState::ReadyForNextTurn {
+            handle
+                .append_journal_event(
+                    faktor_core::event::EventKind::TurnCompleted,
+                    AgentState::ReadyForNextTurn,
+                    Some(op_id),
+                    None,
+                )
+                .await?;
+        }
+        outcome.turns += 1;
+        outcome.final_state = AgentState::ReadyForNextTurn;
+        // Mirror the task path's no-gate branch: settled calls feed
+        // verified routing attribution ONLY behind a completion gate.
+        settled_calls.clear();
+        Ok(())
+    }
+
+    /// The end-of-turn verification quality, split out of
+    /// [`Self::finish_logical_turn`]: the configured/default quality for
+    /// the turn, escalated to Strict when the semantic consult reported
+    /// High/Unknown risk — and raised to Strict by a high/unknown-risk
+    /// engineering contract (audit item 4). None (no provider consulted)
+    /// and non-escalating levels keep the quality byte-identical.
+    fn end_of_turn_verification_quality(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        semantic_risk: Option<faktor_semantic::RiskLevel>,
+        turn_summary: &faktor_context::ledger::TurnSummary,
+    ) -> faktor_core::Result<VerificationQuality> {
+        let quality = verification_quality_for(
+            semantic_risk,
+            self.quality_for_turn(!turn_summary.files_changed.is_empty()),
+        );
+        Ok(if self.contract_policy(handle)?.quality_strict {
+            VerificationQuality::Strict
+        } else {
+            quality
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn finish_logical_turn(
         &self,
@@ -746,34 +807,9 @@ impl AgentRuntime {
         // Bound at drive start; never re-read after TurnCompleted is visible.
         let settlement_task_id = task_id;
         if execution.is_ask() {
-            // ASK (audit P0-ASK): the CONVERSATIONAL genuine end. Durable
-            // turn lifecycle ONLY — the turn lands its ONE TurnCompleted
-            // and the shared loop-signal machinery resets on real
-            // progress; NOTHING of the engineering tail runs: no ledger
-            // fold or persistence (this turn never mutates the working
-            // memory), no memory rows, NO verification, NO task-row sync,
-            // NO completion/budget/criteria gate, NO engineering
-            // typed-ledger tail and NO task-complete hook. Conversation
-            // history lives in the message stream and is untouched.
-            if turn_made_progress(turn_summary) {
-                self.guarded_reset_loop_signals(handle, DW_SITE_END_LOOP_SIGNALS)?;
-            }
-            if handle.state()? != AgentState::ReadyForNextTurn {
-                handle
-                    .append_journal_event(
-                        faktor_core::event::EventKind::TurnCompleted,
-                        AgentState::ReadyForNextTurn,
-                        Some(op_id),
-                        None,
-                    )
-                    .await?;
-            }
-            outcome.turns += 1;
-            outcome.final_state = AgentState::ReadyForNextTurn;
-            // Mirror the task path's no-gate branch: settled calls feed
-            // verified routing attribution ONLY behind a completion gate.
-            settled_calls.clear();
-            return Ok(());
+            return self
+                .finish_ask_logical_turn(handle, op_id, outcome, turn_summary, settled_calls)
+                .await;
         }
         // P0-2 remainder: generic-shell changes are attributed through the
         // durable `shell_change` facts, so a crash-resumed turn (or a live
@@ -791,22 +827,11 @@ impl AgentRuntime {
         if turn_made_progress(turn_summary) {
             self.guarded_reset_loop_signals(handle, DW_SITE_END_LOOP_SIGNALS)?;
         }
-        // Verification-tier escalation (audit 54): the configured/default
-        // quality for the turn, escalated to Strict when the semantic
-        // consult reported High/Unknown risk. None (no provider consulted)
-        // and non-escalating levels keep the quality byte-identical.
-        let quality = verification_quality_for(
-            outcome.semantic_risk,
-            self.quality_for_turn(!turn_summary.files_changed.is_empty()),
-        );
-        // Engineering contract (audit item 4): a high/unknown risk contract
-        // raises the end-of-turn verification depth to Strict — its risk
-        // hypotheses demand the deeper review bar before completion.
-        let quality = if self.contract_policy(handle)?.quality_strict {
-            VerificationQuality::Strict
-        } else {
-            quality
-        };
+        // Verification-tier escalation (audit 54) + engineering-contract
+        // Strict raise (audit item 4) — see
+        // [`Self::end_of_turn_verification_quality`].
+        let quality =
+            self.end_of_turn_verification_quality(handle, outcome.semantic_risk, turn_summary)?;
         let verdict = self
             .run_turn_verification(
                 handle,

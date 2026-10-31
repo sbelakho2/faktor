@@ -304,6 +304,29 @@ steps:
       # is copied to the workspace path the smoke receives via -PfaktorCliBin.
       - CARGO_TARGET_DIR=/woodpecker-cache/target cargo build -p faktor-cli && mkdir -p target/debug && cp /woodpecker-cache/target/debug/faktor-cli target/debug/faktor-cli
       - cd apps/jetbrains && ./gradlew --console=plain --no-daemon -PfaktorCliBin="$CI_WORKSPACE/target/debug/faktor-cli" :frontend:smokeHostMatrixZip
+      # HAR-16 second IDE-version leg (appended; the pin leg above is
+      # byte-identical): the SAME frontend proof (smoke + test) against an
+      # OLDER stable IntelliJ Platform release, env-driven
+      # (FAKTOR_JETBRAINS_ALT_IDEA_VERSION, default 2024.1 — the oldest 241-line
+      # stable release this plugin declares support for). A leg failure IS this
+      # lane's failure: a non-zero exit stops the step before the marker below,
+      # so no `passed` marker can ever claim a run whose second leg failed.
+      # Cost: one extra IDE distribution download (~700-900 MB) into the
+      # project-local Gradle plugin cache per clean workspace + roughly doubled
+      # frontend runtime (the ~/.gradle volume only caches Maven artifacts).
+      # Visual/digest certification is deliberately structural-only on this leg:
+      # the pinned baselines' environment fingerprint carries no IDE release
+      # (JetBrainsParityMatrix), so second-release digests must neither compare
+      # against nor be written into the shared per-platform baselines — see
+      # apps/jetbrains/README.md "Two IDE versions (HAR-16)". The runner
+      # restores gradle/verification-metadata.xml and never rewrites lockfiles,
+      # so the committed integrity surface stays untouched.
+      - |
+        set -eu
+        cd "$CI_WORKSPACE"
+        ALT_IDEA_VERSION="${FAKTOR_JETBRAINS_ALT_IDEA_VERSION:-2024.1}"
+        echo "ui-smoke-jetbrains: HAR-16 second IDE-version leg ($ALT_IDEA_VERSION)"
+        bash apps/jetbrains/two-ide-matrix.sh --only-alt --alt "$ALT_IDEA_VERSION" --cli "$CI_WORKSPACE/target/debug/faktor-cli"
       - |
         set -eu
         mkdir -p target/certification/lanes
@@ -318,11 +341,17 @@ steps:
         . "$HOME/.cargo/env"
         CARGO_TARGET_DIR=/woodpecker-cache/target cargo build -p faktor-cli && mkdir -p target/debug && cp /woodpecker-cache/target/debug/faktor-cli target/debug/faktor-cli
         cd apps/jetbrains && ./gradlew --console=plain --no-daemon -PfaktorCliBin="$CI_WORKSPACE/target/debug/faktor-cli" :frontend:smokeHostMatrixZip
+        cd "$CI_WORKSPACE"
+        ALT_IDEA_VERSION="${FAKTOR_JETBRAINS_ALT_IDEA_VERSION:-2024.1}"
+        echo "ui-smoke-jetbrains: HAR-16 second IDE-version leg ($ALT_IDEA_VERSION)"
+        bash apps/jetbrains/two-ide-matrix.sh --only-alt --alt "$ALT_IDEA_VERSION" --cli "$CI_WORKSPACE/target/debug/faktor-cli"
         CMDS
         )"
+        ALT_IDEA_VERSION="${FAKTOR_JETBRAINS_ALT_IDEA_VERSION:-2024.1}"
         printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
           --lane ui-smoke-jetbrains --status passed \
           --artifact target/certification/jetbrains-host-matrix.json \
+          --artifact "target/certification/jetbrains-host-matrix-${ALT_IDEA_VERSION}.json" \
           --out target/certification/lanes/ui-smoke-jetbrains.json
   # -------------------------------------------------------- superlinearity
   # Static superlinearity budget, re-run on the nightly checkout as an

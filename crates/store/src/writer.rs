@@ -258,6 +258,11 @@ struct WriterInner {
     /// single writes) is admitted here BEFORE it is enqueued, so no write
     /// path can grow SQLite/WAL past the hard budget.
     storage_governor: Mutex<Option<Arc<faktor_storage::StorageGovernor>>>,
+    /// HAR-05 fault seam shared with the owning `Store` (disk-full /
+    /// read-only / busy injection at the admission boundary). `None` until
+    /// the harness attaches one; production never attaches.
+    #[cfg(any(test, feature = "fault-injection"))]
+    fault: Mutex<Option<Arc<crate::connection::FaultSeam>>>,
 }
 
 impl std::fmt::Debug for WriterInner {
@@ -339,6 +344,8 @@ impl WriterService {
             stopped: Mutex::new(false),
             stopped_cv: Condvar::new(),
             storage_governor: Mutex::new(None),
+            #[cfg(any(test, feature = "fault-injection"))]
+            fault: Mutex::new(None),
         });
         {
             let progress_inner = Arc::clone(&inner);
@@ -390,6 +397,15 @@ impl WriterService {
     /// against the SQLite/WAL class quota and aggregate budget).
     pub(crate) fn attach_storage_governor(&self, governor: Arc<faktor_storage::StorageGovernor>) {
         self.inner.attach_storage_governor(governor);
+    }
+
+    /// Attach the HAR-05 fault seam: the store hands its write-boundary
+    /// seam over so every admission funnelled through
+    /// `execute_with_purpose` observes it. Test/`fault-injection` builds
+    /// only.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub(crate) fn attach_fault(&self, seam: Arc<crate::connection::FaultSeam>) {
+        *self.inner.fault.lock().unwrap_or_else(|p| p.into_inner()) = Some(seam);
     }
 
     /// Typed one-line reason the writer stopped, when it did.
@@ -473,16 +489,72 @@ impl WriterService {
     /// typed result. Closure captures must be owned/`'static`, which is what
     /// statically prevents a job from re-entering the store: a job can never
     /// borrow `&Store`, so it can never enqueue another job and deadlock.
+    ///
+    /// Ordinary mutations are admitted in the EMERGENCY-METADATA band
+    /// exactly as before; recovery-class commands have their own explicit
+    /// entry points below and no caller can select a band here.
     pub(crate) fn execute<R, F>(&self, label: &'static str, f: F) -> crate::StoreResult<R>
     where
         R: Send + 'static,
         F: FnOnce(&mut Connection) -> crate::StoreResult<R> + Send + 'static,
     {
+        self.execute_with_purpose(
+            faktor_storage::AdmissionPurpose::EmergencyMetadata,
+            label,
+            f,
+        )
+    }
+
+    /// RECOVERY-CLASS execution: uses the recovery admission band (the only
+    /// path into the 90–100% reserve).
+    ///
+    /// AUTHORITY: this is a per-call argument, never a global/thread-local
+    /// toggle, and the method is crate-private so NO external crate can ask
+    /// the writer for recovery powers. The only legitimate callers are the
+    /// named recovery commands of this crate — crash-reconciliation
+    /// materialization (`finish_recovered_tool_run_and_event`) and the
+    /// recovery journal append (`append_event_v_recovery`) — each of which
+    /// exists solely to reconstruct durable state after a crash. A poisoned
+    /// or concurrent writer cannot flip another call's purpose: each call
+    /// carries its own band into its own admission guard.
+    pub(crate) fn execute_recovery<R, F>(&self, label: &'static str, f: F) -> crate::StoreResult<R>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut Connection) -> crate::StoreResult<R> + Send + 'static,
+    {
+        self.execute_with_purpose(faktor_storage::AdmissionPurpose::Recovery, label, f)
+    }
+
+    fn execute_with_purpose<R, F>(
+        &self,
+        purpose: faktor_storage::AdmissionPurpose,
+        label: &'static str,
+        f: F,
+    ) -> crate::StoreResult<R>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut Connection) -> crate::StoreResult<R> + Send + 'static,
+    {
+        // HAR-05 write-boundary fault injection: every admission funnel
+        // (`execute`, `execute_recovery`, `execute_retry_busy*`) passes
+        // here, so one check drives the typed fault under EVERY write op.
+        #[cfg(any(test, feature = "fault-injection"))]
+        if let Some(err) = self
+            .inner
+            .fault
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .and_then(|seam| seam.take_error())
+        {
+            return Err(err);
+        }
         self.inner.check_available(label)?;
         // The admission guard must outlive the write: a concurrent
         // maintenance scan may only discount bytes whose write completed
-        // before the scan started.
-        let _storage_admission = self.inner.admit_storage(label)?;
+        // before the scan started. The purpose travels WITH this call's
+        // guard, so it can never leak to another queued writer.
+        let _storage_admission = self.inner.admit_storage(label, purpose)?;
         let (result_tx, result_rx) = mpsc::sync_channel::<crate::StoreResult<R>>(1);
         let job_inner = Arc::clone(&self.inner);
         let job = Job {
@@ -524,13 +596,48 @@ impl WriterService {
     pub(crate) fn execute_retry_busy<R, F>(
         &self,
         label: &'static str,
+        f: F,
+    ) -> crate::StoreResult<R>
+    where
+        R: Send + 'static,
+        F: FnMut(&mut Connection) -> crate::StoreResult<R> + Send + 'static,
+    {
+        self.execute_retry_busy_with_purpose(
+            faktor_storage::AdmissionPurpose::EmergencyMetadata,
+            label,
+            f,
+        )
+    }
+
+    /// [`WriterService::execute_recovery`] with the same bounded transient
+    /// lock retry as [`WriterService::execute_retry_busy`].
+    ///
+    /// AUTHORITY: recovery-class only (same argument as
+    /// [`WriterService::execute_recovery`]); the retry closure must be
+    /// idempotent exactly like the ordinary busy-retry path.
+    pub(crate) fn execute_retry_busy_recovery<R, F>(
+        &self,
+        label: &'static str,
+        f: F,
+    ) -> crate::StoreResult<R>
+    where
+        R: Send + 'static,
+        F: FnMut(&mut Connection) -> crate::StoreResult<R> + Send + 'static,
+    {
+        self.execute_retry_busy_with_purpose(faktor_storage::AdmissionPurpose::Recovery, label, f)
+    }
+
+    pub(crate) fn execute_retry_busy_with_purpose<R, F>(
+        &self,
+        purpose: faktor_storage::AdmissionPurpose,
+        label: &'static str,
         mut f: F,
     ) -> crate::StoreResult<R>
     where
         R: Send + 'static,
         F: FnMut(&mut Connection) -> crate::StoreResult<R> + Send + 'static,
     {
-        self.execute(label, move |conn| {
+        self.execute_with_purpose(purpose, label, move |conn| {
             let mut attempt = 0u32;
             loop {
                 match f(conn) {
@@ -669,9 +776,14 @@ impl WriterInner {
     /// quota or aggregate budget cannot hold it. The estimate is a fixed
     /// per-statement bound; the exact usage is reconciled by WAL maintenance
     /// on the same hot path.
+    /// `purpose` is an explicit per-call argument (never shared state), so a
+    /// concurrent or poisoned writer cannot change which band another call
+    /// is admitted under. Ordinary `execute*` entry points pass
+    /// `EmergencyMetadata`, preserving their exact historical behavior.
     fn admit_storage(
         &self,
         label: &'static str,
+        purpose: faktor_storage::AdmissionPurpose,
     ) -> crate::StoreResult<Option<faktor_storage::SqliteAdmission>> {
         let governor = self
             .storage_governor
@@ -682,7 +794,7 @@ impl WriterInner {
             return Ok(None);
         };
         governor
-            .admit_sqlite_growth_tracked(STORAGE_APPEND_ESTIMATE_BYTES)
+            .admit_sqlite_growth_tracked_for(purpose, STORAGE_APPEND_ESTIMATE_BYTES)
             .map(Some)
             .map_err(|error| StoreError::StorageRefused(format!("`{label}`: {error}")))
     }

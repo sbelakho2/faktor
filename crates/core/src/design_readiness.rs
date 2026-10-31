@@ -15,9 +15,20 @@
 //!   contract statement without a claim-bound proof that names the same
 //!   specific concern and shares a non-generic subject with that statement.
 //!
-//! Matching is deliberately statement-specific: an unrelated bound proof, a
-//! generic/control word, or another concern from the same class never covers
-//! a risk or statement on its own.
+//! Matching is IDENTITY-FIRST and deliberately statement-specific. A risk
+//! hypothesis or contract statement that names structural identities
+//! (`::`-paths such as component/symbol/dependency/interface selectors, and
+//! prefixed contract ids such as `po1:`/`i1:`/`c1:`/`r1:` references) is an
+//! IDENTIFIED node: only a claim-bound proof whose subject identities
+//! (evidence-binding targets plus identity-shaped claim tokens) intersect
+//! those identities — by exact equality or segment-aligned `::`-path prefix
+//! containment — can cover it, EVEN WHEN the two sides share zero words.
+//! A lexically similar but identity-disjoint proof never covers an
+//! identified node. Lexical non-generic subject overlap remains ONLY as the
+//! documented fallback for nodes lacking identities (prose hypotheses with
+//! no structural references), where no identity edge can exist to demand.
+//! An unrelated bound proof, a generic/control word, or another concern from
+//! the same class never covers a risk or statement on its own.
 //!
 //! Applying an audit may only append bounded risk rows. It never creates or
 //! discharges a proof obligation, never certifies completion and never raises
@@ -79,6 +90,13 @@ const MAX_FOCUS_CANDIDATES: usize = MAX_DESIGN_FOCUS_TERMS * 8;
 const MIN_DESIGN_FOCUS_TERM_BYTES: usize = 3;
 /// Hard bound on one matching profile's token set.
 const MAX_MATCH_TOKENS: usize = 128;
+/// Hard bound on ONE structural identity (UTF-8 bytes). An identity-shaped
+/// run longer than this is DROPPED, never truncated: a truncated identity
+/// could falsely equal the shared prefix of another truncated identity and
+/// fabricate a proof edge.
+const MAX_IDENTITY_BYTES: usize = 96;
+/// Hard bound on the structural identities carried by one match profile.
+const MAX_IDENTITY_TOKENS: usize = 32;
 /// Priority classes, highest first: binding selectors, component/symbol ids,
 /// invariant subjects, high-risk subjects, then generic words.
 const FOCUS_RANK_BINDING_SELECTOR: usize = 0;
@@ -410,7 +428,7 @@ pub fn audit_compiled_design(source: &impl DesignReadinessSource) -> DesignReadi
         let risk_profile = match_profile(&risk.description);
         if proofs
             .iter()
-            .any(|proof| proof_covers_risk(&risk_profile.subjects, proof))
+            .any(|proof| proof_covers_risk(&risk_profile, proof))
         {
             continue;
         }
@@ -419,7 +437,12 @@ pub fn audit_compiled_design(source: &impl DesignReadinessSource) -> DesignReadi
             "{} risk is carried without a subject-matching claim-bound proof obligation: {description}",
             risk.severity.severity_str()
         );
-        let basis = if risk_profile.subjects.is_empty() {
+        let basis = if !risk_profile.identities.is_empty() {
+            format!(
+                "risk names {} structural identity edge(s); no claim-bound proof shares one (identity-first matching)",
+                risk_profile.identities.len()
+            )
+        } else if risk_profile.subjects.is_empty() {
             "risk carries only generic/control vocabulary; no non-generic subject can match a proof"
                 .to_string()
         } else {
@@ -491,9 +514,9 @@ pub fn audit_compiled_design(source: &impl DesignReadinessSource) -> DesignReadi
             let uncovered: Vec<&'static str> = statement_concepts
                 .iter()
                 .filter(|concept| {
-                    !proofs.iter().any(|proof| {
-                        proof_covers_concept(**concept, &source_profile.subjects, proof)
-                    })
+                    !proofs
+                        .iter()
+                        .any(|proof| proof_covers_concept(**concept, &source_profile, proof))
                 })
                 .map(|concept| concept.name)
                 .collect();
@@ -506,9 +529,16 @@ pub fn audit_compiled_design(source: &impl DesignReadinessSource) -> DesignReadi
                 "{} concern {uncovered} is not covered by a statement-matching claim-bound proof obligation: {source_statement}",
                 kind.concern_label()
             );
-            let basis = format!(
-                "statement names uncovered concept(s) {uncovered}; no claim-bound proof names the same concern and shares a non-generic subject"
-            );
+            let basis = if !source_profile.identities.is_empty() {
+                format!(
+                    "statement names uncovered concept(s) {uncovered} and {} structural identity edge(s); no claim-bound proof names the same concern and shares an identity",
+                    source_profile.identities.len()
+                )
+            } else {
+                format!(
+                    "statement names uncovered concept(s) {uncovered}; no claim-bound proof names the same concern and shares a non-generic subject"
+                )
+            };
             push_finding(&mut findings, kind, statement, basis, RiskSeverity::Medium);
         }
     }
@@ -935,12 +965,14 @@ struct ConcernConcept {
     name: &'static str,
 }
 
-/// Bounded lexical view of one statement or proof: specific concern concepts
-/// plus concrete (non-generic) subject tokens.
+/// Bounded view of one statement or proof: specific concern concepts,
+/// concrete (non-generic) subject tokens AND structural identities
+/// (`::`-paths and prefixed contract ids).
 #[derive(Debug, Default)]
 struct MatchProfile {
     concepts: BTreeSet<ConcernConcept>,
     subjects: BTreeSet<String>,
+    identities: BTreeSet<String>,
 }
 
 impl MatchProfile {
@@ -954,6 +986,30 @@ impl MatchProfile {
             if is_match_subject(&token) {
                 self.subjects.insert(token);
             }
+        }
+        for identity in identity_tokens(text) {
+            self.add_identity(identity);
+        }
+    }
+
+    /// One evidence-binding target is an AUTHORITATIVE identity: exactly what
+    /// the obligation claims can discharge it, even when the target is a
+    /// single-segment id (`cargo-test`) prose extraction never treats as a
+    /// structural identity. Oversized targets are dropped, never truncated.
+    fn add_binding_target(&mut self, target: &str) {
+        self.add_text(target);
+        if target.is_empty() || target.len() > MAX_IDENTITY_BYTES {
+            return;
+        }
+        self.add_identity(target.to_ascii_lowercase());
+    }
+
+    fn add_identity(&mut self, identity: String) {
+        if identity.is_empty() || identity.len() > MAX_IDENTITY_BYTES {
+            return;
+        }
+        if self.identities.len() < MAX_IDENTITY_TOKENS {
+            self.identities.insert(identity);
         }
     }
 }
@@ -978,7 +1034,7 @@ fn proof_profile(obligation: &ProofObligation) -> MatchProfile {
     let mut profile = MatchProfile::default();
     profile.add_text(&obligation.claim);
     for_each_binding_target(&obligation.evidence_binding, |target| {
-        profile.add_text(target);
+        profile.add_binding_target(target);
     });
     profile
 }
@@ -1005,16 +1061,155 @@ fn contract_statements(contract: &EngineeringContract) -> impl Iterator<Item = &
         )
 }
 
-fn proof_covers_risk(risk_subjects: &BTreeSet<String>, proof: &MatchProfile) -> bool {
+/// IDENTITY-FIRST coverage of one risk hypothesis. A risk that names
+/// structural identities is an identified node: only an identity edge
+/// (equality or segment-aligned `::`-path prefix containment between the
+/// risk's identities and the proof's subject/binding identities) covers it,
+/// even when the two sides share zero words. Lexical non-generic subject
+/// overlap is the documented fallback for unidentified (pure prose) risks,
+/// where no identity edge can exist.
+fn proof_covers_risk(source: &MatchProfile, proof: &MatchProfile) -> bool {
+    if !source.identities.is_empty() {
+        return identities_intersect(&source.identities, &proof.identities);
+    }
+    proof_covers_risk_lexically(&source.subjects, proof)
+}
+
+fn proof_covers_risk_lexically(risk_subjects: &BTreeSet<String>, proof: &MatchProfile) -> bool {
     !risk_subjects.is_empty() && !risk_subjects.is_disjoint(&proof.subjects)
 }
 
+/// IDENTITY-FIRST concern coverage: the proof must name the same specific
+/// concept AND (for an identified statement) share a structural identity.
+/// The lexical subject fallback applies only to unidentified statements.
 fn proof_covers_concept(
+    concept: ConcernConcept,
+    source: &MatchProfile,
+    proof: &MatchProfile,
+) -> bool {
+    if !source.identities.is_empty() {
+        return proof.concepts.contains(&concept)
+            && identities_intersect(&source.identities, &proof.identities);
+    }
+    proof_covers_concept_lexically(concept, &source.subjects, proof)
+}
+
+fn proof_covers_concept_lexically(
     concept: ConcernConcept,
     statement_subjects: &BTreeSet<String>,
     proof: &MatchProfile,
 ) -> bool {
     proof.concepts.contains(&concept) && !statement_subjects.is_disjoint(&proof.subjects)
+}
+
+/// TRUE when two bounded identity sets share an edge: exact equality, or
+/// segment-aligned `::`-path prefix containment in either direction (a risk
+/// naming `auth::refresh` is covered by a proof bound to
+/// `auth::refresh::replay_is_rejected`, never by `auth::refresh2::x`).
+fn identities_intersect(left: &BTreeSet<String>, right: &BTreeSet<String>) -> bool {
+    !left.is_empty()
+        && !right.is_empty()
+        && left
+            .iter()
+            .any(|a| right.iter().any(|b| identity_matches(a, b)))
+}
+
+fn identity_matches(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    if !left.contains("::") || !right.contains("::") {
+        return false;
+    }
+    let (prefix, longer) = if left.len() <= right.len() {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    longer
+        .strip_prefix(prefix)
+        .is_some_and(|rest| rest.starts_with("::"))
+}
+
+/// Collect bounded structural identities from raw text: `::`-paths with at
+/// least two identifier segments and prefixed contract ids (`po1:<digest>`,
+/// `i1:<name>`, `c1:`, `r1:`, `dr1:`). Runs longer than
+/// [`MAX_IDENTITY_BYTES`] are dropped, never truncated. Non-ASCII content
+/// (including bidi controls and hostile markup) breaks a run, so it can
+/// never extend, corrupt or slice through an identity.
+fn identity_tokens(text: &str) -> BTreeSet<String> {
+    let source = bounded_slice(text, MAX_FOCUS_SOURCE_BYTES);
+    let mut identities = BTreeSet::new();
+    let mut run = String::new();
+    for ch in source.chars() {
+        if ch.is_ascii_alphanumeric() || ch == ':' {
+            run.push(ch);
+        } else if !run.is_empty() {
+            insert_structural_identity(&mut identities, &run);
+            run.clear();
+            if identities.len() >= MAX_IDENTITY_TOKENS {
+                return identities;
+            }
+        }
+    }
+    insert_structural_identity(&mut identities, &run);
+    identities
+}
+
+fn insert_structural_identity(identities: &mut BTreeSet<String>, run: &str) {
+    if identities.len() >= MAX_IDENTITY_TOKENS || run.is_empty() || run.len() > MAX_IDENTITY_BYTES {
+        return;
+    }
+    if let Some(identity) = structural_identity(run) {
+        identities.insert(identity);
+    }
+}
+
+/// The structural identity of one bounded ASCII run, or `None` when the run
+/// is plain vocabulary (a single word, a prose colon, a clock time, ...).
+fn structural_identity(run: &str) -> Option<String> {
+    if run.contains("::") {
+        let mut segments = run.split("::");
+        if !is_identity_segment(segments.next()?) {
+            return None;
+        }
+        let mut count = 1usize;
+        for segment in segments {
+            if !is_identity_segment(segment) {
+                return None;
+            }
+            count += 1;
+        }
+        (count >= 2).then(|| run.to_ascii_lowercase())
+    } else {
+        is_prefixed_contract_id(run).then(|| run.to_ascii_lowercase())
+    }
+}
+
+fn is_identity_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+/// A prefixed contract id: one to four lowercase letters, one or two digits,
+/// a colon, then a non-empty identifier/digest tail (`po1:<64 hex>`,
+/// `i1:migration`, `dr1:<digest>`). Prose colons (`note:replay`) and clock
+/// times (`12:30`) never qualify.
+fn is_prefixed_contract_id(run: &str) -> bool {
+    let Some((prefix, tail)) = run.split_once(':') else {
+        return false;
+    };
+    let bytes = prefix.as_bytes();
+    let letters = bytes
+        .iter()
+        .take_while(|byte| byte.is_ascii_lowercase())
+        .count();
+    (1..=4).contains(&letters)
+        && bytes[letters..].iter().all(|byte| byte.is_ascii_digit())
+        && (1..=2).contains(&(bytes.len() - letters))
+        && is_identity_segment(tail)
 }
 
 fn concern_concept(kind: DesignReadinessKind, token: &str) -> Option<&'static str> {
@@ -2171,5 +2366,246 @@ mod tests {
             "dedupe preserves the HIGHEST-priority occurrence: {terms:?}"
         );
         assert_eq!(terms, design_focus_terms(&contract));
+    }
+
+    #[test]
+    fn identity_edge_with_disjoint_vocabulary_proves_the_risk() {
+        // Adversarial pin for identity-first matching: the proof and the
+        // risk share ZERO non-identity words; only the structural identity
+        // `payments::capture_flow` creates the proof edge.
+        let mut contract = EngineeringContract::default();
+        contract.risks.push(risk(
+            "payments::capture_flow may double charge the ledger",
+            RiskSeverity::High,
+        ));
+        assert!(audit_compiled_design(&contract)
+            .findings
+            .iter()
+            .any(|finding| finding.kind == DesignReadinessKind::ElevatedRiskWithoutProof));
+
+        contract.proof_obligations.push(obligation(
+            "wvby bgr qzx settle ok",
+            Requirement::Required,
+            EvidenceBinding::TestSelector("payments::capture_flow".into()),
+        ));
+        let audit = audit_compiled_design(&contract);
+        assert!(
+            !audit
+                .findings
+                .iter()
+                .any(|finding| finding.kind == DesignReadinessKind::ElevatedRiskWithoutProof),
+            "an identity edge must prove the risk even with zero shared words: {:?}",
+            audit.findings
+        );
+
+        // Identity-disjoint control: identical wording, different selector.
+        let mut control = contract.clone();
+        control.proof_obligations = vec![obligation(
+            "wvby bgr qzx settle ok",
+            Requirement::Required,
+            EvidenceBinding::TestSelector("ui::settings_panel".into()),
+        )];
+        let audit = audit_compiled_design(&control);
+        assert!(audit
+            .findings
+            .iter()
+            .any(|finding| finding.kind == DesignReadinessKind::ElevatedRiskWithoutProof));
+    }
+
+    #[test]
+    fn lexical_similarity_never_proves_an_identified_risk() {
+        // Adversarial pin: a lexically near-identical proof that shares
+        // three non-generic subjects but carries a disjoint identity must
+        // NOT prove an identified risk — the lexical fallback is only for
+        // hypotheses lacking identities.
+        let mut contract = EngineeringContract::default();
+        contract.risks.push(risk(
+            "payments::capture_flow may double charge the ledger",
+            RiskSeverity::High,
+        ));
+        contract.proof_obligations.push(obligation(
+            "double charge the ledger is verified",
+            Requirement::Required,
+            EvidenceBinding::TestSelector("ui::settings_panel".into()),
+        ));
+        let audit = audit_compiled_design(&contract);
+        let finding = audit
+            .findings
+            .iter()
+            .find(|finding| finding.kind == DesignReadinessKind::ElevatedRiskWithoutProof)
+            .expect("shared words must never prove an identity-disjoint identified risk");
+        assert!(
+            finding.basis.contains("identity"),
+            "the basis names identity-first matching: {}",
+            finding.basis
+        );
+    }
+
+    #[test]
+    fn identity_edge_covers_a_concern_with_disjoint_vocabulary() {
+        // The concern concept stays bounded lexical vocabulary (replay);
+        // the subject edge is structural: `auth::refresh` is a
+        // segment-aligned prefix of the bound selector.
+        let mut contract = EngineeringContract::default();
+        contract.risks.push(risk(
+            "replay of auth::refresh may duplicate tokens",
+            RiskSeverity::Medium,
+        ));
+        contract.proof_obligations.push(obligation(
+            "wvby bgr qzx ok",
+            Requirement::Required,
+            EvidenceBinding::TestSelector("auth::refresh::replay_is_rejected".into()),
+        ));
+        let audit = audit_compiled_design(&contract);
+        assert!(
+            !audit
+                .findings
+                .iter()
+                .any(|finding| finding.kind == DesignReadinessKind::ConcurrencyWithoutProof),
+            "prefix containment plus concept coverage must prove the concern: {:?}",
+            audit.findings
+        );
+
+        let mut control = contract.clone();
+        control.proof_obligations = vec![obligation(
+            "wvby bgr qzx ok",
+            Requirement::Required,
+            EvidenceBinding::TestSelector("ui::settings::replay_is_rejected".into()),
+        )];
+        let audit = audit_compiled_design(&control);
+        assert!(
+            audit
+                .findings
+                .iter()
+                .any(|finding| finding.kind == DesignReadinessKind::ConcurrencyWithoutProof),
+            "an identity-disjoint replay proof never covers an identified statement"
+        );
+    }
+
+    #[test]
+    fn contract_id_references_are_structural_identities() {
+        // A required-invariant identity referenced by a risk description and
+        // by an obligation's property binding proves the risk with zero
+        // shared words; a different invariant id never does.
+        let mut contract = EngineeringContract::default();
+        contract.risks.push(risk(
+            "invariant i1:orders_unique must hold under load",
+            RiskSeverity::High,
+        ));
+        contract.proof_obligations.push(obligation(
+            "wvby bgr qzx ok",
+            Requirement::Required,
+            EvidenceBinding::PropertyIds(vec!["i1:orders_unique".into()]),
+        ));
+        let audit = audit_compiled_design(&contract);
+        assert!(
+            !audit
+                .findings
+                .iter()
+                .any(|finding| finding.kind == DesignReadinessKind::ElevatedRiskWithoutProof),
+            "prefixed contract ids are structural identities: {:?}",
+            audit.findings
+        );
+
+        let mut control = contract.clone();
+        control.proof_obligations = vec![obligation(
+            "wvby bgr qzx ok",
+            Requirement::Required,
+            EvidenceBinding::PropertyIds(vec!["i1:other_invariant".into()]),
+        )];
+        let audit = audit_compiled_design(&control);
+        assert!(audit
+            .findings
+            .iter()
+            .any(|finding| finding.kind == DesignReadinessKind::ElevatedRiskWithoutProof));
+    }
+
+    #[test]
+    fn truncation_never_fabricates_an_identity_edge() {
+        // A hostile 200-byte target shares its first 96+ bytes with the
+        // risk's real identity. Truncating the target would fabricate an
+        // edge; dropping oversized identities keeps the identified risk
+        // unproven although the pair shares lexical subjects.
+        let real = format!("ledger::{}", "a".repeat(20));
+        let hostile = format!("ledger::{}", "a".repeat(200));
+        let mut contract = EngineeringContract::default();
+        contract.risks.push(risk(
+            &format!("{real} may double charge"),
+            RiskSeverity::High,
+        ));
+        contract.proof_obligations.push(obligation(
+            "double charge is verified",
+            Requirement::Required,
+            EvidenceBinding::TestSelector(hostile),
+        ));
+        let first = audit_compiled_design(&contract);
+        let second = audit_compiled_design(&contract);
+        assert_eq!(first, second, "identity matching stays deterministic");
+        assert!(
+            first
+                .findings
+                .iter()
+                .any(|finding| finding.kind == DesignReadinessKind::ElevatedRiskWithoutProof),
+            "an oversized candidate edge is dropped, never truncated into a match"
+        );
+        assert!(first.findings.len() <= MAX_DESIGN_READINESS_FINDINGS);
+    }
+
+    #[test]
+    fn identity_extraction_is_bidi_and_control_safe() {
+        // Bidi overrides and NUL bytes break identity runs without corrupting
+        // or extending them; the structural edge still matches and nothing
+        // panics or grows past its bound.
+        let mut contract = EngineeringContract::default();
+        contract.risks.push(risk(
+            "\u{202e}payments::capture_flow\u{202c}\u{0} may double charge",
+            RiskSeverity::High,
+        ));
+        contract.proof_obligations.push(obligation(
+            "wvby bgr qzx ok",
+            Requirement::Required,
+            EvidenceBinding::TestSelector("payments::capture_flow".into()),
+        ));
+        let audit = audit_compiled_design(&contract);
+        assert_eq!(audit, audit_compiled_design(&contract));
+        assert!(
+            !audit
+                .findings
+                .iter()
+                .any(|finding| finding.kind == DesignReadinessKind::ElevatedRiskWithoutProof),
+            "bidi/control bytes never corrupt the structural edge: {:?}",
+            audit.findings
+        );
+        for finding in &audit.findings {
+            assert!(finding.statement.len() <= MAX_DESIGN_FINDING_BYTES);
+            assert!(finding.basis.len() <= MAX_DESIGN_BASIS_BYTES);
+            assert!(finding.id.starts_with("dr1:"));
+        }
+    }
+
+    #[test]
+    fn prose_colons_and_clock_times_are_not_identities() {
+        // The prefixed-id shape is strict: prose colons (`note:replay`) and
+        // clock times (`12:30`) never become identities, so the statement
+        // stays on the documented lexical fallback for unidentified nodes.
+        let mut contract = EngineeringContract::default();
+        contract.risks.push(risk(
+            "note:replay at 12:30 may double charge",
+            RiskSeverity::High,
+        ));
+        contract.proof_obligations.push(obligation(
+            "double charge is verified",
+            Requirement::Required,
+            EvidenceBinding::CheckIds(vec!["cargo-test".into()]),
+        ));
+        let audit = audit_compiled_design(&contract);
+        assert!(
+            !audit
+                .findings
+                .iter()
+                .any(|finding| finding.kind == DesignReadinessKind::ElevatedRiskWithoutProof),
+            "unidentified prose keeps the lexical subject fallback: {:?}",
+            audit.findings
+        );
     }
 }

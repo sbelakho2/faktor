@@ -2236,3 +2236,69 @@ fn doctor_reports_storage_governor_totals_quotas_refusals_and_degraded_health() 
     );
     assert!(report.issues >= 1, "{:?}", report.lines);
 }
+
+/// Audit item 12 doctor surface: before any evidence insert the section
+/// reports the absent backing store — and doctor NEVER creates the backing
+/// CAS directory itself (creation belongs to the first insert). The wording
+/// deliberately avoids "not initialized", which the corrupt-governor test
+/// reserves for the storage-governor section.
+#[test]
+fn doctor_evidence_aging_reports_no_backing_store_and_never_creates_the_cas_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let report = doctor_run(dir.path(), false);
+    assert!(
+        report
+            .lines
+            .iter()
+            .any(|l| l.starts_with("evidence-aging: no backing store yet")),
+        "{:?}",
+        report.lines
+    );
+    assert!(!dir.path().join("store/evidence-cas").exists());
+    // Direct call with a fresh store: same refusal-to-create behavior.
+    let session =
+        SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas")).unwrap();
+    let mut lines = Vec::new();
+    let mut issues = 0usize;
+    doctor_evidence_aging_line(session.store().clone(), &mut lines, &mut issues);
+    assert_eq!(issues, 0, "{lines:?}");
+    assert!(
+        lines[0].starts_with("evidence-aging: no backing store yet"),
+        "{lines:?}"
+    );
+    assert!(!dir.path().join("store/evidence-cas").exists());
+}
+
+/// Once the backing CAS exists (the first insert creates it), the section
+/// prints the read-only dry-run plan: policy, cadence stamp, exact sweep
+/// buckets — all zero on an empty store, with zero issues.
+#[test]
+fn doctor_evidence_aging_prints_the_dry_run_plan_for_an_initialized_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let session =
+        SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas")).unwrap();
+    // The insert path would create this directory; the doctor only reads it.
+    std::fs::create_dir_all(dir.path().join("store/evidence-cas")).unwrap();
+    let mut lines = Vec::new();
+    let mut issues = 0usize;
+    doctor_evidence_aging_line(session.store().clone(), &mut lines, &mut issues);
+    assert_eq!(issues, 0, "{lines:?}");
+    let line = &lines[0];
+    assert!(line.starts_with("evidence-aging: enabled=true"), "{line}");
+    assert!(line.contains("horizon-ms=2592000000"), "{line}");
+    assert!(line.contains("scanned=0"), "{line}");
+    assert!(line.contains("evictable-bodies=0"), "{line}");
+    assert!(line.contains("evictable-bytes=0"), "{line}");
+    assert!(line.contains("truncated=false"), "{line}");
+    // A fresh process has no attached governor: stated loudly, never as an
+    // evictable plan.
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("no storage governor attached")),
+        "{lines:?}"
+    );
+    // The section is pure read: it must not have stamped a cadence or
+    // written anything (the directory gained no entries from the read).
+    assert_eq!(issues, 0);
+}

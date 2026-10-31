@@ -128,6 +128,22 @@ pub(crate) fn command_event(
     })
 }
 
+/// Admission class for the permission-expiry store command (audit item 14).
+///
+/// This is a per-call argument threaded into the named store command; there
+/// is no global or thread-local purpose state and ordinary callers can only
+/// name [`Self::Ordinary`]. [`Self::Recovery`] is reachable solely through
+/// the crate-visible `expire_pending_permissions_locked_recovery` entry point,
+/// whose only caller is `SessionHandle::recover_all` (the crash sweep that
+/// reconstructs durable state after a dead process).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PermissionExpiryAdmission {
+    /// Live/ordinary callers: emergency-metadata band, unchanged.
+    Ordinary,
+    /// Crash-reconciliation sweep only: recovery band (90–100% reserve).
+    Recovery,
+}
+
 impl SessionHandle {
     /// Start a tool run. The op envelope is the caller's (it owns the
     /// deadline/retry/cancellation/recovery); this command journals
@@ -977,7 +993,11 @@ impl SessionHandle {
         &self,
     ) -> faktor_core::Result<faktor_store::ExpiredPermissionResolution> {
         let _guard = self.command_guard();
-        self.expire_pending_permissions_locked()
+        self.expire_pending_permissions_locked_until(
+            self.now_ms(),
+            "durable permission deadline elapsed while no live waiter owned the request",
+            PermissionExpiryAdmission::Ordinary,
+        )
     }
 
     /// Startup recovery: every still-pending permission row is OWNERLESS —
@@ -993,17 +1013,31 @@ impl SessionHandle {
         reason: &str,
     ) -> faktor_core::Result<faktor_store::ExpiredPermissionResolution> {
         let _guard = self.command_guard();
-        self.expire_pending_permissions_locked_until(i64::MAX, reason)
+        self.expire_pending_permissions_locked_until(
+            i64::MAX,
+            reason,
+            PermissionExpiryAdmission::Ordinary,
+        )
     }
 
-    /// [`Self::expire_pending_permissions`] without taking the command guard
-    /// (recovery already holds it). Never call this without the guard.
-    pub(crate) fn expire_pending_permissions_locked(
+    /// RECOVERY-CLASS SITE (audit item 14): [`Self::expire_pending_permissions`]
+    /// without taking the command guard (recovery already holds it), admitted
+    /// through the recovery band. This exists ONLY for
+    /// `SessionHandle::recover_all`: expiry of a permission whose deadline
+    /// passed while the daemon was down is crash reconciliation, so it must
+    /// commit even when ordinary/emergency admission is saturated above the
+    /// 90% emergency ceiling. It still refuses TYPED at the hard budget.
+    ///
+    /// AUTHORITY: crate-visible, named recovery entry point; the recovery
+    /// purpose is a per-call argument (no global state), and the only caller
+    /// is the crash sweep. Never call this without the session command guard.
+    pub(crate) fn expire_pending_permissions_locked_recovery(
         &self,
     ) -> faktor_core::Result<faktor_store::ExpiredPermissionResolution> {
         self.expire_pending_permissions_locked_until(
             self.now_ms(),
             "durable permission deadline elapsed while no live waiter owned the request",
+            PermissionExpiryAdmission::Recovery,
         )
     }
 
@@ -1011,6 +1045,7 @@ impl SessionHandle {
         &self,
         now: i64,
         reason: &str,
+        admission: PermissionExpiryAdmission,
     ) -> faktor_core::Result<faktor_store::ExpiredPermissionResolution> {
         let expired = self
             .manager
@@ -1043,12 +1078,21 @@ impl SessionHandle {
         )?;
         // The atomic store command re-verifies `current` inside its
         // transaction and re-derives the expired set there: the row changes
-        // and the journal event commit together or not at all.
-        self.manager
-            .store()
-            .expire_pending_permissions_for_session(self.id, now, current, event)
-            .map_err(crate::map_store_err)
-            .map_err(Into::into)
+        // and the journal event commit together or not at all. The admission
+        // purpose is a per-call argument to the named command: only the
+        // recovery entry point selects the recovery-band sibling; ordinary
+        // callers keep the byte-identical emergency-band command.
+        let store = self.manager.store();
+        match admission {
+            PermissionExpiryAdmission::Ordinary => store
+                .expire_pending_permissions_for_session(self.id, now, current, event)
+                .map_err(crate::map_store_err)
+                .map_err(Into::into),
+            PermissionExpiryAdmission::Recovery => store
+                .expire_pending_permissions_for_session_recovery(self.id, now, current, event)
+                .map_err(crate::map_store_err)
+                .map_err(Into::into),
+        }
     }
 
     pub fn pending_permission(

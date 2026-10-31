@@ -176,7 +176,10 @@ object Edition5AcceptanceSmoke {
         overlay.append("\"successful_run_cost_labeled_vcsc\":false,\"denominator_hidden\":false},")
         overlay.append("  \"usage_settled_micro\":").append(esc(usage.settledCostMicro.toString())).append(",\n")
 
-        val matrix = File(root, HOST_MATRIX_PATH)
+        // HAR-16: read THIS run's host-matrix artifact (canonical on the pin,
+        // per-version when an IDE release is explicitly selected) — never the
+        // other release's evidence.
+        val matrix = File(root, ParityPath.versionedCertPath(HOST_MATRIX_PATH))
         val hostMatrix =
             if (matrix.isFile) {
                 runCatching { JsonCodec.parse(matrix.readText()).view("matrix") }.getOrNull()
@@ -202,9 +205,12 @@ object Edition5AcceptanceSmoke {
         overlay.append("\"find_only_rendered\":false}\n")
         overlay.append("}\n")
 
-        val out = File(root, OVERLAY_PATH)
+        // HAR-16: per-version overlay file so a second-IDE-version leg never
+        // clobbers the pinned-release acceptance evidence.
+        val overlayPath = ParityPath.versionedCertPath(OVERLAY_PATH)
+        val out = File(root, overlayPath)
         out.parentFile.mkdirs()
         out.writeText(overlay.toString(), Charsets.UTF_8)
-        println("jetbrains acceptance probe: overlays written for ${40} scenarios -> $OVERLAY_PATH")
+        println("jetbrains acceptance probe: overlays written for ${40} scenarios -> $overlayPath")
     }
 }

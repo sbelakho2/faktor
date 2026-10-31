@@ -1379,3 +1379,11 @@ mod tests {
 #[cfg(test)]
 #[path = "memory_pager_plan_tests.rs"]
 mod memory_pager_plan_tests;
+
+// HAR-12: panic-hook test support + the seeded route/mode/permission fuzz
+// driver (new modules; the hook lives in `panic_hook` so future long-run
+// suites in this crate can adopt it without a shared main).
+#[cfg(test)]
+mod panic_hook;
+#[cfg(test)]
+mod route_fuzz_tests;

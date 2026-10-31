@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! Wire request rendering (audit 33): the context budget must bound the
 //! provider request (conservative normalized estimate — not a
 //! provider-tokenizer-exact count), and every conceptual element must appear
@@ -92,6 +93,16 @@ pub const MAX_PROMPT_OBSERVATION_SEGMENTS: usize = 64;
 
 /// Hard bound on the serialized [`PrefixObservation`] JSON bytes.
 const MAX_PREFIX_OBSERVATION_JSON: usize = 64 * 1024;
+
+/// Design-focus pretest slack (audit item 10, P2 token economics): the fixed
+/// volatile-context envelope (`\n[faktor:volatile-context]\n` + the DATA
+/// notice, ~101 bytes ≈ ≤35 tokens under the conservative estimator) plus
+/// BPE join slack at the two seams where the envelope meets the task-progress
+/// and evidence renders (a real tokenizer can shift a join by a token or two,
+/// never more). The slack makes
+/// [`WirePlan::design_focus_savings_upper_bound`] an over-estimate, so the
+/// pretest may only SKIP a build it can prove hopeless — never accept.
+pub const DESIGN_FOCUS_VOLATILE_ENVELOPE_SLACK_TOKENS: usize = 64;
 
 /// §8.4 memory stability class of one prompt segment, in cache order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -644,6 +655,77 @@ impl WirePlan {
             .longest_stable_prefix(previous)
             .stable_leading_tokens
     }
+
+    /// A mathematically safe UPPER BOUND on the tokens a focused design
+    /// variant of THIS rendered plan could possibly save (audit item 10).
+    ///
+    /// Both the baseline and the focused plan are rendered by
+    /// [`plan_wire_request`] from IDENTICAL cacheable-head and tool-bundle
+    /// inputs (the renderer is pure; only the evidence list differs), so
+    /// every focused plan satisfies `focused.total_tokens >= head + tools`.
+    /// Therefore
+    /// `baseline.total − focused.total ≤ baseline.total − (head + tools)`
+    /// and `plan_wire_request`'s total decomposes exactly as
+    /// `head + tools + recent_history + volatile`, giving
+    ///
+    /// ```text
+    /// savings ≤ recent_history + volatile
+    /// volatile ≤ evidence + envelope   (the task-progress block is
+    ///                                  identical in both plans and
+    ///                                  cancels whenever the focused
+    ///                                  volatile message exists; when it
+    ///                                  does not, the fixed envelope is
+    ///                                  the extra term)
+    /// ```
+    ///
+    /// — i.e. this bound. A focused plan that re-plans a SMALLER history
+    /// window only saves less (its total still clears `head + tools`); a
+    /// focused plan that re-plans a LARGER window makes savings negative.
+    /// The bound over-estimates by [`DESIGN_FOCUS_VOLATILE_ENVELOPE_SLACK_TOKENS`]
+    /// by construction, so a pretest that skips on it can never skip a case
+    /// the real final-token gate would have accepted. Saturating: hostile
+    /// segment totals can never panic or wrap the bound upward.
+    pub fn design_focus_savings_upper_bound(&self) -> usize {
+        self.prompt_segments
+            .recent_history
+            .tokens
+            .saturating_add(self.prompt_segments.evidence.tokens)
+            .saturating_add(
+                u64::try_from(DESIGN_FOCUS_VOLATILE_ENVELOPE_SLACK_TOKENS).unwrap_or(u64::MAX),
+            )
+            .try_into()
+            .unwrap_or(usize::MAX)
+    }
+}
+
+/// The design-focus UPPER-BOUND pretest (audit item 10, P2 token economics).
+///
+/// The cheap eligibility gate ([`faktor_core::design_focus_should_run`];
+/// more than 2 KiB of duplicated paths) can pass on a turn whose WIRE
+/// evidence is tiny: production then built AND tokenized a whole second
+/// final wire plan only for the real dividend gate to reject it. This
+/// pretest computes, from the ALREADY-BUILT baseline plan alone, whether
+/// the focused variant could possibly clear the real gate
+/// (`faktor_core::design_focus_has_dividend`: savings ≥
+/// `max(512, ceil(baseline/8))`):
+///
+/// ```text
+/// threshold = max(512, baseline / 8)          // floor; ≤ the real ceil bound
+/// max_possible_savings = baseline.design_focus_savings_upper_bound()
+/// max_possible_savings < threshold  ⇒  the focused variant CANNOT qualify
+/// ```
+///
+/// Soundness: the real gate requires `savings ≥ required` with
+/// `required = max(512, ceil(baseline/8)) ≥ threshold`; the true savings are
+/// ≤ the upper bound, so `upper_bound < threshold ≤ required` proves the
+/// gate fails and the second plan build can be skipped entirely.
+///
+/// The pretest may only SKIP, never ACCEPT: when it returns `false` the
+/// caller still builds the focused plan and the REAL final-token gate keeps
+/// its verdict unchanged.
+pub fn design_focus_pretest_cannot_qualify(baseline: &WirePlan) -> bool {
+    let threshold = (baseline.total_tokens / 8).max(faktor_core::MIN_DESIGN_FOCUS_SAVINGS_TOKENS);
+    baseline.design_focus_savings_upper_bound() < threshold
 }
 
 /// Render the wire request under the budget, PURELY: every input section is
@@ -2167,6 +2249,235 @@ mod tests {
             &GenericTokenCounter,
         )
         .unwrap()
+    }
+
+    // --------------------------------------- audit item 10: the focused-plan
+    // upper-bound pretest (P2 token economics).
+
+    /// A hand-built plan with explicit segment/total tokens (the pretest
+    /// reads only those; rendering a real request cannot produce hostile
+    /// totals).
+    fn synthetic_plan(total: usize, history_tokens: u64, evidence_tokens: u64) -> WirePlan {
+        let hash = FileHash::from(h(7));
+        let segment = |tokens: u64| PromptSegment {
+            class: PromptStability::Volatile,
+            bytes: 0,
+            hash,
+            tokens,
+            kind: TokenEstimateKind::UpperBound,
+        };
+        WirePlan {
+            system: String::new(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            total_tokens: total,
+            cacheable_prefix_len: 0,
+            prompt_segments: PromptSegments {
+                recent_history: segment(history_tokens),
+                evidence: segment(evidence_tokens),
+                ..PromptSegments::default()
+            },
+            exact: false,
+        }
+    }
+
+    /// The production call-site shape of the pre-gate: the second (focused)
+    /// plan is built IFF the pretest lets it through, and the build counter
+    /// is the side-effect the audit observes. Synthetic input where the
+    /// upper bound cannot reach the threshold: the focused plan is NEVER
+    /// constructed, and the real gate would have rejected it anyway.
+    #[test]
+    fn design_focus_pretest_skips_the_second_build_when_the_upper_bound_cannot_reach_the_threshold()
+    {
+        // Tiny volatile tail: two short turns and one small evidence block
+        // (bound well under 512 tokens). The cheap eligibility gate (>2 KiB
+        // duplicated paths in the LEDGER) can still pass on such a turn,
+        // but no focused variant could ever save 512 wire tokens here.
+        let short_history: Vec<RequestMessage> = (0..2)
+            .map(|i| RequestMessage {
+                role: if i % 2 == 0 {
+                    Role::User
+                } else {
+                    Role::Assistant
+                },
+                content: vec![ContentPart::text(format!("short turn {i}"))],
+            })
+            .collect();
+        let baseline = plan_with("", &[], &evidence(1), &short_history);
+        assert!(
+            design_focus_pretest_cannot_qualify(&baseline),
+            "upper bound {} must stay below the 512-token threshold",
+            baseline.design_focus_savings_upper_bound()
+        );
+        let builds = std::cell::Cell::new(0usize);
+        let focused = if design_focus_pretest_cannot_qualify(&baseline) {
+            None
+        } else {
+            builds.set(builds.get() + 1);
+            Some(
+                plan_wire_request(
+                    "You are Faktor.\n",
+                    "",
+                    &[tool("echo")],
+                    "",
+                    &contract_ledger(),
+                    "src/",
+                    &short_history,
+                    &[],
+                    "",
+                    &ContextBudget::default(),
+                    &GenericTokenCounter,
+                )
+                .unwrap(),
+            )
+        };
+        assert!(focused.is_none(), "the pretest must skip this input");
+        assert_eq!(
+            builds.get(),
+            0,
+            "the focused plan must never be constructed on a skipped input"
+        );
+        // Soundness oracle (built OUTSIDE the gate, test-only): the SAME
+        // inputs with the evidence removed — even the REAL final-token
+        // dividend gate rejects this input, so the skip lost nothing.
+        let counterfactual = plan_wire_request(
+            "You are Faktor.\n",
+            "",
+            &[tool("echo")],
+            "",
+            &contract_ledger(),
+            "src/",
+            &short_history,
+            &[],
+            "",
+            &ContextBudget::default(),
+            &GenericTokenCounter,
+        )
+        .unwrap();
+        assert!(!faktor_core::design_focus_has_dividend(
+            baseline.total_tokens,
+            counterfactual.total_tokens
+        ));
+        let true_savings = baseline
+            .total_tokens
+            .saturating_sub(counterfactual.total_tokens);
+        assert!(
+            true_savings <= baseline.design_focus_savings_upper_bound(),
+            "the bound must cover the real savings ({true_savings} > {})",
+            baseline.design_focus_savings_upper_bound()
+        );
+    }
+
+    /// Inputs the pretest cannot rule out: the production call site builds
+    /// the second plan and the REAL final-token gate keeps its verdict
+    /// unchanged — accept on a true dividend, reject on a near-miss. The
+    /// pretest may only skip, never accept.
+    #[test]
+    fn design_focus_pretest_passes_through_and_the_real_gate_keeps_the_verdict() {
+        let history = text_history(60);
+        let baseline = plan_with("rules", &["step"], &evidence(40), &history);
+        assert!(
+            !design_focus_pretest_cannot_qualify(&baseline),
+            "upper bound {} may not skip a potentially-qualifying baseline (threshold {})",
+            baseline.design_focus_savings_upper_bound(),
+            (baseline.total_tokens / 8).max(512)
+        );
+        // The production call-site shape: the build RUNS (counter 1).
+        let builds = std::cell::Cell::new(0usize);
+        let build = |ev: &[Evidence], builds: &std::cell::Cell<usize>| {
+            builds.set(builds.get() + 1);
+            plan_wire_request(
+                "You are Faktor.\n",
+                "",
+                &[tool("echo")],
+                "rules",
+                &contract_ledger_with_step(),
+                "src/",
+                &history,
+                ev,
+                "",
+                &ContextBudget::default(),
+                &GenericTokenCounter,
+            )
+            .unwrap()
+        };
+        let focused = build(&[], &builds);
+        assert_eq!(builds.get(), 1, "the second plan is actually built");
+        // The real gate adopts a true dividend (>=512 AND >=12.5%).
+        assert!(faktor_core::design_focus_has_dividend(
+            baseline.total_tokens,
+            focused.total_tokens
+        ));
+        // A near-miss focused variant: the real gate rejects it even though
+        // the pretest allowed the build — the verdict is the gate's alone.
+        let near_miss = build(&evidence(39), &builds);
+        assert!(!faktor_core::design_focus_has_dividend(
+            baseline.total_tokens,
+            near_miss.total_tokens
+        ));
+        for focused_total in [focused.total_tokens, near_miss.total_tokens] {
+            let savings = baseline.total_tokens.saturating_sub(focused_total);
+            assert!(
+                savings <= baseline.design_focus_savings_upper_bound(),
+                "the bound must cover the real savings ({savings} > {})",
+                baseline.design_focus_savings_upper_bound()
+            );
+        }
+    }
+
+    fn contract_ledger_with_step() -> TaskLedger {
+        let mut l = contract_ledger();
+        l.open_steps = vec!["step".to_string()];
+        l
+    }
+
+    /// The pretest threshold is `max(512, baseline/8)` with STRICT `<`:
+    /// a bound exactly at the threshold still lets the real gate decide,
+    /// hostile totals saturate instead of wrapping, and a zero baseline
+    /// can never qualify (matching the real gate).
+    #[test]
+    fn design_focus_pretest_is_strictly_less_than_and_saturates_on_hostile_totals() {
+        // total 8192 ⇒ threshold 1024. Bound 1024 (equal) → NOT skipped.
+        let equal = synthetic_plan(8_192, 960, 0);
+        assert_eq!(equal.design_focus_savings_upper_bound(), 1_024);
+        assert!(!design_focus_pretest_cannot_qualify(&equal));
+        // Bound 1023 (one below) → skipped.
+        let just_below = synthetic_plan(8_192, 959, 0);
+        assert_eq!(just_below.design_focus_savings_upper_bound(), 1_023);
+        assert!(design_focus_pretest_cannot_qualify(&just_below));
+        // The 512 floor binds for small baselines: total 2048, bound 128.
+        let small = synthetic_plan(2_048, 64, 0);
+        assert!(design_focus_pretest_cannot_qualify(&small));
+        // Hostile totals: saturating bound, never a panic, never a wrap
+        // that would flip a doomed input into "maybe qualifying".
+        let hostile = synthetic_plan(usize::MAX, u64::MAX, u64::MAX);
+        assert_eq!(hostile.design_focus_savings_upper_bound(), usize::MAX);
+        assert!(!design_focus_pretest_cannot_qualify(&hostile));
+        // A zero baseline can never qualify (the real gate refuses it).
+        let zero = synthetic_plan(0, 0, 0);
+        assert!(design_focus_pretest_cannot_qualify(&zero));
+        assert!(!faktor_core::design_focus_has_dividend(0, 0));
+    }
+
+    /// The bound decomposes exactly as the renderer's total: history +
+    /// evidence + the documented volatile-envelope slack, never less.
+    #[test]
+    fn design_focus_savings_upper_bound_matches_the_renderer_decomposition() {
+        let plan = plan_with("rules", &["step"], &evidence(3), &text_history(5));
+        let expected = (plan.prompt_segments.recent_history.tokens
+            + plan.prompt_segments.evidence.tokens
+            + u64::try_from(DESIGN_FOCUS_VOLATILE_ENVELOPE_SLACK_TOKENS).unwrap())
+        .try_into()
+        .unwrap_or(usize::MAX);
+        assert_eq!(plan.design_focus_savings_upper_bound(), expected);
+        // The volatile segments are a strict sub-total of the plan.
+        assert!(
+            usize::try_from(
+                plan.prompt_segments.recent_history.tokens + plan.prompt_segments.evidence.tokens
+            )
+            .unwrap_or(usize::MAX)
+                <= plan.total_tokens
+        );
     }
 
     #[test]

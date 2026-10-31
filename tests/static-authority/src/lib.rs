@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=independent-reference isolation=isolated-data-dir
 //! Static source-authority certification (audit 31/107-109).
 //!
 //! Seventeen structural invariants are locked by scanning the repository's
@@ -2055,7 +2056,10 @@ mod scans {
         ),
         (
             "crates/fs/src/lib.rs",
-            "fs::rename(&tmp, target).map_err(|e| {",
+            // The copy writer's rename now routes through the crate's
+            // single rename authority (`durable_rename_raw`, HAR-04
+            // failpoint-wrapped) — same sequence, helper-mediated.
+            "atomic::durable_rename_raw(&tmp, target).map_err(|e| {",
         ),
         // crates/git: worktree metadata save (spec §33) — best-effort
         // .git-internal writer with its own unique-temp discipline.
@@ -2081,7 +2085,9 @@ mod scans {
         ),
         (
             "crates/fs/src/entry_state.rs",
-            "fs::rename(&tmp, dst).map_err(|e| {",
+            // The landing rename routes through the crate's single rename
+            // authority (`durable_rename_raw`, HAR-04 failpoint-wrapped).
+            "crate::atomic::durable_rename_raw(&tmp, dst).map_err(|e| {",
         ),
     ];
 
@@ -7156,6 +7162,12 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         // `GlobalAlloc` wrapper whose allocation-free `libc::write` report
         // must not recurse through the allocator.
         ("crates/cli/src/test_memory_guard.rs", 1),
+        // The emulated-HIL firmware (HAR-18): a DETACHED bare-metal
+        // thumbv7m crate whose entire purpose is driving LM3S6965 MMIO —
+        // volatile register access cannot exist without `unsafe`. Zero
+        // `allow(unsafe_code)` attributes (the crate carries none); every
+        // of the eight sites carries its own `// SAFETY:` justification.
+        ("tests/hil/firmware/src/main.rs", 0),
     ];
 
     /// Every `.rs` file under `crates/` and `tests/` (including out-of-line
@@ -9867,6 +9879,22 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         line.trim_start().starts_with("#!") && python_invocation(line)
     }
 
+    /// Product-SURFACE expectations over the `python` language label the
+    /// markdown renderer displays — content the UI shows, never an
+    /// interpreter invocation. Each entry is (file, exact substring); the
+    /// companion test fails when an entry goes stale (the line moved or
+    /// changed), so the list cannot rot into a silent hole.
+    const PYTHON_LABEL_EXPECTATIONS: &[(&str, &str)] = &[(
+        "apps/vscode/scripts/selftest.mjs",
+        "assertEqual(lang.textContent, 'python', 'the language label is shown');",
+    )];
+
+    fn python_label_expectation(rel: &str, line: &str) -> bool {
+        PYTHON_LABEL_EXPECTATIONS
+            .iter()
+            .any(|(file, needle)| *file == rel && line.contains(needle))
+    }
+
     fn python_tooling_offenders(root: &Path, files: &[String]) -> Vec<String> {
         let mut offenders = Vec::new();
         for rel in files {
@@ -9912,7 +9940,7 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
                         number + 1,
                         line.trim()
                     ));
-                } else if python_invocation(line) {
+                } else if python_invocation(line) && !python_label_expectation(rel, line) {
                     offenders.push(format!(
                         "{rel}:{}: Python invocation in repository tooling: {}",
                         number + 1,
@@ -9933,6 +9961,32 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
             offenders.is_empty(),
             "the absolute no-Python constraint is violated (remove the source/invocation or port it to faktor-ci-tools): {offenders:#?}"
         );
+    }
+
+    /// Every label-exemption entry must still exist EXACTLY in its file: a
+    /// moved or reworded line makes the entry stale and fails here, so the
+    /// exemption list can never rot into a silent hole in the no-Python
+    /// constraint.
+    #[test]
+    fn python_label_exemptions_are_live_entries() {
+        let root = repo_root();
+        for (file, needle) in PYTHON_LABEL_EXPECTATIONS {
+            let text = std::fs::read_to_string(root.join(file))
+                .unwrap_or_else(|e| panic!("exemption file {file} unreadable: {e}"));
+            assert!(
+                text.contains(needle),
+                "stale python-label exemption: {file} no longer contains {needle:?} — \
+                 update PYTHON_LABEL_EXPECTATIONS with the moved line or delete the entry"
+            );
+            // The exempted line must actually still trip the raw detector
+            // (otherwise the entry is pointless), and the exemption must be
+            // the ONLY reason it does not fire.
+            assert!(
+                text.lines()
+                    .any(|line| line.contains(needle) && python_invocation(line)),
+                "exemption {file} no longer guards a python_invocation-shaped line: {needle:?}"
+            );
+        }
     }
 
     #[test]

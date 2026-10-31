@@ -545,6 +545,7 @@ fn write_staged_file(tmp: &Path, payload: &[u8], mode: CanonicalMode) -> Result<
         .map_err(|e| io_failure("write", tmp, e))?;
     file.flush().map_err(|e| io_failure("flush", tmp, e))?;
     file.sync_all().map_err(|e| io_failure("fsync", tmp, e))?;
+    crate::fault::trip("entry_stage.fsynced");
     drop(file);
     set_executable_bits(tmp, mode)
 }
@@ -644,7 +645,7 @@ fn transition(
             }
             seam(TransitionStep::Staged)?;
             verify_parent_before_mutation(root, rel)?;
-            let linked = fs::hard_link(&tmp, dst);
+            let linked = crate::atomic::durable_hard_link_raw(&tmp, dst);
             let _ = fs::remove_file(&tmp);
             match linked {
                 Ok(()) => {
@@ -690,7 +691,7 @@ fn transition(
             seam(TransitionStep::Staged)?;
             // rename over a symlink replaces the LINK itself, never the target.
             verify_parent_before_mutation(root, rel)?;
-            fs::rename(&tmp, dst).map_err(|e| {
+            crate::atomic::durable_rename_raw(&tmp, dst).map_err(|e| {
                 let _ = fs::remove_file(&tmp);
                 io_failure("rename", dst, e)
             })?;
@@ -710,7 +711,7 @@ fn transition(
             }
             seam(TransitionStep::Staged)?;
             verify_parent_before_mutation(root, rel)?;
-            fs::rename(&tmp, dst).map_err(|e| {
+            crate::atomic::durable_rename_raw(&tmp, dst).map_err(|e| {
                 let _ = fs::remove_file(&tmp);
                 io_failure("rename", dst, e)
             })?;

@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=independent-reference isolation=isolated-data-dir
 //! NEW-GUARD adversarial verification (measurement layer, owned by the
 //! mutation campaign): model-based properties for the Engineering Outcome
 //! Ledger's metrics fold — the economic truth the VCSC and the
@@ -31,6 +32,8 @@ use faktor_agent::{
     TerminalEngineeringOutcome, SETTLEMENT_SCHEMA_V,
 };
 use faktor_core::model::{ExecutionClass, RiskBucket, TaskClass};
+use proptest::prelude::*;
+use proptest::test_runner::{FileFailurePersistence, RngAlgorithm, TestError, TestRng, TestRunner};
 
 /// Deterministic seeded LCG (the repository's platform-independent property
 /// driver; numerical-recipe constants only).
@@ -264,41 +267,12 @@ fn vcsc_excludes_incomplete_rows_even_with_hostile_amounts() {
     );
 }
 
-/// As settlements land one-by-one, every monetary counter moves by exactly
-/// the landed fact; incomplete landings move only the exclusion counts; VCSC
-/// is the exact ceiling of eligible-cohort spend over verified complete
-/// changes at every prefix.
-#[test]
-fn monetary_metrics_move_exactly_as_settlements_land() {
-    let mut entries: Vec<OutcomeLedgerEntry> = Vec::new();
-    for index in 0..60u64 {
-        let mut lcg = Lcg::new(0xC0FF_EE00_0000_0001 ^ index.wrapping_mul(0x9E37_79B9));
-        let state = match lcg.below(5) {
-            0 => MoneyState::Pending,
-            1 => MoneyState::Unavailable,
-            _ => MoneyState::Complete,
-        };
-        let verified = lcg.chance(50);
-        let (model, verification, rework) = if state == MoneyState::Complete {
-            let model = lcg.below(2_000_000);
-            let verification = lcg.below(100_000);
-            let rework = lcg.below(model + 1);
-            (Some(model), Some(verification), Some(rework))
-        } else {
-            (None, None, None)
-        };
-        entries.push(entry(
-            &format!("run-{index}"),
-            state,
-            verified,
-            model,
-            verification,
-            rework,
-            MeasuredMoney::Unavailable,
-            vec![],
-        ));
-    }
-
+/// The invariant body shared by the fixed corpus and every generated
+/// sequence: as settlements land one-by-one, every monetary counter moves by
+/// exactly the landed fact; incomplete landings move only the exclusion
+/// counts; VCSC is the exact ceiling of eligible-cohort spend over verified
+/// complete changes at every prefix.
+fn assert_prefix_folds_are_exact(entries: &[OutcomeLedgerEntry]) {
     let mut expected_total: u128 = 0;
     let mut expected_verified_total: u128 = 0;
     let mut expected_rework: u128 = 0;
@@ -361,6 +335,84 @@ fn monetary_metrics_move_exactly_as_settlements_land() {
             ceil_div(expected_total, expected_verified_complete),
             "VCSC must be the exact ceiling of the eligible-cohort spend"
         );
+    }
+}
+/// The original fixed 60-seed corpus still folds exactly (kept verbatim so
+/// the hand-written generator's cases are never lost).
+#[test]
+fn monetary_metrics_fixed_sixty_seed_corpus_still_folds_exactly() {
+    let mut entries: Vec<OutcomeLedgerEntry> = Vec::new();
+    for index in 0..60u64 {
+        let mut lcg = Lcg::new(0xC0FF_EE00_0000_0001 ^ index.wrapping_mul(0x9E37_79B9));
+        let state = match lcg.below(5) {
+            0 => MoneyState::Pending,
+            1 => MoneyState::Unavailable,
+            _ => MoneyState::Complete,
+        };
+        let verified = lcg.chance(50);
+        let (model, verification, rework) = if state == MoneyState::Complete {
+            let model = lcg.below(2_000_000);
+            let verification = lcg.below(100_000);
+            let rework = lcg.below(model + 1);
+            (Some(model), Some(verification), Some(rework))
+        } else {
+            (None, None, None)
+        };
+        entries.push(entry(
+            &format!("run-{index}"),
+            state,
+            verified,
+            model,
+            verification,
+            rework,
+            MeasuredMoney::Unavailable,
+            vec![],
+        ));
+    }
+    assert_prefix_folds_are_exact(&entries);
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        // One proptest case per former fixed seed: coverage kept 1:1.
+        cases: 60,
+        ..ProptestConfig::default()
+    })]
+    /// HAR-07 conversion: the same LCG generator, now driven by a
+    /// proptest-chosen seed — every monetary counter still moves by exactly
+    /// the landed fact at every prefix of a generated sequence.
+    #[test]
+    fn monetary_metrics_move_exactly_as_settlements_land(seed: u64) {
+        let mut entries: Vec<OutcomeLedgerEntry> = Vec::new();
+        for index in 0..16u64 {
+            let mut lcg =
+                Lcg::new(0xC0FF_EE00_0000_0001 ^ seed.wrapping_add(index).wrapping_mul(0x9E37_79B9));
+            let state = match lcg.below(5) {
+                0 => MoneyState::Pending,
+                1 => MoneyState::Unavailable,
+                _ => MoneyState::Complete,
+            };
+            let verified = lcg.chance(50);
+            let (model, verification, rework) = if state == MoneyState::Complete {
+                let model = lcg.below(2_000_000);
+                let verification = lcg.below(100_000);
+                let rework = lcg.below(model + 1);
+                (Some(model), Some(verification), Some(rework))
+            } else {
+                (None, None, None)
+            };
+            entries.push(entry(
+                &format!("run-{seed}-{index}"),
+                state,
+                verified,
+                model,
+                verification,
+                rework,
+                MeasuredMoney::Unavailable,
+                vec![],
+            ));
+        }
+        assert_prefix_folds_are_exact(&entries);
     }
 }
 
@@ -658,4 +710,117 @@ fn legacy_local_bit_on_an_unknown_step_is_never_a_local_count() {
         fallback.local_first_success_changes, 0,
         "a local-to-hosted fallback is never a local success"
     );
+}
+
+// ---------------------------------------------------------------------------
+// HAR-07 harness proofs: failures shrink, seeds persist and replay
+// ---------------------------------------------------------------------------
+
+/// The shrinking contract: a failing property over `u64` MUST report the
+/// minimal failing input (shrunk), not the random draw that failed.
+#[test]
+fn proptest_shrinks_a_failing_property_to_the_minimal_case() {
+    let mut runner = TestRunner::new(ProptestConfig {
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    });
+    let error = runner
+        .run(&proptest::num::u64::ANY, |value| {
+            assert!(value < 100, "fail for every value >= 100");
+            Ok(())
+        })
+        .expect_err("the demonstration property must fail");
+    match error {
+        TestError::Fail(_, minimal) => {
+            assert_eq!(
+                minimal, 100,
+                "the reported failing input must be the SHRUNK minimal case"
+            );
+        }
+        TestError::Abort(reason) => panic!("the property aborted instead of failing: {reason:?}"),
+    }
+}
+
+/// The persistence contract: a failing seed is written to disk and replayed
+/// first on the next run, reproducing the identical minimal failing case.
+#[test]
+fn proptest_persists_failing_seeds_and_replays_the_stored_case() {
+    let path = std::env::temp_dir().join(format!(
+        "faktor-economy-har07-replay-{}.txt",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let leaked: &'static str = Box::leak(
+        path.to_str()
+            .expect("temp path is utf8")
+            .to_owned()
+            .into_boxed_str(),
+    );
+    let config = || ProptestConfig {
+        failure_persistence: Some(Box::new(FileFailurePersistence::Direct(leaked))),
+        cases: 16,
+        ..ProptestConfig::default()
+    };
+    let mut first_runner = TestRunner::new(config());
+    let first = first_runner
+        .run(&proptest::num::u64::ANY, |value| {
+            assert!(value < 100, "fail for every value >= 100");
+            Ok(())
+        })
+        .expect_err("the demonstration property must fail");
+    let first_minimal = match first {
+        TestError::Fail(_, minimal) => minimal,
+        TestError::Abort(reason) => panic!("aborted: {reason:?}"),
+    };
+    let persisted =
+        std::fs::read_to_string(&path).expect("the failing seed must be persisted to disk");
+    assert!(
+        !persisted.trim().is_empty(),
+        "the persistence file must contain the stored failing case"
+    );
+
+    let mut replay_runner = TestRunner::new(config());
+    let second = replay_runner
+        .run(&proptest::num::u64::ANY, |value| {
+            assert!(value < 100, "fail for every value >= 100");
+            Ok(())
+        })
+        .expect_err("the replayed property must fail again from the stored seed");
+    let replayed_minimal = match second {
+        TestError::Fail(_, minimal) => minimal,
+        TestError::Abort(reason) => panic!("aborted: {reason:?}"),
+    };
+    assert_eq!(
+        replayed_minimal, first_minimal,
+        "the stored seed must replay the identical failing case"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The same RNG seed reproduces the identical stream of generated cases.
+#[test]
+fn the_same_rng_seed_reproduces_the_identical_case_stream() {
+    fn draw_stream(seed_bytes: [u8; 32]) -> Vec<u64> {
+        let mut runner = TestRunner::new_with_rng(
+            ProptestConfig {
+                failure_persistence: None,
+                cases: 16,
+                ..ProptestConfig::default()
+            },
+            TestRng::from_seed(RngAlgorithm::ChaCha, &seed_bytes),
+        );
+        let seen = std::cell::RefCell::new(Vec::new());
+        runner
+            .run(&proptest::num::u64::ANY, |value| {
+                seen.borrow_mut().push(value);
+                Ok(())
+            })
+            .expect("a passing property");
+        seen.into_inner()
+    }
+    let first = draw_stream([7u8; 32]);
+    let second = draw_stream([7u8; 32]);
+    assert_eq!(first.len(), 16, "every configured case must run");
+    assert_eq!(first, second, "the same seed must reproduce the stream");
+    assert_ne!(first, draw_stream([8u8; 32]), "seeds must diverge (sanity)");
 }

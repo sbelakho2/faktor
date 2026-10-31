@@ -346,6 +346,89 @@ impl CrashSeam {
     pub(crate) fn trip(&self, _point: &'static str) {}
 }
 
+// ---------------------------------------------------------------------------
+// HAR-05 fault-injection seam
+// ---------------------------------------------------------------------------
+
+/// Fault classes the store's fault harness injects at the connection /
+/// execution boundary. Compiled out of production builds (same `cfg`
+/// discipline as [`CrashSeam`]); the injected errors carry the EXACT primary
+/// SQLite code a real failure of that class would surface.
+#[cfg(any(test, feature = "fault-injection"))]
+// In a feature-on non-test build (workspace feature unification) the harness
+// never runs, so the variants are matched by `error_for` but never
+// constructed; the allow covers exactly that shape.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FaultKind {
+    /// SQLITE_FULL (13): the write cannot land because the disk is full.
+    DiskFull,
+    /// SQLITE_READONLY (8): the store directory/files are read-only.
+    ReadOnly,
+    /// SQLITE_BUSY (5): immediate lock contention, no wait granted.
+    Busy,
+}
+
+/// One armed fault at a store boundary (writer admission or read checkout).
+/// `remaining` counts boundary crossings that still inject; `u64::MAX`
+/// means "until disarmed". Production never arms it, and the boundary
+/// checks are compiled away without `cfg(test)`/`fault-injection`.
+#[cfg(any(test, feature = "fault-injection"))]
+#[derive(Debug, Default)]
+pub(crate) struct FaultSeam {
+    armed: Mutex<Option<(FaultKind, u64)>>,
+    fired: AtomicU64,
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
+// `arm`/`disarm`/`fired` are the HARNESS surface (called from test targets
+// only); `take_error` is the production-funnel check. In a feature-on
+// non-test build only `take_error` is referenced.
+#[cfg_attr(not(test), allow(dead_code))]
+impl FaultSeam {
+    pub(crate) fn arm(&self, kind: FaultKind, remaining: u64) {
+        *self.armed.lock().unwrap_or_else(|p| p.into_inner()) = Some((kind, remaining.max(1)));
+    }
+
+    pub(crate) fn disarm(&self) {
+        *self.armed.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
+    /// Number of injected faults so far (the harness asserts this advanced
+    /// so a passing op cannot be vacuous).
+    pub(crate) fn fired(&self) -> u64 {
+        self.fired.load(Ordering::SeqCst)
+    }
+
+    /// Consume one armed crossing: returns the typed error the real fault
+    /// class would produce, or `None` when disarmed/exhausted.
+    pub(crate) fn take_error(&self) -> Option<StoreError> {
+        let mut guard = self.armed.lock().unwrap_or_else(|p| p.into_inner());
+        let (kind, remaining) = (*guard)?;
+        if remaining == 0 {
+            *guard = None;
+            return None;
+        }
+        if remaining != u64::MAX {
+            *guard = Some((kind, remaining - 1));
+        }
+        self.fired.fetch_add(1, Ordering::SeqCst);
+        Some(Self::error_for(kind))
+    }
+
+    fn error_for(kind: FaultKind) -> StoreError {
+        let (code, message) = match kind {
+            FaultKind::DiskFull => (13, "database or disk is full [fault-seam]"),
+            FaultKind::ReadOnly => (8, "attempt to write a readonly database [fault-seam]"),
+            FaultKind::Busy => (5, "database is locked [fault-seam]"),
+        };
+        StoreError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(code),
+            Some(message.to_string()),
+        ))
+    }
+}
+
 /// One active maintenance task: its cancellation token plus the SQLite
 /// interrupt handle of its dedicated connection. `cancel` alone is enough for
 /// the page-batched backup loop (SQLite's backup API does not poll
@@ -517,6 +600,19 @@ pub struct Store {
     /// Always-on storage governor (discovered beside the data dir), used for
     /// WAL maintenance and growth refusal. `None` in bare test stores.
     storage_governor: std::sync::Mutex<Option<Arc<faktor_storage::StorageGovernor>>>,
+    /// HAR-05 write-boundary fault seam (disk-full / read-only / busy
+    /// injection at the writer admission). Armed only by the fault harness;
+    /// production never arms it and the admission check is compiled out
+    /// without `cfg(test)`/`fault-injection`. The seam instance is
+    /// write-only here: it is handed to the writer funnel at construction
+    /// and read exclusively by the harness (test targets).
+    #[cfg(any(test, feature = "fault-injection"))]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fault_write: Arc<FaultSeam>,
+    /// HAR-05 read-boundary fault seam (same discipline as `fault_write`).
+    #[cfg(any(test, feature = "fault-injection"))]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fault_read: Arc<FaultSeam>,
 }
 
 impl Drop for Store {
@@ -1479,10 +1575,13 @@ mod writer_service_tests {
             "over-budget SQLite growth must be refused typed: {error}"
         );
         assert!(governor.counters().unwrap().refusals >= 1);
-        assert!(governor
-            .health()
-            .unwrap()
-            .is_some_and(|health| health.class == Some(StorageClass::SqliteWal)));
+        let health = governor.health().unwrap();
+        assert!(
+            health
+                .as_ref()
+                .is_some_and(|h| h.class == Some(StorageClass::SqliteWal)),
+            "health={health:?}"
+        );
     }
 
     /// Every typed store mutation (not only the hot batch) is admitted
@@ -1523,10 +1622,13 @@ mod writer_service_tests {
             "a typed single write must be refused typed: {error}"
         );
         assert!(governor.counters().unwrap().refusals >= 1);
-        assert!(governor
-            .health()
-            .unwrap()
-            .is_some_and(|health| health.class == Some(StorageClass::SqliteWal)));
+        let health = governor.health().unwrap();
+        assert!(
+            health
+                .as_ref()
+                .is_some_and(|h| h.class == Some(StorageClass::SqliteWal)),
+            "health={health:?}"
+        );
     }
 
     /// The writer thread never blocks reads even when the queue is saturated
@@ -2182,6 +2284,12 @@ impl Store {
         if let Some(governor) = &storage_governor {
             writer.attach_storage_governor(governor.clone());
         }
+        #[cfg(any(test, feature = "fault-injection"))]
+        let fault_write = {
+            let seam = Arc::new(FaultSeam::default());
+            writer.attach_fault(seam.clone());
+            seam
+        };
         Self {
             root,
             writer,
@@ -2193,6 +2301,10 @@ impl Store {
             outcome_revision: AtomicU64::new(0),
             maintenance: Arc::new(MaintenanceRegistry::new()),
             storage_governor: std::sync::Mutex::new(storage_governor),
+            #[cfg(any(test, feature = "fault-injection"))]
+            fault_write,
+            #[cfg(any(test, feature = "fault-injection"))]
+            fault_read: Arc::new(FaultSeam::default()),
         }
     }
 
@@ -2459,6 +2571,12 @@ impl Store {
     /// recorded separately from the caller's query time (see
     /// [`Store::reader_telemetry`]).
     pub(crate) fn read(&self) -> StoreResult<ReadConn> {
+        // HAR-05 read-boundary fault injection: a read op under an armed
+        // class fails here with the typed error of that class.
+        #[cfg(any(test, feature = "fault-injection"))]
+        if let Some(err) = self.fault_read.take_error() {
+            return Err(err);
+        }
         let queued_at = Instant::now();
         let permit = self
             .pool

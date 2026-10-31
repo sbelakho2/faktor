@@ -1,0 +1,18 @@
+# Detached mini-workspace (HAR-18): the firmware image is NOT a member of the
+# root cargo workspace (it is a bare-metal thumbv7m crate with no deps and no
+# std). The explicit empty [workspace] table keeps root `cargo` commands from
+# ever resolving it.
+[package]
+name = "faktor-hil-fw"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[workspace]
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"

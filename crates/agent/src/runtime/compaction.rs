@@ -441,21 +441,15 @@ fn is_archive_digest_turn(turn: &RecentTurn) -> bool {
 }
 
 /// Replace a carried archive artifact ref that is no longer fully
-/// retrievable (the storage governor evicted the archive class or one of its
-/// chunks) with an explicit "archive evicted" marker. Without this the next
-/// compaction keeps claiming that evicted context is retrievable at
-/// `artifact://<hash>`, and the model spends turns trying to recover it. The
-/// durable transcript rows remain the fallback authority; only the wire text
-/// changes. Scans every digest turn (the pointer is normally first, but the
-/// marker must never be missed because of plan ordering). Returns the number
-/// of refs marked.
-pub fn mark_evicted_compaction_archives(
-    cas: Option<&faktor_cas::Cas>,
+/// retrievable with whatever `replacement` decides (`None` = keep the
+/// `artifact://<digest>` ref verbatim). The ONE shared rewrite seam of the
+/// plain loss-marker path and the lifecycle path — the scanning rules
+/// (only compaction digest turns, 64-hex digest token, byte-identical
+/// output when nothing moved) exist exactly once.
+fn rewrite_archive_digest_refs(
     plan: &mut faktor_context::compactor::CompactionPlan,
+    mut replacement: impl FnMut(&str) -> Option<String>,
 ) -> usize {
-    let Some(cas) = cas else {
-        return 0;
-    };
     let mut marked = 0usize;
     for turn in &mut plan.kept_recent {
         // Fast path: only a compaction digest carries a manifest pointer;
@@ -476,15 +470,13 @@ pub fn mark_evicted_compaction_archives(
                 .count()
                 .min(64);
             let digest = &tail[..digest_len];
-            match faktor_core::hash::FileHash::from_hex(digest) {
-                Some(hash) if !archive_manifest_is_retrievable(cas, hash) => {
-                    out.push_str("[archive evicted: ");
-                    out.push_str(digest);
-                    out.push(']');
+            match replacement(digest) {
+                Some(marker) => {
+                    out.push_str(&marker);
                     turn_marked += 1;
                     rest = &tail[digest_len..];
                 }
-                _ => {
+                None => {
                     out.push_str("artifact://");
                     rest = tail;
                 }
@@ -499,10 +491,91 @@ pub fn mark_evicted_compaction_archives(
             turn.text = text;
         }
     }
+    marked
+}
+
+/// Replace a carried archive artifact ref that is no longer fully
+/// retrievable (the storage governor evicted the archive class or one of its
+/// chunks) with an explicit "archive evicted" marker. Without this the next
+/// compaction keeps claiming that evicted context is retrievable at
+/// `artifact://<hash>`, and the model spends turns trying to recover it. The
+/// durable transcript rows remain the fallback authority; only the wire text
+/// changes. Scans every digest turn (the pointer is normally first, but the
+/// marker must never be missed because of plan ordering). Returns the number
+/// of refs marked.
+///
+/// This is the OUTERMOST FALLBACK: with no lifecycle registry consulted
+/// (unknown generation / registry unavailable / non-runtime callers) the
+/// wire names the loss outright, exactly as before.
+pub fn mark_evicted_compaction_archives(
+    cas: Option<&faktor_cas::Cas>,
+    plan: &mut faktor_context::compactor::CompactionPlan,
+) -> usize {
+    let Some(cas) = cas else {
+        return 0;
+    };
+    let marked = rewrite_archive_digest_refs(plan, |digest| {
+        match faktor_core::hash::FileHash::from_hex(digest) {
+            Some(hash) if !archive_manifest_is_retrievable(cas, hash) => {
+                Some(format!("[archive evicted: {digest}]"))
+            }
+            _ => None,
+        }
+    });
     if marked > 0 {
         tracing::warn!(
             refs = marked,
             "compaction archive was evicted; the wire now names the loss instead of a dead artifact ref"
+        );
+    }
+    marked
+}
+
+/// The lifecycle-aware variant of [`mark_evicted_compaction_archives`]
+/// (audit item 15): a non-retrievable archive body whose generation still
+/// has a record in the session's
+/// [`ArchiveLifecycleRegistry`](faktor_session::compaction::ArchiveLifecycleRegistry)
+/// degrades to a DIGEST_ONLY marker — the retained manifest digest +
+/// metadata survive as cryptographic continuity (any later-presented body
+/// still rehashes against it) INSTEAD of the old full-archive →
+/// loss-marker jump. A non-retrievable hash with NO lifecycle record
+/// (unknown generation, registry load refused, or the digest record was
+/// swept) keeps the loss marker: the governor's eviction + loss-marker
+/// path stays the outermost fallback. Returns the number of refs
+/// rewritten.
+pub fn mark_evicted_compaction_archives_with_lifecycle(
+    cas: Option<&faktor_cas::Cas>,
+    plan: &mut faktor_context::compactor::CompactionPlan,
+    lifecycle: &mut faktor_session::compaction::ArchiveLifecycleRegistry,
+) -> usize {
+    let Some(cas) = cas else {
+        return 0;
+    };
+    let mut digest_only = 0usize;
+    let mut lost = 0usize;
+    let marked = rewrite_archive_digest_refs(plan, |digest| {
+        let hash = faktor_core::hash::FileHash::from_hex(digest)?;
+        if archive_manifest_is_retrievable(cas, hash) {
+            return None;
+        }
+        // The body is gone. With a lifecycle record the honest posture is
+        // DIGEST_ONLY (adopt the observed physical loss — not a scheduled,
+        // grace-guarded degradation); without one the loss stands.
+        let known = lifecycle.get(digest).is_some();
+        if known && lifecycle.adopt_body_loss(digest).is_ok() {
+            digest_only += 1;
+            Some(format!("[archive digest-only: {digest}]"))
+        } else {
+            lost += 1;
+            Some(format!("[archive evicted: {digest}]"))
+        }
+    });
+    if marked > 0 {
+        tracing::warn!(
+            refs = marked,
+            digest_only,
+            lost,
+            "compaction archive body is gone; the wire carries digest-only continuity where a lifecycle record survived and names the loss otherwise"
         );
     }
     marked
@@ -839,77 +912,68 @@ impl AgentRuntime {
         })
     }
 
-    #[allow(clippy::too_many_arguments)] // the head + neutrality seams are explicit, not combinable knobs
-    pub(crate) async fn try_compact_with_head(
-        &self,
-        handle: &faktor_session::SessionHandle,
-        recent: &[RecentTurn],
-        ledger: &TaskLedger,
-        budget: &ContextBudget,
-        // The LOGICAL TURN's token reaches the summarizer stream: a Stop
-        // must cancel compaction (no orphan request after the turn; audit 11).
-        cancel: &CancellationToken,
-        // Durable high-water mark of the window `recent` was loaded from.
-        head_seq: Option<u64>,
-        // Compaction neutrality (audit item 5): a CONVERSATIONAL turn
-        // (no established engineering contract) compacts from CONVERSATION
-        // state ONLY — the projection never derives from `ledger.goal` /
-        // task rows / typed ledger entries, the working ledger handed to
-        // the compactor is the NEUTRAL one, and the accepted plan never
-        // rewrites the durable engineering ledger or prunes the typed entry
-        // stream (those are ENGINEERING authorities a chat turn may not
-        // touch). Task compaction (`false`) is byte-identical to before.
-        conversational: bool,
-    ) -> faktor_core::Result<Option<CompactionPlan>> {
-        // Strip the PREVIOUS compaction's synthesized blocks before the
-        // next compaction: the identity/durable-facts turns are regenerated
-        // from the durable projection below, and carrying the old copies
-        // would duplicate them on every cycle. The prior eviction digest is
-        // KEPT: the compactor carries it forward verbatim when this cycle
-        // evicts nothing, so repeated compactions never orphan the durable
-        // archive. Prior `summary` turns stay too: the newest is carried
-        // verbatim and never re-summarized.
+    /// The prepared compaction input, split out of
+    /// [`Self::try_compact_with_head`]: strip the PREVIOUS compaction's
+    /// synthesized blocks before the next compaction (the identity/
+    /// durable-facts turns are regenerated from the durable projection,
+    /// and carrying the old copies would duplicate them on every cycle —
+    /// the prior eviction digest and prior `summary` turns are KEPT), then
+    /// measure the history and apply the floors. `None` = not compactable.
+    ///
+    /// SAME token unit as the compactor's `after_tokens`: the previous
+    /// `bytes / 4` underestimated the estimator by ~25%, so the recorded
+    /// reduction ratio could pass while the exact wire shrank by less. A
+    /// tiny history cannot need compaction: the wire plan is dominated by
+    /// the system prompt/tool bundle, which compaction does not touch, and
+    /// a fresh session's first turn used to be failed by a summary that
+    /// could only GROW the 3-token history. The deterministic/summary
+    /// floors are ~65 tokens; a history below this can never be reduced by
+    /// any summary, so compaction is skipped instead of being attempted
+    /// (and rejected as a grow).
+    fn compactable_history(recent: &[RecentTurn]) -> Option<(Vec<RecentTurn>, usize)> {
         let input: Vec<RecentTurn> = recent
             .iter()
             .filter(|t| t.role != "system")
             .cloned()
             .collect();
-        let recent = input.as_slice();
-        // SAME token unit as the compactor's `after_tokens`: the previous
-        // `bytes / 4` underestimated the estimator by ~25%, so the recorded
-        // reduction ratio could pass while the exact wire shrank by less.
-        let before = faktor_context::estimate_history_tokens(recent);
-        if before == 0 {
-            return Ok(None);
-        }
-        // A tiny history cannot need compaction: the wire plan is dominated
-        // by the system prompt/tool bundle, which compaction does not touch,
-        // and a fresh session's first turn used to be failed by a summary
-        // that could only GROW the 3-token history. Below this floor the
-        // honest behavior is "no compaction" (an oversized call still fails
-        // with a typed context error from the provider).
-        // The deterministic/summary floors are ~65 tokens; a history below
-        // this can never be reduced by any summary, so compaction is skipped
-        // instead of being attempted (and rejected as a grow).
+        let before = faktor_context::estimate_history_tokens(&input);
         const MIN_COMPACTABLE_HISTORY_TOKENS: usize = 128;
-        if before < MIN_COMPACTABLE_HISTORY_TOKENS {
-            return Ok(None);
+        if before == 0 || before < MIN_COMPACTABLE_HISTORY_TOKENS {
+            return None;
         }
-        let target = budget.context_max();
-        // Compaction-model selection (P0-2 phase mapping): an EXPLICIT
-        // compaction_model config ("model" or "provider/model") is honored
-        // verbatim (spec §36 — explicit config wins over routing). Without
-        // one, the ECONOMIC policy is consulted for the Compact phase: in
-        // Economy mode the router picks the cheapest compaction-capable
-        // model; in Pinned mode the pin is validated for compaction; the
-        // passthrough pin (empty decision) keeps the deterministic ledger
-        // summarizer (today's no-model default). Routing failures follow the
-        // fail-closed matrix: only RouterUnavailable may degrade to the
-        // ledger summarizer (warned); every other refusal is a typed error
-        // on the turn — compaction never silently substitutes a model.
-        // Audit item 3: the accepted summarizer text is captured here as a
-        // typed context-compression output so the provenance row below can
-        // name its trust class + durable call id.
+        Some((input, before))
+    }
+
+    /// Compaction-model selection + compactor construction, split out of
+    /// [`Self::try_compact_with_head`] (P0-2 phase mapping): an EXPLICIT
+    /// compaction_model config ("model" or "provider/model") is honored
+    /// verbatim (spec §36 — explicit config wins over routing). Without
+    /// one, the ECONOMIC policy is consulted for the Compact phase: in
+    /// Economy mode the router picks the cheapest compaction-capable
+    /// model; in Pinned mode the pin is validated for compaction; the
+    /// passthrough pin (empty decision) keeps the deterministic ledger
+    /// summarizer (today's no-model default). Routing failures follow the
+    /// fail-closed matrix: only RouterUnavailable may degrade to the
+    /// ledger summarizer (warned); every other refusal is a typed error
+    /// on the turn — compaction never silently substitutes a model.
+    /// Audit item 3: the accepted summarizer text is captured as a typed
+    /// context-compression output so the provenance row can name its
+    /// trust class + durable call id. Evidence extracted from huge
+    /// historical tool output is archived through the daemon's DURABLE
+    /// authority at the live session scope (a failed durable write keeps
+    /// the raw output inline, never a dangling ref).
+    async fn build_compactor_for_turn(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        before: usize,
+        cancel: &CancellationToken,
+    ) -> faktor_core::Result<(
+        Compactor,
+        Arc<std::sync::Mutex<Option<ModelOutput>>>,
+        Arc<std::sync::Mutex<Option<CanonicalUsage>>>,
+        Option<Arc<tokio::sync::Mutex<crate::AttemptAccounting>>>,
+        Option<CompactCallTrace>,
+    )> {
         let compaction_output_slot: Arc<std::sync::Mutex<Option<ModelOutput>>> =
             Arc::new(std::sync::Mutex::new(None));
         let compaction_usage_slot: Arc<std::sync::Mutex<Option<CanonicalUsage>>> =
@@ -932,11 +996,6 @@ impl AgentRuntime {
             // them on the wire.
             None => Compactor::deterministic_only(),
         };
-        // Evidence extracted from huge historical tool output is archived
-        // through the daemon's DURABLE authority at the live session scope:
-        // the `evidence://<id>` rendered on the wire must still resolve after
-        // this compactor is dropped and the daemon restarts. A failed durable
-        // write keeps the raw output inline (never a dangling ref).
         let workspace_id = handle.row()?.workspace_id.raw();
         let task_id = handle
             .task_id() // allowed-task-id-read: read-only evidence archive scope; compaction never writes a task row
@@ -947,6 +1006,45 @@ impl AgentRuntime {
             .with_evidence_scope(handle.id().raw(), workspace_id, task_id)
             .map_err(|error| Error::internal(format!("compaction evidence scope: {error}")))?
             .with_durable_evidence(self.evidence_authority.clone());
+        Ok((
+            compactor,
+            compaction_output_slot,
+            compaction_usage_slot,
+            machine,
+            trace,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)] // the head + neutrality seams are explicit, not combinable knobs
+    pub(crate) async fn try_compact_with_head(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        recent: &[RecentTurn],
+        ledger: &TaskLedger,
+        budget: &ContextBudget,
+        // The LOGICAL TURN's token reaches the summarizer stream: a Stop
+        // must cancel compaction (no orphan request after the turn; audit 11).
+        cancel: &CancellationToken,
+        // Durable high-water mark of the window `recent` was loaded from.
+        head_seq: Option<u64>,
+        // Compaction neutrality (audit item 5): a CONVERSATIONAL turn
+        // (no established engineering contract) compacts from CONVERSATION
+        // state ONLY — the projection never derives from `ledger.goal` /
+        // task rows / typed ledger entries, the working ledger handed to
+        // the compactor is the NEUTRAL one, and the accepted plan never
+        // rewrites the durable engineering ledger or prunes the typed entry
+        // stream (those are ENGINEERING authorities a chat turn may not
+        // touch). Task compaction (`false`) is byte-identical to before.
+        conversational: bool,
+    ) -> faktor_core::Result<Option<CompactionPlan>> {
+        let Some((input, before)) = Self::compactable_history(recent) else {
+            return Ok(None);
+        };
+        let recent = input.as_slice();
+        let target = budget.context_max();
+        let (compactor, compaction_output_slot, compaction_usage_slot, machine, trace) = self
+            .build_compactor_for_turn(handle, before, cancel)
+            .await?;
         // Audit 70/71: compaction consumes a READ-ONLY projection built from
         // the durable rows — goal/criteria/plan/state from the typed Task
         // row, decisions + child progress from the typed session ledger,
@@ -1215,8 +1313,74 @@ impl AgentRuntime {
             // placeholder — the digest rides the wire with the archive
             // behind ONE artifact ref. Best-effort: an unwritable CAS leaves
             // an explicit unavailable marker (never breaks the turn).
-            mark_evicted_compaction_archives(self.deps.cas.as_deref(), &mut plan);
-            attach_compaction_archive(self.deps.cas.as_deref(), &mut plan);
+            // Archive lifecycle (audit item 15): the session's generation
+            // registry decides whether a dead body still has DIGEST_ONLY
+            // continuity. Load is best-effort: a hostile/corrupt registry
+            // degrades to the plain loss-marker path (never trusted, never
+            // fatal for the turn) and skips persistence so durable rows
+            // cannot be overwritten from a failed read.
+            let mut lifecycle = match handle.archive_lifecycle_registry() {
+                Ok(registry) => Some(registry),
+                Err(err) => {
+                    tracing::warn!(
+                        session = %handle.id(),
+                        "archive lifecycle registry unavailable; falling back to plain loss markers: {err}"
+                    );
+                    None
+                }
+            };
+            let registry_snapshot = lifecycle.clone();
+            if let Some(registry) = lifecycle.as_mut() {
+                registry.advance_elapsed(self.deps.clock.now_ms());
+                mark_evicted_compaction_archives_with_lifecycle(
+                    self.deps.cas.as_deref(),
+                    &mut plan,
+                    registry,
+                );
+            } else {
+                mark_evicted_compaction_archives(self.deps.cas.as_deref(), &mut plan);
+            }
+            let published = attach_compaction_archive(self.deps.cas.as_deref(), &mut plan);
+            if let (Some(registry), Some(manifest)) = (lifecycle.as_mut(), published) {
+                // A fresh archive is the NEW live recovery authority; every
+                // other unpinned live generation is superseded at this
+                // publication. Persistence is best-effort — a failed save
+                // leaves the durable registry stale, which only means the
+                // plain loss-marker classification (the safe direction).
+                let now = self.deps.clock.now_ms();
+                let metadata = faktor_session::compaction::ArchiveMetadata {
+                    total_bytes: plan
+                        .archive_chunks
+                        .iter()
+                        .map(String::len)
+                        .sum::<usize>()
+                        .try_into()
+                        .unwrap_or(u64::MAX),
+                    chunk_count: plan.archive_chunks.len().try_into().unwrap_or(u32::MAX),
+                    created_ms: now,
+                };
+                if let Err(err) = registry.register_live(&manifest.to_string(), metadata, now) {
+                    tracing::warn!(
+                        session = %handle.id(),
+                        "archive lifecycle registration refused: {err}"
+                    );
+                }
+            }
+            // Write-back ONLY when this compaction actually moved the
+            // lifecycle (aged generations, adopted body loss, or a new
+            // publication): a steady-state compaction never rewrites the
+            // durable rows, and the bounded registry cannot grow without
+            // the write the snapshot proves necessary.
+            if lifecycle.is_some() && lifecycle != registry_snapshot {
+                if let Some(registry) = lifecycle.as_mut() {
+                    if let Err(err) = handle.save_archive_lifecycle_registry(registry) {
+                        tracing::warn!(
+                            session = %handle.id(),
+                            "archive lifecycle persistence failed: {err}"
+                        );
+                    }
+                }
+            }
             let Some(through_seq) = head_seq else {
                 // No durable source window was supplied (direct callers and
                 // unit tests pass a synthetic history). There is nothing to

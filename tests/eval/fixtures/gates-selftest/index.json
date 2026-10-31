@@ -1,0 +1,10 @@
+{
+  "fixtures": [
+    "clean.json",
+    "boilerplate-in-ask.json",
+    "missing-history.json",
+    "early-engineering-state.json",
+    "escalation-never-established.json",
+    "cost-cap-skip.json"
+  ]
+}

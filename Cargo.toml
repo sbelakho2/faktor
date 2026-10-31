@@ -81,6 +81,8 @@ members = [
     "tests/streams",
     "tests/economy",
     "tests/fault",
+    "tests/chaos",
+    "tests/eval",
     "tests/fuzz-seeds",
     "tests/visual",
     "tests/static-authority",

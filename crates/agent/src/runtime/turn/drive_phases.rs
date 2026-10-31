@@ -1020,8 +1020,25 @@ impl AgentRuntime {
         // SAME acquired candidates, and its FINAL tokenizer-counted plan must
         // beat the baseline by max(512, 12.5%). Any failure to prove that
         // leaves the baseline plan/evidence byte-identical.
+        //
+        // Pretest (audit item 10, P2 token economics): the >2 KiB
+        // duplicated-path eligibility gate can pass on a turn whose WIRE
+        // evidence is tiny; building AND tokenizing the second final wire
+        // plan for a dividend that provably cannot reach the threshold is
+        // pure waste. `design_focus_pretest_cannot_qualify` computes a
+        // mathematically safe upper bound from the ALREADY-BUILT baseline
+        // plan alone — when it is below `max(512, baseline/8)` the focused
+        // variant CANNOT qualify and the second plan is never constructed.
+        // The pretest may only SKIP, never ACCEPT: every surviving case
+        // still runs the REAL final-token gate in `choose_design_focus_plan`
+        // on the actual plans, unchanged.
         let focused = match focused_evidence {
-            Some(focused) if focused != evidence => {
+            Some(focused)
+                if focused != evidence
+                    && !faktor_context::wire_plan::design_focus_pretest_cannot_qualify(
+                        &baseline_plan,
+                    ) =>
+            {
                 let focused_plan = plan_wire_turn_with_prior(
                     turn_instructions.as_ref(),
                     &st.system_extra,

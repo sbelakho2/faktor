@@ -1830,6 +1830,10 @@ pub(crate) fn doctor_run_with_config(
             // audit item 7): the durable completed-run metrics aggregate,
             // read-only. A ledger read failure is an ISSUE, never silence.
             doctor_outcome_ledger_line(store.clone(), &mut lines, &mut issues);
+            // The additive evidence heavy-body aging section (audit item
+            // 12): the read-only dry-run plan + last opportunistic pass.
+            // Never mutates; a read failure is an ISSUE, never silence.
+            doctor_evidence_aging_line(store.clone(), &mut lines, &mut issues);
         }
         Err(e) => {
             lines.push(format!("store: FAILED ({e})"));
@@ -2211,6 +2215,60 @@ pub(crate) struct DoctorGenerationEmbeddings {
 /// `GET /native/outcomes` serves). An empty ledger is a truthful zero line;
 /// a read/parse failure is an ISSUE — doctor never repairs and never
 /// fabricates a number.
+/// The additive evidence heavy-body aging section (audit item 12): a
+/// read-only dry-run plan of what the next aging pass would sweep and the
+/// horizon policy. Never mutates and never creates: the section runs ONLY
+/// when the backing CAS directory already exists (a fresh install reports
+/// the absent backing store), and it reads through
+/// `DurableEvidenceAuthority::read_only_aging_status` — a status-only path
+/// that constructs NO authority — so the daemon's `DaemonGraph::evidence`
+/// remains the single authority over the rows even in this out-of-process
+/// read. (The write-path cadence stamp is in-daemon memory, invisible to
+/// other processes, so it is deliberately not printed here.) A read failure
+/// is an ISSUE, never silence.
+pub(crate) fn doctor_evidence_aging_line(
+    store: Arc<faktor_store::Store>,
+    lines: &mut Vec<String>,
+    issues: &mut usize,
+) {
+    let cas_root = store.root().join("evidence-cas");
+    if !cas_root.exists() {
+        lines.push(
+            "evidence-aging: no backing store yet (the first evidence insert creates it)".into(),
+        );
+        return;
+    }
+    match faktor_context::compiler::DurableEvidenceAuthority::read_only_aging_status(store) {
+        Ok(status) => {
+            lines.push(format!(
+                "evidence-aging: enabled={} horizon-ms={} governed={} scanned={} within-horizon={} evictable-bodies={} evictable-bytes={} recovery-refused={} shared-blocked={} shared-unbounded={} reconcile-pending={} lease-releases={} already-absent={} truncated={}",
+                status.config.enabled,
+                status.config.replay_horizon_ms,
+                status.governed,
+                status.scanned_rows,
+                status.within_horizon_rows,
+                status.evictable_bodies,
+                status.evictable_bytes,
+                status.recovery_refused_bodies,
+                status.shared_blocked_bodies,
+                status.shared_unbounded_bodies,
+                status.pending_reconcile_bodies,
+                status.pending_lease_releases,
+                status.already_absent_bodies,
+                status.scan_truncated,
+            ));
+            if !status.governed {
+                lines.push(
+                    "evidence-aging: no storage governor attached — nothing is evictable (bodies accumulate until the daemon attaches the EvidenceCas class)".into(),
+                );
+            }
+        }
+        Err(error) => {
+            lines.push(format!("evidence-aging: UNREADABLE ({error})"));
+            *issues += 1;
+        }
+    }
+}
 pub(crate) fn doctor_outcome_ledger_line(
     store: Arc<faktor_store::Store>,
     lines: &mut Vec<String>,

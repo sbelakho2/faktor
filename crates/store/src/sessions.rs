@@ -1046,8 +1046,60 @@ impl Store {
     /// Zero expired rows is a clean no-op: the transaction is rolled back,
     /// no row is touched, no event is appended and `event_seq` is `None` —
     /// a second recovery sweep is byte-for-byte invisible.
+    ///
+    /// ORDINARY path: admitted through the emergency-metadata band exactly
+    /// as before. The crash sweep must NOT call this; it uses
+    /// [`Self::expire_pending_permissions_for_session_recovery`].
     pub fn expire_pending_permissions_for_session(
         &self,
+        session_id: SessionId,
+        now_ms: i64,
+        expected_state: AgentState,
+        event: CommandEvent,
+    ) -> StoreResult<ExpiredPermissionResolution> {
+        self.expire_pending_permissions_for_session_with_purpose(
+            false,
+            session_id,
+            now_ms,
+            expected_state,
+            event,
+        )
+    }
+
+    /// RECOVERY-CLASS sibling of
+    /// [`Self::expire_pending_permissions_for_session`], used ONLY by the
+    /// crash-reconciliation sweep (`SessionHandle::recover_all`) when a
+    /// pending permission expired while no live waiter owned it. That repair
+    /// is the sweep's own durable reconstruction and must commit even when
+    /// ordinary/emergency admission is saturated above the 90% emergency
+    /// ceiling; it must still refuse TYPED at the 100% hard budget.
+    ///
+    /// AUTHORITY: recovery-only by construction. The band is a per-call
+    /// argument to the store writer (no global/thread-local purpose state),
+    /// this command exists solely for the named recovery call site, and no
+    /// external caller can reach the crate-private `execute_recovery`
+    /// writer entry point. The ordinary command keeps the emergency band.
+    /// SQL, transaction boundaries and event payload are IDENTICAL to the
+    /// ordinary command — only the admission purpose differs.
+    pub fn expire_pending_permissions_for_session_recovery(
+        &self,
+        session_id: SessionId,
+        now_ms: i64,
+        expected_state: AgentState,
+        event: CommandEvent,
+    ) -> StoreResult<ExpiredPermissionResolution> {
+        self.expire_pending_permissions_for_session_with_purpose(
+            true,
+            session_id,
+            now_ms,
+            expected_state,
+            event,
+        )
+    }
+
+    fn expire_pending_permissions_for_session_with_purpose(
+        &self,
+        recovery: bool,
         session_id: SessionId,
         now_ms: i64,
         expected_state: AgentState,
@@ -1078,102 +1130,109 @@ impl Store {
                                      mismatch; refusing a partial sweep"
             .to_owned();
         let seq_messages = EventSeqMessages::for_session(session_id);
-        self.writer
-            .execute("expire_pending_permissions_for_session", move |conn| {
-                let txn =
-                    SessionCommandTxn::begin_prepared(conn, &seam, session_id, expectation)?;
-                let expired: Vec<(i64, OpId)> = {
-                    let mut stmt = txn.tx.prepare(
-                        "SELECT id, op_id FROM permission
+        let run = move |conn: &mut rusqlite::Connection| {
+            let txn = SessionCommandTxn::begin_prepared(conn, &seam, session_id, expectation)?;
+            let expired: Vec<(i64, OpId)> = {
+                let mut stmt = txn.tx.prepare(
+                    "SELECT id, op_id FROM permission
                  WHERE session_id = ?1 AND decision = 'pending' AND expires_ms <= ?2
                  ORDER BY id ASC",
-                    )?;
-                    let rows = stmt
-                        .query_map(params![session_id.raw() as i64, now_ms], |r| {
-                            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
-                        })?
-                        .collect::<Result<Vec<_>, _>>()?;
-                    rows.into_iter()
-                        .map(|(id, op_raw)| {
-                            Ok((id, id_field(expired_op_id_context, op_raw)?))
-                        })
-                        .collect::<StoreResult<Vec<_>>>()?
-                };
-                if expired.is_empty() {
-                    // Drop without commit: the durable world is untouched.
-                    return Ok(ExpiredPermissionResolution::default());
-                }
-                // ONE indexed aggregate pass builds both arrays; the former
-                // per-row `json_set('$[#]', ...)` chain re-parsed and
-                // re-serialized the growing array once per row (O(n^2)).
-                let (ids_json, ops_json): (String, String) = txn.tx.query_row(
-                    "SELECT COALESCE(json_group_array(pid), '[]'),
+                )?;
+                let rows = stmt
+                    .query_map(params![session_id.raw() as i64, now_ms], |r| {
+                        Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows.into_iter()
+                    .map(|(id, op_raw)| Ok((id, id_field(expired_op_id_context, op_raw)?)))
+                    .collect::<StoreResult<Vec<_>>>()?
+            };
+            if expired.is_empty() {
+                // Drop without commit: the durable world is untouched.
+                return Ok(ExpiredPermissionResolution::default());
+            }
+            // ONE indexed aggregate pass builds both arrays; the former
+            // per-row `json_set('$[#]', ...)` chain re-parsed and
+            // re-serialized the growing array once per row (O(n^2)).
+            let (ids_json, ops_json): (String, String) = txn.tx.query_row(
+                "SELECT COALESCE(json_group_array(pid), '[]'),
                             COALESCE(json_group_array(opid), '[]')
                      FROM (SELECT id AS pid, op_id AS opid FROM permission
                            WHERE session_id = ?1 AND decision = 'pending' AND expires_ms <= ?2
                            ORDER BY id ASC)",
-                    params![session_id.raw() as i64, now_ms],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )?;
-                let changed = txn.tx.execute(
-                    "UPDATE permission SET decision = 'expired', resolved_ms = ?2
+                params![session_id.raw() as i64, now_ms],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            let changed = txn.tx.execute(
+                "UPDATE permission SET decision = 'expired', resolved_ms = ?2
              WHERE session_id = ?1 AND decision = 'pending' AND expires_ms <= ?2",
-                    params![session_id.raw() as i64, now_ms],
-                )?;
-                if changed != expired.len() {
-                    return Err(StoreError::Migration(terminalized_mismatch));
-                }
-                // The journal names the rows this transaction actually terminalized;
-                // the caller cannot know them before the SELECT under the same lock,
-                // so the caller-prepared payload is patched by SQL (an existing
-                // object gets both arrays replaced; a missing payload becomes the
-                // object; a non-object payload is left unchanged, exactly like the
-                // former in-closure patch).
-                let payload_json = match payload_base {
-                    Some(base) => {
-                        let is_object = txn.conn().query_row(
-                            "SELECT json_type(?1) = 'object'",
-                            params![base],
-                            |r| r.get::<_, i64>(0),
-                        )? == 1;
-                        if is_object {
-                            Some(txn.conn().query_row(
+                params![session_id.raw() as i64, now_ms],
+            )?;
+            if changed != expired.len() {
+                return Err(StoreError::Migration(terminalized_mismatch));
+            }
+            // The journal names the rows this transaction actually terminalized;
+            // the caller cannot know them before the SELECT under the same lock,
+            // so the caller-prepared payload is patched by SQL (an existing
+            // object gets both arrays replaced; a missing payload becomes the
+            // object; a non-object payload is left unchanged, exactly like the
+            // former in-closure patch).
+            let payload_json = match payload_base {
+                Some(base) => {
+                    let is_object = txn.conn().query_row(
+                        "SELECT json_type(?1) = 'object'",
+                        params![base],
+                        |r| r.get::<_, i64>(0),
+                    )? == 1;
+                    if is_object {
+                        Some(txn.conn().query_row(
                                 "SELECT json_set(?1, '$.permission_ids', json(?2), '$.op_ids', json(?3))",
                                 params![base, ids_json, ops_json],
                                 |r| r.get::<_, String>(0),
                             )?)
-                        } else {
-                            Some(base)
-                        }
+                    } else {
+                        Some(base)
                     }
-                    None => Some(txn.conn().query_row(
-                        "SELECT json_object('permission_ids', json(?1), 'op_ids', json(?2))",
-                        params![ids_json, ops_json],
-                        |r| r.get::<_, String>(0),
-                    )?),
-                };
-                if event.op_id.is_none() && expired.len() == 1 {
-                    event.op_id = Some(expired[0].1);
                 }
-                txn.side_row_applied();
-                let seq = Self::insert_event_locked(
-                    txn.conn(),
-                    session_id,
-                    event.op_id,
-                    event.kind,
-                    &event_state_json,
-                    event.ts_ms,
-                    payload_json,
-                    event.payload_ver,
-                    &seq_messages,
-                )?;
-                txn.precommit();
-                txn.commit()?;
-                Ok(ExpiredPermissionResolution {
-                    expired,
-                    event_seq: Some(seq),
-                })
+                None => Some(txn.conn().query_row(
+                    "SELECT json_object('permission_ids', json(?1), 'op_ids', json(?2))",
+                    params![ids_json, ops_json],
+                    |r| r.get::<_, String>(0),
+                )?),
+            };
+            if event.op_id.is_none() && expired.len() == 1 {
+                event.op_id = Some(expired[0].1);
+            }
+            txn.side_row_applied();
+            let seq = Self::insert_event_locked(
+                txn.conn(),
+                session_id,
+                event.op_id,
+                event.kind,
+                &event_state_json,
+                event.ts_ms,
+                payload_json,
+                event.payload_ver,
+                &seq_messages,
+            )?;
+            txn.precommit();
+            txn.commit()?;
+            Ok(ExpiredPermissionResolution {
+                expired,
+                event_seq: Some(seq),
             })
+        };
+        // RECOVERY-CLASS SITE (audit item 14): the crash sweep's permission
+        // expiry is durable crash reconciliation, so it is admitted through
+        // the explicit per-call recovery purpose. The ordinary command above
+        // keeps the emergency band byte-for-byte.
+        if recovery {
+            self.writer
+                .execute_recovery("expire_pending_permissions_for_session_recovery", run)
+        } else {
+            self.writer
+                .execute("expire_pending_permissions_for_session", run)
+        }
     }
 
     /// `put_checkpoint` as ONE transaction: insert the checkpoint row (with a

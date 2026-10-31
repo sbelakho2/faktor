@@ -1296,8 +1296,15 @@ impl Store {
         let expectation = PreparedSessionStateExpectation::prepare(session_id, state);
         let not_running = format!("recovered tool run {op_id} is not running");
         let seq_messages = EventSeqMessages::for_session(session_id);
+        // RECOVERY-CLASS SITE (audit item 14): this command exists ONLY to
+        // materialize a crashed operation's terminal row and its
+        // `RecoveryApplied` event. It is the recovery-band materialization
+        // the crash sweep must be able to commit even when ordinary
+        // admission is saturated; a normal live write must never use this
+        // command, and the recovery band is selected per call (no shared
+        // state).
         self.writer
-            .execute("finish_recovered_tool_run_and_event", move |conn| {
+            .execute_recovery("finish_recovered_tool_run_and_event", move |conn| {
                 let txn = SessionCommandTxn::begin_prepared(conn, &seam, session_id, expectation)?;
                 let changed = txn.tx.execute(
                     "UPDATE tool_run SET status = ?3, effect_status = ?4, ended_ms = ?5
@@ -3067,6 +3074,33 @@ impl Store {
         turn_op_id: OpId,
         status: &str,
     ) -> StoreResult<bool> {
+        self.finish_turn_record_with_purpose(false, session_id, turn_op_id, status)
+    }
+
+    /// RECOVERY-CLASS sibling of [`Self::finish_turn_record`], used ONLY by
+    /// the crash-reconciliation sweep to close a turn record left ACTIVE by
+    /// the dead process. That close is the sweep's own durable repair and
+    /// must land when ordinary admission is saturated.
+    ///
+    /// AUTHORITY: recovery-only by construction (called from
+    /// `SessionHandle::recover_all`); the flag is a per-call argument, never
+    /// shared state. The ordinary command keeps the emergency band.
+    pub fn finish_turn_record_recovery(
+        &self,
+        session_id: SessionId,
+        turn_op_id: OpId,
+        status: &str,
+    ) -> StoreResult<bool> {
+        self.finish_turn_record_with_purpose(true, session_id, turn_op_id, status)
+    }
+
+    fn finish_turn_record_with_purpose(
+        &self,
+        recovery: bool,
+        session_id: SessionId,
+        turn_op_id: OpId,
+        status: &str,
+    ) -> StoreResult<bool> {
         if !matches!(
             status,
             TURN_RECORD_COMPLETED | TURN_RECORD_CANCELLED | TURN_RECORD_FAILED
@@ -3079,20 +3113,25 @@ impl Store {
         // Preparation BEFORE enqueueing: the timestamp is captured on the
         // caller's thread (audit item 8) — the writer job executes SQL only.
         let now = now_ms();
-        self.writer
-            .execute_retry_busy("finish_turn_record", move |conn| {
-                let n = conn.execute(
-                    "UPDATE turn_record SET status = ?3, updated_ms = ?4
+        let run = move |conn: &mut rusqlite::Connection| {
+            let n = conn.execute(
+                "UPDATE turn_record SET status = ?3, updated_ms = ?4
              WHERE session_id = ?1 AND turn_op_id = ?2 AND status = 'active'",
-                    params![
-                        session_id.raw() as i64,
-                        turn_op_id.raw() as i64,
-                        status,
-                        now
-                    ],
-                )?;
-                Ok(n > 0)
-            })
+                params![
+                    session_id.raw() as i64,
+                    turn_op_id.raw() as i64,
+                    status,
+                    now
+                ],
+            )?;
+            Ok(n > 0)
+        };
+        if recovery {
+            self.writer
+                .execute_retry_busy_recovery("finish_turn_record", run)
+        } else {
+            self.writer.execute_retry_busy("finish_turn_record", run)
+        }
     }
 
     /// The session's single active logical-turn record (at most one exists).

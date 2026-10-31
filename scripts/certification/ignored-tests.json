@@ -83,6 +83,24 @@
   ],
   "manual": [
     {
+      "file": "crates/store/src/query_plan_inventory_tests.rs",
+      "fn": "record_query_plan_inventory",
+      "tag": "perf",
+      "reason": "manual query-plan inventory regeneration: merges reviewed plan annotations back into crates/store/query_plan_inventory.json; run with `cargo test -p faktor-store record_query_plan_inventory -- --ignored` when SQL statements or schema ladders change, then review the plan diff (new SCANs, lost blessings) before committing"
+    },
+    {
+      "file": "crates/session/tests/session_modelcheck.rs",
+      "fn": "session_modelcheck_long_exhaustive",
+      "tag": "fault",
+      "reason": "manual long model-check campaign: longer seeded command sequences with crash-at-boundary reconstruction against the independent reference session model (HAR-09); run explicitly with `cargo test -p faktor-session --test session_modelcheck -- --ignored --nocapture` when session lifecycle transitions change"
+    },
+    {
+      "file": "tests/chaos/src/har01.rs",
+      "fn": "har01_real_deepseek_kill_mid_stream_is_typed_and_single_charge",
+      "tag": "live",
+      "reason": "manual live-environment test: ONE real DeepSeek completion through the local chaos proxy (gated on ~/.faktor-live/deepseek.env; absent → recorded skip, never a failure); run explicitly with `cargo test -p faktor-tests-chaos -- --ignored`"
+    },
+    {
       "file": "crates/cloud/src/billing_rollup_tests.rs",
       "fn": "billing_admission_is_constant_at_one_million_events",
       "tag": "perf",
@@ -329,10 +347,22 @@
       "reason": "manual fault/scale probe outside the nightly fault lane's package set: run explicitly with `cargo test -- --ignored`"
     },
     {
+      "file": "tests/quality/src/route_fuzz_tests.rs",
+      "fn": "route_fuzz_longrun_soak_under_panic_hook",
+      "tag": "fault",
+      "reason": "manual long-run route-fuzz soak (>=50k seeded iterations under the panic-hook harness) outside the nightly fault lane's package set: run explicitly with `cargo test -p faktor-tests-quality -- --ignored`"
+    },
+    {
       "file": "crates/payments/src/scale_tests.rs",
       "fn": "perf_100k_invoices_reads_stay_bounded",
       "tag": "perf",
       "reason": "manual performance/long probe: 100k-invoice billing page/stats/export/reconciliation bound check; run explicitly with `cargo test -p faktor-payments --lib -- --ignored` when the billing read path or scale shape changes; not a CI timing gate"
+    },
+    {
+      "file": "tests/eval/tests/fixtures_scale.rs",
+      "fn": "legacy_one_million_line_corpus_generation_indexing_and_bounds",
+      "tag": "perf",
+      "reason": "manual performance/long probe: HAR-14 1M-line fixture corpus (generation + indexing + entry-bounded snapshot) against committed regression budgets in tests/eval/fixtures/budgets.json; run explicitly via `node scripts/run-evals.mjs fixtures` (or `cargo test -p faktor-tests-eval --release --test fixtures_scale -- --ignored`); never a CI timing gate"
     }
   ],
   "non_test": [

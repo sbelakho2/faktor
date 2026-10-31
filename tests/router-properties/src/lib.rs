@@ -1,4 +1,12 @@
+// TEST-SEPARATION: oracle=independent-reference isolation=isolated-data-dir
 //! Randomized routing economic property tests (audit item 101).
+//!
+//! HAR-07: every randomized property below runs under `proptest` (the LCG
+//! generators are ported unchanged and driven by a proptest-chosen `seed`),
+//! so failures shrink to a minimal case, failing seeds persist into
+//! `proptest-regressions/` (SourceParallel default, next to this crate's
+//! `lib.rs`), and a stored seed replays first on the next run. The fixed
+//! adversarial tails kept their own plain `#[test]`s — no case was lost.
 //!
 //! Every test generates seeded LCG cases over prices (exact, local-zero,
 //! conservative-ceiling, unknown), token shapes, cache hits, quality,
@@ -15,14 +23,16 @@
 //! - MaximumQuality does not discard unknown-price high-quality models when
 //!   there is no cap.
 
-#![cfg_attr(
-    not(test),
-    allow(dead_code, unused_imports, unused_variables, unused_mut)
-)]
+// This crate exists only to be tested: the whole library is cfg(test) so the
+// proptest dev-dependency never leaks into a normal build of the lib target.
+#![cfg(test)]
 
 use std::any::type_name;
 use std::cmp::Ordering;
 use std::sync::Arc;
+
+use proptest::prelude::*;
+use proptest::test_runner::{FileFailurePersistence, RngAlgorithm, TestError, TestRng, TestRunner};
 
 use faktor_agent::{EconomicRoutingPolicy, RouteFailure, RoutingPolicy};
 use faktor_core::model::{
@@ -283,66 +293,75 @@ fn oracle_cmp(a: &OracleRow, b: &OracleRow) -> Ordering {
 
 // ------------------------------------------------------------- properties
 
-/// Unknown price is never treated as free; a zero-by-number snapshot with
-/// Unknown authority is still not free; LocalZero is free BY AUTHORITY.
-#[test]
-fn unknown_price_is_never_free() {
-    let mut g = Gen::new(0xE100);
-    for _ in 0..4_000 {
-        let quote = random_quote(&mut g);
-        let (tin, tcr, tcw, tout) = (
-            g.range(0, 50_000),
-            g.range(0, 50_000),
-            g.range(0, 50_000),
-            g.range(0, 5_000),
-        );
-        let unknown = PricingSnapshot::unknown(1, "property".into());
-        assert_eq!(unknown.settle_cost(tin, tcr, tcw, tout), None);
-        assert_ne!(unknown.authority, PriceAuthority::LocalZero);
+proptest! {
+    #![proptest_config(ProptestConfig {
+        // One proptest case per former LCG pass: coverage kept 1:1.
+        cases: 4_000,
+        ..ProptestConfig::default()
+    })]
+    /// Unknown price is never treated as free; a zero-by-number snapshot with
+    /// Unknown authority is still not free; LocalZero is free BY AUTHORITY.
+    #[test]
+    fn unknown_price_is_never_free(seed: u64) {
+        let mut g = Gen::new(0xE100 ^ seed);
+    let quote = random_quote(&mut g);
+    let (tin, tcr, tcw, tout) = (
+        g.range(0, 50_000),
+        g.range(0, 50_000),
+        g.range(0, 50_000),
+        g.range(0, 5_000),
+    );
+    let unknown = PricingSnapshot::unknown(1, "property".into());
+    assert_eq!(unknown.settle_cost(tin, tcr, tcw, tout), None);
+    assert_ne!(unknown.authority, PriceAuthority::LocalZero);
 
-        let local = PricingSnapshot::local_zero(1, "property".into());
-        assert_eq!(local.settle_cost(tin, tcr, tcw, tout), Some(0));
-        assert!(local.is_local_zero());
+    let local = PricingSnapshot::local_zero(1, "property".into());
+    assert_eq!(local.settle_cost(tin, tcr, tcw, tout), Some(0));
+    assert!(local.is_local_zero());
 
-        let exact = PricingSnapshot::exact(quote, 1, "property".into());
-        let ceiling = PricingSnapshot::conservative_ceiling(quote, 1, "property".into());
-        assert_eq!(
-            ceiling.settle_cost(tin, tcr, tcw, tout),
-            exact.settle_cost(tin, tcr, tcw, tout),
-            "a ceiling snapshot prices exactly like the bound it states"
-        );
+    let exact = PricingSnapshot::exact(quote, 1, "property".into());
+    let ceiling = PricingSnapshot::conservative_ceiling(quote, 1, "property".into());
+    assert_eq!(
+        ceiling.settle_cost(tin, tcr, tcw, tout),
+        exact.settle_cost(tin, tcr, tcw, tout),
+        "a ceiling snapshot prices exactly like the bound it states"
+    );
 
-        // A hostile zero quote under Unknown authority must stay unknown.
-        let mut hostile = PricingSnapshot::unknown(1, "property".into());
-        hostile.quote = Some(PriceQuote::ZERO);
-        assert_eq!(
-            hostile.settle_cost(1, 0, 0, 0),
-            None,
+    // A hostile zero quote under Unknown authority must stay unknown.
+    let mut hostile = PricingSnapshot::unknown(1, "property".into());
+    hostile.quote = Some(PriceQuote::ZERO);
+    assert_eq!(
+        hostile.settle_cost(1, 0, 0, 0),
+        None,
             "a zero-by-number unknown-authority snapshot is NOT free"
         );
     }
 }
 
-/// A hard cap never admits a known estimate above the free balance; the
-/// chosen decision's base cost never exceeds the remaining budget.
-#[test]
-fn hard_cap_never_admits_known_estimate_over_free() {
-    for seed in 0..SEEDS {
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: SEEDS as u32,
+        ..ProptestConfig::default()
+    })]
+    /// A hard cap never admits a known estimate above the free balance; the
+    /// chosen decision's base cost never exceeds the remaining budget.
+    #[test]
+    fn hard_cap_never_admits_known_estimate_over_free(seed: u64) {
         let mut g = Gen::new(0xCA9 ^ seed);
         let count = 2 + g.range(0, 4);
         let candidates: Vec<ModelDescriptor> =
             (0..count).map(|i| random_descriptor(&mut g, i)).collect();
         let mut req = random_request(&mut g);
         req.task_budget_remaining_micro = g.range(1, 80_000);
-        let qualified = match qualified_candidates(&candidates, &req, &[], &LiveHealth::default()) {
-            Ok(q) => q,
-            Err(_) => continue,
-        };
-        for q in &qualified {
-            assert!(
-                q.call_cost_micro <= req.task_budget_remaining_micro,
-                "seed {seed}: qualified candidate above the free budget"
-            );
+        if let Ok(qualified) =
+            qualified_candidates(&candidates, &req, &[], &LiveHealth::default())
+        {
+            for q in &qualified {
+                assert!(
+                    q.call_cost_micro <= req.task_budget_remaining_micro,
+                    "seed {seed}: qualified candidate above the free budget"
+                );
+            }
         }
         if let Ok(d) = Router::new(candidates.clone()).route(&req, &[]) {
             assert!(
@@ -357,7 +376,12 @@ fn hard_cap_never_admits_known_estimate_over_free() {
             );
         }
     }
+}
 
+/// Adversarial fixed pair: a top-tier candidate known to cost above the
+/// free balance is never admitted, while an affordable lower tier serves.
+#[test]
+fn hard_cap_above_the_free_balance_is_never_admitted_adversarially() {
     // Adversarial: a top-tier candidate known to cost above the free balance
     // is never admitted, while an affordable lower tier still serves.
     let expensive = descriptor("premium", "big", 99, 40, 120, 200, RateLimitState::Healthy);
@@ -464,10 +488,14 @@ fn price_and_latency_are_structurally_distinct() {
     assert_eq!(r2.route(&req, &[]).unwrap().provider, "fast");
 }
 
-/// A hard quality floor is never lowered by any policy mode.
-#[test]
-fn hard_quality_floor_is_never_lowered() {
-    for seed in 0..SEEDS {
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: SEEDS as u32,
+        ..ProptestConfig::default()
+    })]
+    /// A hard quality floor is never lowered by any policy mode.
+    #[test]
+    fn hard_quality_floor_is_never_lowered(seed: u64) {
         let mut g = Gen::new(0xF100 ^ seed);
         let count = 2 + g.range(0, 4);
         let candidates: Vec<ModelDescriptor> =
@@ -513,7 +541,13 @@ fn hard_quality_floor_is_never_lowered() {
             }
         }
     }
+}
 
+/// Adversarial witness: a floor above every candidate is a typed refusal
+/// (`NoCapableModel`), never a decision at a lowered floor; a candidate
+/// above the floor still serves.
+#[test]
+fn a_floor_above_every_candidate_is_a_typed_refusal_not_a_lowered_floor() {
     // Adversarial: a floor above every candidate is a typed refusal, never a
     // decision at a lowered floor.
     let only = descriptor("weak", "m", 50, 1, 3, 100, RateLimitState::Healthy);
@@ -554,22 +588,25 @@ fn hard_quality_floor_is_never_lowered() {
     assert_eq!(d.provider, "strong");
 }
 
-/// Economy minimizes the expected verified-work cost over generated pairs
-/// with verified-outcome histories (the reference oracle re-implements the
-/// documented work-cost math with the public estimators).
-#[test]
-fn economy_minimizes_expected_verified_work_cost() {
-    for seed in 0..SEEDS {
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: SEEDS as u32,
+        ..ProptestConfig::default()
+    })]
+    /// Economy minimizes the expected verified-work cost over generated pairs
+    /// with verified-outcome histories (the reference oracle re-implements the
+    /// documented work-cost math with the public estimators).
+    #[test]
+    fn economy_minimizes_expected_verified_work_cost(seed: u64) {
         let mut g = Gen::new(0xEC0 ^ seed);
         let count = 2 + g.range(0, 3);
         let candidates: Vec<ModelDescriptor> =
             (0..count).map(|i| random_descriptor(&mut g, i)).collect();
         let mut req = random_request(&mut g);
         req.task_budget_remaining_micro = 0;
-        let qualified = match qualified_candidates(&candidates, &req, &[], &LiveHealth::default()) {
-            Ok(q) => q,
-            Err(_) => continue,
-        };
+        if let Ok(qualified) =
+            qualified_candidates(&candidates, &req, &[], &LiveHealth::default())
+        {
         let store = Arc::new(MemoryOutcomeStore::new());
         for (i, q) in qualified.iter().enumerate() {
             if i % 4 == 3 {
@@ -635,6 +672,7 @@ fn economy_minimizes_expected_verified_work_cost() {
                         .saturating_add(est.expected_rework_micro)
                 );
             }
+        }
         }
     }
 }
@@ -715,12 +753,17 @@ fn maximum_quality_keeps_unpriced_high_quality_model_without_cap() {
     );
 }
 
-/// The cache-hit term never understates and never fabricates a discount for
-/// an unknown-priced candidate; a cache hit can only lower a KNOWN cost.
-#[test]
-fn cache_hits_only_lower_known_estimates() {
-    let mut g = Gen::new(0xCAC4E);
-    for _ in 0..2_000 {
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 2_000,
+        ..ProptestConfig::default()
+    })]
+    /// The cache-hit term never understates and never fabricates a discount
+    /// for an unknown-priced candidate; a cache hit can only lower a KNOWN
+    /// cost.
+    #[test]
+    fn cache_hits_only_lower_known_estimates(seed: u64) {
+        let mut g = Gen::new(0xCAC4E ^ seed);
         let mut d = random_descriptor(&mut g, 0);
         d.economics.rate_limit_state = RateLimitState::Healthy;
         let req = RouteRequest {
@@ -747,6 +790,12 @@ fn cache_hits_only_lower_known_estimates() {
             assert_eq!(with, 0, "local zero stays zero");
         }
     }
+}
+
+/// Fixed witness: a cache state for a DIFFERENT model cannot discount this
+/// decision.
+#[test]
+fn a_cache_state_for_another_model_never_discounts_this_decision() {
     // A cache state for a DIFFERENT model cannot discount this decision.
     let a = descriptor("a", "one", 80, 10, 30, 100, RateLimitState::Healthy);
     let other = CacheState {
@@ -798,11 +847,15 @@ fn zero_authority_and_rework_absorb_invariants() {
     assert_eq!(stats.rework_cost_micro_sum, 7);
 }
 
-/// Keep the helper honest: the cached-cost recomputation uses the router's
-/// own public integer estimate.
-#[test]
-fn cached_estimate_matches_the_public_cost_function() {
-    for seed in 0..200 {
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 200,
+        ..ProptestConfig::default()
+    })]
+    /// Keep the helper honest: the cached-cost recomputation uses the router's
+    /// own public integer estimate.
+    #[test]
+    fn cached_estimate_matches_the_public_cost_function(seed: u64) {
         let mut g = Gen::new(0xC057 ^ seed);
         let mut d = random_descriptor(&mut g, 0);
         d.economics.rate_limit_state = RateLimitState::Healthy;
@@ -831,34 +884,158 @@ fn cached_estimate_matches_the_public_cost_function() {
     }
 }
 
-/// The empty outcome registry keeps scoring byte-identical to the legacy
-/// math (so Economy's verified-cost minimization degrades honestly to the
-/// telemetry prior when no history exists).
-#[test]
-fn empty_registry_matches_legacy_prior_scoring() {
-    for seed in 0..SEEDS {
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: SEEDS as u32,
+        ..ProptestConfig::default()
+    })]
+    /// The empty outcome registry keeps scoring byte-identical to the legacy
+    /// math (so Economy's verified-cost minimization degrades honestly to the
+    /// telemetry prior when no history exists).
+    #[test]
+    fn empty_registry_matches_legacy_prior_scoring(seed: u64) {
         let mut g = Gen::new(0xE49 ^ seed);
         let count = 2 + g.range(0, 3);
         let candidates: Vec<ModelDescriptor> =
             (0..count).map(|i| random_descriptor(&mut g, i)).collect();
         let mut req = random_request(&mut g);
         req.task_budget_remaining_micro = 0;
-        let qualified = match qualified_candidates(&candidates, &req, &[], &LiveHealth::default()) {
-            Ok(q) => q,
-            Err(_) => continue,
-        };
-        let empty = MemoryOutcomeStore::new();
-        let rows = oracle_rows(&qualified, req.phase, &empty);
-        let best = rows
-            .iter()
-            .min_by(|a, b| oracle_cmp(a, b))
-            .expect("non-empty");
-        let service = RouterService::new(candidates.clone());
-        let d = service.route(&req, &[]).unwrap();
-        assert_eq!(
-            (&d.provider, &d.model),
-            (&best.provider, &best.model),
-            "seed {seed}: empty-registry scoring diverged from the legacy prior math"
-        );
+        if let Ok(qualified) =
+            qualified_candidates(&candidates, &req, &[], &LiveHealth::default())
+        {
+            let empty = MemoryOutcomeStore::new();
+            let rows = oracle_rows(&qualified, req.phase, &empty);
+            let best = rows
+                .iter()
+                .min_by(|a, b| oracle_cmp(a, b))
+                .expect("non-empty");
+            let service = RouterService::new(candidates.clone());
+            let d = service.route(&req, &[]).unwrap();
+            assert_eq!(
+                (&d.provider, &d.model),
+                (&best.provider, &best.model),
+                "seed {seed}: empty-registry scoring diverged from the legacy prior math"
+            );
+        }
     }
+}
+
+// ---------------------------------------------------------------------------
+// HAR-07 harness proofs: failures shrink, seeds persist and replay
+// ---------------------------------------------------------------------------
+
+/// The shrinking contract: a failing property over `u64` MUST report the
+/// minimal failing input (shrunk), not the random draw that stumbled into
+/// the failure.
+#[test]
+fn proptest_shrinks_a_failing_property_to_the_minimal_case() {
+    let mut runner = TestRunner::new(ProptestConfig {
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    });
+    let error = runner
+        .run(&proptest::num::u64::ANY, |value| {
+            assert!(value < 100, "fail for every value >= 100");
+            Ok(())
+        })
+        .expect_err("the demonstration property must fail");
+    match error {
+        TestError::Fail(_, minimal) => {
+            assert_eq!(
+                minimal, 100,
+                "the reported failing input must be the SHRUNK minimal case \
+                 (any value >= 100 fails, so 100 is the minimum)"
+            );
+        }
+        TestError::Abort(reason) => panic!("the property aborted instead of failing: {reason:?}"),
+    }
+}
+
+/// The persistence contract: a failing seed is written to disk, and the next
+/// runner replays the stored case FIRST — reproducing the identical minimal
+/// failing case from the stored seed.
+#[test]
+fn proptest_persists_failing_seeds_and_replays_the_stored_case() {
+    let path = std::env::temp_dir().join(format!(
+        "faktor-router-properties-har07-replay-{}.txt",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let leaked: &'static str = Box::leak(
+        path.to_str()
+            .expect("temp path is utf8")
+            .to_owned()
+            .into_boxed_str(),
+    );
+    let config = || ProptestConfig {
+        failure_persistence: Some(Box::new(FileFailurePersistence::Direct(leaked))),
+        cases: 16,
+        ..ProptestConfig::default()
+    };
+    let property = |runner: &mut TestRunner| -> (u64, String) {
+        let error = runner
+            .run(&proptest::num::u64::ANY, |value| {
+                assert!(value < 100, "fail for every value >= 100");
+                Ok(())
+            })
+            .expect_err("the demonstration property must fail");
+        match error {
+            TestError::Fail(_, minimal) => (minimal, "fail".to_string()),
+            TestError::Abort(reason) => panic!("aborted: {reason:?}"),
+        }
+    };
+
+    // 1) First run: the failure is persisted to the configured file.
+    let (first_minimal, _) = property(&mut TestRunner::new(config()));
+    let persisted =
+        std::fs::read_to_string(&path).expect("the failing seed must be persisted to disk");
+    assert!(
+        !persisted.trim().is_empty(),
+        "the persistence file must contain the stored failing case"
+    );
+
+    // 2) Second run: proptest replays persisted cases FIRST, reproducing the
+    //    identical minimal failing case from the stored seed.
+    let (replayed_minimal, _) = property(&mut TestRunner::new(config()));
+    assert_eq!(
+        replayed_minimal, first_minimal,
+        "the stored seed must replay the identical failing case"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The same RNG seed reproduces the identical stream of generated cases
+/// (proptest's replayability: `PROPTEST_SEED`/persisted seeds converge on the
+/// same inputs run after run).
+#[test]
+fn the_same_rng_seed_reproduces_the_identical_case_stream() {
+    fn draw_stream(seed_bytes: [u8; 32]) -> Vec<u64> {
+        let mut runner = TestRunner::new_with_rng(
+            ProptestConfig {
+                failure_persistence: None,
+                cases: 16,
+                ..ProptestConfig::default()
+            },
+            TestRng::from_seed(RngAlgorithm::ChaCha, &seed_bytes),
+        );
+        let seen = std::cell::RefCell::new(Vec::new());
+        runner
+            .run(&proptest::num::u64::ANY, |value| {
+                seen.borrow_mut().push(value);
+                Ok(())
+            })
+            .expect("a passing property");
+        seen.into_inner()
+    }
+
+    let seed = [7u8; 32];
+    let first = draw_stream(seed);
+    let second = draw_stream(seed);
+    assert_eq!(first.len(), 16, "every configured case must run");
+    assert_eq!(
+        first, second,
+        "the same seed must reproduce the identical case stream"
+    );
+    let other = draw_stream([8u8; 32]);
+    assert_ne!(first, other, "different seeds must diverge (sanity)");
 }

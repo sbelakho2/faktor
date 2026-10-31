@@ -107,7 +107,14 @@ object JetBrainsParitySmoke {
         if (System.getProperty("faktor.parity.visualOnly") == "true") {
             // Visual-only mode: render the pinned panels and compare/repin the
             // per-platform record. Used to pin a platform lane (Linux CI
-            // container) without a daemon binary of that platform.
+            // container) without a daemon binary of that platform. HAR-16:
+            // re-pinning is a PINNED-release operation — structural-only mode
+            // is mutually exclusive with it (fail closed, never a silent
+            // re-pin under a different IDE release).
+            require(!ParityPath.visualCertStructuralOnly()) {
+                "visualOnly (baseline pinning) and structural visual certification " +
+                    "(HAR-16 alternate release) are mutually exclusive"
+            }
             ParityMatrix.run()
             println(
                 if (failures == 0) {
@@ -185,9 +192,14 @@ object JetBrainsParitySmoke {
         // The executable parity matrices: every row runs against the canned
         // frames AND the fake daemon, the visual matrix renders each panel
         // against the pinned baselines, and the artifact is written to
-        // target/certification/jetbrains-parity.json bound to this HEAD.
+        // target/certification/jetbrains-parity.json bound to this HEAD
+        // (per-version jetbrains-parity-<release>.json when an alternate IDE
+        // release is explicitly selected — HAR-16).
         step("visual certification policy: platform records are never inherited") {
             ParityMatrix.visualCertificationPolicySelfTest()
+        }
+        step("artifact naming policy: per-version paths never clobber the canonical pin (HAR-16)") {
+            ParityPath.artifactNamingPolicySelfTest()
         }
         step("parity matrix: behavioral rows + visual render vs pinned baselines + artifact") {
             assertTrue(
@@ -198,7 +210,29 @@ object JetBrainsParitySmoke {
                 0, ParityMatrix.behavioralFailures(),
                 "parity matrix behavioral rows failed (see the artifact row evidence)"
             )
+            // HAR-16: an explicitly selected ALTERNATE IDE release runs the
+            // structural matrix only — the visual baselines certify
+            // (platform × fonts × PINNED release) and the environment
+            // fingerprint carries no IDE release, so comparing or re-pinning
+            // another release's digests against them would be dishonest. The
+            // rows still RENDER (structural evidence) and every drift is
+            // surfaced as a typed note in the per-version artifact.
+            val structuralOnly = ParityPath.visualCertStructuralOnly()
+            if (structuralOnly) {
+                println(
+                    "VISUAL CERTIFICATION: structural-only for alternate IDE release " +
+                        "${ParityPath.selectedIdeaVersion()} (HAR-16: baselines certify the pinned release)"
+                )
+            }
             for (result in ParityMatrix.visuals()) {
+                if (structuralOnly) {
+                    if (result.drifted || result.notCertified) {
+                        println(
+                            "VISUAL STRUCTURAL-ONLY: ${result.panel}: ${result.detail}"
+                        )
+                    }
+                    continue
+                }
                 // Audit 28: drift against THIS platform's own record is a
                 // hard failure; a platform with no baseline record is
                 // surfaced as not certified (never compared against another

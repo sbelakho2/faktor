@@ -107,6 +107,13 @@
       "count": 1,
       "reason": "locates the configured directory root for one inventory key",
       "measured": "<= configured roots (default 1-2), exact-match fast path"
+    },
+    {
+      "file": "crates/session/src/compaction.rs",
+      "rule": "rust-position-in-loop",
+      "count": 1,
+      "reason": "locates one archive generation inside the lifecycle registry on publish/lookup, once per operation (not per generation)",
+      "measured": "<= MAX_ARCHIVE_LIFECYCLE_GENERATIONS (64) rows"
     }
   ]
 }

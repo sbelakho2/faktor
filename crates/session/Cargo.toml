@@ -31,3 +31,6 @@ test-utils = []
 [dev-dependencies]
 # Unit tests arm the store's deterministic crash seam (recovery windows).
 faktor-store = { workspace = true, features = ["fault-injection"] }
+# Recovery-band seam tests drive the storage governor the session's own
+# store/CAS discover (audit item 14: recovery writes at normal saturation).
+faktor-storage.workspace = true

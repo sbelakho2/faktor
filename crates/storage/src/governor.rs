@@ -2022,6 +2022,7 @@ impl StorageGovernor {
 
     fn charge_sqlite_growth(
         &self,
+        purpose: AdmissionPurpose,
         incoming_bytes: u64,
         tracked: bool,
     ) -> GovernorResult<Option<SqliteAdmission>> {
@@ -2034,14 +2035,13 @@ impl StorageGovernor {
         }
         let budget = capacity.effective_budget_bytes;
         let quota = self.inner.config.quota_for(StorageClass::SqliteWal, budget);
-        // Emergency/critical-metadata band: ledger/WAL growth may consume
-        // up to the emergency ceiling (default 90% of the effective
-        // budget); the RECOVERY-ONLY reserve above it is never spent by
-        // ongoing metadata growth — only explicit recovery admissions.
-        let total = self
-            .inner
-            .config
-            .emergency_ceiling_bytes(budget)
+        // The ceiling is the PURPOSE's band: ordinary metadata growth stops
+        // at the emergency ceiling (default 90% of the effective budget),
+        // while an explicit recovery admission may reach the FULL effective
+        // budget (the 90–100% recovery reserve). Normal callers can never
+        // reach either upper band.
+        let total = purpose
+            .ceiling_bytes(&self.inner.config, budget)
             .min(budget);
         loop {
             let mut stop = false;
@@ -2108,20 +2108,32 @@ impl StorageGovernor {
     /// pressure/age, and refuse the incoming append when the class quota or
     /// aggregate budget cannot hold it. The caller must not execute the write
     /// on `Err`.
-    pub fn admit_sqlite_growth(&self, incoming_bytes: u64) -> GovernorResult<()> {
-        self.admit_sqlite_growth_inner(incoming_bytes, false)
+    /// The purpose-aware form: an explicit per-call [`AdmissionPurpose`]
+    /// decides the band. There is deliberately NO global/thread-local
+    /// purpose state, so a concurrent or poisoned caller can never change
+    /// which band another call is admitted under. Existing callers keep the
+    /// emergency-metadata band byte-identically through
+    /// [`Self::admit_sqlite_growth`].
+    pub fn admit_sqlite_growth_for(
+        &self,
+        purpose: AdmissionPurpose,
+        incoming_bytes: u64,
+    ) -> GovernorResult<()> {
+        self.admit_sqlite_growth_inner(purpose, incoming_bytes, false)
             .map(|_| ())
     }
 
-    /// Tracked variant for the store writer: the returned guard keeps the
-    /// admission marked in-flight for exactly the life of the write, so a
-    /// concurrent maintenance scan can never discount bytes that are not on
-    /// disk yet.
-    pub fn admit_sqlite_growth_tracked(
+    /// Tracked, purpose-aware variant for the store writer: the returned
+    /// guard keeps the admission marked in-flight for exactly the life of
+    /// the write, so a concurrent maintenance scan can never discount bytes
+    /// that are not on disk yet. The purpose is an explicit argument; the
+    /// guard carries its own accounting and no outer state.
+    pub fn admit_sqlite_growth_tracked_for(
         &self,
+        purpose: AdmissionPurpose,
         incoming_bytes: u64,
     ) -> GovernorResult<SqliteAdmission> {
-        self.admit_sqlite_growth_inner(incoming_bytes, true)
+        self.admit_sqlite_growth_inner(purpose, incoming_bytes, true)
             .map(|admission| {
                 admission.unwrap_or_else(|| SqliteAdmission {
                     governor: self.clone(),
@@ -2131,8 +2143,40 @@ impl StorageGovernor {
             })
     }
 
+    /// Growth refusal for SQLite: admit against durable usage plus the
+    /// shared admitted-but-unsettled debt, run WAL maintenance only under
+    /// pressure/age, and refuse the incoming append when the class quota or
+    /// aggregate budget cannot hold it. The caller must not execute the write
+    /// on `Err`.
+    pub fn admit_sqlite_growth(&self, incoming_bytes: u64) -> GovernorResult<()> {
+        self.admit_sqlite_growth_for(AdmissionPurpose::EmergencyMetadata, incoming_bytes)
+    }
+
+    /// Tracked variant for the store writer: the returned guard keeps the
+    /// admission marked in-flight for exactly the life of the write, so a
+    /// concurrent maintenance scan can never discount bytes that are not on
+    /// disk yet. Keeps the historical emergency-metadata band.
+    pub fn admit_sqlite_growth_tracked(
+        &self,
+        incoming_bytes: u64,
+    ) -> GovernorResult<SqliteAdmission> {
+        self.admit_sqlite_growth_tracked_for(AdmissionPurpose::EmergencyMetadata, incoming_bytes)
+    }
+
+    /// Explicit RECOVERY-class SQLite admission: the ONLY SQLite path that
+    /// may consume the 90–100% recovery reserve. Named separately from the
+    /// general purpose-aware constructors so a call site opting into the
+    /// recovery band is auditable and cannot be produced by a default.
+    pub fn admit_sqlite_recovery_growth_tracked(
+        &self,
+        incoming_bytes: u64,
+    ) -> GovernorResult<SqliteAdmission> {
+        self.admit_sqlite_growth_tracked_for(AdmissionPurpose::Recovery, incoming_bytes)
+    }
+
     fn admit_sqlite_growth_inner(
         &self,
+        purpose: AdmissionPurpose,
         incoming_bytes: u64,
         tracked: bool,
     ) -> GovernorResult<Option<SqliteAdmission>> {
@@ -2151,7 +2195,7 @@ impl StorageGovernor {
         // so a reconcile reset of the unsettled counter cannot erase the
         // admission of a write that is already in flight.
         let _ = self.maintain_if_due(300_000, 30_000);
-        if let Some(admission) = self.charge_sqlite_growth(incoming_bytes, tracked)? {
+        if let Some(admission) = self.charge_sqlite_growth(purpose, incoming_bytes, tracked)? {
             return Ok(Some(admission));
         }
         // Pressure: at most one WAL maintenance per second; an explicit call
@@ -2164,7 +2208,7 @@ impl StorageGovernor {
             .load(Ordering::Relaxed);
         if now.saturating_sub(last) >= 1_000 {
             let _ = self.sqlite_maintenance();
-            if let Some(admission) = self.charge_sqlite_growth(incoming_bytes, tracked)? {
+            if let Some(admission) = self.charge_sqlite_growth(purpose, incoming_bytes, tracked)? {
                 return Ok(Some(admission));
             }
         }
@@ -2179,7 +2223,7 @@ impl StorageGovernor {
         };
         if volume_deficit > 0 {
             let _ = self.evict_global_for(volume_deficit);
-            if let Some(admission) = self.charge_sqlite_growth(incoming_bytes, tracked)? {
+            if let Some(admission) = self.charge_sqlite_growth(purpose, incoming_bytes, tracked)? {
                 return Ok(Some(admission));
             }
         }
@@ -2193,13 +2237,16 @@ impl StorageGovernor {
         let capacity = self.capacity_snapshot();
         let budget = capacity.effective_budget_bytes;
         let quota = self.inner.config.quota_for(StorageClass::SqliteWal, budget);
-        // The admission comparison runs against the emergency band; the
+        // The admission comparison runs against the CALL'S purpose band; the
         // health report below still names the FULL effective budget.
-        let total = self
-            .inner
-            .config
-            .emergency_ceiling_bytes(budget)
+        let total = purpose
+            .ceiling_bytes(&self.inner.config, budget)
             .min(budget);
+        let band = match purpose {
+            AdmissionPurpose::Normal => "normal ceiling",
+            AdmissionPurpose::EmergencyMetadata => "emergency ceiling",
+            AdmissionPurpose::Recovery => "recovery ceiling",
+        };
         let debt = self.inner.wal_debt.admitted.load(Ordering::Acquire);
         let class_used = snapshot
             .class_bytes
@@ -2238,7 +2285,7 @@ impl StorageGovernor {
             SqliteVolumeRoom::Reserve { detail, .. } => detail.clone(),
             SqliteVolumeRoom::Ok => format!(
                 "SQLite/WAL growth refused before the append ({class_used} used of {quota} \
-                 quota, emergency ceiling {total} of {budget} byte budget)"
+                 quota, {band} {total} of {budget} byte budget)"
             ),
         };
         let available = quota
@@ -2259,7 +2306,7 @@ impl StorageGovernor {
             code: format!("storage_{}", reason.as_str()),
             detail: format!(
                 "SQLite growth of {incoming_bytes} bytes refused ({detail}; {class_used} used of \
-                 {quota} quota, emergency ceiling {total}, pinned {pinned})"
+                 {quota} quota, {band} {total}, pinned {pinned})"
             ),
             total_bytes: total_used,
             total_budget_bytes: budget,

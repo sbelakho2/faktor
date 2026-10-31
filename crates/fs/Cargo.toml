@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+
+[features]
+# Fault-certification seam payloads (HAR-04 durable-write failpoints:
+# fault::arm/trip arming + panics). OFF in production builds: the crate
+# then compiles a zero-sized no-op at every trip call site.
+fault-injection = []
+
 [dependencies]
 faktor-core.workspace = true
 notify = "8"

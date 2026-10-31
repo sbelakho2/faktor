@@ -1,0 +1,77 @@
+{
+  "schema": "faktor-eval-report/v1",
+  "kind": "template",
+  "_comment": "TEMPLATE ONLY — committed skeleton of the report that scripts/run-evals.mjs writes to target/certification/evals/<timestamp>.report.json. No run output is ever committed; 'kind' stays 'template' here and is 'run' for a real report. All request bodies in a real report are redacted of secrets (api keys, authorization, passwords) before writing.",
+  "generated_at": "<ISO-8601>",
+  "suite": "conversation-quality/v1",
+  "provider": { "id": "deepseek", "model": "deepseek-chat", "upstream": "api.deepseek.com" },
+  "daemon": { "binary": "<path to faktor binary>", "data_dir": "[temp]" },
+  "workspace": "target/eval-fixtures/polyglot (seed 42)",
+  "budget": { "max_provider_requests": 20, "provider_requests": 0, "rejected_past_cap": 0 },
+  "turns": [
+    {
+      "index": 0,
+      "id": "greeting",
+      "kind": "ask",
+      "status": "completed",
+      "tasks_before": 0,
+      "tasks_after": 0,
+      "assistant_excerpt": "<first 600 chars of the durable assistant reply>",
+      "gates": [
+        { "id": "turn-completed@0", "status": "pass", "detail": "greeting completed" },
+        { "id": "request-material-recorded@0", "status": "pass", "detail": "1 provider request(s) recorded" },
+        { "id": "no-engineering-boilerplate@0", "status": "pass", "detail": "no task protocol/state marker in request material" },
+        { "id": "engineering-state-only-at-escalation@0", "status": "pass", "detail": "no task ledger / verification state" }
+      ],
+      "provider_requests": [
+        {
+          "index": 0,
+          "bytes": 12345,
+          "truncated": false,
+          "body": {
+            "model": "deepseek-chat",
+            "stream": true,
+            "messages": [
+              { "role": "system", "content": "<ask conversational profile + repository context>" },
+              { "role": "user", "content": "<the prompt as the daemon lowered it into provider history>" }
+            ],
+            "_note": "exact recorded provider request material for human review; secrets redacted"
+          }
+        }
+      ]
+    },
+    {
+      "index": 8,
+      "id": "escalation",
+      "kind": "task",
+      "status": "completed",
+      "tasks_before": 0,
+      "tasks_after": 1,
+      "assistant_excerpt": "<summary of the implementation turn>",
+      "gates": [
+        { "id": "turn-completed@8", "status": "pass", "detail": "escalation completed" },
+        { "id": "escalation-established@8", "status": "pass", "detail": "task ledger entries=1; task-profile request recorded" },
+        { "id": "cross-turn-reference@8", "status": "pass", "detail": "3/5 reply tokens present in request" }
+      ],
+      "provider_requests": [
+        { "index": 0, "bytes": 20480, "truncated": false, "body": { "messages": [{ "role": "system", "content": "…## Working protocol…" }] } }
+      ]
+    }
+  ],
+  "global_gates": [
+    { "id": "cost-cap", "status": "pass", "detail": "11/20 provider requests" }
+  ],
+  "review_items": [
+    "turn 3 (pronoun-follow-up): human judges whether the pronoun was resolved against turn 1's actual content",
+    "turn 4 (instruction-reversal): human judges that the assistant explained WITHOUT claiming an edit (no fix applied)",
+    "turn 2 (code-explanation): human inspects the recorded request for the attached file's material"
+  ],
+  "summary": {
+    "turns": 10,
+    "provider_requests": 11,
+    "gates_pass": 37,
+    "gates_fail": 0,
+    "gates_review": 2,
+    "assertion_failures": 0
+  }
+}

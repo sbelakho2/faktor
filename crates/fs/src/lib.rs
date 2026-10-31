@@ -23,6 +23,7 @@ use tokio::sync::mpsc;
 
 pub mod atomic;
 pub mod entry_state;
+pub mod fault;
 pub mod legacy;
 mod platform;
 pub mod rooted;
@@ -1224,9 +1225,10 @@ pub(crate) fn copy_open_file(
             .map_err(|e| Error::internal(format!("flush {}: {e}", tmp.display())))?;
         out.sync_all()
             .map_err(|e| Error::internal(format!("fsync {}: {e}", tmp.display())))?;
+        crate::fault::trip("copy_stage.fsynced");
         (copied, FileHash::from(hasher.finalize().into()))
     };
-    fs::rename(&tmp, target).map_err(|e| {
+    atomic::durable_rename_raw(&tmp, target).map_err(|e| {
         let _ = fs::remove_file(&tmp);
         Error::internal(format!(
             "rename {} -> {}: {e}",

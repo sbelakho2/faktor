@@ -1,0 +1,15 @@
+{
+  "schema": "faktor-eval-budgets/v1",
+  "note": "Measured regression budgets for the HAR-14 fixture pipeline (tests/eval). baseline_ms = the recorded measurement on the reference machine (release profile for the 1M probe, debug for the offline lane); bound_ms = max(3 x baseline, absolute CI-safe floor). Tests fail only when a measurement exceeds bound_ms — egregious regression, never ordinary wall-clock noise. Refresh baselines deliberately when the generator or machine class changes.",
+  "budgets": {
+    "polyglot_generate_ms": { "baseline_ms": 9, "bound_ms": 15000 },
+    "polyglot_index_ms": { "baseline_ms": 10, "bound_ms": 15000 },
+    "polyglot_snapshot_ms": { "baseline_ms": 2, "bound_ms": 15000 },
+    "legacy_small_generate_ms": { "baseline_ms": 200, "bound_ms": 15000 },
+    "legacy_small_snapshot_ms": { "baseline_ms": 100, "bound_ms": 15000 },
+    "legacy_1m_generate_ms": { "baseline_ms": 912, "bound_ms": 60000 },
+    "legacy_1m_index_ms": { "baseline_ms": 38543, "bound_ms": 120000 },
+    "legacy_1m_snapshot_full_ms": { "baseline_ms": 648, "bound_ms": 60000 },
+    "legacy_1m_snapshot_refuse_ms": { "baseline_ms": 37020, "bound_ms": 120000 }
+  }
+}

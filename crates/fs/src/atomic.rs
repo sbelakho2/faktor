@@ -36,6 +36,31 @@ pub fn fsync_parent(dir: &Path) {
     }
     #[cfg(not(unix))]
     let _ = dir;
+    crate::fault::trip("fsync_parent.done");
+}
+
+/// The single rename authority of the crate: every durable `rename(2)` in
+/// non-test code goes through here so its [`crate::fault`] failpoint fires
+/// (the drift test in `fault.rs` fails the build if a raw `fs::rename`
+/// appears anywhere else). The error mapping and temp cleanup stay with the
+/// caller — this helper only owns the syscall and the trip.
+pub(crate) fn durable_rename_raw(tmp: &Path, dest: &Path) -> std::io::Result<()> {
+    let result = fs::rename(tmp, dest);
+    if result.is_ok() {
+        crate::fault::trip("rename.done");
+    }
+    result
+}
+
+/// The single hard-link authority of the crate: every durable `link(2)` in
+/// non-test code goes through here so its [`crate::fault`] failpoint fires
+/// (same drift discipline as [`durable_rename_raw`]).
+pub(crate) fn durable_hard_link_raw(tmp: &Path, dest: &Path) -> std::io::Result<()> {
+    let result = fs::hard_link(tmp, dest);
+    if result.is_ok() {
+        crate::fault::trip("hard_link.done");
+    }
+    result
 }
 
 /// Atomically replace the file at `path` with `bytes`. The parent directory
@@ -63,7 +88,7 @@ pub fn atomic_replace_guarded(
     verify(path).inspect_err(|_| {
         let _ = fs::remove_file(&tmp);
     })?;
-    fs::rename(&tmp, path).map_err(|e| {
+    durable_rename_raw(&tmp, path).map_err(|e| {
         let _ = fs::remove_file(&tmp);
         Error::internal(format!(
             "rename {} -> {}: {e}",
@@ -85,7 +110,7 @@ pub fn atomic_create(path: &Path, bytes: &[u8]) -> Result<FileHash, Error> {
     let tmp = nonce_temp(path)?;
     write_and_fsync(&tmp, bytes)?;
     // hard_link(2) never clobbers: an existing destination is an error.
-    fs::hard_link(&tmp, path).map_err(|e| {
+    durable_hard_link_raw(&tmp, path).map_err(|e| {
         let _ = fs::remove_file(&tmp);
         if e.kind() == std::io::ErrorKind::AlreadyExists {
             Error::conflict(format!("{} already exists", path.display()))
@@ -123,11 +148,12 @@ pub fn atomic_adopt(tmp: &Path, dest: &Path) -> Result<(), Error> {
         .map_err(|e| Error::internal(format!("open {}: {e}", tmp.display())))?;
     file.sync_all()
         .map_err(|e| Error::internal(format!("fsync {}: {e}", tmp.display())))?;
+    crate::fault::trip("adopt.fsynced");
     drop(file);
     // rename(2) is the atomic swap (same filesystem; the caller's unique
     // destination name makes an existing destination crash residue, never a
     // live-writer race).
-    fs::rename(tmp, dest).map_err(|e| {
+    durable_rename_raw(tmp, dest).map_err(|e| {
         Error::internal(format!(
             "rename {} -> {}: {e}",
             tmp.display(),
@@ -164,7 +190,7 @@ pub fn atomic_adopt_dir(tmp: &Path, dest: &Path) -> Result<(), Error> {
     // platform supports it (macOS refuses directory fsync with EINVAL, which
     // `fsync_parent` deliberately ignores, exactly like every other writer).
     fsync_parent(tmp);
-    fs::rename(tmp, dest).map_err(|e| {
+    durable_rename_raw(tmp, dest).map_err(|e| {
         Error::internal(format!(
             "rename {} -> {}: {e}",
             tmp.display(),
@@ -213,7 +239,9 @@ pub fn atomic_publish_at(root: &RootedDir, tmp_rel: &Path, dest_rel: &Path) -> R
                 dest_rel.display()
             ))
         })?;
+        crate::fault::trip("publish_at.renamed");
         let _ = crate::rooted::unix_fsync(&dir);
+        crate::fault::trip("publish_at.fsynced");
         Ok(())
     }
     #[cfg(windows)]
@@ -224,14 +252,19 @@ pub fn atomic_publish_at(root: &RootedDir, tmp_rel: &Path, dest_rel: &Path) -> R
         // parent and the rename names the same parent handle; no absolute
         // pathname selects either object after the call begins.
         let _ = (tmp_name, dest_name);
-        root.windows_publish(tmp_rel, dest_rel)
+        root.windows_publish(tmp_rel, dest_rel)?;
+        // The handle-anchored publish performs the rename and its durability
+        // boundary in one platform call; both points cross together.
+        crate::fault::trip("publish_at.renamed");
+        crate::fault::trip("publish_at.fsynced");
+        Ok(())
     }
     #[cfg(not(any(unix, windows)))]
     {
         let _ = (tmp_name, dest_name);
         let tmp = crate::rooted::canonicalize_rooted(root.root(), tmp_rel)?;
         let dest = crate::rooted::canonicalize_rooted(root.root(), dest_rel)?;
-        fs::rename(&tmp, &dest).map_err(|e| {
+        durable_rename_raw(&tmp, &dest).map_err(|e| {
             Error::internal(format!(
                 "cannot publish {} -> {}: {e}",
                 tmp_rel.display(),
@@ -311,6 +344,7 @@ fn write_and_fsync(tmp: &Path, bytes: &[u8]) -> Result<(), Error> {
         .map_err(|e| Error::internal(format!("flush {}: {e}", tmp.display())))?;
     f.sync_all()
         .map_err(|e| Error::internal(format!("fsync {}: {e}", tmp.display())))?;
+    crate::fault::trip("write_and_fsync.fsynced");
     Ok(())
 }
 
@@ -640,7 +674,7 @@ pub fn atomic_replace_cas_guarded(
     verify(path).inspect_err(|_| {
         let _ = fs::remove_file(&tmp);
     })?;
-    fs::rename(&tmp, path).map_err(|e| {
+    durable_rename_raw(&tmp, path).map_err(|e| {
         let _ = fs::remove_file(&tmp);
         Error::internal(format!(
             "rename {} -> {}: {e}",

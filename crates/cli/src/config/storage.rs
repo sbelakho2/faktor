@@ -1,3 +1,4 @@
+// TEST-SEPARATION: oracle=external-fixture isolation=isolated-data-dir
 //! The always-on storage governor configuration (`[storage]`).
 //!
 //! One hard aggregate budget plus optional per-class quotas. Absent class
@@ -123,6 +124,18 @@ impl StorageCfg {
         };
         for (class, bytes) in self.overrides() {
             config.quotas.insert(class, bytes);
+        }
+        #[cfg(test)]
+        {
+            // Hermetic against HOST free space: the cli's own tests pin
+            // construction/admission BEHAVIOR, not the operator's disk
+            // pressure (the `band_config` precedent in crates/storage). The
+            // volume-reserve path still executes at the clamped minimum
+            // (1 per-mille of capacity, 2 GiB floor) — production builds
+            // compile this block out entirely, so the operator's 5% reserve
+            // default is untouched outside tests.
+            config.reserve_permille = 1;
+            config.reserve_bytes = 0;
         }
         config.validated()
     }

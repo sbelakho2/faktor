@@ -45,6 +45,54 @@ fun faktorRepoRoot(): File {
 
 val faktorRepo = faktorRepoRoot()
 
+// HAR-16 (two-IDE-version matrix): which IntelliJ Platform release the smoke
+// / parity / host-matrix JVMs see is decided by the frontend module's
+// `faktor.ideaVersion` property (frontend/build.gradle.kts resolves the
+// dependency; the pin lives in gradle.properties). This root script threads
+// the SELECTION into the executable smokes so an explicitly selected release
+// writes per-version certification artifacts (never clobbering the canonical
+// ones) and can opt into the structural-only visual-certification mode. With
+// the property absent nothing below changes: the smokes run exactly as
+// before against the pinned release and write the canonical artifacts.
+val faktorIdeaPin = (findProperty("faktor.ideaVersion.pin") as String?)
+    ?.trim()
+    ?.takeIf { it.isNotEmpty() }
+    ?: error("gradle.properties must pin faktor.ideaVersion.pin (the default IntelliJ Platform release)")
+val faktorIdeaVersionExplicit =
+    (findProperty("faktor.ideaVersion") as String?)?.trim().orEmpty()
+val faktorIdeaVersion = faktorIdeaVersionExplicit.ifEmpty { faktorIdeaPin }
+val faktorIdeaVisual = (findProperty("faktor.ideaVisual") as String?)?.trim().orEmpty()
+if (faktorIdeaVisual.isNotEmpty() && faktorIdeaVisual != "structural") {
+    error("faktor.ideaVisual accepts only 'structural' (got '$faktorIdeaVisual')")
+}
+if (faktorIdeaVisual == "structural") {
+    // Fail-closed (adversarial): the pinned release ALWAYS runs the full
+    // visual digest certification; structural-only is exclusively the
+    // explicitly-selected alternate-release leg's mode (HAR-16).
+    if (faktorIdeaVersionExplicit.isEmpty()) {
+        error(
+            "faktor.ideaVisual=structural requires an explicit " +
+                "-Pfaktor.ideaVersion=<older-release> (HAR-16 alternate leg); " +
+                "the pinned $faktorIdeaPin always runs full visual certification"
+        )
+    }
+    if (faktorIdeaVersion == faktorIdeaPin) {
+        error(
+            "faktor.ideaVisual=structural is refused for the pinned release " +
+                "$faktorIdeaPin (HAR-16): visual certification is mandatory on the pin"
+        )
+    }
+}
+// The JVM-side arguments every frontend smoke inherits for this invocation.
+val faktorIdeaSmokeJvmArgs: List<String> = buildList {
+    if (faktorIdeaVersionExplicit.isNotEmpty()) {
+        add("-Dfaktor.idea.version=$faktorIdeaVersion")
+    }
+    if (faktorIdeaVisual == "structural") {
+        add("-Dfaktor.parity.visualCertMode=structural")
+    }
+}
+
 // Pinned core-fonts environment for the offscreen Swing render (see the file's
 // header). Only applied on Linux hosts; macOS/Windows record their own
 // environment fingerprints. The smoke JVM runs with a checkout-local
@@ -132,6 +180,10 @@ subprojects {
                 }
                 val smokeHome = layout.buildDirectory.dir("smoke/home").get().asFile
                 jvmArgs.add("-Duser.home=${smokeHome.absolutePath}")
+                // HAR-16: per-release artifact naming + structural visual mode
+                // for an explicitly selected IDE release (empty without the
+                // faktor.ideaVersion property: no behavior change).
+                jvmArgs.addAll(faktorIdeaSmokeJvmArgs)
                 val smokeArgs = mutableListOf<String>()
                 smokeArgs.addAll(jvmArgs)
                 smokeArgs.add("-cp")
@@ -202,6 +254,9 @@ subprojects {
                     "$libs/*${File.pathSeparator}${(testRuntime + stdlib).asPath}",
                     "dev.faktor.frontend.JetBrainsHostMatrixSmoke"
                 )
+                // HAR-16: per-release artifact naming + structural visual mode
+                // (empty without the faktor.ideaVersion property).
+                matrixArgs.addAll(0, faktorIdeaSmokeJvmArgs)
                 findProperty("faktorCliBin")?.let { matrixArgs.add(it.toString()) }
                 doFirst {
                     matrixLog.get().asFile.parentFile.mkdirs()

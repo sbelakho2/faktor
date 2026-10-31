@@ -201,6 +201,12 @@ fn compaction_archive_store_is_classified_evictable_and_leaves_a_loss_marker() {
         total_budget_bytes: 10_000_000,
         watermark_permille: 900,
         reservation_lease_ms: 60_000,
+        // Hermetic against HOST free space (band_config precedent): the
+        // volume-reserve path still executes at the clamped minimum — this
+        // fixture pins eviction classification, not the operator's disk
+        // pressure.
+        reserve_permille: 1,
+        reserve_bytes: 0,
         quotas: StorageClass::ALL
             .into_iter()
             .map(|class| {
@@ -3568,8 +3574,14 @@ async fn compaction_soak_core(turns: usize) -> SoakReport {
         .into_iter()
         // The durable context checkpoint LIVES in the fact space (kind
         // `context_checkpoint`) and changes with every accepted
-        // compaction by design; the immutable fact set is everything else.
-        .filter(|(kind, _, _)| kind != faktor_session::CONTEXT_CHECKPOINT_KIND)
+        // compaction by design; the archive-lifecycle rows are
+        // COMPACTION-OWNED durable state (audit item 15: they advance
+        // live -> superseded as new archives publish). The immutable fact
+        // set is everything else.
+        .filter(|(kind, _, _)| {
+            kind != faktor_session::CONTEXT_CHECKPOINT_KIND
+                && kind != faktor_session::compaction::ARCHIVE_LIFECYCLE_FACT_KIND
+        })
         .collect();
     facts_before.sort();
 
@@ -3671,12 +3683,32 @@ async fn compaction_soak_core(turns: usize) -> SoakReport {
             .memory_facts()
             .unwrap()
             .into_iter()
-            .filter(|(kind, _, _)| kind != faktor_session::CONTEXT_CHECKPOINT_KIND)
+            .filter(|(kind, _, _)| {
+                kind != faktor_session::CONTEXT_CHECKPOINT_KIND
+                    && kind != faktor_session::compaction::ARCHIVE_LIFECYCLE_FACT_KIND
+            })
             .collect();
         facts_now.sort();
         assert_eq!(
             facts_now, facts_before,
             "turn {turn}: memory facts must survive every compaction"
+        );
+        // The archive-lifecycle registry the compactions maintain is
+        // HARD-BOUNDED: however many compactions ran, its durable rows can
+        // never exceed the documented generation cap (the oldest degraded
+        // record is dropped first; nothing is silently forgotten below the
+        // cap).
+        let lifecycle_rows = handle
+            .memory_facts_of_kinds(
+                &[faktor_session::compaction::ARCHIVE_LIFECYCLE_FACT_KIND],
+                u64::try_from(faktor_session::compaction::MAX_ARCHIVE_LIFECYCLE_GENERATIONS + 1)
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(
+            lifecycle_rows.0.len() <= faktor_session::compaction::MAX_ARCHIVE_LIFECYCLE_GENERATIONS,
+            "turn {turn}: the archive lifecycle registry grew past its bound: {}",
+            lifecycle_rows.0.len()
         );
         let head = handle.ledger_ensure_head().unwrap();
         assert!(
@@ -3751,5 +3783,150 @@ async fn compaction_soak_10k_turns_plateaus_with_bounded_growth() {
         report.max_rows,
         report.min_reduction_seen,
         report.elapsed
+    );
+}
+
+/// Audit item 15: a dead archive body whose generation still has a
+/// lifecycle record degrades to a DIGEST_ONLY wire marker (retained digest
+/// = cryptographic continuity); a dead hash WITHOUT a record keeps the
+/// plain loss marker — the governor fallback stays outermost.
+#[test]
+fn lifecycle_body_loss_renders_digest_only_continuity_while_unknown_hashes_keep_the_loss_marker() {
+    use faktor_session::compaction::{ArchiveLifecycleRegistry, ArchiveMetadata};
+    let dir = tempfile::tempdir().unwrap();
+    let cas = faktor_cas::Cas::open(dir.path().join("cas")).unwrap();
+    // A published archive whose body the governor then evicted.
+    let known = store_compaction_archive(&cas, &["chunk\n".to_string()]).expect("archive stored");
+    cas.evict_verified(known).unwrap();
+    assert!(!archive_manifest_is_retrievable(&cas, known));
+    // An unknown hash: never registered (or never seen) — no continuity.
+    let unknown = faktor_core::hash::FileHash::from_hex(&"a".repeat(64)).unwrap();
+    let mut registry = ArchiveLifecycleRegistry::new();
+    registry
+        .register_live(
+            &known.to_string(),
+            ArchiveMetadata {
+                total_bytes: 7,
+                chunk_count: 1,
+                created_ms: 1,
+            },
+            1,
+        )
+        .unwrap();
+    let mut plan = archive_plan();
+    plan.kept_recent[0].text =
+        format!("[Earlier context archived: x artifact://{known} and artifact://{unknown}]");
+    let marked =
+        mark_evicted_compaction_archives_with_lifecycle(Some(&cas), &mut plan, &mut registry);
+    assert_eq!(marked, 2, "both dead refs are rewritten");
+    let text = &plan.kept_recent[0].text;
+    assert!(
+        text.contains(&format!("[archive digest-only: {known}]")),
+        "the known generation keeps digest continuity: {text}"
+    );
+    assert!(
+        text.contains(&format!("[archive evicted: {unknown}]")),
+        "the unknown generation stays a loss: {text}"
+    );
+    assert!(!text.contains(&format!("artifact://{known}")), "{text}");
+    assert!(!text.contains(&format!("artifact://{unknown}")), "{text}");
+    // The record adopted the OBSERVED physical loss (state is digest-only).
+    assert_eq!(
+        registry.get(&known.to_string()).unwrap().state,
+        faktor_session::compaction::ArchiveLifecycleState::DigestOnly,
+    );
+    // A retrievable archive is never rewritten by either path.
+    let live = store_compaction_archive(&cas, &["still here\n".to_string()]).unwrap();
+    let mut live_plan = archive_plan();
+    live_plan.kept_recent[0].text = format!("[Earlier context archived: x artifact://{live}]");
+    assert_eq!(
+        mark_evicted_compaction_archives_with_lifecycle(Some(&cas), &mut live_plan, &mut registry),
+        0
+    );
+    assert!(live_plan.kept_recent[0]
+        .text
+        .contains(&format!("artifact://{live}")));
+}
+
+/// Audit item 15: sweeping even the DIGEST_ONLY record ends continuity on
+/// purpose — the very next wire pass falls back to the plain loss marker
+/// for that hash (the governor's outermost fallback).
+#[test]
+fn a_swept_digest_record_falls_back_to_the_loss_marker() {
+    use faktor_session::compaction::{ArchiveLifecycleRegistry, ArchiveMetadata};
+    let dir = tempfile::tempdir().unwrap();
+    let cas = faktor_cas::Cas::open(dir.path().join("cas")).unwrap();
+    let known = store_compaction_archive(&cas, &["chunk\n".to_string()]).expect("archive stored");
+    cas.evict_verified(known).unwrap();
+    let mut registry = ArchiveLifecycleRegistry::new();
+    registry
+        .register_live(
+            &known.to_string(),
+            ArchiveMetadata {
+                total_bytes: 7,
+                chunk_count: 1,
+                created_ms: 1,
+            },
+            1,
+        )
+        .unwrap();
+    // First pass: digest-only continuity.
+    let mut plan = archive_plan();
+    plan.kept_recent[0].text = format!("[Earlier context archived: x artifact://{known}]");
+    assert_eq!(
+        mark_evicted_compaction_archives_with_lifecycle(Some(&cas), &mut plan, &mut registry),
+        1
+    );
+    assert!(plan.kept_recent[0]
+        .text
+        .contains(&format!("[archive digest-only: {known}]")));
+    // The digest record is swept (retention pressure / operator action).
+    assert!(registry.sweep(&known.to_string()).is_some());
+    // Second pass: the dead ref no longer resolves to continuity — LOSS.
+    let mut plan = archive_plan();
+    plan.kept_recent[0].text = format!("[Earlier context archived: x artifact://{known}]");
+    assert_eq!(
+        mark_evicted_compaction_archives_with_lifecycle(Some(&cas), &mut plan, &mut registry),
+        1
+    );
+    assert!(
+        plan.kept_recent[0]
+            .text
+            .contains(&format!("[archive evicted: {known}]")),
+        "no record ⇒ the loss stands: {}",
+        plan.kept_recent[0].text
+    );
+}
+
+/// Audit item 15 wiring witness: the production compaction path loads the
+/// registry, marks through the lifecycle-aware seam (with the plain loss
+/// marker as its fallback branch), registers each published archive and
+/// persists the result. Removing any leg re-opens the full-archive →
+/// loss-marker jump or strands the registry unwritten.
+#[test]
+fn the_runtime_compaction_path_consults_the_archive_lifecycle() {
+    const SOURCE: &str = include_str!("compaction.rs");
+    let flat = SOURCE.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains("handle.archive_lifecycle_registry()"),
+        "the accepted-plan path must load the session registry"
+    );
+    assert!(
+        flat.contains(
+            "mark_evicted_compaction_archives_with_lifecycle( self.deps.cas.as_deref(), &mut plan, registry, )"
+        ),
+        "the wire marker must run through the lifecycle seam"
+    );
+    assert!(
+        flat.contains("mark_evicted_compaction_archives(self.deps.cas.as_deref(), &mut plan);"),
+        "the plain loss marker remains the fallback branch"
+    );
+    assert!(
+        flat.contains("registry.register_live(&manifest.to_string(), metadata, now)"),
+        "each published archive joins the lifecycle"
+    );
+    assert!(
+        flat.contains("handle.save_archive_lifecycle_registry(registry)"),
+        "the registry is persisted after mutation"
     );
 }

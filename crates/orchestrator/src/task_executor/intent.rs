@@ -71,18 +71,41 @@
 //!   contract: the false-positive posture stays asymmetric (questions and
 //!   non-English prose cannot establish; the user can always attach
 //!   explicit contract fields — rule 1 — or use a task run).
-//! - **No LLM fallback in this module**: promoting a conversational verdict
-//!   mid-turn would require a typed promotion request surfacing from the
-//!   already-running conversational drive and a second admission inside
-//!   the SAME turn loop (settlement + runtime seams, see the module
-//!   report). That seam is deliberately NOT implemented here; the
-//!   deterministic classifier stays the single admission-time authority.
+//! - **No LLM fallback, no mid-turn authority flip**: the classifier stays
+//!   the single admission-time authority. The escalation the classifier
+//!   cannot express mid-turn (it can miss — non-English, unusual phrasing)
+//!   is handled by the SHIPPED deferred promotion seam instead of an
+//!   in-turn re-entry: the conversational drive's tool loop intercepts the
+//!   reserved `promotion_request` signal (never executes it), answers the
+//!   typed `promotion_deferred` refusal and arms a durable
+//!   [`faktor_protocol::TurnPromotionRow`] marker (one per turn); THIS
+//!   module's [`resolve_ask_admission`] then upgrades the NEXT
+//!   single-item ask admission whose text classifies Conversational to
+//!   [`TurnIntent::EstablishContract`] — the SAME [`promote_ask_request`]
+//!   authority, the same validation, the same shadow/contract/budget/
+//!   verification establishment, no second agent, and no re-run of the
+//!   signaling turn (its provider request was already made and charged
+//!   once). In-turn re-entry is deliberately NOT shipped: the shadow/
+//!   contract/budget rows are admission-time state established BEFORE the
+//!   first model call, the drive's ask/task policy switch
+//!   (`st.execution`) is fixed at drive start, and the runtime has no
+//!   path back into `TaskExecutor` — a half-flip would be a half-hook.
+//!   Deferral is the provable alternative: a refusal that is honest about
+//!   when authority actually changes.
 //!
 //! Determinism contract: the same (request fields, prompt bytes, active
 //! objective presence) always yields the same verdict — no clock, no model,
 //! no I/O in the pure classifier ([`classify_turn_intent`]); the session
 //! consult ([`resolve_ask_admission`]) reads ONLY the durable task row of
-//! the SAME handle and is the documented single I/O point. False-positive
+//! the SAME handle plus, for a verdict of Conversational, the session's
+//! ONE fixed-key pending-promotion marker ([`pending_promotion`]) — the
+//! documented single I/O point, still no clock and no model. An armed
+//! marker can only UPGRADE Conversational → EstablishContract (it never
+//! rewrites a continuation or an engineering verdict, never mints a
+//! continuation, and cannot make a multi-item admission conversational-
+//! shaped); a corrupt marker is skipped LOUDLY (error log) and never
+//! bricks admission — the deterministic classifier remains the fallback
+//! authority. False-positive
 //! posture is deliberately asymmetric: a question or description can never
 //! establish a contract (questions lead with question words, not verbs), a
 //! conversational turn NEVER reads the engineering ledger, and a
@@ -703,11 +726,103 @@ fn active_objective(handle: &faktor_session::SessionHandle) -> Result<bool, Exec
     Ok(task.is_some_and(|task| !task.state.is_terminal() && !task.goal.trim().is_empty()))
 }
 
+/// The session's armed deferred-promotion marker (the ONE fixed
+/// memory-fact slot — [`faktor_protocol::PROMOTION_PENDING_ROW_KIND`] /
+/// [`faktor_protocol::PROMOTION_PENDING_ROW_KEY`]): `Some` when a
+/// conversational turn's `promotion_request` signal armed a promotion for
+/// the NEXT submission. A store read failure refuses typed; a CORRUPT row
+/// is skipped LOUDLY (error log — never a silent default, never an
+/// admission brick: the deterministic classifier remains the fallback
+/// authority, and the next valid arm overwrites/heals the slot).
+pub fn pending_promotion(
+    handle: &faktor_session::SessionHandle,
+) -> Result<Option<faktor_protocol::TurnPromotionRow>, ExecError> {
+    let value = handle
+        .memory_fact_get(
+            faktor_protocol::PROMOTION_PENDING_ROW_KIND,
+            faktor_protocol::PROMOTION_PENDING_ROW_KEY,
+        )
+        .map_err(|e| ExecError::Internal(format!("pending promotion read: {e}")))?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    match faktor_protocol::TurnPromotionRow::decode(&value) {
+        Ok(row) => Ok(Some(row)),
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "pending promotion row corrupt: the admission keeps its deterministic verdict"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Consume the armed deferred-promotion marker EXACTLY ONCE — called only
+/// at the executor's intent-row persistence of an accepted PROMOTING
+/// admission (so a refusal earlier in the same admission never eats the
+/// promotion). CAS-delete against the exact stamp that was read: a
+/// concurrent re-arm (Conflict) is retried once and otherwise left armed
+/// for a later admission (never double-consumed, never force-deleted); an
+/// already-absent slot returns `None` (Missing — a concurrent consumer
+/// won, exactly-once held). The returned objective becomes the audit
+/// field of the persisted intent row. A corrupt row returns `None` LOUD
+/// and stays for the next arm to heal (a corrupt row could never have
+/// upgraded this admission anyway).
+pub(crate) fn consume_pending_promotion(
+    handle: &faktor_session::SessionHandle,
+) -> Result<Option<String>, ExecError> {
+    for _attempt in 0..2u8 {
+        let stamped = handle
+            .memory_fact_get_stamped(
+                faktor_protocol::PROMOTION_PENDING_ROW_KIND,
+                faktor_protocol::PROMOTION_PENDING_ROW_KEY,
+            )
+            .map_err(|e| ExecError::Internal(format!("pending promotion read: {e}")))?;
+        let Some((value, stamp)) = stamped else {
+            return Ok(None);
+        };
+        let row = match faktor_protocol::TurnPromotionRow::decode(&value) {
+            Ok(row) => row,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "pending promotion row corrupt at consumption: leaving it for the next arm to heal"
+                );
+                return Ok(None);
+            }
+        };
+        let outcome = handle
+            .delete_memory_fact_cas(
+                faktor_protocol::PROMOTION_PENDING_ROW_KIND,
+                faktor_protocol::PROMOTION_PENDING_ROW_KEY,
+                Some(stamp),
+            )
+            .map_err(|e| ExecError::Internal(format!("pending promotion consume: {e}")))?;
+        match outcome {
+            faktor_store::MemoryFactDeleteCas::Deleted(_) => return Ok(Some(row.objective)),
+            faktor_store::MemoryFactDeleteCas::Missing => return Ok(None),
+            faktor_store::MemoryFactDeleteCas::Conflict => continue,
+        }
+    }
+    tracing::warn!(
+        "pending promotion marker raced two re-arms during consumption; still armed for a later admission"
+    );
+    Ok(None)
+}
+
 /// Resolve ONE ask-classified request against the session's active
 /// objective (the ONLY I/O point of this module, see the module docs):
 ///
 /// - [`TurnIntent::Conversational`] — the turn stays conversational
-///   end-to-end (no promotion);
+///   end-to-end (no promotion), UNLESS the session carries an armed
+///   deferred-promotion marker ([`pending_promotion`]) and this is a
+///   SINGLE-item admission (the ordinary conversational shape): the
+///   verdict is then UPGRADED to EstablishContract+promote — the
+///   deliverable "the turn's NEXT submission is pre-marked
+///   EstablishContract". The marker never mints, never rewrites a
+///   continuation or an engineering verdict, and a multi-item admission
+///   is left untouched (it cannot be conversational-shaped anyway);
 /// - [`TurnIntent::EstablishContract`] — promote to the engineering
 ///   admission path (a fresh objective when the row is free; when a
 ///   non-terminal row exists, a MATERIALLY NEW objective mints a NEW
@@ -720,17 +835,34 @@ fn active_objective(handle: &faktor_session::SessionHandle) -> Result<bool, Exec
 ///   ("continue fixing the flaky test"), anything else stays conversational
 ///   (a "continue" into the void is a chat turn, never a fabricated
 ///   objective).
+///
+/// The armed marker is CONSUMED by the EXECUTOR, not here: only at the
+/// intent row's persistence (an accepted promoting admission), so a
+/// refusal later in this same admission never eats the promotion.
 pub fn resolve_ask_admission(
     handle: &faktor_session::SessionHandle,
     req: &TaskRunRequest,
 ) -> Result<AskAdmissionDecision, ExecError> {
     let verdict = classify_turn_intent(&req.goal, carries_contract_fields(req));
     match verdict {
-        TurnIntent::Conversational => Ok(AskAdmissionDecision {
-            intent: TurnIntent::Conversational,
-            promote: false,
-            suppress_regal: false,
-        }),
+        TurnIntent::Conversational => {
+            // Deferred promotion (the shipped mid-turn escalation seam): an
+            // armed marker upgrades THIS single-item conversational
+            // admission into the engineering establishment path — same
+            // authority as any other EstablishContract admission.
+            if req.work_items.len() == 1 && pending_promotion(handle)?.is_some() {
+                return Ok(AskAdmissionDecision {
+                    intent: TurnIntent::EstablishContract,
+                    promote: true,
+                    suppress_regal: false,
+                });
+            }
+            Ok(AskAdmissionDecision {
+                intent: TurnIntent::Conversational,
+                promote: false,
+                suppress_regal: false,
+            })
+        }
         TurnIntent::EstablishContract => Ok(AskAdmissionDecision {
             intent: TurnIntent::EstablishContract,
             promote: true,
